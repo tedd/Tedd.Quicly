@@ -20,6 +20,7 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 | Testing | deterministic simulated network and transport, recording sink, test certificates, in-process fake ACME CA | 260 | 99.9 % | [simulation](benchmarks/simulation.md) |
 | Acme | RFC 8555 client for any CA, EAB, http-01 / dns-01 / tls-alpn-01, renewal (ARI aware) | 430 | ~98 % (Unix-only branches) | [acme](benchmarks/acme.md) |
 | Server · Certificates | provisioning from a static certificate, a file or ACME; consumer binding with grace-period disposal; reverse-DNS tls-alpn-01 responder | 308 | 99.5 % | — |
+| EndToEnd · Certificates | real-network suite: fake ACME CA -> provisioner -> MsQuic listener -> TLS 1.3 handshake; hot swap, SPKI pinning, tls-alpn-01, restart reuse | 30 | — | — |
 | Http | hardened HTTP/1.1 server, ACME responders, ClientHello peek for tls-alpn-01, static files | 772 (2 skipped) | 99.9 % | [http](benchmarks/http.md) |
 | Replication | entity ids, bit packing, quantisation, SIMD delta codec, snapshot history, inputs, prediction, interpolation, dedup, tick clock | 474 | 100 % | [replication](benchmarks/replication.md) |
 

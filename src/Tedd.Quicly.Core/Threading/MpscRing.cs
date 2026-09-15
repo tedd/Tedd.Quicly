@@ -1,0 +1,145 @@
+using System.Runtime.CompilerServices;
+
+namespace Tedd.Quicly.Core.Threading;
+
+/// <summary>
+/// Bounded lock-free multi-producer / single-consumer ring buffer (Vyukov's bounded queue).
+/// </summary>
+/// <remarks>
+/// <para>
+/// Any number of threads may call <see cref="TryEnqueue"/> concurrently; exactly one thread may call
+/// <see cref="TryDequeue"/> / <see cref="TryDequeueBatch"/> at any time. Every slot carries its own sequence
+/// number, so producers never contend on anything but the enqueue position (one compare-exchange per element)
+/// and the consumer never touches the enqueue position at all. Elements are dequeued in the order in which
+/// producers claimed their slots.
+/// </para>
+/// <para>The ring never allocates after construction.</para>
+/// </remarks>
+/// <typeparam name="T">Element type; must be unmanaged so that the buffer is a flat array of values.</typeparam>
+public sealed class MpscRing<T> where T : unmanaged
+{
+    private struct Slot
+    {
+        public long Sequence;
+        public T Value;
+    }
+
+    private readonly Slot[] _slots;
+    private readonly int _mask;
+    private MpscPositions _pos;
+
+    /// <summary>Creates a ring that holds at least <paramref name="minimumCapacity"/> elements.</summary>
+    /// <param name="minimumCapacity">Requested capacity; rounded up to the next power of two (minimum 2).</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="minimumCapacity"/> is not positive or exceeds 2^30.</exception>
+    public MpscRing(int minimumCapacity)
+    {
+        int capacity = SpscRing<T>.RoundUpCapacity(minimumCapacity);
+        _slots = new Slot[capacity];
+        _mask = capacity - 1;
+        for (int i = 0; i < capacity; i++)
+            _slots[i].Sequence = i;
+    }
+
+    /// <summary>Number of elements the ring can hold. Always a power of two.</summary>
+    public int Capacity => _mask + 1;
+
+    /// <summary>
+    /// Approximate number of queued elements (claimed slots, including ones a producer has not yet finished
+    /// writing).
+    /// </summary>
+    public int Count
+    {
+        get
+        {
+            // Dequeue is read first, so concurrent producers can only make the difference too large, never negative.
+            long dequeue = Volatile.Read(ref _pos.Dequeue);
+            return (int)Math.Min(Volatile.Read(ref _pos.Enqueue) - dequeue, _mask + 1);
+        }
+    }
+
+    /// <summary>True when no element is queued (approximate; see <see cref="Count"/>).</summary>
+    public bool IsEmpty => Volatile.Read(ref _pos.Enqueue) == Volatile.Read(ref _pos.Dequeue);
+
+    /// <summary>Appends an element. Safe to call from any number of threads concurrently.</summary>
+    /// <param name="item">Element to copy into the ring.</param>
+    /// <returns><see langword="false"/> when the ring is full; the element is not stored.</returns>
+    public bool TryEnqueue(in T item)
+    {
+        Slot[] slots = _slots;
+        long pos = Volatile.Read(ref _pos.Enqueue);
+        while (true)
+        {
+            ref Slot slot = ref slots[(int)(pos & _mask)];
+            long diff = Volatile.Read(ref slot.Sequence) - pos;
+            if (diff == 0)
+            {
+                long seen = Interlocked.CompareExchange(ref _pos.Enqueue, pos + 1, pos);
+                if (seen == pos)
+                {
+                    slot.Value = item;
+                    Volatile.Write(ref slot.Sequence, pos + 1);
+                    return true;
+                }
+
+                pos = seen;
+            }
+            else if (diff < 0)
+            {
+                // The slot still holds an element from the previous lap: the ring is full.
+                return false;
+            }
+            else
+            {
+                // Another producer claimed this slot after we read the position; reload and retry.
+                pos = Volatile.Read(ref _pos.Enqueue);
+            }
+        }
+    }
+
+    /// <summary>Removes the oldest element. Consumer thread only.</summary>
+    /// <param name="item">Receives the element, or <see langword="default"/> when the ring is empty.</param>
+    /// <returns>
+    /// <see langword="false"/> when the ring is empty, or when the oldest claimed slot has not yet been written
+    /// by its producer (it will be readable a few instructions later).
+    /// </returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryDequeue(out T item)
+    {
+        long pos = _pos.Dequeue;
+        ref Slot slot = ref _slots[(int)(pos & _mask)];
+        if (Volatile.Read(ref slot.Sequence) != pos + 1)
+        {
+            item = default;
+            return false;
+        }
+
+        item = slot.Value;
+        Volatile.Write(ref slot.Sequence, pos + _mask + 1);
+        Volatile.Write(ref _pos.Dequeue, pos + 1);
+        return true;
+    }
+
+    /// <summary>Removes up to <paramref name="destination"/>.Length elements in FIFO order. Consumer thread only.</summary>
+    /// <param name="destination">Receives the dequeued elements, oldest first.</param>
+    /// <returns>Number of elements written to <paramref name="destination"/>.</returns>
+    public int TryDequeueBatch(Span<T> destination)
+    {
+        Slot[] slots = _slots;
+        long pos = _pos.Dequeue;
+        int count = 0;
+        while (count < destination.Length)
+        {
+            ref Slot slot = ref slots[(int)(pos & _mask)];
+            if (Volatile.Read(ref slot.Sequence) != pos + 1)
+                break;
+
+            destination[count++] = slot.Value;
+            Volatile.Write(ref slot.Sequence, pos + _mask + 1);
+            pos++;
+        }
+
+        if (count != 0)
+            Volatile.Write(ref _pos.Dequeue, pos);
+        return count;
+    }
+}

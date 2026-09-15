@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated 2026-09-15. Test counts are totals across both target frameworks (net11.0 + net10.0).
+Last updated 2026-09-16. Test counts are totals across both target frameworks (net11.0 + net10.0).
 Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.CodeCoverage, cobertura).
 
 ## Merged into `main`
@@ -28,7 +28,7 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 
 | Module | Content |
 |---|---|
-| Core · Session (wave C1) | `QuiclyPeer`, handshake and admission, control stream, ping/clock sync, scheduler and packer, unreliable and ordered engines, Poll/Drain, completions |
+| Core · Session (wave C1) | Steps 1–3 done on `quicly/c1-session`, awaiting review: `QuiclyPeer`, handshake and admission, control stream, ping/clock sync, scheduler and packer, `UnreliableUnordered` / `UnreliableSequenced` / `ReliableOrdered` engines, `SendAsync` / `FlushAsync` / `WaitAsync` / `TryCancel`, `ThreadSafeSend`, Poll/Drain, completions; stream flow control in the simulator. On the branch: Core 3 140 tests, Testing 366; Session line coverage 96.4 %; [session](benchmarks/session.md) benchmarks |
 
 ## Remaining
 

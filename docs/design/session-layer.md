@@ -387,11 +387,14 @@ during a large ordered transfer with DropWhenBlocked); `OrderedStreamTests` (str
 re-sent on a new stream, STOP_SENDING closes the channel, a duplicate persistent stream and an oversized or FIN-cut frame are
 protocol violations, the sender's size limit, a full ring and an exhausted receive budget hold the stream back, a message that can
 never fit closes with LimitExceeded, expiry before the stream, close completes queued messages Disconnected, the send-table reserve,
-the queue limit counts bytes in flight, back-pressure from a receiver that stops polling to QueueFull and back); `AsyncApiTests`
-(SendAsync at once, waiting in call order, canceled, unreliable, NotConnected and disposed; FlushAsync at once, under the send cap,
+the queue limit counts bytes in flight, back-pressure from a receiver that stops polling to QueueFull and back, a segment arena of
+eight entries, an Immediate send without a Flush, a message that expires behind the head left out of the stream send);
+`AsyncApiTests` (SendAsync at once, waiting in call order, waiting for the send budget, canceled, unreliable, NotConnected and
+disposed, from another thread while the ThreadSafeSend front is full; FlushAsync at once, under the send cap,
 waiting for stream credit; WaitAsync / Wait / GetDeliveryStatus of both stages; ThreadPool completion; TryCancel while queued);
 `ThreadSafeSendTests` (four producer threads, a foreign Immediate send's pass on the game thread, tracked sends refused, every send
-path, drops counted); `OrderedZeroAllocationTests` (ordered traffic both ways with jitter and stream loss, the synchronous paths of
+path, drops counted, the checks made before a request is queued); `OrderedZeroAllocationTests` (ordered traffic both ways with
+jitter and stream loss, the synchronous paths of
 SendAsync and FlushAsync, admitting sends queued by another thread); the CancelOnBlocked capability tests in `SchedulerTests`; and,
 in the simulator's own suite, `FlowControlTests`.
 

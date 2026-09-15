@@ -26,12 +26,12 @@ public class AsyncApiTests
     }
 
     [Fact]
-    public void SendAsync_Completes_At_Once_When_The_Channel_Has_Room()
+    public async Task SendAsync_Completes_At_Once_When_The_Channel_Has_Room()
     {
         using SessionHarness h = new(table: Table);
         ValueTask<SendResult> send = h.Client.SendAsync(new SendHeader(4), new byte[] { 1 });
         Assert.True(send.IsCompletedSuccessfully);
-        Assert.Equal(SendStatus.Admitted, send.Result.Status);
+        Assert.Equal(SendStatus.Admitted, (await send).Status);
     }
 
     [Fact]
@@ -89,12 +89,12 @@ public class AsyncApiTests
     }
 
     [Fact]
-    public void SendAsync_On_An_Unreliable_Channel_Answers_At_Once()
+    public async Task SendAsync_On_An_Unreliable_Channel_Answers_At_Once()
     {
         using SessionHarness h = new(table: Table, client: o => o.SendBudgetBytes = 64);
         ValueTask<SendResult> send = h.Client.SendAsync(new SendHeader(2), new byte[500]);
         Assert.True(send.IsCompletedSuccessfully);
-        Assert.Equal(SendStatus.OutOfBuffers, send.Result.Status);
+        Assert.Equal(SendStatus.OutOfBuffers, (await send).Status);
     }
 
     [Fact]
@@ -262,6 +262,56 @@ public class AsyncApiTests
         for (int i = 0; i <= queued; i++)
         {
             Assert.Equal(OrderedKit.Payload(i, 4_000), got[i].Payload);
+        }
+    }
+
+    [Fact]
+    public async Task SendAsync_From_Another_Thread_Waits_While_The_ThreadSafeSend_Front_Is_Full()
+    {
+        using SessionHarness h = new(table: Table, client: o =>
+        {
+            o.ThreadSafeSend = true;
+            o.SendTableCapacity = 16;
+        });
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(4, Handlers.Collect(got));
+        QuiclyPeer client = h.Client;
+        client.Poll();
+        SendStatus first = default;
+        int queued = 0;
+        Task<SendResult>? waiting = null;
+        Thread producer = new(() =>
+        {
+            ValueTask<SendResult> at = client.SendAsync(new SendHeader(4), new byte[] { 0 });
+            first = at.IsCompleted ? at.Result.Status : SendStatus.QueueFull;
+            queued = 1;
+            while (client.SendCopy(new SendHeader(4), new byte[] { (byte)queued }).Status == SendStatus.Admitted)
+            {
+                queued++;
+            }
+
+            waiting = client.SendAsync(new SendHeader(4), new byte[] { (byte)queued }).AsTask();
+        });
+        producer.Start();
+        Assert.True(producer.Join(TimeSpan.FromSeconds(10)));
+        Assert.Equal(SendStatus.Admitted, first);
+        Assert.NotNull(waiting);
+
+        // The front stays full until the game thread drains it at its next Poll or Flush; the waiting send retries every
+        // millisecond, in real time.
+        Assert.False(waiting.IsCompleted);
+        long deadline = Environment.TickCount64 + 30_000;
+        while (!waiting.IsCompleted && Environment.TickCount64 < deadline)
+        {
+            h.Run(1_000);
+            Thread.Sleep(1);
+        }
+
+        Assert.Equal(SendStatus.Admitted, (await waiting).Status);
+        Assert.True(h.RunUntil(() => got.Count == queued + 1));
+        for (int i = 0; i <= queued; i++)
+        {
+            Assert.Equal(new byte[] { (byte)i }, got[i].Payload);
         }
     }
 }

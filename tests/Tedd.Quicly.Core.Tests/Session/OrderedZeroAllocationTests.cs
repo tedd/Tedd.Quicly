@@ -47,7 +47,10 @@ public class OrderedZeroAllocationTests
             client.Poll();
         }
 
-        for (int i = 0; i < 1_200; i++)
+        // Warm up past the harness's own growth: on this lossy link the simulator's buffer pool allocates a pinned buffer (on
+        // this thread) whenever more sends are in flight at once than ever before. With seed 1 that happens at ticks 1 382 and
+        // 1 428, then not before tick 5 422.
+        for (int i = 0; i < 3_000; i++)
         {
             Tick();
         }

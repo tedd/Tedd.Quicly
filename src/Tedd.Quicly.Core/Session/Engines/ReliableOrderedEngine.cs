@@ -151,16 +151,6 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
         _maxSegments = Math.Min(MaxSegmentsPerSend, core.Segments.Capacity);
     }
 
-    /// <summary>Messages queued on a channel and not yet handed to the transport (game thread; tests and statistics).</summary>
-    /// <param name="channelIndex">Dense index of a channel of this engine.</param>
-    /// <returns>The count.</returns>
-    internal int QueuedMessages(int channelIndex) => _send[_localOf[channelIndex]].QueueCount;
-
-    /// <summary>Messages handed to the transport and not yet completed (game thread; tests).</summary>
-    /// <param name="channelIndex">Dense index of a channel of this engine.</param>
-    /// <returns>The count.</returns>
-    internal int InFlightMessages(int channelIndex) => _send[_localOf[channelIndex]].InFlightCount;
-
     /// <summary>The lifecycle phase of a channel's send stream (game thread; tests).</summary>
     /// <param name="channelIndex">Dense index of a channel of this engine.</param>
     /// <returns>The phase.</returns>

@@ -457,4 +457,43 @@ public class OrderedStreamTests
 
         Assert.True(DatagramKit.Statistics(h.Client).StreamSends >= 25);
     }
+
+    [Fact]
+    public void An_Immediate_Ordered_Send_Goes_Out_Without_A_Flush()
+    {
+        using SessionHarness h = new(table: Table);
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(4, Handlers.Collect(got));
+        long sends = DatagramKit.Statistics(h.Client).StreamSends;
+        Assert.True(h.Client.SendCopy(new SendHeader(4), [1], SendOptions.Immediate).IsAdmitted);
+
+        // The send ran its own scheduler pass: the stream send is with the transport before any Flush.
+        Assert.Equal(sends + 1, DatagramKit.Statistics(h.Client).StreamSends);
+        Assert.True(h.RunUntil(() => got.Count == 1));
+        Assert.Equal(new byte[] { 1 }, got[0].Payload);
+    }
+
+    [Fact]
+    public void A_Message_That_Expires_Behind_The_Head_Is_Left_Out_Of_The_Stream_Send()
+    {
+        using SessionHarness h = new(table: Table);
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(4, Handlers.Collect(got));
+        Assert.True(h.Client.SendCopy(new SendHeader(4), [0]).IsAdmitted);
+        Assert.True(h.RunUntil(() => got.Count == 1));
+
+        // Queued with no pass in between: the head never expires, the message behind it expires before the next Flush.
+        Assert.True(h.Client.SendCopy(new SendHeader(4), [1]).IsAdmitted);
+        SendToken expiring = h.Client.SendCopy(new SendHeader(4), [2], new SendOptions { Track = true, ExpiryMicros = 1_000 }).Token;
+        Assert.True(h.Client.SendCopy(new SendHeader(4), [3]).IsAdmitted);
+        h.Network.Advance(5_000);
+        h.Client.Flush();
+        Assert.True(h.RunUntil(() => got.Count == 3 && h.Client.GetDeliveryStatus(expiring) != DeliveryStatus.Pending));
+        Assert.Equal(DeliveryStatus.Expired, h.Client.GetDeliveryStatus(expiring));
+        Assert.Equal(new byte[] { 1 }, got[1].Payload);
+        Assert.Equal(new byte[] { 3 }, got[2].Payload);
+        Assert.Equal(1, OrderedKit.Stats(h.Client, 4).Expired);
+        h.Run(100_000);
+        Assert.Equal(3, got.Count);
+    }
 }

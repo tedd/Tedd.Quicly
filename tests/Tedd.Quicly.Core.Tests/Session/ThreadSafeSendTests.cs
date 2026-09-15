@@ -188,4 +188,50 @@ public unsafe class ThreadSafeSendTests
         Assert.Equal(10, stats.ThreadSafeSendDrops);
         Assert.Equal(0, stats.SendBytesOutstanding);
     }
+
+    [Fact]
+    public void Sends_From_Other_Threads_Are_Checked_Before_They_Are_Queued()
+    {
+        using SessionHarness h = new(table: Table, client: o =>
+        {
+            o.ThreadSafeSend = true;
+            o.SendBudgetBytes = 16 * 1024;
+        });
+        QuiclyPeer client = h.Client;
+        client.Poll();
+        SendStatus[] statuses = new SendStatus[4];
+        Exception? keyFailure = null;
+        Thread producer = new(() =>
+        {
+            statuses[0] = client.SendCopy(new SendHeader(99), [1]).Status;
+            statuses[1] = client.SendCopy(new SendHeader(9), new byte[1_001]).Status;
+            statuses[2] = client.SendCopy(new SendHeader(4), new byte[1_000]).Status;
+            statuses[3] = client.SendCopy(new SendHeader(4), new byte[20_000]).Status;
+            try
+            {
+                client.SendCopy(new SendHeader(5, ulong.MaxValue), [1]);
+            }
+            catch (ArgumentOutOfRangeException exception)
+            {
+                keyFailure = exception;
+            }
+        });
+        producer.Start();
+        Assert.True(producer.Join(TimeSpan.FromSeconds(10)));
+
+        // Unknown channel, the channel's size limit, the send budget (20 000 bytes cannot fit 16 KiB) and a key beyond
+        // 2^62 - 1: all answered on the producing thread; only the 1 000-byte request was queued.
+        Assert.Equal(new[] { SendStatus.InvalidChannel, SendStatus.TooLarge, SendStatus.Admitted, SendStatus.OutOfBuffers }, statuses);
+        Assert.NotNull(keyFailure);
+        Assert.Equal(1, DatagramKit.Statistics(client).ThreadSafeSends);
+
+        client.Close();
+        Assert.True(h.RunUntilClosed());
+        SendStatus late = default;
+        producer = new(() => late = client.SendCopy(new SendHeader(4), [1]).Status);
+        producer.Start();
+        Assert.True(producer.Join(TimeSpan.FromSeconds(10)));
+        Assert.Equal(SendStatus.NotConnected, late);
+        Assert.Equal(1, DatagramKit.Statistics(client).ThreadSafeSends);
+    }
 }

@@ -59,7 +59,10 @@ public enum StreamEvent : byte
 /// bulk — <c>Preamble, BulkHeader</c>, then the body as one message (unchunked) or one message per chunk
 /// (<see cref="StreamMessageHeader.Length"/> = ChunkLength, <see cref="StreamMessageHeader.RawLength"/> = RawLength).</para>
 /// <para>This is a mutable struct: keep it in a field or array element and never copy it between calls. Allocation-free;
-/// never throws on malformed input.</para>
+/// never throws on malformed input. It holds only scalars (no managed references), so per-stream parsers can live in
+/// reference-free native or pinned struct arrays (ADR 0008 invariant 12); the channel table is passed to
+/// <see cref="Read"/> for the preamble lookup, and the stream's channel is resolved by the caller from
+/// <see cref="Channel"/>.</para>
 /// </remarks>
 public struct StreamFrameParser
 {
@@ -68,8 +71,6 @@ public struct StreamFrameParser
 
     private const StreamEvent Continue = (StreamEvent)0xFF;
 
-    private ChannelTable? _table;
-    private ChannelDefinition? _definition;
     private BulkHeader _bulk;
     private StreamMessageHeader _message;
     private ulong _groupId;
@@ -112,9 +113,6 @@ public struct StreamFrameParser
     /// <summary>The group id of a group stream (for ReliableLatest: the value's version).</summary>
     public readonly ulong GroupId => _groupId;
 
-    /// <summary>The preamble's channel (null for the control stream or before the preamble).</summary>
-    public readonly ChannelDefinition? Definition => _definition;
-
     /// <summary>Header of the current (or most recent) message.</summary>
     public readonly StreamMessageHeader Message => _message;
 
@@ -130,13 +128,12 @@ public struct StreamFrameParser
     /// <summary>The reason of the last <see cref="StreamEvent.Error"/>, or <see cref="ParseStatus.Ok"/>.</summary>
     public readonly ParseStatus Error => _error;
 
-    /// <summary>Effective maximum message size of the stream's channel (after the preamble).</summary>
+    /// <summary>
+    /// Effective maximum message size of the stream's channel (after the preamble): <c>min(channel.MaxMessageSize,
+    /// session cap)</c> for message streams, the channel's own <c>MaxMessageSize</c> (largest transfer <c>Length</c>) for
+    /// Bulk streams, 16 383 (largest control body) for the control stream.
+    /// </summary>
     public readonly int MaxMessageSize => _limit;
-
-    /// <summary>Prepares the parser for a new peer-initiated unidirectional stream (role decided by the preamble).</summary>
-    /// <param name="table">The session's channel table.</param>
-    /// <param name="maxMessageSize">Session cap (<c>HelloAck.maxMessageSize</c>); 0 = only each channel's limit.</param>
-    public void Reset(ChannelTable? table, int maxMessageSize = 0) => Reset(StreamRole.Unknown, table, maxMessageSize);
 
     /// <summary>Prepares the parser for a new stream.</summary>
     /// <param name="role">
@@ -145,11 +142,14 @@ public struct StreamFrameParser
     /// <see cref="StreamRole.Group"/> or <see cref="StreamRole.Bulk"/> to additionally require that kind
     /// (<see cref="ParseStatus.RoleMismatch"/> otherwise).
     /// </param>
-    /// <param name="table">The session's channel table (may be null for the control stream).</param>
-    /// <param name="maxMessageSize">Session cap; 0 = only each channel's limit.</param>
+    /// <param name="maxMessageSize">
+    /// Session cap (<c>HelloAck.maxMessageSize</c>) for ordered and group message frames; 0 = only each channel's limit.
+    /// It does not apply to Bulk transfers, whose <c>Length</c> is bounded by the Bulk channel's own
+    /// <c>MaxMessageSize</c> (PROTOCOL.md §8).
+    /// </param>
     /// <param name="bulkMaxChunk">Largest bulk chunk length and chunk raw length.</param>
     /// <exception cref="ArgumentOutOfRangeException">An argument is out of range.</exception>
-    public void Reset(StreamRole role, ChannelTable? table, int maxMessageSize = 0, int bulkMaxChunk = StreamFraming.DefaultBulkMaxChunk)
+    public void Reset(StreamRole role = StreamRole.Unknown, int maxMessageSize = 0, int bulkMaxChunk = StreamFraming.DefaultBulkMaxChunk)
     {
         if ((byte)role > (byte)StreamRole.Control)
         {
@@ -167,7 +167,6 @@ public struct StreamFrameParser
         }
 
         this = default;
-        _table = table;
         _expected = role;
         _maxMessageSize = maxMessageSize;
         _bulkMaxChunk = bulkMaxChunk;
@@ -178,10 +177,14 @@ public struct StreamFrameParser
     /// it returns <see cref="StreamEvent.NeedMore"/> (then <paramref name="input"/> is empty) or
     /// <see cref="StreamEvent.Error"/>.
     /// </summary>
+    /// <param name="table">
+    /// The session's channel table, consulted only to resolve the preamble of a unidirectional stream (may be null for
+    /// the control stream; a null table rejects every other preamble as <see cref="ParseStatus.UnknownChannel"/>).
+    /// </param>
     /// <param name="input">The unconsumed bytes of the current receive segment; advanced past consumed bytes.</param>
     /// <param name="payload">For <see cref="StreamEvent.PayloadChunk"/>: the payload slice of the input; otherwise empty.</param>
     /// <returns>The event.</returns>
-    public StreamEvent Read(ref ReadOnlySpan<byte> input, out ReadOnlySpan<byte> payload)
+    public StreamEvent Read(ChannelTable? table, ref ReadOnlySpan<byte> input, out ReadOnlySpan<byte> payload)
     {
         payload = default;
         while (true)
@@ -235,7 +238,7 @@ public struct StreamFrameParser
                         return StreamEvent.NeedMore;
                     }
 
-                    StreamEvent result = ParseNextHeader(ref input);
+                    StreamEvent result = ParseNextHeader(table, ref input);
                     if (result != Continue)
                     {
                         return result;
@@ -248,8 +251,9 @@ public struct StreamFrameParser
     }
 
     /// <summary>
-    /// Checks that the stream may end here (its FIN arrived). Call after <see cref="Read"/> returned
-    /// <see cref="StreamEvent.NeedMore"/>. Ordered, unordered-group and control streams must be at a message boundary
+    /// Checks that the stream may end here (its FIN arrived). Call once all received bytes were fed to <see cref="Read"/>;
+    /// a message whose last payload byte was handed out counts as complete even before <see cref="StreamEvent.MessageEnd"/>
+    /// was returned. Ordered, unordered-group and control streams must be at a message boundary
     /// after the preamble; a ReliableLatest group stream must have delivered its one message; a bulk stream its whole body.
     /// </summary>
     /// <returns><see cref="ParseStatus.Ok"/>, <see cref="ParseStatus.Truncated"/>, or the sticky error.</returns>
@@ -263,18 +267,26 @@ public struct StreamFrameParser
                 return ParseStatus.Ok;
             case State.Header when _bufferLength == 0 && !_latest && _role != StreamRole.Bulk:
                 return ParseStatus.Ok;
+            case State.MessageEnd:
+            {
+                // The last payload byte was handed out; only the MessageEnd event is pending.
+                State next = StateAfterMessage();
+                return next == State.Done || (next == State.Header && !_latest && _role != StreamRole.Bulk)
+                    ? ParseStatus.Ok
+                    : ParseStatus.Truncated;
+            }
             default:
                 return ParseStatus.Truncated;
         }
     }
 
-    private StreamEvent ParseNextHeader(ref ReadOnlySpan<byte> input)
+    private StreamEvent ParseNextHeader(ChannelTable? table, ref ReadOnlySpan<byte> input)
     {
         ParseStatus status;
         int consumed;
         if (_bufferLength == 0)
         {
-            status = ParseHeader(input, out consumed);
+            status = ParseHeader(table, input, out consumed);
             if (status != ParseStatus.Truncated)
             {
                 goto Parsed;
@@ -286,7 +298,7 @@ public struct StreamFrameParser
         int take = Math.Min(HeaderBufferSize - _bufferLength, input.Length);
         input.Slice(0, take).CopyTo(buffer.Slice(_bufferLength));
         int available = _bufferLength + take;
-        status = ParseHeader(buffer.Slice(0, available), out consumed);
+        status = ParseHeader(table, buffer.Slice(0, available), out consumed);
         if (status == ParseStatus.Truncated)
         {
             if (available == HeaderBufferSize)
@@ -313,12 +325,12 @@ public struct StreamFrameParser
         return OnHeaderParsed();
     }
 
-    private ParseStatus ParseHeader(ReadOnlySpan<byte> source, out int consumed)
+    private ParseStatus ParseHeader(ChannelTable? table, ReadOnlySpan<byte> source, out int consumed)
     {
         switch (_state)
         {
             case State.Preamble:
-                return ParsePreamble(source, out consumed);
+                return ParsePreamble(table, source, out consumed);
             case State.Header:
                 if (_role == StreamRole.Control)
                 {
@@ -388,7 +400,7 @@ public struct StreamFrameParser
         }
     }
 
-    private ParseStatus ParsePreamble(ReadOnlySpan<byte> source, out int consumed)
+    private ParseStatus ParsePreamble(ChannelTable? table, ReadOnlySpan<byte> source, out int consumed)
     {
         consumed = 0;
         int pos = 0;
@@ -417,7 +429,7 @@ public struct StreamFrameParser
             return ParseStatus.ChannelNotStream;
         }
 
-        ChannelDefinition? definition = channel <= ChannelDefinition.MaxId ? _table?[(int)channel] : null;
+        ChannelDefinition? definition = channel <= ChannelDefinition.MaxId ? table?[(int)channel] : null;
         if (definition is null)
         {
             return ParseStatus.UnknownChannel;
@@ -457,11 +469,11 @@ public struct StreamFrameParser
 
         _channel = (ushort)channel;
         _groupId = groupId;
-        _definition = definition;
         _role = role;
         _latest = latest;
         _shape = definition.StreamShape;
-        _limit = StreamFraming.EffectiveLimit(definition, _maxMessageSize);
+        // The session cap bounds message frames; a Bulk transfer is bounded by its channel alone (PROTOCOL.md §8).
+        _limit = role == StreamRole.Bulk ? definition.MaxMessageSize : StreamFraming.EffectiveLimit(definition, _maxMessageSize);
         consumed = pos;
         return ParseStatus.Ok;
     }

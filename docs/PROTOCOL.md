@@ -400,7 +400,14 @@ Byte-exact examples are in [protocol-vectors.md](protocol-vectors.md).
 
 * **§1 table section.** `flags` bit 7 is reserved and MUST be 0; compression codecs 2 and 3 are rejected in a v1
   table; `maxMessageSize` is 1 … 16 MiB; names are valid UTF-8 (a name of length 0 is allowed). `count` is at most
-  16 382 and ids are strictly ascending.
+  16 382 and ids are strictly ascending. A name length is a minimal varint, so a 64-byte name takes the two-byte length
+  `0x40 0x40`.
+* **§1 / §3.4 table size.** The table section travels inside the HelloAck (or the ChannelTableRequest answer), whose
+  body is at most 16 383 bytes. With the other HelloAck fields at their worst case (42 bytes of fixed fields and
+  varints, a session token of up to 4 096 bytes, a reason of up to 512 bytes) a table section of at most
+  **11 729 bytes** always fits; each channel costs 6 … 75 bytes (≈ 1 950 unnamed channels). A server whose table
+  section does not fit the frame MUST send `tableIncluded = 0` instead of an oversized frame; implementations should
+  check the section length (`ChannelTableCodec.GetLengthWithNames`) against this budget when the table is built.
 * **§1 defaults.** A channel's local `ExpiryMicros` default is 0 (none) for every mode except
   `UnreliableSequenced` (2 × the flush interval, §4.5), including `UnreliableUnordered`. `MaxGroups` defaults to 1
   for `ReliableOrdered` and 0 for datagram-only modes.
@@ -424,4 +431,6 @@ Byte-exact examples are in [protocol-vectors.md](protocol-vectors.md).
   not `TotalLength`. `Flags` bits 4–7 MUST be 0 and the hash-algorithm bits 2–3 MUST be 0 (SHA-256; the others are
   rejected, whether or not bit 0 is set). An unchunked body is exactly `Length` bytes. In a chunked body
   `ChunkLength ≥ 1`; `RawLength = 0` means the chunk is stored uncompressed, otherwise `ChunkLength < RawLength`;
-  the decoded sizes of all chunks sum to exactly `Length`. Bytes after the body are malformed.
+  the decoded sizes of all chunks sum to exactly `Length`. Bytes after the body are malformed. The session cap
+  `HelloAck.maxMessageSize` bounds message frames only (datagram messages, ordered and group stream frames); it does
+  not apply to Bulk transfers, whose `Length` is bounded by the Bulk channel's own `MaxMessageSize` alone.

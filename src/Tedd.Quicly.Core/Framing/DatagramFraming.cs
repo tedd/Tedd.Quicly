@@ -62,11 +62,17 @@ public static class DatagramFraming
     /// <param name="header">Sequence (low 16 bits on a 16-bit channel), key, fragment fields, RawLength.</param>
     /// <returns>Bytes written.</returns>
     /// <exception cref="ArgumentException">
-    /// The destination is too small, or the header is invalid for the channel (key above 2^62−1, FragCount above 8,
-    /// FragIndex ≥ FragCount, negative RawLength).
+    /// The destination is too small, the channel is stream-only (ReliableOrdered, ReliableUnordered, Bulk: every receiver
+    /// rejects such a datagram as <see cref="ParseStatus.ChannelNotDatagram"/>), or the header is invalid for the channel
+    /// (key above 2^62−1, FragCount above 8, FragIndex ≥ FragCount, negative RawLength).
     /// </exception>
     public static int WriteHeader(Span<byte> destination, ChannelDefinition channel, in MessageHeader header)
     {
+        if (!channel.IsDatagramMode)
+        {
+            ThrowNotDatagramChannel(channel);
+        }
+
         if ((channel.Keyed && header.Key > VarInt.MaxValue)
             || (channel.Fragmentation && (header.FragCount > MaxFragments || (header.FragCount > 1 && header.FragIndex >= header.FragCount)))
             || header.RawLength < 0)
@@ -340,6 +346,9 @@ public static class DatagramFraming
 
     private static void ThrowInvalidHeader() =>
         throw new ArgumentException("Header is invalid for the channel (key above 2^62-1, FragCount above 8, FragIndex >= FragCount, or negative RawLength).", "header");
+
+    private static void ThrowNotDatagramChannel(ChannelDefinition channel) =>
+        throw new ArgumentException($"Channel {channel.Id} ('{channel.Name}', {channel.Mode}) is stream-only; its messages cannot be sent as datagrams.", nameof(channel));
 
     private static void ThrowDestinationTooSmall(int length) =>
         throw new ArgumentException($"Destination is too small for the {length}-byte header.", "destination");

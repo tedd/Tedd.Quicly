@@ -44,7 +44,8 @@ public static class ChannelTableCodec
         int length = GetCanonicalLength(table);
         foreach (ChannelDefinition ch in table.All)
         {
-            length += 1 + ch.NameUtf8.Length; // name length ≤ 64 is always a one-byte varint
+            // 0…63 is a one-byte varint but 64 (MaxNameBytes) needs two bytes (0x40 0x40).
+            length += VarInt.GetLength((ulong)ch.NameUtf8.Length) + ch.NameUtf8.Length;
         }
 
         return length;
@@ -115,7 +116,7 @@ public static class ChannelTableCodec
         int pos = WriteCanonicalCore(table, destination);
         foreach (ChannelDefinition ch in table.All)
         {
-            destination[pos++] = (byte)ch.NameUtf8.Length;
+            pos += VarInt.Write(destination.Slice(pos), (ulong)ch.NameUtf8.Length);
             ch.NameUtf8.CopyTo(destination.Slice(pos));
             pos += ch.NameUtf8.Length;
         }

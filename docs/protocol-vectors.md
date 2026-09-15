@@ -49,6 +49,16 @@ The 38 canonical bytes followed by, per channel in id order, `name length varint
 05 776F726C64               "world"
 ```
 
+### Name of exactly 64 bytes
+
+A name length is a minimal varint like every other length: names of 0–63 bytes cost one length byte, a 64-byte name
+(the maximum) costs two (`4040`). One channel (id 2, `UnreliableUnordered`, defaults, name = 64 × `a`):
+
+```
+01 02 00 00 80 44B0         canonical: count 1; id 2, mode 0, flags 0x00, priority 128, maxMessageSize 1200
+4040 6161…61                name length 64 (two-byte varint), then 64 bytes "a"
+```
+
 ## 2. Datagram message headers (PROTOCOL §2.1) — `DatagramFramingTests.Header_Vectors_Write_And_Parse`
 
 `Sequence` is little-endian; `ChannelId`, `Key`, `RawLength` are minimal QUIC varints.

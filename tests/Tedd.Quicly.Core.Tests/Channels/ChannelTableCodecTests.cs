@@ -60,6 +60,32 @@ public class ChannelTableCodecTests
     }
 
     [Fact]
+    public void Golden_64_Byte_Name_Uses_A_Two_Byte_Length()
+    {
+        // docs/protocol-vectors.md, "Name of exactly 64 bytes".
+        string name = new('a', ChannelDefinition.MaxNameBytes);
+        ChannelTable table = ChannelTable.Create().Add(2, name, ChannelMode.UnreliableUnordered).Build();
+        byte[] expected = Bytes.Hex("01 02 00 00 80 44B0" + "4040" + string.Concat(Enumerable.Repeat("61", 64)));
+        Assert.Equal(7 + 2 + 64, expected.Length);
+        Assert.Equal(expected.Length, ChannelTableCodec.GetLengthWithNames(table));
+        byte[] actual = new byte[expected.Length];
+        Assert.True(ChannelTableCodec.TryWriteWithNames(table, actual, out int written));
+        Assert.Equal(expected.Length, written);
+        Assert.Equal(Bytes.ToHex(expected), Bytes.ToHex(actual));
+        Assert.False(ChannelTableCodec.TryWriteWithNames(table, actual.AsSpan(0, expected.Length - 1), out written));
+        Assert.Equal(0, written);
+
+        Assert.Equal(ChannelTableParseStatus.Ok, ChannelTableCodec.TryParseWithNames(expected, out ChannelTableDescription? d, out int consumed));
+        Assert.Equal(expected.Length, consumed);
+        Assert.Equal(name, d!.Channels[0].Name);
+        Assert.Equal(table.Hash, d.Hash);
+
+        // The same length written non-minimally (a four-byte varint) is rejected.
+        byte[] nonMinimal = Bytes.Hex("01 02 00 00 80 44B0" + "80000040" + string.Concat(Enumerable.Repeat("61", 64)));
+        Assert.Equal(ChannelTableParseStatus.NonMinimalVarint, ChannelTableCodec.TryParseWithNames(nonMinimal, out _, out _));
+    }
+
+    [Fact]
     public void Golden_Table_Section_Parses()
     {
         byte[] section = Bytes.Hex(ReferenceCanonicalHex + ReferenceNamesHex + "FFFF");

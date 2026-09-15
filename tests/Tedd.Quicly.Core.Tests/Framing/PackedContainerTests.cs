@@ -33,7 +33,7 @@ public class PackedContainerTests
     [InlineData(64, 66)]
     [InlineData(1200, 1202)]
     [InlineData(16384, 16388)]
-    public void Entry_Length(int messageLength, int expected) => Assert.Equal(expected, PackedContainer.GetEntryLength(messageLength));
+    public void Entry_Length(int messageLength, int expected) => Assert.Equal((long)expected, PackedContainer.GetEntryLength(messageLength));
 
     [Fact]
     public void Writer_And_Reader_Round_Trip()
@@ -248,7 +248,7 @@ public class PackedContainerTests
             if (status == ParseStatus.Ok)
             {
                 int count = 0;
-                int total = 0;
+                long total = 0;
                 foreach (ReadOnlySpan<byte> m in reader)
                 {
                     Assert.False(m.IsEmpty);

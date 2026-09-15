@@ -328,4 +328,20 @@ public class ChannelTableBuilderTests
         Assert.Equal(16382, ChannelTableCodec.MaxChannels);
         Assert.Same(table.All[^1], table[16383]);
     }
+
+    [Fact]
+    public void ResolveExpiryMicros_Resolves_The_Flush_Interval_Sentinel()
+    {
+        ChannelTable t = ChannelTable.Create()
+            .Add(2, "seq", ChannelMode.UnreliableSequenced)
+            .Add(3, "never", ChannelMode.UnreliableUnordered)
+            .Add(4, "fixed", ChannelMode.UnreliableSequenced, o => o.ExpiryMicros = 5000)
+            .Build();
+        Assert.Equal(ChannelDefinition.ExpiryTwiceFlushInterval, t[2]!.ExpiryMicros);
+        Assert.Equal(33_332, t[2]!.ResolveExpiryMicros(16_666));
+        Assert.Equal(long.MaxValue, t[2]!.ResolveExpiryMicros(long.MaxValue));
+        Assert.Equal(0, t[3]!.ResolveExpiryMicros(16_666));
+        Assert.Equal(5000, t[4]!.ResolveExpiryMicros(1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => t[2]!.ResolveExpiryMicros(0));
+    }
 }

@@ -24,7 +24,8 @@ public static class PackedContainer
 
     /// <summary>Returns the bytes one message of <paramref name="messageLength"/> bytes costs inside a container (length varint + message).</summary>
     /// <param name="messageLength">Encoded message size (header + payload), ≥ 1.</param>
-    public static int GetEntryLength(int messageLength) => WireReader.VarIntLength((uint)messageLength) + messageLength;
+    /// <returns>The entry size, computed in 64 bits so that no <see cref="int"/> length can overflow it.</returns>
+    public static long GetEntryLength(int messageLength) => WireReader.VarIntLength((uint)messageLength) + (long)messageLength;
 
     /// <summary>Writes the container header.</summary>
     /// <param name="destination">Buffer of at least <see cref="GetHeaderLength"/> bytes.</param>
@@ -235,7 +236,7 @@ public ref struct PackedContainerWriter
     /// <summary>Whether a message of <paramref name="messageLength"/> bytes still fits (space and message count).</summary>
     /// <param name="messageLength">Encoded message size, ≥ 1.</param>
     public readonly bool CanAppend(int messageLength) =>
-        messageLength > 0 && _count < PackedContainer.MaxMessages && PackedContainer.GetEntryLength(messageLength) <= _buffer.Length - _length;
+        messageLength > 0 && _count < PackedContainer.MaxMessages && PackedContainer.GetEntryLength(messageLength) <= Remaining;
 
     /// <summary>Copies a complete message (its channel id first) into the container.</summary>
     /// <param name="message">A channel-0 or channel-≥2 frame of at least one byte.</param>

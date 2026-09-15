@@ -95,7 +95,7 @@ public class FramingZeroAllocationTests
         StreamFrameParser parser = default;
         AllocationAssert.None(() =>
         {
-            parser.Reset(table);
+            parser.Reset();
             long payload = 0;
             int ends = 0;
             for (int offset = 0; offset < stream.Length; offset += 7)
@@ -103,7 +103,7 @@ public class FramingZeroAllocationTests
                 ReadOnlySpan<byte> input = stream.AsSpan(offset, Math.Min(7, stream.Length - offset));
                 while (true)
                 {
-                    StreamEvent ev = parser.Read(ref input, out ReadOnlySpan<byte> chunk);
+                    StreamEvent ev = parser.Read(table, ref input, out ReadOnlySpan<byte> chunk);
                     if (ev == StreamEvent.NeedMore)
                     {
                         break;
@@ -139,15 +139,15 @@ public class FramingZeroAllocationTests
         StreamFrameParser parser = default;
         AllocationAssert.None(() =>
         {
-            parser.Reset(table);
+            parser.Reset();
             ReadOnlySpan<byte> input = bulk;
-            while (parser.Read(ref input, out _) is not (StreamEvent.NeedMore or StreamEvent.Error))
+            while (parser.Read(table, ref input, out _) is not (StreamEvent.NeedMore or StreamEvent.Error))
             {
             }
 
-            parser.Reset(StreamRole.Control, null);
+            parser.Reset(StreamRole.Control);
             ReadOnlySpan<byte> input2 = control;
-            while (parser.Read(ref input2, out _) is not (StreamEvent.NeedMore or StreamEvent.Error))
+            while (parser.Read(null, ref input2, out _) is not (StreamEvent.NeedMore or StreamEvent.Error))
             {
             }
 

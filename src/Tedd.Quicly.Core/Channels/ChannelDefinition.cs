@@ -140,7 +140,10 @@ public sealed class ChannelDefinition
     /// <summary>Per-channel send queue limit in bytes; 0 = only the peer budget applies.</summary>
     public int QueueLimitBytes { get; }
 
-    /// <summary>Send expiry in microseconds; 0 = never; <see cref="ExpiryTwiceFlushInterval"/> = twice the flush interval.</summary>
+    /// <summary>
+    /// Configured send expiry in microseconds; 0 = never; <see cref="ExpiryTwiceFlushInterval"/> (−1) = twice the flush
+    /// interval. Never add this to a timestamp directly: use <see cref="ResolveExpiryMicros"/>.
+    /// </summary>
     public long ExpiryMicros { get; }
 
     /// <summary>Keys per channel per peer.</summary>
@@ -193,6 +196,23 @@ public sealed class ChannelDefinition
 
     /// <summary>UTF-8 bytes of <see cref="Name"/>.</summary>
     internal byte[] NameUtf8 { get; }
+
+    /// <summary>
+    /// Returns the send expiry as a real duration: 0 = never expires, otherwise a positive number of microseconds
+    /// (<see cref="ExpiryTwiceFlushInterval"/> resolved against <paramref name="flushIntervalMicros"/>).
+    /// </summary>
+    /// <param name="flushIntervalMicros">The flush interval in microseconds, ≥ 1.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="flushIntervalMicros"/> is less than 1.</exception>
+    public long ResolveExpiryMicros(long flushIntervalMicros)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(flushIntervalMicros, 1L);
+        if (ExpiryMicros != ExpiryTwiceFlushInterval)
+        {
+            return ExpiryMicros;
+        }
+
+        return flushIntervalMicros > long.MaxValue / 2 ? long.MaxValue : flushIntervalMicros * 2;
+    }
 
     /// <inheritdoc/>
     public override string ToString() => $"{Id} '{Name}' {Mode}";

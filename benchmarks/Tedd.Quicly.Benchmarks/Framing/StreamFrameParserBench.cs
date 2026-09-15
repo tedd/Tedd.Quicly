@@ -39,7 +39,7 @@ public class StreamFrameParserBench
     [Benchmark]
     public long Parse()
     {
-        _parser.Reset(FramingBenchData.Table);
+        _parser.Reset();
         long payload = 0;
         long messages = 0;
         byte[] stream = _stream;
@@ -49,7 +49,7 @@ public class StreamFrameParserBench
             ReadOnlySpan<byte> input = stream.AsSpan(offset, Math.Min(segment, stream.Length - offset));
             while (true)
             {
-                StreamEvent ev = _parser.Read(ref input, out ReadOnlySpan<byte> chunk);
+                StreamEvent ev = _parser.Read(FramingBenchData.Table, ref input, out ReadOnlySpan<byte> chunk);
                 if (ev == StreamEvent.NeedMore)
                 {
                     break;

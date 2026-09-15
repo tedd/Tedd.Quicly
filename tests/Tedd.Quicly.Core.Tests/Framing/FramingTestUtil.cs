@@ -151,7 +151,7 @@ internal sealed class StreamBuilder
 /// <summary>Drives a <see cref="StreamFrameParser"/> over segments and records a canonical event log.</summary>
 internal static class StreamDriver
 {
-    public static List<string> Run(ref StreamFrameParser parser, IEnumerable<byte[]> segments, bool finish = true)
+    public static List<string> Run(ref StreamFrameParser parser, ChannelTable? table, IEnumerable<byte[]> segments, bool finish = true)
     {
         List<string> log = new();
         List<byte> payload = new();
@@ -162,7 +162,7 @@ internal static class StreamDriver
             while (true)
             {
                 Assert.True(++guard < 100_000, "parser made no progress");
-                StreamEvent ev = parser.Read(ref input, out ReadOnlySpan<byte> chunk);
+                StreamEvent ev = parser.Read(table, ref input, out ReadOnlySpan<byte> chunk);
                 if (ev != StreamEvent.PayloadChunk)
                 {
                     Assert.True(chunk.IsEmpty);
@@ -198,7 +198,7 @@ internal static class StreamDriver
                         break;
                     case StreamEvent.Error:
                         log.Add($"X {parser.Error}");
-                        Assert.Equal(StreamEvent.Error, parser.Read(ref input, out _));
+                        Assert.Equal(StreamEvent.Error, parser.Read(table, ref input, out _));
                         return log;
                 }
             }
@@ -217,15 +217,15 @@ internal static class StreamDriver
     public static List<string> Run(StreamRole role, ChannelTable? table, byte[] stream, int maxMessageSize = 0, int bulkMaxChunk = StreamFraming.DefaultBulkMaxChunk)
     {
         StreamFrameParser parser = default;
-        parser.Reset(role, table, maxMessageSize, bulkMaxChunk);
-        return Run(ref parser, new[] { stream });
+        parser.Reset(role, maxMessageSize, bulkMaxChunk);
+        return Run(ref parser, table, new[] { stream });
     }
 
     public static List<string> RunSegments(StreamRole role, ChannelTable? table, IEnumerable<byte[]> segments, int maxMessageSize = 0, int bulkMaxChunk = StreamFraming.DefaultBulkMaxChunk)
     {
         StreamFrameParser parser = default;
-        parser.Reset(role, table, maxMessageSize, bulkMaxChunk);
-        return Run(ref parser, segments);
+        parser.Reset(role, maxMessageSize, bulkMaxChunk);
+        return Run(ref parser, table, segments);
     }
 
     public static IEnumerable<byte[]> SplitAt(byte[] stream, params int[] cuts)
@@ -273,13 +273,20 @@ internal static class AllocationAssert
             body();
         }
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < iterations; i++)
+        // A steady-state allocation shows up in every round; one-off runtime work on the test thread (tier-up, call-counting
+        // installation, OSR) while the rest of the suite keeps the JIT busy does not. Report the best of three rounds.
+        long best = long.MaxValue;
+        for (int round = 0; round < 3 && best != 0; round++)
         {
-            body();
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < iterations; i++)
+            {
+                body();
+            }
+
+            best = Math.Min(best, GC.GetAllocatedBytesForCurrentThread() - before);
         }
 
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        Assert.Equal(0, best);
     }
 }

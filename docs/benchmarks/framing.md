@@ -102,3 +102,31 @@ Segmentation does not matter: the straddling-header slow path (copy ≤ 32 bytes
 re-parse) triggers on ≈ 3 % of frames at 1 350-byte segments and costs nothing measurable. Per message the parser
 returns three events (`MessageStart`, `PayloadChunk`, `MessageEnd`); ≈ 12 ns per event including the payload slice.
 No further optimisation is planned until the session-layer E2E benchmark shows the parser on the profile.
+
+## 5. Re-run after the review fixes (2026-09-15)
+
+Hot paths touched by the review fixes: `DatagramFraming.WriteHeader` gained a stream-only channel guard (one
+predictable branch on a precomputed bool), and `StreamFrameParser.Read` now takes the `ChannelTable` as a parameter
+instead of holding it in a field (the parser is reference-free). Same machine and command, filtered to the three
+affected classes; the machine was shared with other builds, so ShortRun error bars are wider than in §§ 2–4.
+
+| Benchmark | Case | Default | InProcess | Before (Default) |
+|---|---|---:|---:|---:|
+| `DatagramFramingBench.WriteHeader` (256) | unkeyed16 | 0.751 µs | 0.849 µs | 1.135 µs |
+| | keyed32 | 1.303 µs | 1.286 µs | 2.155 µs |
+| `DatagramFramingBench.TryParse` (256) | unkeyed16 | 1.927 µs | 1.468 µs | 2.465 µs |
+| | keyed32 | 1.935 µs | 1.954 µs | 3.045 µs |
+| `DatagramFramingBench.WriteAndParse` (256) | unkeyed16 | 2.944 µs | 2.368 µs | 3.189 µs |
+| | keyed32 | 3.814 µs | 3.874 µs | 5.071 µs |
+| `PackedContainerBench` (32 messages) | Iterate | 260.5 ns | 252.3 ns | 275.1 ns |
+| | IterateAndParse | 429.1 ns | 430.4 ns | 568.5 ns |
+| | Build | 502.0 ns | 583.0 ns | 898.8 ns |
+| `StreamFrameParserBench` (≈ 1 MiB) | 1 350 B segments | 1 400.5 µs | 745.4 µs | 981.2 µs |
+| | 16 KiB segments | 604.8 µs | 770.2 µs | 916.1 µs |
+| | 1 MiB (one span) | 626.0 µs | 779.9 µs | 967.1 µs |
+
+No regression: the guard is free (the datagram numbers are at or below the previous run) and passing the table as an
+argument costs nothing measurable. The single slower cell (1 350 B segments, Default, 1.40 ms) is not reproduced by the
+in-process run of the same case (0.75 ms) and is attributed to load from concurrent builds. Allocation is 0 B in the
+`Default` toolchain; the in-process toolchain reports 7 B/op on the stream parser, the harness overhead noted in the
+setup section.

@@ -100,6 +100,17 @@ public class DatagramFramingTests
         Assert.Equal("header", ex.ParamName);
     }
 
+    [Theory]
+    [InlineData(Ordered)]
+    [InlineData(Unordered)]
+    [InlineData(BulkChannel)]
+    [InlineData(WideOrdered)]
+    public void WriteHeader_Rejects_Stream_Only_Channels(int channelId)
+    {
+        ArgumentException ex = Assert.Throws<ArgumentException>(() => DatagramFraming.WriteHeader(new byte[32], Get(channelId), default(MessageHeader)));
+        Assert.Equal("channel", ex.ParamName);
+    }
+
     [Fact]
     public void WriteHeader_Rejects_Small_Destination()
     {

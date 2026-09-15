@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Framing;
 using static Tedd.Quicly.Core.Tests.Framing.TestTables;
@@ -255,10 +256,24 @@ public class StreamFrameParserTests
     [Fact]
     public void Bulk_Header_Is_Validated_Through_The_Parser()
     {
-        BulkHeader tooLong = StreamFramingTests.SampleBulk(false, false, 1001);
-        byte[] stream = new StreamBuilder().Preamble(BulkChannel).Bulk(tooLong).ToArray();
-        Assert.Equal(X(ParseStatus.MessageTooLarge), StreamDriver.Run(StreamRole.Unknown, All, stream, maxMessageSize: 1000)[^1]);
-        Assert.Equal(F(ParseStatus.Truncated), StreamDriver.Run(StreamRole.Unknown, All, stream, maxMessageSize: 1001)[^1]);
+        // A transfer's Length is bounded by the Bulk channel's own MaxMessageSize (16 MiB here) ...
+        BulkHeader tooLong = StreamFramingTests.SampleBulk(false, false, (ulong)ChannelDefinition.BulkMaxMessageSize + 1);
+        tooLong.TotalLength = 1UL << 40;
+        byte[] tooLongStream = new StreamBuilder().Preamble(BulkChannel).Bulk(tooLong).ToArray();
+        Assert.Equal(X(ParseStatus.MessageTooLarge), StreamDriver.Run(StreamRole.Unknown, All, tooLongStream)[^1]);
+        Assert.Equal(X(ParseStatus.MessageTooLarge), StreamDriver.Run(StreamRole.Unknown, All, tooLongStream, maxMessageSize: 1000)[^1]);
+
+        // ... and not by the session cap (HelloAck.maxMessageSize), which bounds message frames only (PROTOCOL.md §8).
+        BulkHeader atLimit = StreamFramingTests.SampleBulk(false, false, ChannelDefinition.BulkMaxMessageSize);
+        atLimit.TotalLength = 1UL << 40;
+        byte[] stream = new StreamBuilder().Preamble(BulkChannel).Bulk(atLimit).ToArray();
+        Assert.Equal(F(ParseStatus.Truncated), StreamDriver.Run(StreamRole.Unknown, All, stream, maxMessageSize: 1000)[^1]);
+        StreamFrameParser parser = default;
+        parser.Reset(maxMessageSize: 1000);
+        ReadOnlySpan<byte> input = stream;
+        Assert.Equal(StreamEvent.Preamble, parser.Read(All, ref input, out _));
+        Assert.Equal(ChannelDefinition.BulkMaxMessageSize, parser.MaxMessageSize);
+        Assert.Equal(StreamEvent.BulkHeader, parser.Read(All, ref input, out _));
 
         Assert.Equal(X(ParseStatus.BadBulkRange), StreamDriver.Run(StreamRole.Unknown, All, Bytes.Hex("10 01 02 03 3C 32 0B 00"))[^1]);
         Assert.Equal(X(ParseStatus.BadFlags), StreamDriver.Run(StreamRole.Unknown, All, Bytes.Hex("10 01 02 03 3C 00 0A 04"))[^1]);
@@ -303,7 +318,7 @@ public class StreamFrameParserTests
         Assert.Equal(new[] { X(ParseStatus.UnknownChannel) }, StreamDriver.Run(StreamRole.Unknown, null, Bytes.Hex("0C")));
 
         StreamFrameParser parser = default;
-        Assert.Equal(new[] { X(ParseStatus.UnknownChannel) }, StreamDriver.Run(ref parser, new[] { Bytes.Hex("0C 00") }));
+        Assert.Equal(new[] { X(ParseStatus.UnknownChannel) }, StreamDriver.Run(ref parser, null, new[] { Bytes.Hex("0C 00") }));
     }
 
     [Fact]
@@ -330,25 +345,26 @@ public class StreamFrameParserTests
     public void Properties_Reflect_The_Stream()
     {
         StreamFrameParser parser = default;
-        parser.Reset(All, maxMessageSize: 1000);
+        parser.Reset(maxMessageSize: 1000);
         Assert.Equal(StreamRole.Unknown, parser.Role);
-        Assert.Null(parser.Definition);
+        Assert.Equal(0, parser.Channel);
         ReadOnlySpan<byte> input = new StreamBuilder().GroupPreamble(UnorderedKeyedLz4, 5).Frame(Get(UnorderedKeyedLz4), new StreamMessageHeader { Key = 1 }, P100).ToArray();
-        Assert.Equal(StreamEvent.Preamble, parser.Read(ref input, out _));
-        Assert.Same(Get(UnorderedKeyedLz4), parser.Definition);
+        Assert.Equal(StreamEvent.Preamble, parser.Read(All, ref input, out _));
+        Assert.Same(Get(UnorderedKeyedLz4), All[parser.Channel]);
         Assert.Equal(1000, parser.MaxMessageSize);
         Assert.Equal(5UL, parser.GroupId);
-        Assert.Equal(StreamEvent.MessageStart, parser.Read(ref input, out _));
+        Assert.Equal(StreamEvent.MessageStart, parser.Read(All, ref input, out _));
         Assert.Equal(100, parser.RemainingPayload);
         Assert.Equal(ParseStatus.Ok, parser.Error);
         Assert.Equal(ParseStatus.Truncated, parser.Finish());
-        Assert.Equal(StreamEvent.PayloadChunk, parser.Read(ref input, out ReadOnlySpan<byte> payload));
+        Assert.Equal(StreamEvent.PayloadChunk, parser.Read(All, ref input, out ReadOnlySpan<byte> payload));
         Assert.Equal(100, payload.Length);
         Assert.True(input.IsEmpty);
-        Assert.Equal(ParseStatus.Truncated, parser.Finish());
-        Assert.Equal(StreamEvent.MessageEnd, parser.Read(ref input, out _));
-        Assert.Equal(StreamEvent.NeedMore, parser.Read(ref input, out _));
-        Assert.Equal(StreamEvent.NeedMore, parser.Read(ref input, out _));
+        // The last payload byte was handed out: the FIN may arrive before MessageEnd is drained.
+        Assert.Equal(ParseStatus.Ok, parser.Finish());
+        Assert.Equal(StreamEvent.MessageEnd, parser.Read(All, ref input, out _));
+        Assert.Equal(StreamEvent.NeedMore, parser.Read(All, ref input, out _));
+        Assert.Equal(StreamEvent.NeedMore, parser.Read(All, ref input, out _));
         Assert.Equal(ParseStatus.Ok, parser.Finish());
     }
 
@@ -357,11 +373,11 @@ public class StreamFrameParserTests
     {
         byte[] stream = OrderedStream();
         StreamFrameParser parser = default;
-        parser.Reset(All);
+        parser.Reset();
         ReadOnlySpan<byte> input = stream;
-        parser.Read(ref input, out _); // preamble
-        parser.Read(ref input, out _); // start
-        Assert.Equal(StreamEvent.PayloadChunk, parser.Read(ref input, out ReadOnlySpan<byte> payload));
+        parser.Read(All, ref input, out _); // preamble
+        parser.Read(All, ref input, out _); // start
+        Assert.Equal(StreamEvent.PayloadChunk, parser.Read(All, ref input, out ReadOnlySpan<byte> payload));
         Assert.True(System.Runtime.CompilerServices.Unsafe.AreSame(
             ref System.Runtime.InteropServices.MemoryMarshal.GetReference(payload), ref stream[2]));
     }
@@ -370,29 +386,29 @@ public class StreamFrameParserTests
     public void Error_Is_Sticky_Until_Reset()
     {
         StreamFrameParser parser = default;
-        parser.Reset(All);
+        parser.Reset();
         ReadOnlySpan<byte> input = Bytes.Hex("02 0C 05");
-        Assert.Equal(StreamEvent.Error, parser.Read(ref input, out _));
+        Assert.Equal(StreamEvent.Error, parser.Read(All, ref input, out _));
         Assert.Equal(ParseStatus.ChannelNotStream, parser.Error);
         int remaining = input.Length;
-        Assert.Equal(StreamEvent.Error, parser.Read(ref input, out _));
+        Assert.Equal(StreamEvent.Error, parser.Read(All, ref input, out _));
         Assert.Equal(remaining, input.Length);
         Assert.Equal(ParseStatus.ChannelNotStream, parser.Finish());
 
-        parser.Reset(StreamRole.Unknown, All);
+        parser.Reset(StreamRole.Unknown);
         Assert.Equal(ParseStatus.Ok, parser.Error);
         input = OrderedStream();
-        Assert.Equal(StreamEvent.Preamble, parser.Read(ref input, out _));
+        Assert.Equal(StreamEvent.Preamble, parser.Read(All, ref input, out _));
     }
 
     [Fact]
     public void Reset_Validates_Arguments()
     {
         StreamFrameParser parser = default;
-        Assert.Throws<ArgumentOutOfRangeException>(() => { StreamFrameParser p = default; p.Reset((StreamRole)5, All); });
-        Assert.Throws<ArgumentOutOfRangeException>(() => { StreamFrameParser p = default; p.Reset(StreamRole.Unknown, All, -1); });
-        Assert.Throws<ArgumentOutOfRangeException>(() => { StreamFrameParser p = default; p.Reset(StreamRole.Unknown, All, 0, 0); });
-        parser.Reset(StreamRole.Bulk, All, 0, 1);
+        Assert.Throws<ArgumentOutOfRangeException>(() => { StreamFrameParser p = default; p.Reset((StreamRole)5); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { StreamFrameParser p = default; p.Reset(StreamRole.Unknown, -1); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => { StreamFrameParser p = default; p.Reset(StreamRole.Unknown, 0, 0); });
+        parser.Reset(StreamRole.Bulk, 0, 1);
         Assert.Equal(StreamRole.Unknown, parser.Role);
     }
 
@@ -557,4 +573,65 @@ public class StreamFrameParserTests
             Assert.Equal(whole, split);
         }
     }
+
+    [Fact]
+    public void Parser_Is_Reference_Free_For_Native_And_Pinned_Struct_Arrays()
+    {
+        // ADR 0008 invariant 12: the per-stream table is a reference-free struct array.
+        Assert.False(RuntimeHelpers.IsReferenceOrContainsReferences<StreamFrameParser>());
+        Assert.True(UnmanagedSize<StreamFrameParser>() > 0); // compile-time proof: satisfies the unmanaged constraint
+
+        StreamFrameParser[] parsers = GC.AllocateArray<StreamFrameParser>(4, pinned: true);
+        parsers[2].Reset(maxMessageSize: 1000);
+        ReadOnlySpan<byte> input = new StreamBuilder().Preamble(Ordered).Frame(Get(Ordered), new StreamMessageHeader(), P100).ToArray();
+        Assert.Equal(StreamEvent.Preamble, parsers[2].Read(All, ref input, out _));
+        Assert.Equal(Ordered, parsers[2].Channel);
+        Assert.Same(Get(Ordered), All[parsers[2].Channel]);
+        Assert.Equal(StreamEvent.MessageStart, parsers[2].Read(All, ref input, out _));
+        Assert.Equal(StreamRole.Unknown, parsers[1].Role);
+    }
+
+    [Fact]
+    public void Finish_Treats_A_Fully_Handed_Out_Message_As_Complete()
+    {
+        // ReliableLatest group stream: its single message is complete, so the stream may end before MessageEnd is drained.
+        byte[] latest = new StreamBuilder().GroupPreamble(Latest, 9).Frame(Get(Latest), new StreamMessageHeader { Sequence = 9, Key = 1 }, P100).ToArray();
+        Assert.Equal(ParseStatus.Ok, FinishAfterPayloadOf(latest, 1));
+
+        // Zero-length ordered message (MessageStart goes straight to the message end).
+        byte[] empty = new StreamBuilder().Preamble(Ordered).Frame(Get(Ordered), new StreamMessageHeader(), Array.Empty<byte>()).ToArray();
+        Assert.Equal(ParseStatus.Ok, FinishAfterPayloadOf(empty, 1));
+
+        // Chunked bulk body: complete after the last chunk only.
+        BulkHeader header = StreamFramingTests.SampleBulk(hash: false, chunked: true, length: 200);
+        byte[] chunked = new StreamBuilder().Preamble(BulkChannel).Bulk(header).Chunk(0, Bytes.Fill(100)).Chunk(0, Bytes.Fill(100)).ToArray();
+        Assert.Equal(ParseStatus.Truncated, FinishAfterPayloadOf(chunked, 1));
+        Assert.Equal(ParseStatus.Ok, FinishAfterPayloadOf(chunked, 2));
+
+        // Unchunked bulk body.
+        BulkHeader whole = StreamFramingTests.SampleBulk(hash: false, chunked: false, length: 100);
+        byte[] unchunked = new StreamBuilder().Preamble(BulkChannel).Bulk(whole).Raw(Bytes.Fill(100)).ToArray();
+        Assert.Equal(ParseStatus.Ok, FinishAfterPayloadOf(unchunked, 1));
+    }
+
+    private static ParseStatus FinishAfterPayloadOf(byte[] stream, int message)
+    {
+        StreamFrameParser parser = default;
+        parser.Reset();
+        ReadOnlySpan<byte> input = stream;
+        int complete = 0;
+        while (true)
+        {
+            StreamEvent ev = parser.Read(All, ref input, out _);
+            Assert.NotEqual(StreamEvent.Error, ev);
+            Assert.NotEqual(StreamEvent.NeedMore, ev);
+            if (ev is StreamEvent.MessageStart or StreamEvent.PayloadChunk && parser.RemainingPayload == 0 && ++complete == message)
+            {
+                return parser.Finish();
+            }
+        }
+    }
+
+    private static int UnmanagedSize<T>()
+        where T : unmanaged => Unsafe.SizeOf<T>();
 }

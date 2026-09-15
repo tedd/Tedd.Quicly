@@ -746,7 +746,7 @@ internal sealed unsafe class PeerCore : IDisposable
     /// plus payload segment (when not empty). Sets <see cref="SendEntryFlags.Datagram"/>. Game thread.
     /// </summary>
     /// <param name="slot">A <c>Filling</c> entry.</param>
-    /// <param name="flags">Datagram flags (Priority, DelaySend, CancelOnBlocked).</param>
+    /// <param name="flags">Datagram flags: <c>Priority</c>; <c>CancelOnBlocked</c> only when the transport reports it, and no <c>DelaySend</c> for tick bursts (§7.1).</param>
     /// <returns>
     /// <see cref="TransportStatus.Success"/> (a completion will follow; do not touch the entry until it is drained), or the
     /// failure (no completion follows; the entry is <c>Filling</c> again and still owned by the caller).
@@ -793,7 +793,7 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <param name="segments">Contiguous segment array.</param>
     /// <param name="count">Number of segments.</param>
     /// <param name="slot">The <c>Filling</c> entry whose context the completion carries.</param>
-    /// <param name="flags">Stream flags (Start, Fin, DelaySend, Priority).</param>
+    /// <param name="flags">Stream flags (<c>Start</c>, <c>Fin</c>, <c>Priority</c>; no <c>DelaySend</c> for tick bursts).</param>
     /// <returns>As <see cref="SubmitDatagram"/>.</returns>
     public TransportStatus SubmitStream(TransportStreamId stream, TransportSegment* segments, int count, int slot, TransportSendFlags flags)
     {

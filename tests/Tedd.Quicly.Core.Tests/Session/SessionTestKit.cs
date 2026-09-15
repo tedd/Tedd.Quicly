@@ -774,6 +774,13 @@ internal sealed unsafe class TestEngine : ChannelEngine
         if (status != TransportStatus.Success)
         {
             Core.DiscardEntry(slot);
+            if (!_sendStarted)
+            {
+                // Never started (no accepted send carrying Start): releasing the slot is enough, no callback follows for it.
+                Core.Transport?.CloseStream(_sendStream);
+                _sendStream = default;
+            }
+
             return status == TransportStatus.StreamLimitReached ? SendStatus.QueueFull : SendStatus.ChannelClosed;
         }
 

@@ -196,6 +196,10 @@ slot's context. Both publish before the call; on a failed call the entry is back
     The owning engine gets `OnStreamClosed` exactly once per accepted stream (reset by either side, error, or shutdown complete);
     events of locally opened streams (peer STOP_SENDING, shutdown complete) are broadcast to every engine. `CloseStream` follows
     shutdown complete.
+  * Receive results: the peer consumes a whole indication (`Consumed(all)`) or returns `PendingAfter(n)`; it never returns a partial
+    `Consumed` and never `Consumed(0)` for a non-empty indication, because both mean back-pressure in the `ReceiveResult` contract.
+    `ResumeStreamReceive` is called only from Poll on the game thread, never from inside the receive callback; a resume that races
+    the returning callback takes effect when it returns.
 * Control stream (both directions start with `0x00`; `StreamFrameParser(Control)`; bodies used in place or assembled in a lazily
   grown array; control-rate limit): server — the first frame must be Hello, a second Hello or a HelloAck is a violation, the Hello body
   is copied and signalled (malformed ⇒ violation; version ≠ 1 ⇒ answered with status 1); client — the first frame must be a HelloAck
@@ -282,9 +286,11 @@ completion due "now" arrives at the next `Advance(0)`. `CreatePair` raises `OnDa
   queued datagram too large, or with `CancelOnBlocked` when the serializer is busy). `TooLarge` is returned synchronously.
 - Streams: `OnStreamStarted` locally at the next step, `OnPeerStreamStarted` one one-way delay later. Data is cut into packets of the
   current payload size, reassembled in order and indicated one segment per packet. A send completes at delivery of it and of every
-  byte before it + one-way delay. `PendingAfter` holds bytes back until `ResumeStreamReceive`. Aborts are causal: the peer keeps
-  delivering what it holds until the reset arrives. `OnStreamShutdownComplete` comes once both directions are done, and `CloseStream`
-  then bumps the slot generation. A stream's peer credit returns to its opener when the peer side has shut down.
+  byte before it + one-way delay. `PendingAfter` holds bytes back until `ResumeStreamReceive`; consuming part of an indication has the
+  rest indicated again at the next step, consuming nothing of a non-empty indication counts as `PendingAfter(0)`, and aborting a local
+  stream that was never started releases it like `CloseStream` (the `ITransport` contract as clarified by the MsQuic transport wave).
+  Aborts are causal: the peer keeps delivering what it holds until the reset arrives. `OnStreamShutdownComplete` comes once both
+  directions are done, and `CloseStream` then bumps the slot generation. A stream's peer credit returns to its opener when the peer side has shut down.
 - `Close`: in-flight sends complete canceled, streams shut down, then `OnClosed` (Local). One one-way delay later the peer does the same
   (Peer, code, reason). Data already on the wire still reaches the peer before its close, as in QUIC. Data queued behind a bandwidth
   limit, or in flight when the link is cut, is lost. No callbacks follow `OnClosed`.
@@ -400,6 +406,9 @@ and only frees the slot.
   `ReceiveFlags.Compressed` when `header.Compressed`), then `TryEnqueueReceive` (false ⇒ return the lease, count the channel's
   `RingDrops`) or, for coalescing keyed channels, a mailbox from `CreateMailbox` (`TryPost`; return the displaced lease and count
   `Superseded`). Poll decodes LZ4, dispatches and releases; engines never touch the game-thread side of a received message.
+* Send flags: set `TransportSendFlags.CancelOnBlocked` (PROTOCOL.md §4.5 `DropWhenBlocked` for unreliable datagrams) only when the
+  transport reports `TransportCapabilities.CancelOnBlocked`; without it the datagram is queued instead of being dropped and counted
+  `Expired`. Do not set `DelaySend` for tick bursts: it measured 16-19 % slower per datagram for bursts of 32 on MsQuic loopback.
 * `SessionTestKit.TestEngine` is a working example of every one of these calls.
 
 ### 7.2 Seams for step 3 (ordered-stream engine, async completion APIs)
@@ -416,6 +425,10 @@ and only frees the slot.
   lease. `MaxMessageSize` (session cap included) is enforced by `StreamFrameParser` (`MessageTooLarge`), which the peer turns into a
   connection `ProtocolViolation` on an ordered stream. Local-stream events (`OnStreamClosed` broadcast) arrive on the transport thread:
   hand them to the game thread with an `Interlocked` flag per channel.
+* Local streams: one whose first `SubmitStream` (with `Start`) failed was never started — release it with `PeerCore.Transport.CloseStream`
+  (`AbortStream` does the same for it), expect no callback and treat the id as stale; only a started stream reports
+  `OnStreamShutdownComplete`. Back-pressure is `StreamConsume.Pend`: never call `ResumeStreamReceive` from inside a receive callback,
+  the peer resumes pended streams from Poll.
 * Async APIs: `QuiclyPeer.SendAsync` (today one synchronous admission attempt), `FlushAsync` (today `Flush()` + a completed task),
   `WaitAsync`/`Wait`/`GetDeliveryStatus` (wired to `CompletionTable`) and `TryCancel` (wired to `ChannelEngine.TryCancel` through
   `PeerCore.EntryOfToken`). `PeerOptions.ThreadSafeSend` is reserved: add the Vyukov MPSC front in QuiclyPeer.Send.cs and drain it at

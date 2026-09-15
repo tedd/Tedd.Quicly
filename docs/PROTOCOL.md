@@ -244,16 +244,52 @@ expired auth token, bad or expired session token, admission policy — never dis
 4 server full; 5 reserved; 6 internal error; 7 datagrams required. The effective maximum message size is
 `min(channel.MaxMessageSize, HelloAck.maxMessageSize)`.
 
+Control-message bounds (clarifications; they apply to both endpoints, and a violation is a malformed frame:
+`ProtocolViolation` on the control stream, drop + count for a control datagram):
+
+* The HelloAck table section (present when `tableIncluded` = 1; a `tableIncluded` other than 0 or 1 is
+  malformed) is the §1 canonical table encoding followed by exactly `count` names in the same ascending-id
+  order, each `len varint (≤ 64) + utf8`. It has no length prefix: the receiver finds the `reason` that follows
+  by walking that structure. Channel ids in the section MUST be in [2, 16383].
+* `HelloAck.sessionToken` is bounded like Hello's tokens: ≤ 4096 bytes. `HelloAck.status` values other than
+  0–4, 6, 7 and 0xFF are malformed.
+* Hello with `version` ≠ 1: only `magic` and `version` are interpreted (a later version may lay out the rest
+  differently) and the server answers status 1. A wrong `magic` is malformed.
+* Every `channel` field of a control message (LatestAck/LatestReject entries, BulkRequest, KeyRetired) MUST be
+  in [2, 16383]; whether that channel exists and has the right mode is the session layer's check.
+* LatestAck/LatestReject: `count` MUST NOT exceed the remaining body length divided by the smallest entry
+  (6 bytes, 7 with the reason), checked before any entry is read; the whole batch is validated before any entry
+  is applied, so a malformed batch is dropped as a unit. `count` = 0 is well-formed (senders never send it).
+  `LatestReject.reason` values other than 1–4 are malformed.
+* BulkRequest: `offset + length` MUST NOT exceed 2^62−1 (range semantics such as `length > 0` belong to the bulk
+  engine). `code` fields (Close, BulkCancel, BulkReject) accept any u32.
+* Types 0x10–0x17 inside a control datagram, and undefined types (0x00, 0x06–0x0F, 0x18–0xFF) anywhere, are
+  malformed. Channel 0 written as a non-minimal varint (`0x40 0x00`) is malformed, not another channel.
+* Before logging a peer-supplied `reason` or channel name, invalid UTF-8 sequences and every character of
+  Unicode category Cc, Cf (including bidirectional overrides), Zl and Zp are replaced with U+FFFD.
+
 ## 4. Session semantics
 
 ### 4.1 Sessions, tokens, epochs
 
 * `sessionId` is a random 64-bit value chosen by the server; it is an identifier, never a secret.
-* `sessionToken` is minted only by the server: 16 random bytes ‖ HMAC-SHA256(serverKey, random ‖ sessionId ‖
-  epoch ‖ expiry) ‖ expiry u64 — at least 56 bytes. It is rotated in every HelloAck, single-use (an old
-  token is invalid once a resume succeeded or a newer token was issued), expires after `graceMicros`, and is
-  a *locator*, not a credential: a resume MUST also present an `authToken` that the admission policy accepts.
-  Token comparison is constant-time; failed auth attempts are rate-limited per remote address.
+* `sessionToken` is minted only by the server. Layout (69 bytes, integers little-endian):
+  `version u8 (= 1) ‖ sessionId u64 ‖ epoch u32 ‖ expiry i64 ‖ random (16 bytes) ‖ HMAC-SHA256(serverKey, all
+  37 preceding bytes)`. `sessionId` and `epoch` travel in clear (neither is a secret) so the server can verify a
+  token without a lookup; `expiry` is absolute microseconds on the server's clock (issue time + `graceMicros`);
+  the HMAC makes every field tamper-evident. Clients treat the token as opaque bytes. *(Clarification: the
+  earlier layout "16 random bytes ‖ HMAC ‖ expiry, ≥ 56 bytes" did not carry `sessionId`/`epoch`, so the server
+  could not recompute the MAC without already knowing the session.)* It is rotated in every HelloAck, single-use
+  (an old token is invalid once a resume succeeded or a newer token was issued), expires after `graceMicros`,
+  and is a *locator*, not a credential: a resume MUST also present an `authToken` that the admission policy
+  accepts. Token comparison is constant-time; failed auth attempts are rate-limited per remote address.
+  Implementation policy: single use is enforced by a bounded replay cache of the random parts, each entry kept
+  until its token expires; when the cache is full of unexpired entries a presented token is rejected (fail
+  closed: status 3, the client starts a fresh session) rather than an entry evicted. "A newer token was issued"
+  is enforced by the session registry comparing the token's `epoch` with the session's current epoch. Key
+  rotation keeps accepting the previous key until a deadline (typically `graceMicros` after the rotation). The
+  per-address failure limiter keys IPv4 (and IPv4-mapped IPv6) by address and IPv6 by /64 prefix; addresses its
+  bounded table cannot track share one global overflow bucket.
 * `epoch` is allocated by the server, strictly increasing per `sessionId`, starting at 1; the client's
   `lastEpoch` is informational. Every sequence/version/counter is scoped to the current epoch.
 * A valid resume for a session that still has a live connection replaces that connection (the old one is

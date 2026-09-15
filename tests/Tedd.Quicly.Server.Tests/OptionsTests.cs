@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Net;
+using System.Reflection;
 using System.Security.Cryptography.X509Certificates;
 using Tedd.Quicly.Acme;
 using Tedd.Quicly.Acme.Models;
@@ -87,15 +89,41 @@ public sealed class OptionsTests
         ["tls-handler-null"] = o => o.TlsEndpointHandlers.Add(null!),
         ["same-endpoint"] = o =>
         {
+            o.ChallengeTypes.Add(AcmeChallengeKind.TlsAlpn01);
             o.HttpChallengeEndpoint = new IPEndPoint(IPAddress.Loopback, 8080);
             o.TlsAlpnEndpoint = new IPEndPoint(IPAddress.Loopback, 8080);
         },
         ["same-port-wildcard"] = o =>
         {
+            o.ChallengeTypes.Add(AcmeChallengeKind.TlsAlpn01);
             o.HttpChallengeEndpoint = new IPEndPoint(IPAddress.Loopback, 8080);
             o.TlsAlpnEndpoint = new IPEndPoint(IPAddress.IPv6Any, 8080);
         },
+        ["name-null"] = o => o.DnsNames.Add(null!),
+        ["name-underscore"] = o => o.DnsNames.Add("bad_name.example.test"),
+        ["name-leading-hyphen"] = o => o.DnsNames.Add("-bad.example.test"),
+        ["name-trailing-hyphen"] = o => o.DnsNames.Add("bad-.example.test"),
+        ["name-empty-label"] = o => o.DnsNames.Add("a..example.test"),
+        ["name-trailing-dot"] = o => o.DnsNames.Add("game.example.test."),
+        ["name-label-too-long"] = o => o.DnsNames.Add(new string('a', 64) + ".example.test"),
+        ["name-total-too-long"] = o => o.DnsNames.Add(new string('a', 63) + "." + new string('b', 63) + "." + new string('c', 63) + "." + new string('d', 62)),
+        ["wildcard-in-the-middle"] = o => WithDns01(o).DnsNames.Add("lobby.*.example.test"),
+        ["double-wildcard"] = o => WithDns01(o).DnsNames.Add("*.*.example.test"),
+        ["same-account-and-certificate-path"] = o => o.AccountStorePath = "server.pfx",
+        ["account-path-is-the-certificate-metadata"] = o => o.AccountStorePath = "server.pfx.acme.json",
+        ["path-with-nul"] = o => o.CertificatePath = "server\0.pfx",
+        ["propagation-delay-too-long"] = o => o.ChallengePropagationDelay = TimeSpan.FromDays(31),
+        ["renewal-retry-delay-too-long"] = o => o.Renewal = new RenewalSchedulerOptions { RetryDelay = TimeSpan.FromDays(31) },
+        ["renewal-threshold-too-long"] = o => o.Renewal = new RenewalSchedulerOptions { ImmediateRenewalThreshold = TimeSpan.MaxValue },
+        ["renewal-lead-too-long"] = o => o.Renewal = new RenewalSchedulerOptions { RenewBefore = TimeSpan.FromDays(399) },
     };
+
+    private static AcmeProvisioningOptions WithDns01(AcmeProvisioningOptions options)
+    {
+        options.ChallengeTypes.Add(AcmeChallengeKind.Dns01);
+        options.Dns01Provider = new InMemoryDns01Provider();
+        return options;
+    }
 
     public static TheoryData<string> InvalidCaseNames => [.. InvalidCases.Keys];
 
@@ -156,9 +184,9 @@ public sealed class OptionsTests
 
         Assert.Equal(AcmeDirectories.LetsEncrypt, options.DirectoryUrl);
         Assert.False(options.AgreeToTermsOfService);
-        Assert.Equal([AcmeChallengeKind.Http01, AcmeChallengeKind.TlsAlpn01], options.ChallengeTypes);
-        Assert.Equal(new IPEndPoint(IPAddress.Any, 80), options.HttpChallengeEndpoint);
-        Assert.Equal(new IPEndPoint(IPAddress.Any, 443), options.TlsAlpnEndpoint);
+        Assert.Equal([AcmeChallengeKind.Http01], options.ChallengeTypes); // ADR 0009: ACME responder plus redirect on TCP 80
+        Assert.Equal(new IPEndPoint(IPAddress.IPv6Any, 80), options.HttpChallengeEndpoint); // dual-mode
+        Assert.Equal(new IPEndPoint(IPAddress.IPv6Any, 443), options.TlsAlpnEndpoint);
         Assert.True(options.RedirectToHttps);
         Assert.False(options.EnableHealthEndpoint);
         Assert.Equal(AcmeProvisioningOptions.DefaultHealthPath, options.HealthPath);
@@ -180,7 +208,7 @@ public sealed class OptionsTests
         options.Contacts.Add("mailto:admin@example.test");
 
         Assert.Equal([AcmeIdentifier.Dns("game.example.test"), AcmeIdentifier.Ip("127.0.0.1")], options.BuildIdentifiers());
-        Assert.Equal([AcmeChallengeTypes.Http01, AcmeChallengeTypes.TlsAlpn01, AcmeChallengeTypes.Dns01], options.BuildChallengeTypes());
+        Assert.Equal([AcmeChallengeTypes.Http01, AcmeChallengeTypes.Dns01], options.BuildChallengeTypes());
         Assert.Equal(["mailto:ops@example.test", "mailto:admin@example.test"], options.BuildContacts());
     }
 
@@ -278,5 +306,85 @@ public sealed class OptionsTests
             options.ExternalAccountHmacKey = key;
             Assert.Equal(ServerCertificateSourceKind.Acme, ServerCertificateOptions.Acme(options).Kind);
         }
+    }
+
+    [Fact]
+    public void DnsNames_AreNormalisedToLowerCaseAscii_IncludingInternationalisedNames()
+    {
+        AcmeProvisioningOptions options = WithDns01(Valid());
+        options.DnsNames.Add("Bücher.Example.TEST");
+        options.DnsNames.Add("xn--bcher-kva.example.test"); // the same name, already in ASCII
+        options.DnsNames.Add("*.Lobby.example.test");
+        options.DnsNames.Add(new string('a', 63) + "." + new string('b', 63) + "." + new string('c', 63) + "." + new string('d', 61)); // 253 characters
+
+        Assert.Equal(ServerCertificateSourceKind.Acme, ServerCertificateOptions.Acme(options).Kind);
+
+        IReadOnlyList<AcmeIdentifier> identifiers = options.BuildIdentifiers();
+        Assert.Equal(4, identifiers.Count);
+        Assert.Equal(AcmeIdentifier.Dns("xn--bcher-kva.example.test"), identifiers[1]);
+        Assert.Equal(AcmeIdentifier.Dns("*.lobby.example.test"), identifiers[2]);
+    }
+
+    [Fact]
+    public void Secrets_AreRedactedFromToString_AndHiddenFromTheDebugger()
+    {
+        AcmeProvisioningOptions options = Valid();
+        options.ExternalAccountKeyId = "kid-1";
+        options.ExternalAccountHmacKey = "c2VjcmV0LWhtYWMta2V5";
+        options.CertificatePassword = "pfx-secret";
+
+        string text = options.ToString();
+
+        Assert.DoesNotContain("c2VjcmV0LWhtYWMta2V5", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("pfx-secret", text, StringComparison.Ordinal);
+        Assert.Contains("ExternalAccountKeyId = kid-1", text, StringComparison.Ordinal);
+        Assert.Contains("ExternalAccountHmacKey = ***", text, StringComparison.Ordinal);
+        Assert.Contains("CertificatePassword = ***", text, StringComparison.Ordinal);
+        Assert.Contains("game.example.test", text, StringComparison.Ordinal);
+        Assert.Contains("CertificatePassword = (none)", Valid().ToString(), StringComparison.Ordinal);
+        Assert.Contains("ExternalAccountHmacKey = (none)", Valid().ToString(), StringComparison.Ordinal);
+
+        ServerCertificateOptions file = ServerCertificateOptions.File("server.pfx", "file-secret");
+        Assert.DoesNotContain("file-secret", file.ToString(), StringComparison.Ordinal);
+        Assert.Contains("FilePath = server.pfx, FilePassword = ***", file.ToString(), StringComparison.Ordinal);
+        Assert.Contains("FilePassword = (none)", ServerCertificateOptions.File("server.pfx").ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("pfx-secret", ServerCertificateOptions.Acme(options).ToString(), StringComparison.Ordinal);
+        using X509Certificate2 certificate = Certs.Create();
+        Assert.Contains(certificate.Thumbprint, ServerCertificateOptions.Static(certificate).ToString(), StringComparison.Ordinal);
+
+        Assert.Equal(DebuggerBrowsableState.Never, BrowsableState(typeof(AcmeProvisioningOptions), nameof(AcmeProvisioningOptions.ExternalAccountHmacKey)));
+        Assert.Equal(DebuggerBrowsableState.Never, BrowsableState(typeof(AcmeProvisioningOptions), nameof(AcmeProvisioningOptions.CertificatePassword)));
+        Assert.Equal(DebuggerBrowsableState.Never, BrowsableState(typeof(ServerCertificateOptions), nameof(ServerCertificateOptions.FilePassword)));
+        Assert.Equal("{ToString(),nq}", typeof(AcmeProvisioningOptions).GetCustomAttribute<DebuggerDisplayAttribute>()!.Value);
+        Assert.Equal("{ToString(),nq}", typeof(ServerCertificateOptions).GetCustomAttribute<DebuggerDisplayAttribute>()!.Value);
+
+        static DebuggerBrowsableState? BrowsableState(Type type, string property) => type.GetProperty(property)!.GetCustomAttribute<DebuggerBrowsableAttribute>()?.State;
+    }
+
+    [Fact]
+    public void ReloadInterval_IsCappedAtOneDay()
+    {
+        Assert.Equal(ServerCertificateOptions.MaxReloadInterval, ServerCertificateOptions.File("server.pfx", reloadInterval: TimeSpan.FromDays(1)).ReloadInterval);
+        Assert.Throws<ArgumentOutOfRangeException>(() => ServerCertificateOptions.File("server.pfx", reloadInterval: TimeSpan.FromDays(1) + TimeSpan.FromSeconds(1)));
+    }
+
+    [Fact]
+    public void DualModeListenEndpoints_FallBackToIPv4_OnHostsWithoutIPv6()
+    {
+        IPEndPoint dualMode = new(IPAddress.IPv6Any, 80);
+        IPEndPoint loopback = new(IPAddress.Loopback, 0);
+
+        Assert.Same(dualMode, CertificateProvisioner.ResolveListenEndpoint(dualMode, supportsIPv6: true));
+        Assert.Equal(new IPEndPoint(IPAddress.Any, 80), CertificateProvisioner.ResolveListenEndpoint(dualMode, supportsIPv6: false));
+        Assert.Same(loopback, CertificateProvisioner.ResolveListenEndpoint(loopback, supportsIPv6: false));
+    }
+
+    [Fact]
+    public void ClockArithmetic_SaturatesInsteadOfThrowing()
+    {
+        DateTimeOffset now = new(2026, 9, 15, 12, 0, 0, TimeSpan.Zero);
+
+        Assert.Equal(now.AddHours(1), CertificateProvisioner.AddSaturated(now, TimeSpan.FromHours(1)));
+        Assert.Equal(DateTimeOffset.MaxValue, CertificateProvisioner.AddSaturated(now, TimeSpan.MaxValue));
     }
 }

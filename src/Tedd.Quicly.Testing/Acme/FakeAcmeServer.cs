@@ -28,7 +28,8 @@ namespace Tedd.Quicly.Testing.Acme;
 /// TLS with SNI set to the identifier (the <c>in-addr.arpa</c> / <c>ip6.arpa</c> name for IP identifiers, RFC 8738)
 /// and ALPN <c>acme-tls/1</c>, and checks the presented certificate: a single subjectAltName equal to the identifier
 /// and a critical <c>acmeIdentifier</c> extension (<c>1.3.6.1.5.5.7.1.31</c>) holding SHA-256(keyAuthorization).
-/// When a callback is set it takes precedence. <c>dns-01</c> always queries the injected <see cref="DnsTxtLookup"/>
+/// When a callback is set it takes precedence; a certificate returned by <see cref="TlsAlpnLookup"/> is checked by the
+/// same rules, and a malformed one fails the validation with a problem document. <c>dns-01</c> always queries the injected <see cref="DnsTxtLookup"/>
 /// (for example <see cref="InMemoryDns01Provider.Lookup"/>); real DNS is out of scope. Every validation is recorded in
 /// <see cref="ValidationLog"/>.</para>
 /// </remarks>
@@ -1206,26 +1207,12 @@ public sealed class FakeAcmeServer : IAsyncDisposable
             return await HandshakeTlsAlpn01Async(identifier, host, TlsAlpnValidationPort, keyAuth);
         }
 
+        // The certificate the responder would present is held to the same RFC 8737 rules as one presented over the network:
+        // exactly one subjectAltName, and a malformed acmeIdentifier is a failed validation (a problem document), not a 500.
         X509Certificate2? cert = TlsAlpnLookup?.Invoke(domain);
-        if (cert is null)
-        {
-            return "No acme-tls/1 certificate presented for " + domain + ".";
-        }
-
-        if (!cert.MatchesHostname(domain))
-        {
-            return "Certificate SAN does not cover " + domain + ".";
-        }
-
-        X509Extension? ext = cert.Extensions[AcmeIdentifierOid];
-        if (ext is null || !ext.Critical)
-        {
-            return "acmeIdentifier extension missing or not critical.";
-        }
-
-        byte[] value = new AsnReader(ext.RawData, AsnEncodingRules.DER).ReadOctetString();
-        byte[] expected = SHA256.HashData(Encoding.ASCII.GetBytes(keyAuth));
-        return value.AsSpan().SequenceEqual(expected) ? null : "acmeIdentifier hash mismatch.";
+        return cert is null
+            ? "No acme-tls/1 certificate presented for " + domain + "."
+            : CheckTlsAlpnCertificate(cert, identifier, keyAuth);
     }
 
     /// <summary>

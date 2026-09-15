@@ -148,8 +148,11 @@ public sealed class ProvisionerSourceTests : IDisposable
         X509Certificate2 second = provisioner.Current!;
         Assert.True(second.MatchesHostname("b.example.test"));
         Assert.Same(second, consumer.Received[1]);
-        Assert.True(Certs.IsDisposed(first)); // zero grace period
-        Assert.True(recorder.HasStatus(CertificateState.Valid, "Reloaded "));
+
+        // The binder disposes the superseded certificate (zero grace period) after it updated the consumers, and the
+        // status follows the Changed handlers, so both are awaited rather than asserted the instant the consumer saw it.
+        await Wait.ForAsync(() => Certs.IsDisposed(first), LongWait, "the superseded certificate to be disposed");
+        await Wait.ForAsync(() => recorder.HasStatus(CertificateState.Valid, "Reloaded "), LongWait, "the Reloaded status");
 
         // A file that cannot be read is reported; the previous certificate stays in use.
         Certs.WriteAtomically(path, "half-written"u8.ToArray(), DateTime.UtcNow.AddMinutes(-4));

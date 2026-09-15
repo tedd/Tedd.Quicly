@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography.X509Certificates;
 
 namespace Tedd.Quicly.Server.Certificates;
@@ -19,10 +20,17 @@ public enum ServerCertificateSourceKind
 /// Chooses one of the three certificate sources a <see cref="CertificateProvisioner"/> can serve: a fixed certificate
 /// (<see cref="Static"/>), a PFX file (<see cref="File"/>), or ACME (<see cref="Acme"/>). Create with the factory methods.
 /// </summary>
+[DebuggerDisplay("{ToString(),nq}")]
 public sealed class ServerCertificateOptions
 {
     /// <summary>Default polling interval for <see cref="File"/> sources with reload enabled.</summary>
     public static readonly TimeSpan DefaultReloadInterval = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Longest accepted polling interval for <see cref="File"/> sources: one day. A longer poll could notice a renewed file
+    /// only after the certificate it replaces has expired.
+    /// </summary>
+    public static readonly TimeSpan MaxReloadInterval = TimeSpan.FromDays(1);
 
     private ServerCertificateOptions(ServerCertificateSourceKind kind)
     {
@@ -38,7 +46,8 @@ public sealed class ServerCertificateOptions
     /// <summary>The PFX path of a <see cref="ServerCertificateSourceKind.File"/> source.</summary>
     public string? FilePath { get; private init; }
 
-    /// <summary>The PFX password of a <see cref="ServerCertificateSourceKind.File"/> source.</summary>
+    /// <summary>The PFX password of a <see cref="ServerCertificateSourceKind.File"/> source. Secret: redacted from <see cref="ToString"/> and the debugger view.</summary>
+    [DebuggerBrowsable(DebuggerBrowsableState.Never)]
     public string? FilePassword { get; private init; }
 
     /// <summary>Whether a <see cref="ServerCertificateSourceKind.File"/> source reloads the file when its modification time changes.</summary>
@@ -71,12 +80,13 @@ public sealed class ServerCertificateOptions
     /// file is loaded and announced through <see cref="CertificateProvisioner.Changed"/>. Replace the file atomically
     /// (write a temporary file, then rename it over the old one); a half-written file is reported and retried.
     /// </summary>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="reloadInterval"/> is not positive.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="reloadInterval"/> is not positive, or longer than <see cref="MaxReloadInterval"/>.</exception>
     public static ServerCertificateOptions File(string pfxPath, string? password = null, bool reloadOnChange = true, TimeSpan? reloadInterval = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(pfxPath);
         TimeSpan interval = reloadInterval ?? DefaultReloadInterval;
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero, nameof(reloadInterval));
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(interval, MaxReloadInterval, nameof(reloadInterval));
         return new ServerCertificateOptions(ServerCertificateSourceKind.File)
         {
             FilePath = pfxPath,
@@ -93,5 +103,17 @@ public sealed class ServerCertificateOptions
         ArgumentNullException.ThrowIfNull(options);
         options.Validate();
         return new ServerCertificateOptions(ServerCertificateSourceKind.Acme) { AcmeOptions = options };
+    }
+
+    /// <summary>A summary for logs; the PFX password is redacted.</summary>
+    public override string ToString()
+    {
+        return Kind switch
+        {
+            ServerCertificateSourceKind.Static => "ServerCertificateOptions { Kind = Static, Certificate = " + Certificate!.Subject + " (" + Certificate.Thumbprint + ") }",
+            ServerCertificateSourceKind.File => "ServerCertificateOptions { Kind = File, FilePath = " + FilePath + ", FilePassword = " + (FilePassword is null ? "(none)" : "***")
+                + ", ReloadOnChange = " + ReloadOnChange + ", ReloadInterval = " + ReloadInterval + " }",
+            _ => "ServerCertificateOptions { Kind = Acme, AcmeOptions = " + AcmeOptions + " }",
+        };
     }
 }

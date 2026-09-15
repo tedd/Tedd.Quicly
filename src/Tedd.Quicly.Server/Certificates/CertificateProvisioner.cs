@@ -1,4 +1,6 @@
 using System.Net;
+using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Tedd.Quicly.Acme;
@@ -52,6 +54,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     private readonly Lock _lock = new();
     private readonly Lock _publishLock = new();
     private readonly Lock _statusLock = new();
+    private readonly Lock _filePollLock = new();
     private readonly List<X509Certificate2> _owned = [];
     private readonly CancellationTokenSource _stopCts = new();
     private readonly TaskCompletionSource _firstCertificate = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -68,7 +71,11 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     private HttpServer? _httpServer;
     private HttpServer? _tlsServer;
     private FileCertificateSource? _fileSource;
+    private ITimer? _fileTimer;
     private Task? _loop;
+
+    // File source polling state, touched only by the (never overlapping) polls and start-up.
+    private DateTime _fileLastWrite;
 
     // ACME state.
     private Http01ChallengeHandler? _http01;
@@ -77,6 +84,8 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     private RenewalScheduler? _scheduler;
     private HttpClient? _ownedHttp;
     private byte[]? _currentPfx;
+    private byte[]? _unloadedPfx;
+    private bool _servedFromConfiguredDirectory;
 
     // Renewal loop coordination, guarded by _lock.
     private RenewalRequest? _pendingRenewal;
@@ -149,6 +158,12 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
 
     /// <summary>Loads the served certificate from PKCS#12 bytes (test seam for load failures).</summary>
     internal Func<byte[], string?, X509KeyStorageFlags, X509Certificate2> CertificateLoader { get; set; } = LoadServedCertificate;
+
+    /// <summary>
+    /// How much longer than <see cref="AcmeProvisioningOptions.ChallengeCleanupTimeout"/> stopping waits for the start-up
+    /// order or the renewal loop to wind down before abandoning it (tests shorten it).
+    /// </summary>
+    internal TimeSpan StopWaitMargin { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>Number of certificates held for disposal; superseded ones a binder has disposed are dropped (tests).</summary>
     internal int OwnedCertificateCount
@@ -264,6 +279,12 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
             return Task.FromException(new InvalidOperationException("Only ACME certificates can be renewed on demand."));
         }
 
+        if (cancellationToken.IsCancellationRequested)
+        {
+            // A caller that has already given up gets nothing queued on its behalf.
+            return Task.FromCanceled(cancellationToken);
+        }
+
         TaskCompletionSource completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_lock)
         {
@@ -320,6 +341,10 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         {
             certificate.Dispose();
         }
+
+        // The PFX bytes hold the private key (unencrypted without a CertificatePassword): not left to the GC.
+        Zero(Interlocked.Exchange(ref _currentPfx, null));
+        Zero(Interlocked.Exchange(ref _unloadedPfx, null));
     }
 
     private async Task StopCoreAsync()
@@ -332,7 +357,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
             {
                 // StartAsync may still be between becoming Running and starting the loop: let it finish, so that the loop
                 // (and everything else it started) is seen and released below.
-                await _startCompleted.Task.ConfigureAwait(false);
+                await WaitBoundedAsync(_startCompleted.Task, "Start-up").ConfigureAwait(false);
             }
 
             await ReleaseResourcesAsync().ConfigureAwait(false);
@@ -355,6 +380,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         HttpServer? http;
         HttpServer? tls;
         FileCertificateSource? file;
+        ITimer? fileTimer;
         lock (_lock)
         {
             loop = _loop;
@@ -365,19 +391,26 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
             _tlsServer = null;
             file = _fileSource;
             _fileSource = null;
+            fileTimer = _fileTimer;
+            _fileTimer = null;
         }
 
         if (loop is not null)
         {
             // Never faults; exits once _stopCts is cancelled (an order in progress still removes its challenge material,
             // bounded by ChallengeCleanupTimeout), so the endpoints serving that material are closed only afterwards.
-            await loop.ConfigureAwait(false);
+            await WaitBoundedAsync(loop, "The renewal loop").ConfigureAwait(false);
         }
 
         if (file is not null)
         {
-            file.Changed -= OnFileChanged;
-            file.ReloadFailed -= OnFileReloadFailed;
+            fileTimer?.Dispose();
+            lock (_filePollLock)
+            {
+                // Entered only to wait for a poll that is under way; later polls find the source gone and stop.
+                file.Changed -= OnFileChanged;
+            }
+
             file.Dispose();
         }
 
@@ -392,19 +425,53 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
     }
 
+    /// <summary>
+    /// Waits for work that was told to stop, for at most the cleanup bound plus <see cref="StopWaitMargin"/>. Work that
+    /// does not finish (a challenge responder or <see cref="IDns01Provider"/> that ignores cancellation) is reported
+    /// through <see cref="Error"/> and abandoned, so that stopping and disposing cannot hang.
+    /// </summary>
+    private async Task WaitBoundedAsync(Task task, string what)
+    {
+        TimeSpan bound = (_options.AcmeOptions?.ChallengeCleanupTimeout ?? TimeSpan.Zero) + StopWaitMargin;
+        try
+        {
+            await task.WaitAsync(bound).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            ReportError(new TimeoutException(what + " did not finish within " + bound + " of being stopped (a challenge responder or IDns01Provider that ignores cancellation?); it is abandoned and stopping continues."));
+        }
+    }
+
     // ---- file source ------------------------------------------------------------------------------------------------
 
     private void StartFile()
     {
-        FileCertificateSource source = new(_options.FilePath!, _options.FilePassword, _options.ReloadOnChange ? _options.ReloadInterval : null);
+        // The modification time is read before the file is loaded, so a replacement landing in between is seen as a change
+        // by the first poll (at worst the same certificate is read twice). The provisioner polls, not the source's own
+        // timer, so that it sees every outcome, including a reload that finds the certificate being served.
+        string path = _options.FilePath!;
+        DateTime lastWrite = File.GetLastWriteTimeUtc(path);
+        FileCertificateSource source = new(path, _options.FilePassword);
         source.Changed += OnFileChanged;
-        source.ReloadFailed += OnFileReloadFailed;
         lock (_lock)
         {
             _fileSource = source;
         }
 
+        _fileLastWrite = lastWrite;
         PublishFileCertificate(source, "Loaded ");
+        if (_options.ReloadOnChange)
+        {
+            // Armed only once stored: each poll re-arms it when done, so polls never overlap.
+            ITimer timer = TimeProvider.System.CreateTimer(static state => ((CertificateProvisioner)state!).PollFile(), this, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+            lock (_lock)
+            {
+                _fileTimer = timer;
+            }
+
+            timer.Change(_options.ReloadInterval, Timeout.InfiniteTimeSpan);
+        }
     }
 
     private void OnFileChanged(X509Certificate2 certificate)
@@ -432,9 +499,57 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
     }
 
-    private void OnFileReloadFailed(Exception exception)
+    /// <summary>One poll of a reloading file source; re-arms the timer unless the provisioner stopped meanwhile. Never throws.</summary>
+    private void PollFile()
     {
-        SetStatus(CertificateStatus.Failed("Reloading " + _options.FilePath + " failed; the previous certificate stays in use: " + exception.Message, exception));
+        lock (_filePollLock)
+        {
+            FileCertificateSource? source;
+            lock (_lock)
+            {
+                source = _fileSource;
+            }
+
+            // Null once stopped: a poll that was already on its way does nothing and does not re-arm the timer.
+            if (source is not null)
+            {
+                ReloadFile(source);
+                lock (_lock)
+                {
+                    _fileTimer?.Change(_options.ReloadInterval, Timeout.InfiniteTimeSpan);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reloads the file when its modification time changed. A different certificate is published through
+    /// <see cref="OnFileChanged"/>; a failure is reported as <see cref="CertificateState.Failed"/> (the previous certificate
+    /// stays in use and the next poll tries again); and a file that is readable again after a failure but holds the
+    /// certificate being served (a re-export, a restored backup) makes the status <see cref="CertificateState.Valid"/> again.
+    /// </summary>
+    private void ReloadFile(FileCertificateSource source)
+    {
+        string path = source.FilePath;
+        try
+        {
+            DateTime lastWrite = File.GetLastWriteTimeUtc(path);
+            if (lastWrite == _fileLastWrite)
+            {
+                return;
+            }
+
+            bool changed = source.Reload();
+            _fileLastWrite = lastWrite;
+            if (!changed && Status.State == CertificateState.Failed)
+            {
+                SetStatus(new CertificateStatus(CertificateState.Valid, "Reloaded " + path + ": readable again, with the certificate already being served, " + CertificateIdentity.Describe(source.Current!) + "."));
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or CryptographicException)
+        {
+            SetStatus(CertificateStatus.Failed("Reloading " + path + " failed; the previous certificate stays in use: " + e.Message, e));
+        }
     }
 
     // ---- ACME start-up ----------------------------------------------------------------------------------------------
@@ -517,19 +632,32 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
             return;
         }
 
+        bool issuedButNotLoaded = false;
         try
         {
-            IssuedCertificate issued = await manager.OrderCertificateAsync(cancellationToken).ConfigureAwait(false);
-            string served = ApplyIssued(issued);
+            string? replaces = persisted ? await GetReplacesAsync(cancellationToken).ConfigureAwait(false) : null;
+            IssuedCertificate issued = await manager.OrderCertificateAsync(replaces, cancellationToken).ConfigureAwait(false);
+            issuedButNotLoaded = true;
+            string served = await ApplyIssuedAsync(issued, cancellationToken).ConfigureAwait(false);
             SetStatus(new CertificateStatus(CertificateState.Valid, "Obtained " + served + " from " + o.DirectoryUrl + "."));
         }
         catch (Exception e) when (!(e is OperationCanceledException && cancellationToken.IsCancellationRequested))
         {
-            // Not fatal for start-up: the background loop orders again after the retry delay until an order succeeds, and
-            // a persisted certificate (if any) is served meanwhile.
-            string serving = persisted ? " The persisted certificate is served meanwhile; ordering again after " : " Ordering again after ";
-            SetStatus(CertificateStatus.Failed("Ordering a certificate from " + o.DirectoryUrl + " failed: " + e.Message + serving + o.Renewal.RetryDelay + ".", e));
-            QueueRetry(persisted ? "Renewing the persisted certificate, which is due, after the start-up order failed." : "Ordering again after the start-up order failed.");
+            // Not fatal for start-up: the background loop tries again after the retry delay until it succeeds (a certificate
+            // that was issued but could not be loaded is loaded again before anything is ordered), and a persisted
+            // certificate (if any) is served meanwhile.
+            string next = issuedButNotLoaded
+                ? "loading it again after " + o.Renewal.RetryDelay + ", before anything is ordered."
+                : "ordering again after " + o.Renewal.RetryDelay + ".";
+            string failure = (issuedButNotLoaded
+                    ? "A certificate was issued by " + o.DirectoryUrl + " but could not be loaded: "
+                    : "Ordering a certificate from " + o.DirectoryUrl + " failed: ")
+                + Sentence(e.Message)
+                + (persisted ? " The persisted certificate is served meanwhile; " + next : " " + char.ToUpperInvariant(next[0]) + next[1..]);
+            SetStatus(CertificateStatus.Failed(failure, e));
+            QueueRetry(issuedButNotLoaded ? "Loading the certificate issued at start-up, which could not be loaded then."
+                : persisted ? "Renewing the persisted certificate, which is due, after the start-up order failed."
+                : "Ordering again after the start-up order failed.");
         }
     }
 
@@ -547,7 +675,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
             return false;
         }
 
-        byte[] pfx;
+        byte[]? pfx = null;
         X509Certificate2 certificate;
         try
         {
@@ -556,6 +684,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or CryptographicException)
         {
+            Zero(pfx);
             ReportError(new InvalidDataException("The persisted certificate " + path + " cannot be loaded; ordering a new one.", e));
             SetStatus(new CertificateStatus(CertificateState.Starting, "The persisted certificate " + path + " cannot be loaded (" + e.Message + "); ordering a new one."));
             return false;
@@ -569,25 +698,32 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         if (unusable is not null)
         {
             certificate.Dispose();
+            Zero(pfx);
             SetStatus(new CertificateStatus(CertificateState.Starting, "The persisted certificate " + path + " " + unusable + "; ordering a new one."));
             return false;
         }
 
-        // Everything is read from the certificate before it is published: a concurrent DisposeAsync disposes it there.
-        due = _scheduler!.IsRenewalDue(certificate);
+        // Everything is read from the certificate before it is published: a concurrent DisposeAsync disposes it there. A
+        // certificate another directory issued (staging, before the switch to production), or whose origin was not
+        // recorded, is served only until a replacement from the configured directory is obtained.
+        Uri? issuedBy = CertificateMetadata.ReadDirectory(CertificateMetadata.PathFor(path), certificate);
+        _servedFromConfiguredDirectory = issuedBy is not null && issuedBy.Equals(o.DirectoryUrl);
+        due = !_servedFromConfiguredDirectory || _scheduler!.IsRenewalDue(certificate);
         string description = CertificateIdentity.Describe(certificate);
         Volatile.Write(ref _currentPfx, pfx);
         Publish(certificate, owned: true);
-        SetStatus(due
-            ? new CertificateStatus(CertificateState.Starting, "The persisted certificate " + description + " is due for renewal; it is served while a replacement is ordered.")
-            : new CertificateStatus(CertificateState.Valid, "Loaded the persisted certificate " + description + "."));
+        SetStatus(!_servedFromConfiguredDirectory
+            ? new CertificateStatus(CertificateState.Starting, "The persisted certificate " + description + " was issued by " + (issuedBy is null ? "an unrecorded directory" : issuedBy.AbsoluteUri) + ", not " + o.DirectoryUrl + "; it is served while a replacement is ordered.")
+            : due
+                ? new CertificateStatus(CertificateState.Starting, "The persisted certificate " + description + " is due for renewal; it is served while a replacement is ordered.")
+                : new CertificateStatus(CertificateState.Valid, "Loaded the persisted certificate " + description + "."));
         return true;
     }
 
     private HttpServer CreateHttpChallengeServer(AcmeProvisioningOptions o, Http01ChallengeHandler handler)
     {
         HttpServerOptions options = new() { OnError = ReportError };
-        options.Listen(o.HttpChallengeEndpoint);
+        options.Listen(ResolveListenEndpoint(o.HttpChallengeEndpoint, Socket.OSSupportsIPv6));
         options.Use(handler);
         if (o.EnableHealthEndpoint)
         {
@@ -608,19 +744,25 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         HttpServerOptions options = new() { OnError = ReportError };
 
         // Normal clients get the current certificate (read per handshake, so renewals apply at once); clients offering
-        // only acme-tls/1 for a published name get the challenge certificate.
-        options.Listen(o.TlsAlpnEndpoint, new HttpTlsOptions { CertificateSource = this, Alpn01Responder = responder });
+        // only acme-tls/1 for a published name get the challenge certificate. The health endpoint is served on the HTTP
+        // challenge endpoint only; add a HealthHandler to TlsEndpointHandlers to answer it here as well.
+        HttpTlsOptions tls = new() { CertificateSelector = new CurrentCertificateSelector(this), Alpn01Responder = responder };
+        options.Listen(ResolveListenEndpoint(o.TlsAlpnEndpoint, Socket.OSSupportsIPv6), tls);
         foreach (IHttpHandler handler in o.TlsEndpointHandlers)
         {
             options.Use(handler);
         }
 
-        if (o.EnableHealthEndpoint)
-        {
-            options.Use(new HealthHandler(o.HealthPath));
-        }
-
         return new HttpServer(options);
+    }
+
+    /// <summary>
+    /// The endpoint to bind: the dual-mode <c>[::]</c> wildcard (the default) falls back to <c>0.0.0.0</c> on a host
+    /// without IPv6, where an IPv6 socket cannot even be created, so the default configuration starts everywhere.
+    /// </summary>
+    internal static IPEndPoint ResolveListenEndpoint(IPEndPoint endpoint, bool supportsIPv6)
+    {
+        return endpoint.Address.Equals(IPAddress.IPv6Any) && !supportsIPv6 ? new IPEndPoint(IPAddress.Any, endpoint.Port) : endpoint;
     }
 
     // ---- ACME background loop ---------------------------------------------------------------------------------------
@@ -725,24 +867,24 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
     }
 
-    private Task OnRenewedAsync(IssuedCertificate issued, CancellationToken cancellationToken)
+    private async Task OnRenewedAsync(IssuedCertificate issued, CancellationToken cancellationToken)
     {
         string served;
         try
         {
-            served = ApplyIssued(issued);
+            served = await ApplyIssuedAsync(issued, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
-            // The scheduler now tracks a certificate that is not being served: interrupt it and order again after the
-            // retry delay, so the served certificate cannot silently run out.
-            SetStatus(CertificateStatus.Failed("A renewed certificate could not be loaded (" + e.Message + "); ordering again after " + _options.AcmeOptions!.Renewal.RetryDelay + ".", e));
-            QueueRetry("Ordering again after a renewed certificate could not be loaded.");
-            return Task.CompletedTask;
+            // The scheduler now tracks a certificate that is not being served: interrupt it. The retry loads the kept
+            // certificate again (and orders a new one only if it still cannot be loaded), so the served certificate cannot
+            // silently run out.
+            SetStatus(CertificateStatus.Failed("A renewed certificate could not be loaded (" + e.Message + "); loading it again after " + _options.AcmeOptions!.Renewal.RetryDelay + ", before anything is ordered.", e));
+            QueueRetry("Loading the renewed certificate, which could not be loaded.");
+            return;
         }
 
         SetStatus(new CertificateStatus(CertificateState.Valid, "Renewed: " + served + "."));
-        return Task.CompletedTask;
     }
 
     private void OnRenewalFailed(Exception exception)
@@ -755,13 +897,26 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     {
         AcmeProvisioningOptions o = _options.AcmeOptions!;
         bool hadCertificate = Current is not null;
+        bool issuedButNotLoaded = false;
         try
         {
             SetStatus(new CertificateStatus(CertificateState.Renewing, request.Reason));
-            IssuedCertificate issued = await _manager!.OrderCertificateAsync(stop).ConfigureAwait(false);
-            string served = ApplyIssued(issued);
-            string message = !hadCertificate ? "Obtained " + served + " from " + o.DirectoryUrl + "."
-                : (request.Requested ? "Renewed on request: " : "Renewed: ") + served + ".";
+            string message;
+            if (await TryServeUnloadedAsync(stop).ConfigureAwait(false) is { } loaded)
+            {
+                // Issued earlier but not loadable then: serving it now costs no order.
+                message = "Loaded the certificate issued earlier, which could not be loaded then: " + loaded + ".";
+            }
+            else
+            {
+                string? replaces = await GetReplacesAsync(stop).ConfigureAwait(false);
+                IssuedCertificate issued = await _manager!.OrderCertificateAsync(replaces, stop).ConfigureAwait(false);
+                issuedButNotLoaded = true;
+                string served = await ApplyIssuedAsync(issued, stop).ConfigureAwait(false);
+                message = !hadCertificate ? "Obtained " + served + " from " + o.DirectoryUrl + "."
+                    : (request.Requested ? "Renewed on request: " : "Renewed: ") + served + ".";
+            }
+
             SetStatus(new CertificateStatus(CertificateState.Valid, message));
             Complete(request, error: null, cancelled: false);
         }
@@ -772,8 +927,11 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
         catch (Exception e)
         {
-            bool retry = request.RetryUntilSuccess;
-            SetStatus(CertificateStatus.Failed("Renewal failed" + (retry ? "; retrying after " + o.Renewal.RetryDelay : string.Empty) + ": " + e.Message, e));
+            // A certificate that was issued but could not be loaded is always tried again (and loaded before anything is
+            // ordered); other failures only for internal retries.
+            bool retry = request.RetryUntilSuccess || issuedButNotLoaded;
+            string failure = issuedButNotLoaded ? "The renewed certificate could not be loaded" : "Renewal failed";
+            SetStatus(CertificateStatus.Failed(failure + (retry ? "; retrying after " + o.Renewal.RetryDelay : string.Empty) + ": " + e.Message, e));
             Complete(request, e, cancelled: false);
             if (retry)
             {
@@ -786,7 +944,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     private void QueueRetry(string reason)
     {
         RenewalSchedulerOptions renewal = _options.AcmeOptions!.Renewal;
-        DateTimeOffset notBefore = renewal.TimeProvider.GetUtcNow() + renewal.RetryDelay;
+        DateTimeOffset notBefore = AddSaturated(renewal.TimeProvider.GetUtcNow(), renewal.RetryDelay);
         lock (_lock)
         {
             // A request queued already keeps its own (earlier) start, and is retried until it succeeds as well.
@@ -921,11 +1079,18 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
 
     private Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
     {
-        // Rounded up to a whole millisecond (timers truncate: a wait that ends a fraction of a millisecond early would
-        // make the loop spin until the due time) and clamped to the longest wait a timer accepts.
-        long milliseconds = (delay.Ticks + TimeSpan.TicksPerMillisecond - 1) / TimeSpan.TicksPerMillisecond;
-        TimeSpan rounded = TimeSpan.FromMilliseconds(Math.Clamp(milliseconds, 0, (long)MaxDelay.TotalMilliseconds));
-        return Task.Delay(rounded, _options.AcmeOptions!.Renewal.TimeProvider, cancellationToken);
+        // Clamped to the longest wait a timer accepts (the loop re-evaluates afterwards) before it is rounded up to a whole
+        // millisecond: timers truncate, and a wait that ends a fraction of a millisecond early would make the loop spin
+        // until the due time. Clamping first keeps the rounding from overflowing into a negative (zero) wait.
+        TimeSpan clamped = delay > MaxDelay ? MaxDelay : delay < TimeSpan.Zero ? TimeSpan.Zero : delay;
+        long milliseconds = (clamped.Ticks + TimeSpan.TicksPerMillisecond - 1) / TimeSpan.TicksPerMillisecond;
+        return Task.Delay(TimeSpan.FromMilliseconds(milliseconds), _options.AcmeOptions!.Renewal.TimeProvider, cancellationToken);
+    }
+
+    /// <summary><paramref name="instant"/> + <paramref name="delay"/>, saturating at <see cref="DateTimeOffset.MaxValue"/> instead of throwing.</summary>
+    internal static DateTimeOffset AddSaturated(DateTimeOffset instant, TimeSpan delay)
+    {
+        return delay >= DateTimeOffset.MaxValue - instant ? DateTimeOffset.MaxValue : instant + delay;
     }
 
     /// <summary>
@@ -953,32 +1118,151 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     }
 
     /// <summary>
-    /// Loads the served certificate from the issued PKCS#12, makes it current and disposes <paramref name="issued"/>.
-    /// Returns the certificate's description, for the status.
+    /// Records which directory issued the certificate the manager has just persisted, disposes <paramref name="issued"/>
+    /// and serves its PKCS#12 (<see cref="ServeIssuedAsync"/>). Returns the certificate's description, for the status.
     /// </summary>
-    /// <exception cref="OperationCanceledException">The provisioner was disposed meanwhile; the certificate was discarded.</exception>
-    private string ApplyIssued(IssuedCertificate issued)
+    private Task<string> ApplyIssuedAsync(IssuedCertificate issued, CancellationToken cancellationToken)
     {
-        AcmeProvisioningOptions o = _options.AcmeOptions!;
         byte[] pfx = issued.Pfx;
-        X509Certificate2 served;
         try
         {
-            served = CertificateLoader(pfx, o.CertificatePassword, o.KeyStorageFlags);
+            RecordIssuer(issued);
         }
         finally
         {
             issued.Dispose();
         }
 
+        return ServeIssuedAsync(pfx, cancellationToken);
+    }
+
+    /// <summary>
+    /// Loads an issued PKCS#12 with the configured key storage and makes it current. A failed load is retried with the
+    /// ACME back-off (<see cref="AcmeProvisioningOptions.Retry"/>): the certificate is issued and persisted, so a key
+    /// storage hiccup must not cost another order against the CA's rate limits. Until the certificate is served its PFX is
+    /// kept, and the next retry (or renewal request) loads it again before anything is ordered.
+    /// </summary>
+    /// <exception cref="OperationCanceledException">Stopped during a back-off wait, or disposed meanwhile (the certificate was discarded).</exception>
+    private async Task<string> ServeIssuedAsync(byte[] pfx, CancellationToken cancellationToken)
+    {
+        KeepUnloaded(pfx);
+        X509Certificate2 served = await LoadWithRetryAsync(pfx, cancellationToken).ConfigureAwait(false);
+        Volatile.Write(ref _unloadedPfx, null); // not zeroed: it is the current PFX from now on
         string description = CertificateIdentity.Describe(served);
-        Volatile.Write(ref _currentPfx, pfx);
+        _servedFromConfiguredDirectory = true;
+        Zero(Interlocked.Exchange(ref _currentPfx, pfx));
         if (!Publish(served, owned: true))
         {
             throw new OperationCanceledException("The certificate provisioner was disposed while a new certificate was being applied; the certificate was discarded.");
         }
 
         return description;
+    }
+
+    private async Task<X509Certificate2> LoadWithRetryAsync(byte[] pfx, CancellationToken cancellationToken)
+    {
+        AcmeProvisioningOptions o = _options.AcmeOptions!;
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return CertificateLoader(pfx, o.CertificatePassword, o.KeyStorageFlags);
+            }
+            catch (Exception e) when (e is not OperationCanceledException && attempt < o.Retry.MaxAttempts)
+            {
+                TimeSpan delay = o.Retry.GetDelay(attempt, null);
+                CertificateState state = Status.State == CertificateState.Starting ? CertificateState.Starting : CertificateState.Renewing;
+                SetStatus(new CertificateStatus(state, "The issued certificate could not be loaded (" + e.Message + "); loading it again in " + delay + "."));
+                await DelayAsync(delay, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Serves the certificate kept because it could not be loaded when it was issued. Returns its description, or
+    /// <see langword="null"/> when nothing is kept or it still cannot be loaded (it is then dropped, and a new one ordered).
+    /// </summary>
+    private async Task<string?> TryServeUnloadedAsync(CancellationToken cancellationToken)
+    {
+        byte[]? pfx = Volatile.Read(ref _unloadedPfx);
+        if (pfx is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return await ServeIssuedAsync(pfx, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            ReportError(new CryptographicException("The certificate issued earlier still cannot be loaded; a new one is ordered.", e));
+            KeepUnloaded(null);
+            return null;
+        }
+    }
+
+    /// <summary>Replaces the kept, not yet served PFX, zeroing the one it replaces (it holds a private key).</summary>
+    private void KeepUnloaded(byte[]? pfx)
+    {
+        byte[]? previous = Interlocked.Exchange(ref _unloadedPfx, pfx);
+        if (!ReferenceEquals(previous, pfx))
+        {
+            Zero(previous);
+        }
+    }
+
+    private static void Zero(byte[]? bytes)
+    {
+        if (bytes is not null)
+        {
+            CryptographicOperations.ZeroMemory(bytes);
+        }
+    }
+
+    /// <summary><paramref name="message"/> ending with a full stop, so that another sentence can follow it.</summary>
+    private static string Sentence(string message) => message.EndsWith('.') ? message : message + ".";
+
+    /// <summary>Records which directory issued the certificate the manager has just persisted; a failure is reported, not fatal.</summary>
+    private void RecordIssuer(IssuedCertificate issued)
+    {
+        AcmeProvisioningOptions o = _options.AcmeOptions!;
+        string path = CertificateMetadata.PathFor(o.CertificatePath!);
+        try
+        {
+            CertificateMetadata.Write(path, o.DirectoryUrl, issued.Certificate);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            ReportError(new IOException("Recording which ACME directory issued the certificate failed (" + path + "); after a restart the certificate is replaced once, because its origin is unknown.", e));
+        }
+    }
+
+    /// <summary>
+    /// The ARI identifier of the served certificate, for an order that replaces it (RFC 9773 §5), as the renewal scheduler
+    /// passes for scheduled renewals: only while ARI is enabled, the CA advertises <c>renewalInfo</c> and the served
+    /// certificate was issued by the configured directory. Best effort: <see langword="null"/> when it cannot be determined.
+    /// </summary>
+    private async Task<string?> GetReplacesAsync(CancellationToken cancellationToken)
+    {
+        X509Certificate2? current = Current;
+        if (!_options.AcmeOptions!.Renewal.UseRenewalInfo || current is null || !_servedFromConfiguredDirectory)
+        {
+            return null;
+        }
+
+        try
+        {
+            string id = AcmeClient.GetAriCertificateId(current);
+            AcmeClient client = await _manager!.GetClientAsync(cancellationToken).ConfigureAwait(false);
+            AcmeDirectory directory = await client.GetDirectoryAsync(cancellationToken).ConfigureAwait(false);
+            return directory.RenewalInfo is null ? null : id;
+        }
+        catch (Exception e) when (!(e is OperationCanceledException && cancellationToken.IsCancellationRequested))
+        {
+            // No Authority Key Identifier in the certificate, or the CA is unreachable (the order then reports that).
+            return null;
+        }
     }
 
     /// <summary>
@@ -1093,6 +1377,19 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
             {
                 // Nowhere left to report it.
             }
+        }
+    }
+
+    /// <summary>
+    /// Presents the current certificate to normal clients of the TLS endpoint. Before the first certificate exists the
+    /// handshake is refused with an <see cref="AuthenticationException"/>, which the HTTP server counts as an expected
+    /// handshake failure (anyone can connect to a public port) instead of reporting an error for every client.
+    /// </summary>
+    private sealed class CurrentCertificateSelector(CertificateProvisioner owner) : ICertificateSelector
+    {
+        public X509Certificate2? SelectCertificate(string? serverName)
+        {
+            return owner.Current ?? throw new AuthenticationException("No certificate has been obtained yet; TLS handshakes are refused until the first one is available.");
         }
     }
 

@@ -40,8 +40,11 @@ contract, for the Server/Http glue and for applications that drive the client di
   (`***`) in `ToString()` and in the debugger. `AcmeAccountKey` has no textual form.
 * **EAB HMAC key.** It is used only to sign the EAB JWS on `newAccount` and is not persisted by the store.
 * **Certificate PFX.** `AcmeCertificateManagerOptions.CertificatePath` holds the certificate's private key. It is
-  written atomically with mode `0600` on Unix; set `CertificatePassword` to encrypt it. `IssuedCertificate.Load(pfx,
-  password, flags)` lets the TLS glue choose the key storage flags its certificate path needs (ADR 0009).
+  written atomically with mode `0600` on Unix. On Windows it inherits the ACL of its directory: the library does not
+  narrow it, because a service whose account changes (or an administrator) must still be able to replace the file, so
+  keep it in a directory that only the service account can read. Set `CertificatePassword` in any case (recommended):
+  backups and copies of the file then keep the key encrypted. `IssuedCertificate.Load(pfx, password, flags)` lets the
+  TLS glue choose the key storage flags its certificate path needs (ADR 0009).
 
 ## Challenge responders
 
@@ -115,6 +118,7 @@ var certificates = new CertificateProvisioner(ServerCertificateOptions.Acme(new 
     DnsNames = { "play.example.com" },
     AccountStorePath = "/var/lib/mygame/acme-account.json",
     CertificatePath = "/var/lib/mygame/server.pfx",
+    CertificatePassword = secrets["pfx-password"],        // recommended: the PFX holds the private key
 }));
 certificates.StatusChanged += s => logger.Log(s.ToString());   // Starting, Valid, Renewing, Failed(reason), Stopped
 await certificates.StartAsync(ct);
@@ -122,34 +126,51 @@ X509Certificate2 first = await certificates.WaitForCertificateAsync(ct);
 ```
 
 `StartAsync` throws only for problems that retrying cannot fix: invalid options, an endpoint that cannot be bound,
-or an unreadable PFX file. A CA that cannot issue a certificate does not make it throw. The status becomes `Failed`
-with the reason, and the provisioner keeps retrying in the background (the manager's back-off within an attempt, then
-`Renewal.RetryDelay` between attempts). `WaitForCertificateAsync` completes once a certificate exists. Background work
-never throws: every failure is reported through `Status`/`StatusChanged`. Non-fatal problems (for example an event
-handler that threw) go to `Error`, and every ACME stage goes to `Progress`, for logging.
+or an unreadable PFX file. Options are checked up front (in `ServerCertificateOptions.Acme` and again by the
+constructor), including DNS names: host names of letters, digits and hyphens, an optional leading `*.`, with
+internationalised names converted to their ASCII form, so a typo fails at start-up rather than in every order. A CA
+that cannot issue a certificate does not make `StartAsync` throw. The status becomes `Failed` with the reason, and the
+provisioner keeps retrying in the background (the manager's back-off within an attempt, then `Renewal.RetryDelay`
+between attempts). A certificate the CA has issued but that cannot be loaded (a key storage failure) is not simply
+ordered again, which would spend the CA's rate limits: the load is retried with the same back-off, and after
+`Renewal.RetryDelay` the kept certificate is loaded again before anything new is ordered. `WaitForCertificateAsync`
+completes once a certificate exists. Background work never throws: every failure is reported through
+`Status`/`StatusChanged`. Non-fatal problems (for example an event handler that threw) go to `Error`, and every ACME
+stage goes to `Progress`, for logging. `StopAsync` and `DisposeAsync` wait for an order in progress to wind down for at
+most `ChallengeCleanupTimeout` plus 10 seconds: a challenge responder or `IDns01Provider` that ignores cancellation is
+reported through `Error` and abandoned, so shutting down cannot hang.
 
 On start, a persisted certificate at `CertificatePath` is served without contacting the CA if it covers every
-configured name, has not expired, and is not due for renewal. A restart therefore costs no rate limit. A persisted
-certificate that is valid but due is served while a replacement is ordered. After that, `RenewalScheduler` renews at
-the CA's ARI window, or when one third of the lifetime remains (`Renewal.RenewBefore` overrides this). `RenewNowAsync`
-forces a renewal, for example on key compromise or after the CA revoked the certificate. It cuts a pending retry wait
-short, and calls made while such an order is queued or running share its outcome. (Changed names need a restart: the
-persisted certificate then no longer covers them and a new one is ordered.)
+configured name, has not expired, is not due for renewal, and was issued by the configured directory (recorded in a
+small `<CertificatePath>.acme.json` next to it, which holds no secrets). A restart therefore costs no rate limit. A
+persisted certificate that is valid but due, or that another directory issued, is served while a replacement is
+ordered. After that, `RenewalScheduler` renews at the CA's ARI window, or when one third of the lifetime remains
+(`Renewal.RenewBefore` overrides this). `RenewNowAsync` forces a renewal, for example on key compromise or after the CA
+revoked the certificate. It cuts a pending retry wait short, and calls made while such an order is queued or running
+share its outcome; a call whose token is already cancelled queues nothing. When the CA offers ARI, on-demand renewals
+and the start-up renewal of a due certificate carry the replaced certificate's ARI identifier (`replaces`), like
+scheduled renewals. (Changed names need a restart: the persisted certificate then no longer covers them and a new one
+is ordered.)
 
 ### Ports
 
 | Challenge (`ChallengeTypes`) | Needs | Endpoint option |
 | --- | --- | --- |
-| `Http01` (default, first) | TCP 80, reachable from the internet at every name's address | `HttpChallengeEndpoint` (default `0.0.0.0:80`) |
-| `TlsAlpn01` (default, second) | TCP 443 | `TlsAlpnEndpoint` (default `0.0.0.0:443`) |
-| `Dns01` | no inbound port; an `IDns01Provider` for your DNS host; the only way to get wildcards | `Dns01Provider`, `ChallengePropagationDelay` |
+| `Http01` (the default, alone) | TCP 80, reachable from the internet at every name's address | `HttpChallengeEndpoint` (default `[::]:80`) |
+| `TlsAlpn01` (opt-in) | TCP 443 | `TlsAlpnEndpoint` (default `[::]:443`) |
+| `Dns01` (opt-in) | no inbound port; an `IDns01Provider` for your DNS host; the only way to get wildcards | `Dns01Provider`, `ChallengePropagationDelay` |
 
-QUIC uses UDP, so the game's QUIC listener on UDP 443 and the `tls-alpn-01` endpoint on TCP 443 do not conflict. Only
-the listed challenge types are served. List just `Dns01` for a server that must not open TCP ports. The HTTP endpoint
-answers the challenge path and, by default, redirects everything else to HTTPS (`RedirectToHttps`, ADR 0009).
-`EnableHealthEndpoint` adds `/healthz` there. Normal TLS clients on the TLS endpoint get the current certificate; add
-handlers with `TlsEndpointHandlers`. For IP identifiers (RFC 8738), the challenge certificate is also published under the
-reverse-DNS name, which is the SNI the CA sends.
+By default only `Http01` is served, so the exposure is what ADR 0009 prescribes: the ACME responder plus a redirect to
+HTTPS on TCP 80. The default endpoints are dual-mode `[::]` sockets that accept IPv4 and IPv6 (a CA validates over IPv6
+when a name has an AAAA record); on a host without IPv6 they fall back to `0.0.0.0`. QUIC uses UDP, so the game's QUIC
+listener on UDP 443 and the `tls-alpn-01` endpoint on TCP 443 do not conflict. Only the listed challenge types are
+served. List just `Dns01` for a server that must not open TCP ports. The HTTP endpoint answers the challenge path and,
+by default, redirects everything else to HTTPS (`RedirectToHttps`). `EnableHealthEndpoint` adds `/healthz` there, on
+the HTTP endpoint only. Normal TLS clients on the TLS endpoint get the current certificate and whatever
+`TlsEndpointHandlers` serve (add a `HealthHandler` there for health checks over TLS). Before the first certificate
+exists their handshakes are refused; like any failed handshake on a public port they are counted, not reported through
+`Error`. For IP identifiers (RFC 8738), the challenge certificate is also published under the reverse-DNS name, which
+is the SNI the CA sends.
 
 ### Hot swap into running listeners
 
@@ -166,19 +187,35 @@ binder.ConsumerFailed += f => logger.Log(f.Exception);
 ```
 
 Each consumer switches only new handshakes to the new certificate; established connections are not affected. A
-consumer that throws is reported and does not stop the others. The replaced certificate is disposed only after
-`SupersededCertificateGracePeriod` (default 2 minutes), because handshakes that had already selected it still need its
+consumer that throws is reported and does not stop the others. It keeps presenting its previous certificate, so the
+binder keeps that certificate alive (`RetainedCertificateCount`) until the consumer accepts a newer one, is removed,
+or the binder is disposed. A replaced certificate is disposed only `SupersededCertificateGracePeriod` (default 2
+minutes) after the last consumer stopped presenting it, because handshakes that had already selected it still need its
 private key to sign. On Windows, disposing a PKCS#12-imported certificate deletes its key container. This matches
 ADR 0009: open the new configuration, swap it in, and close the old one when nothing uses it. Stop the listeners before
 disposing the binder, and dispose the binder before the provisioner.
+
+### Key storage on Windows
+
+Served certificates are loaded from the PFX with `KeyStorageFlags` (default `DefaultKeySet`): never `Exportable`, and
+never ephemeral, because Schannel cannot sign with an ephemeral key (`EphemeralKeySet` is refused on Windows). On
+Windows the private key then lives in a key container of the current user's profile for as long as the certificate
+object lives, and disposing the certificate deletes the container. The binder's grace period is therefore the step
+ADR 0009 describes as deleting the old key containers once the configuration swap has completed. ADR 0009's
+`PersistKeySet | UserKeySet` (interactive) and `PersistKeySet | MachineKeySet` (services) describe MsQuic's
+`CERTIFICATE_CONTEXT` credential path; `PersistKeySet` keeps a container after disposal, so it is not the default here,
+where every renewal would leave one behind. A service whose account has no loaded user profile needs
+`KeyStorageFlags = X509KeyStorageFlags.MachineKeySet`. The preferred MsQuic path, a PKCS#12 credential, imports no key
+container at all. On Linux the key stays in process memory and the flags make no difference.
 
 ### Staging, production and EAB
 
 Test a deployment against a staging directory (`AcmeDirectories.LetsEncryptStaging`, `BuypassTest`,
 `GoogleTrustServicesTest`). Staging has much higher rate limits but issues untrusted certificates. Then switch
 `DirectoryUrl` to production. The account store records its directory, so switching creates a new account
-automatically. Delete `CertificatePath` when you switch, so that the staging certificate is not served until it is
-due.
+automatically. The persisted certificate's record (`<CertificatePath>.acme.json`) names the directory that issued it,
+so after the switch the staging certificate is served only until the production one, ordered at the first start, has
+arrived. A certificate without such a record (placed there by hand, say) is replaced the same way.
 
 ZeroSSL, Google Trust Services and SSL.com require External Account Binding (`AcmeDirectories.KnownCas` lists which
 CAs do). Copy the key id and HMAC key from the CA's dashboard, or from `gcloud publicca external-account-keys create`
@@ -197,9 +234,10 @@ SSL.com's RSA directory needs `KeyAlgorithm = AcmeKeyAlgorithm.RS256`. A private
 
 `ServerCertificateOptions.Static(cert)` serves a certificate the application owns. The provisioner never disposes it.
 `ServerCertificateOptions.File(path, password, reloadOnChange: true)` serves a PFX and polls its modification time
-(`ReloadInterval`, default 10 s). Replace the file atomically (write a temporary file, then rename it). A replaced file
-raises `Changed`, and the binder swaps it in like a renewal. A file that cannot be read reports `Failed` and keeps the
-previous certificate.
+(`ReloadInterval`, default 10 s, at most one day). Replace the file atomically (write a temporary file, then rename
+it). A replaced file raises `Changed`, and the binder swaps it in like a renewal. A file that cannot be read reports
+`Failed` and keeps the previous certificate; the next readable version makes the status `Valid` again, even when it
+holds the certificate that is already being served.
 
 ### Testing
 
@@ -209,7 +247,7 @@ code). Besides callback validation, it validates like a real CA:
 * `Http01ValidationHost`/`Port`: `GET /.well-known/acme-challenge/{token}` with the identifier as `Host`, with no
   redirects followed.
 * `TlsAlpnValidationHost`/`Port`: a TLS handshake with SNI and ALPN `acme-tls/1`, checking the single SAN and the
-  critical `acmeIdentifier` hash.
+  critical `acmeIdentifier` hash. A certificate returned by the `TlsAlpnLookup` callback is held to the same rules.
 * `DnsTxtLookup`: an injected TXT table such as `InMemoryDns01Provider.Lookup`.
 
 `CertificateLifetime`, `UnavailableRequestsRemaining` and `FailValidation` drive the renewal, outage and failure paths.

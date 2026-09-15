@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -40,8 +42,10 @@ public enum AcmeChallengeKind
 /// </summary>
 /// <remarks>
 /// Do not change the options after they have been handed to a <see cref="CertificateProvisioner"/>. Secrets (the EAB
-/// HMAC key, <see cref="CertificatePassword"/>) are never logged or included in status messages.
+/// HMAC key, <see cref="CertificatePassword"/>) are never logged or included in status messages, <see cref="ToString"/>
+/// or the debugger view.
 /// </remarks>
+[DebuggerDisplay("{ToString(),nq}")]
 public sealed class AcmeProvisioningOptions
 {
     /// <summary>Default path of the health endpoint.</summary>
@@ -49,7 +53,15 @@ public sealed class AcmeProvisioningOptions
 
     private const int MinRsaKeySizeBits = 2048;
     private const int MaxRsaKeySizeBits = 8192;
+    private const int MaxDnsNameLength = 253;
+    private const int MaxLabelLength = 63;
+    private const string Redacted = "***";
     private static readonly TimeSpan MaxTimeout = TimeSpan.FromDays(30);
+
+    /// <summary>Longest accepted <see cref="RenewalSchedulerOptions.RenewBefore"/>: the longest lifetime a publicly trusted certificate may have.</summary>
+    private static readonly TimeSpan MaxRenewBefore = TimeSpan.FromDays(398);
+
+    private static readonly SearchValues<char> LdhCharacters = SearchValues.Create("abcdefghijklmnopqrstuvwxyz0123456789-");
 
     /// <summary>
     /// The CA's directory URL. Default: Let's Encrypt production (<see cref="AcmeDirectories.LetsEncrypt"/>). Use
@@ -79,11 +91,17 @@ public sealed class AcmeProvisioningOptions
 
     /// <summary>
     /// External Account Binding HMAC key as issued by the CA (base64url; standard base64 is accepted). Secret: it is used
-    /// only to sign the account creation request and is not persisted.
+    /// only to sign the account creation request, is not persisted, and is redacted from <see cref="ToString"/> and the
+    /// debugger view.
     /// </summary>
+    [DebuggerBrowsable(DebuggerBrowsableState.Never)]
     public string? ExternalAccountHmacKey { get; set; }
 
-    /// <summary>DNS names to certify. A leading <c>*.</c> requests a wildcard, which needs <see cref="AcmeChallengeKind.Dns01"/>.</summary>
+    /// <summary>
+    /// DNS names to certify: host names of letters, digits and hyphens (internationalised names are converted to their
+    /// ASCII form). A leading <c>*.</c> requests a wildcard, which needs <see cref="AcmeChallengeKind.Dns01"/>. Invalid
+    /// names are refused up front.
+    /// </summary>
     public IList<string> DnsNames { get; } = new List<string>();
 
     /// <summary>IP addresses to certify (RFC 8738). Only <c>http-01</c> and <c>tls-alpn-01</c> can validate them, and few public CAs issue them.</summary>
@@ -92,9 +110,11 @@ public sealed class AcmeProvisioningOptions
     /// <summary>
     /// Challenge types in order of preference; for each name the first one the CA offers is used. Only the listed types
     /// are served: <see cref="AcmeChallengeKind.Http01"/> starts the HTTP endpoint and <see cref="AcmeChallengeKind.TlsAlpn01"/>
-    /// the TLS endpoint. Default: http-01, then tls-alpn-01.
+    /// the TLS endpoint. Default: http-01 only, so the default exposure is the ACME responder plus the redirect to HTTPS on
+    /// TCP 80 (ADR 0009). Add <see cref="AcmeChallengeKind.TlsAlpn01"/> to answer on TCP 443 as well, or use
+    /// <see cref="AcmeChallengeKind.Dns01"/> for wildcards and servers without inbound TCP.
     /// </summary>
-    public IList<AcmeChallengeKind> ChallengeTypes { get; } = new List<AcmeChallengeKind> { AcmeChallengeKind.Http01, AcmeChallengeKind.TlsAlpn01 };
+    public IList<AcmeChallengeKind> ChallengeTypes { get; } = new List<AcmeChallengeKind> { AcmeChallengeKind.Http01 };
 
     /// <summary>Creates and removes <c>_acme-challenge</c> TXT records; required when <see cref="ChallengeTypes"/> contains <see cref="AcmeChallengeKind.Dns01"/>.</summary>
     public IDns01Provider? Dns01Provider { get; set; }
@@ -115,7 +135,12 @@ public sealed class AcmeProvisioningOptions
     /// </summary>
     public string? CertificatePath { get; set; }
 
-    /// <summary>Optional password protecting <see cref="CertificatePath"/>.</summary>
+    /// <summary>
+    /// Password protecting <see cref="CertificatePath"/>, which holds the private key. Recommended: the file is written
+    /// owner-only on Unix, but on Windows it inherits the directory's ACL, and backups copy it. Secret: redacted from
+    /// <see cref="ToString"/> and the debugger view.
+    /// </summary>
+    [DebuggerBrowsable(DebuggerBrowsableState.Never)]
     public string? CertificatePassword { get; set; }
 
     /// <summary>
@@ -154,16 +179,19 @@ public sealed class AcmeProvisioningOptions
     public TimeSpan ChallengeCleanupTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// Where the plain-HTTP challenge endpoint listens when <c>http-01</c> is allowed. Default <c>0.0.0.0:80</c>: the CA
-    /// always connects to port 80 of the name's address, so a different port only makes sense behind a port forward.
+    /// Where the plain-HTTP challenge endpoint listens when <c>http-01</c> is allowed. Default <c>[::]:80</c>, a dual-mode
+    /// socket that accepts IPv4 and IPv6 (a CA validates over IPv6 when the name has an AAAA record); on a host without
+    /// IPv6 it falls back to <c>0.0.0.0:80</c>. The CA always connects to port 80 of the name's address, so a different
+    /// port only makes sense behind a port forward.
     /// </summary>
-    public IPEndPoint HttpChallengeEndpoint { get; set; } = new(IPAddress.Any, 80);
+    public IPEndPoint HttpChallengeEndpoint { get; set; } = new(IPAddress.IPv6Any, 80);
 
     /// <summary>
-    /// Where the TLS endpoint listens when <c>tls-alpn-01</c> is allowed. Default <c>0.0.0.0:443</c> (TCP; a QUIC listener on
-    /// UDP 443 does not conflict). Normal TLS clients get the current certificate there.
+    /// Where the TLS endpoint listens when <c>tls-alpn-01</c> is allowed. Default <c>[::]:443</c>, dual-mode like
+    /// <see cref="HttpChallengeEndpoint"/> (TCP; a QUIC listener on UDP 443 does not conflict). Normal TLS clients get the
+    /// current certificate there; before the first certificate exists their handshakes are refused.
     /// </summary>
-    public IPEndPoint TlsAlpnEndpoint { get; set; } = new(IPAddress.Any, 443);
+    public IPEndPoint TlsAlpnEndpoint { get; set; } = new(IPAddress.IPv6Any, 443);
 
     /// <summary>Redirect every other plain-HTTP request on the challenge endpoint to HTTPS (ADR 0009 default). Default true.</summary>
     public bool RedirectToHttps { get; set; } = true;
@@ -171,7 +199,11 @@ public sealed class AcmeProvisioningOptions
     /// <summary>HTTPS port used in redirects (omitted from the URL when 443). Default 443.</summary>
     public int RedirectHttpsPort { get; set; } = 443;
 
-    /// <summary>Answer <see cref="HealthPath"/> with <c>200 ok</c> on the challenge endpoints (opt-in, ADR 0009). Default false.</summary>
+    /// <summary>
+    /// Answer <see cref="HealthPath"/> with <c>200 ok</c> on the HTTP challenge endpoint (opt-in, ADR 0009). Default false.
+    /// The TLS endpoint serves only <see cref="TlsEndpointHandlers"/>; add a <see cref="Http.Handlers.HealthHandler"/> there
+    /// to answer health checks over TLS.
+    /// </summary>
     public bool EnableHealthEndpoint { get; set; }
 
     /// <summary>Path of the health endpoint. Default <c>/healthz</c>.</summary>
@@ -196,9 +228,10 @@ public sealed class AcmeProvisioningOptions
         HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
         foreach (string name in DnsNames)
         {
-            if (seen.Add("dns:" + name))
+            string ascii = NormalizeDnsName(name);
+            if (seen.Add("dns:" + ascii))
             {
-                identifiers.Add(AcmeIdentifier.Dns(name));
+                identifiers.Add(AcmeIdentifier.Dns(ascii));
             }
         }
 
@@ -269,6 +302,8 @@ public sealed class AcmeProvisioningOptions
             throw Invalid("CertificatePath is required (the issued certificate is persisted there and reused on restart).");
         }
 
+        ValidateDistinctPaths(AccountStorePath, CertificatePath);
+
         if ((ExternalAccountKeyId is null) != (ExternalAccountHmacKey is null))
         {
             throw Invalid("ExternalAccountKeyId and ExternalAccountHmacKey must be set together.");
@@ -299,7 +334,7 @@ public sealed class AcmeProvisioningOptions
             throw Invalid("At least one DNS name or IP address is required.");
         }
 
-        foreach (string name in DnsNames)
+        foreach (string? name in DnsNames)
         {
             ValidateDnsName(name, dns01);
         }
@@ -337,9 +372,9 @@ public sealed class AcmeProvisioningOptions
             throw Invalid("HealthPath must start with '/'.");
         }
 
-        if (ChallengePropagationDelay < TimeSpan.Zero)
+        if (ChallengePropagationDelay < TimeSpan.Zero || ChallengePropagationDelay > MaxTimeout)
         {
-            throw Invalid("ChallengePropagationDelay must not be negative.");
+            throw Invalid("ChallengePropagationDelay must be between zero and 30 days.");
         }
 
         if (Renewal is null || Retry is null || ClientOptions is null)
@@ -405,11 +440,11 @@ public sealed class AcmeProvisioningOptions
         }
     }
 
-    private static void ValidateDnsName(string name, bool dns01)
+    private static void ValidateDnsName(string? name, bool dns01)
     {
-        if (string.IsNullOrWhiteSpace(name) || name.Length > 253 || name.AsSpan().ContainsAny(" \t\r\n/:"))
+        if (string.IsNullOrWhiteSpace(name))
         {
-            throw Invalid("'" + name + "' is not a valid DNS name.");
+            throw Invalid("DnsNames contains an empty entry.");
         }
 
         if (IPAddress.TryParse(name, out IPAddress? address) && address.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6)
@@ -417,9 +452,70 @@ public sealed class AcmeProvisioningOptions
             throw Invalid("'" + name + "' is an IP address: add it to IpAddresses instead of DnsNames.");
         }
 
-        if (name.StartsWith("*.", StringComparison.Ordinal) && !dns01)
+        if (NormalizeDnsName(name).StartsWith("*.", StringComparison.Ordinal) && !dns01)
         {
             throw Invalid("The wildcard name '" + name + "' can only be validated with Dns01, which is not in ChallengeTypes.");
+        }
+    }
+
+    /// <summary>
+    /// The ASCII form that ACME and certificates use for a DNS name: internationalised labels converted to A-labels
+    /// (<see cref="IdnMapping"/>), in lower case. Throws unless the result is a host name: labels of 1 to 63 letters,
+    /// digits and hyphens that neither start nor end with a hyphen, at most 253 characters, and an optional leading
+    /// <c>*.</c> (a wildcard) as the only asterisk. Invalid names thus fail at start-up rather than in every order.
+    /// </summary>
+    /// <exception cref="ArgumentException">The name is not a valid DNS name.</exception>
+    internal static string NormalizeDnsName(string name)
+    {
+        bool wildcard = name.StartsWith("*.", StringComparison.Ordinal);
+        string host = wildcard ? name[2..] : name;
+        string ascii;
+        try
+        {
+            ascii = new IdnMapping().GetAscii(host).ToLowerInvariant();
+        }
+        catch (ArgumentException)
+        {
+            throw InvalidName(name, "it is not a valid (internationalised) domain name");
+        }
+
+        if (ascii.Length + (wildcard ? 2 : 0) > MaxDnsNameLength)
+        {
+            throw InvalidName(name, "it is longer than 253 characters");
+        }
+
+        foreach (string label in ascii.Split('.'))
+        {
+            if (label.Length is 0 or > MaxLabelLength || label[0] == '-' || label[^1] == '-' || label.AsSpan().ContainsAnyExcept(LdhCharacters))
+            {
+                throw InvalidName(name, "each label needs 1 to 63 letters, digits or hyphens and cannot start or end with a hyphen (a trailing dot is not accepted either)");
+            }
+        }
+
+        return wildcard ? "*." + ascii : ascii;
+    }
+
+    private static ArgumentException InvalidName(string name, string reason) => Invalid("'" + name + "' is not a valid DNS name: " + reason + ".");
+
+    /// <summary>The account store and the certificate (and its metadata file) must be different files, or each write would destroy the other.</summary>
+    private static void ValidateDistinctPaths(string accountStorePath, string certificatePath)
+    {
+        string account;
+        string certificate;
+        try
+        {
+            account = Path.GetFullPath(accountStorePath);
+            certificate = Path.GetFullPath(certificatePath);
+        }
+        catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            throw Invalid("AccountStorePath or CertificatePath is not a valid path: " + e.Message);
+        }
+
+        StringComparison comparison = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (string.Equals(account, certificate, comparison) || string.Equals(account, CertificateMetadata.PathFor(certificate), comparison))
+        {
+            throw Invalid("AccountStorePath and CertificatePath must name different files: the account key and the certificate would overwrite each other.");
         }
     }
 
@@ -465,6 +561,23 @@ public sealed class AcmeProvisioningOptions
             throw Invalid("Renewal.CheckInterval, RetryDelay and RenewalInfoRefreshInterval must be positive (a zero RetryDelay would order again back to back after every failure).");
         }
 
+        // Upper bounds keep every clock computation representable (now + RetryDelay, notAfter - ImmediateRenewalThreshold,
+        // ...) and every wait within what a timer accepts.
+        if (renewal.CheckInterval > MaxTimeout
+            || renewal.RetryDelay > MaxTimeout
+            || renewal.MinimumRenewalInterval > MaxTimeout
+            || renewal.StartupDelay > MaxTimeout
+            || renewal.ImmediateRenewalThreshold > MaxTimeout
+            || renewal.RenewalInfoRefreshInterval > MaxTimeout)
+        {
+            throw Invalid("Renewal.CheckInterval, RetryDelay, MinimumRenewalInterval, StartupDelay, ImmediateRenewalThreshold and RenewalInfoRefreshInterval must be at most 30 days.");
+        }
+
+        if (renewal.RenewBefore > MaxRenewBefore)
+        {
+            throw Invalid("Renewal.RenewBefore must be at most 398 days (the longest lifetime of a publicly trusted certificate).");
+        }
+
         if (renewal.TimeProvider is null || renewal.Random is null)
         {
             throw Invalid("Renewal.TimeProvider and Renewal.Random must not be null.");
@@ -480,4 +593,19 @@ public sealed class AcmeProvisioningOptions
     }
 
     private static ArgumentException Invalid(string message) => new("Invalid ACME provisioning options: " + message, "options");
+
+    /// <summary>A summary for logs: directory, names, challenge types and paths. The EAB HMAC key and the certificate password are redacted.</summary>
+    public override string ToString()
+    {
+        return "AcmeProvisioningOptions { DirectoryUrl = " + DirectoryUrl
+            + ", DnsNames = [" + string.Join(", ", DnsNames)
+            + "], IpAddresses = [" + string.Join(", ", IpAddresses)
+            + "], ChallengeTypes = [" + string.Join(", ", ChallengeTypes)
+            + "], AccountStorePath = " + AccountStorePath
+            + ", CertificatePath = " + CertificatePath
+            + ", CertificatePassword = " + (CertificatePassword is null ? "(none)" : Redacted)
+            + ", ExternalAccountKeyId = " + (ExternalAccountKeyId ?? "(none)")
+            + ", ExternalAccountHmacKey = " + (ExternalAccountHmacKey is null ? "(none)" : Redacted)
+            + " }";
+    }
 }

@@ -105,11 +105,13 @@ public sealed class RenewalLoopTests : IAsyncDisposable
     public async Task UnexpectedLoopFailure_IsReported_AndRenewNowAsyncRecovers()
     {
         File.WriteAllBytes(_env.CertificatePath, "not a pfx"u8.ToArray());
+        X509Certificate2 accepted = Certs.Create();
+        CertificateMetadata.Write(CertificateMetadata.PathFor(_env.CertificatePath), _env.Ca.DirectoryUrl, accepted); // issued by this CA
         CertificateProvisioner provisioner = _env.Create(_env.Options()); // RetryDelay: one hour
 
         // The unreadable file is accepted as a valid certificate, so the loop cannot seed the renewal scheduler from it.
         provisioner.CertificateLoader = (pfx, password, flags) => pfx.AsSpan().SequenceEqual("not a pfx"u8)
-            ? Certs.Create()
+            ? accepted
             : CertificateProvisioner.LoadServedCertificate(pfx, password, flags);
         Recorder recorder = new(provisioner);
 

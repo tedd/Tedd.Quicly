@@ -85,12 +85,12 @@ public sealed class AcmeProvisioningTests : IAsyncDisposable
         using X509Certificate2 served = await Certs.GetServedCertificateAsync(provisioner.TlsEndPoint!, "game.example.test");
         Assert.Equal(provisioner.Current!.Thumbprint, served.Thumbprint);
 
+        // The TLS endpoint serves only TlsEndpointHandlers; EnableHealthEndpoint applies to the HTTP challenge endpoint.
         using HttpClient client = Certs.CreateInsecureClient();
-        foreach (string path in new[] { "/custom", "/healthz" })
-        {
-            using HttpResponseMessage response = await client.GetAsync("https://127.0.0.1:" + provisioner.TlsEndPoint!.Port + path);
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        }
+        using HttpResponseMessage custom = await client.GetAsync("https://127.0.0.1:" + provisioner.TlsEndPoint!.Port + "/custom");
+        Assert.Equal(HttpStatusCode.OK, custom.StatusCode);
+        using HttpResponseMessage health = await client.GetAsync("https://127.0.0.1:" + provisioner.TlsEndPoint!.Port + "/healthz");
+        Assert.Equal(HttpStatusCode.NotFound, health.StatusCode);
     }
 
     [Fact]
@@ -416,26 +416,63 @@ public sealed class AcmeProvisioningTests : IAsyncDisposable
     }
 
     [Fact]
-    public async Task RenewedCertificateThatCannotBeLoaded_IsReported_AndOrderedAgain()
+    public async Task RenewedCertificateThatFailsToLoadOnce_IsLoadedAgain_WithoutAnotherOrder()
     {
         _env.Ca.CertificateLifetime = TimeSpan.FromSeconds(3);
         _env.Ca.CertificateBackdate = TimeSpan.Zero;
         AcmeProvisioningOptions options = _env.Options();
-        options.Renewal = new RenewalSchedulerOptions { UseRenewalInfo = false, CheckInterval = TimeSpan.FromMilliseconds(100), RetryDelay = TimeSpan.FromMilliseconds(200) };
+        options.Renewal = new RenewalSchedulerOptions { UseRenewalInfo = false, CheckInterval = TimeSpan.FromMilliseconds(100), RetryDelay = TimeSpan.FromHours(1) };
         CertificateProvisioner provisioner = _env.Create(options);
         int loads = 0;
         provisioner.CertificateLoader = (pfx, password, flags) => Interlocked.Increment(ref loads) == 2
             ? throw new CryptographicException("simulated key storage failure")
             : CertificateProvisioner.LoadServedCertificate(pfx, password, flags);
         Recorder recorder = new(provisioner);
+        int issuedWhenRenewed = -1;
+        provisioner.StatusChanged += s =>
+        {
+            if (s.State == CertificateState.Valid && s.Reason!.StartsWith("Renewed: ", StringComparison.Ordinal))
+            {
+                Interlocked.CompareExchange(ref issuedWhenRenewed, _env.Ca.IssuedCount, -1);
+            }
+        };
 
         await provisioner.StartAsync();
         X509Certificate2 first = provisioner.Current!;
 
-        await Wait.ForAsync(() => recorder.HasStatus(CertificateState.Failed, "could not be loaded"), LongWait, "the load failure to be reported");
-        await Wait.ForAsync(() => recorder.HasStatus(CertificateState.Valid, "Renewed: "), LongWait, "the certificate to be ordered again");
+        await Wait.ForAsync(() => Volatile.Read(ref issuedWhenRenewed) >= 0, LongWait, "the renewal to be served");
+        Assert.True(recorder.HasStatus(CertificateState.Renewing, "could not be loaded (simulated key storage failure); loading it again in "));
+        Assert.Equal(2, issuedWhenRenewed); // the load was retried; nothing was ordered again
         Assert.NotSame(first, provisioner.Current);
-        Assert.True(_env.Ca.IssuedCount >= 3);
+    }
+
+    [Fact]
+    public async Task RenewedCertificateThatKeepsFailingToLoad_IsKept_AndLoadedAfterTheRetryDelay_BeforeAnythingIsOrdered()
+    {
+        _env.Ca.CertificateLifetime = TimeSpan.FromSeconds(3);
+        _env.Ca.CertificateBackdate = TimeSpan.Zero;
+        AcmeProvisioningOptions options = _env.Options(); // three load attempts per round
+        options.Renewal = new RenewalSchedulerOptions { UseRenewalInfo = false, CheckInterval = TimeSpan.FromMilliseconds(100), RetryDelay = TimeSpan.FromMilliseconds(200) };
+        CertificateProvisioner provisioner = _env.Create(options);
+        int loads = 0;
+        provisioner.CertificateLoader = (pfx, password, flags) => Interlocked.Increment(ref loads) is >= 2 and <= 4
+            ? throw new CryptographicException("simulated key storage failure")
+            : CertificateProvisioner.LoadServedCertificate(pfx, password, flags);
+        Recorder recorder = new(provisioner);
+        int issuedWhenLoaded = -1;
+        provisioner.StatusChanged += s =>
+        {
+            if (s.State == CertificateState.Valid && s.Reason!.StartsWith("Loaded the certificate issued earlier", StringComparison.Ordinal))
+            {
+                Interlocked.CompareExchange(ref issuedWhenLoaded, _env.Ca.IssuedCount, -1);
+            }
+        };
+
+        await provisioner.StartAsync();
+
+        await Wait.ForAsync(() => Volatile.Read(ref issuedWhenLoaded) >= 0, LongWait, "the kept certificate to be served");
+        Assert.True(recorder.HasStatus(CertificateState.Failed, "A renewed certificate could not be loaded (simulated key storage failure); loading it again after 00:00:00.2000000, before anything is ordered."));
+        Assert.Equal(2, issuedWhenLoaded);
     }
 
     [Fact]

@@ -346,13 +346,27 @@ internal static class Certs
         return publicOnly.Export(X509ContentType.Pkcs12)!;
     }
 
-    /// <summary>Replaces a file the way deployments should: write a temporary file, then rename it over the old one.</summary>
+    /// <summary>
+    /// Replaces a file the way deployments should: write a temporary file, then rename it over the old one. Retried: on
+    /// Windows the rename fails with a sharing violation while the poller has the file open.
+    /// </summary>
     public static void WriteAtomically(string path, byte[] bytes, DateTime lastWriteUtc)
     {
         string temp = path + ".tmp";
-        File.WriteAllBytes(temp, bytes);
-        File.SetLastWriteTimeUtc(temp, lastWriteUtc);
-        File.Move(temp, path, overwrite: true);
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                File.WriteAllBytes(temp, bytes);
+                File.SetLastWriteTimeUtc(temp, lastWriteUtc);
+                File.Move(temp, path, overwrite: true);
+                return;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException && attempt < 100)
+            {
+                Thread.Sleep(20);
+            }
+        }
     }
 
     public static bool IsDisposed(X509Certificate2 certificate) => certificate.Handle == IntPtr.Zero;

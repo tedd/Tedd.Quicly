@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Server;
 
@@ -82,5 +83,28 @@ public class ReviewClientTests
         ReconnectedInfo info = Assert.Single(reconnected);
         Assert.True(info.Resumed, "The session was not resumed; the client got a fresh session after " + info.Attempts + " attempts.");
         Assert.Equal(session, info.Peer.SessionId);
+    }
+
+    /// <summary>
+    /// WorkSignal (the "race-free client work signal") clears its pending flag only when the next wait starts, which is
+    /// after ConnectAsync polled the peer. A transport callback that lands between the wake-up and that clear (while
+    /// ConnectAsync polls) finds the flag still set by the callback that woke it, skips the release, and the next wait
+    /// sleeps its full timeout (MaxConnectWait, 100 ms per lost wake-up during a connect) with unpolled work. Clearing the
+    /// flag before the poll (not before the wait) makes every later Set release again.
+    /// </summary>
+    [Fact]
+    public async Task A_Callback_During_The_Poll_Wakes_The_Next_Connect_Wait()
+    {
+        using WorkSignal signal = new();
+        ValueTask first = signal.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken); // nothing pending: it waits
+        signal.Set(); // a callback wakes it
+        await first;
+
+        // ConnectAsync polls the peer now; another callback publishes work before the loop waits again.
+        signal.Set();
+        long started = Stopwatch.GetTimestamp();
+        await signal.WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+        TimeSpan waited = Stopwatch.GetElapsedTime(started);
+        Assert.True(waited < TimeSpan.FromSeconds(1), "The wait slept " + waited.TotalMilliseconds.ToString("F0") + " ms although a callback had signalled work after the last poll.");
     }
 }

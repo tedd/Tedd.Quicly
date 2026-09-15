@@ -55,9 +55,6 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
     private int _epochs;
     private int _resetReceive;
 
-    /// <summary>The peer's shared state.</summary>
-    protected PeerCore Core => _core;
-
     /// <inheritdoc/>
     public override void Initialize(PeerCore core, ReadOnlySpan<ChannelDefinition> channelsOfMode)
     {
@@ -362,14 +359,7 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
             return false;
         }
 
-        int dense = _core.ChannelIndexOf(entry.Channel);
-        int local = dense >= 0 ? _localOf[dense] : -1;
-        if (local < 0)
-        {
-            return false;
-        }
-
-        ref ChannelSendState send = ref _send[local];
+        ref ChannelSendState send = ref _send[_localOf[_core.ChannelIndexOf(entry.Channel)]];
         NativeArray<int> links = entries.Next;
         int previous = -1;
         int slot = send.QueueHead;

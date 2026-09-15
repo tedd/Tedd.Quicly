@@ -152,22 +152,15 @@ internal sealed class ReceiveKeyTracker : IDisposable
 
         if (!_hashed.TryAdd(key, out slot))
         {
-            // Full: evict the key updated longest ago; it re-accepts any sequence if it comes back.
+            // Full, so every live key is on the list: evict the key updated longest ago (it re-accepts any sequence if it
+            // comes back); the freed slot takes the new key.
             int victim = _oldest;
-            if (victim < 0)
-            {
-                slot = -1;
-                return false;
-            }
-
+            System.Diagnostics.Debug.Assert(victim >= 0, "a full table has a least recently updated key");
             Unlink(victim);
             _hashed.Remove(_keys![victim], out _);
             Evictions++;
-            if (!_hashed.TryAdd(key, out slot))
-            {
-                slot = -1;
-                return false;
-            }
+            bool added = _hashed.TryAdd(key, out slot);
+            System.Diagnostics.Debug.Assert(added, "a slot was just freed");
         }
 
         EnsureSlot(slot);

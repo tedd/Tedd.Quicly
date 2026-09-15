@@ -189,7 +189,7 @@ public class SchedulerTests
         ushort[] ids = h.Client.Core.ScheduleOrder.ToArray().Select(i => h.Client.Core.GetChannel(i).Id).ToArray();
         Assert.Equal(7, ids[0]);
         Assert.Equal(8, ids[^1]);
-        Assert.Equal(new ushort[] { 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14 }, ids[1..^1]);
+        Assert.Equal(new ushort[] { 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15 }, ids[1..^1]);
     }
 
     [Fact]

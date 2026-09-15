@@ -16,7 +16,7 @@ internal static class DatagramTables
     /// 2 unordered · 3 sequenced keyed · 4 sequenced keyed coalescing · 5 unordered LZ4 (MinCompressSize 16) · 6 sequenced
     /// unkeyed 16-bit · 7 unordered priority 250 · 8 unordered priority 50 · 9 unordered keyed coalescing · 10 sequenced
     /// keyed, 4 keys · 11 sequenced keyed, dense keys 0 … 15 · 12 unordered, 100-byte queue limit · 13 unordered fragmenting
-    /// · 14 sequenced keyed, 50 ms expiry. Expiry is off unless stated.
+    /// · 14 sequenced keyed, 50 ms expiry · 15 unordered keyed coalescing, dense keys 0 … 3. Expiry is off unless stated.
     /// </summary>
     public static ChannelTable Main { get; } = ChannelTable.Create()
         .Add(2, "events", ChannelMode.UnreliableUnordered)
@@ -32,6 +32,7 @@ internal static class DatagramTables
         .Add(12, "limited", ChannelMode.UnreliableUnordered, o => o.QueueLimitBytes = 100)
         .Add(13, "fragmenting", ChannelMode.UnreliableUnordered, o => { o.Fragmentation = true; o.MaxMessageSize = 4000; })
         .Add(14, "short-lived", ChannelMode.UnreliableSequenced, o => { o.Keyed = true; o.ExpiryMicros = 50_000; })
+        .Add(15, "latest-slots", ChannelMode.UnreliableUnordered, o => { o.Keyed = true; o.CoalesceOnReceive = true; o.KeySpace = KeySpace.Dense(3); })
         .Build();
 }
 

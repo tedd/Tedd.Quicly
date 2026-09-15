@@ -170,11 +170,7 @@ public sealed unsafe partial class QuiclyPeer
     /// </summary>
     private void FlushImmediate()
     {
-        if (_inScheduler || _state != PeerState.Connected)
-        {
-            return;
-        }
-
+        // Only reached from an admitted send, so the peer is Connected; a pass already running makes FlushEngines a no-op.
         EnterCall();
         try
         {

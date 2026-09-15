@@ -1,3 +1,4 @@
+using Tedd.Quicly.Acme.Challenges;
 using System.Collections.Concurrent;
 using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;

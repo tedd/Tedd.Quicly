@@ -1,3 +1,4 @@
+using Tedd.Quicly.Acme.Challenges;
 using System.Buffers;
 using System.Collections.Concurrent;
 using Tedd.Quicly.Acme;

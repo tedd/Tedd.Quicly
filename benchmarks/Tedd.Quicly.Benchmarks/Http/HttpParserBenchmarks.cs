@@ -1,22 +1,9 @@
 using System.Text;
 using BenchmarkDotNet.Attributes;
-using BenchmarkDotNet.Configs;
-using BenchmarkDotNet.Jobs;
-using BenchmarkDotNet.Toolchains.InProcess.Emit;
 using Tedd.Quicly.Archive.Http;
 using Tedd.Quicly.Http.Parsing;
 
 namespace Tedd.Quicly.Benchmarks.Http;
-
-/// <summary>Short in-process run (BenchmarkDotNet 0.15.8 cannot spawn net11.0 child processes) with allocation tracking.</summary>
-public sealed class InProcessShortRunConfig : ManualConfig
-{
-    public InProcessShortRunConfig()
-    {
-        AddJob(Job.ShortRun.WithToolchain(InProcessEmitToolchain.Instance));
-        AddDiagnoser(BenchmarkDotNet.Diagnosers.MemoryDiagnoser.Default);
-    }
-}
 
 /// <summary>
 /// HTTP/1.1 request-line + header parsing: V0 (shipping, vectorised IndexOf + SearchValues per line) versus V1

@@ -141,18 +141,40 @@ public sealed class StaticFileHandler : IHttpHandler
             rel = slash < 0 ? default : rel[(slash + 1)..];
             if (segment.IsEmpty || segment is ".")
                 continue;
-            if (segment is ".." || segment.ContainsAny(ForbiddenSegmentChars))
+            if (segment is ".." || segment.ContainsAny(ForbiddenSegmentChars) || IsReservedDeviceName(segment))
                 return false;
             if (segment[^1] == '.' || segment[^1] == ' ')
                 return false; // Windows would silently trim these
             combined.Append(Path.DirectorySeparatorChar).Append(segment);
         }
 
+        // Defence in depth: the segment rules above already make escaping impossible; verify the canonical path anyway.
         string candidate = Path.GetFullPath(combined.ToString());
-        if (!string.Equals(candidate, _root, StringComparison.Ordinal) && !candidate.StartsWith(_rootWithSeparator, StringComparison.Ordinal))
-            return false;
-        fullPath = candidate;
-        return true;
+        bool inside = candidate.StartsWith(_rootWithSeparator, StringComparison.Ordinal) || string.Equals(candidate, _root, StringComparison.Ordinal);
+        fullPath = inside ? candidate : string.Empty;
+        return inside;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="segment"/> is a Windows reserved device name (<c>CON</c>, <c>PRN</c>, <c>AUX</c>,
+    /// <c>NUL</c>, <c>COM0</c>-<c>COM9</c>, <c>LPT0</c>-<c>LPT9</c> including the superscript-digit forms,
+    /// <c>CONIN$</c>, <c>CONOUT$</c>), with or without an extension. Opening one reaches a device rather than a
+    /// file, so they are refused on every OS for consistent behaviour.
+    /// </summary>
+    internal static bool IsReservedDeviceName(ReadOnlySpan<char> segment)
+    {
+        int dot = segment.IndexOf('.');
+        var stem = (dot < 0 ? segment : segment[..dot]).TrimEnd(' ');
+        return stem.Length switch
+        {
+            3 => stem.Equals("CON", StringComparison.OrdinalIgnoreCase) || stem.Equals("PRN", StringComparison.OrdinalIgnoreCase)
+                 || stem.Equals("AUX", StringComparison.OrdinalIgnoreCase) || stem.Equals("NUL", StringComparison.OrdinalIgnoreCase),
+            4 => (stem.StartsWith("COM", StringComparison.OrdinalIgnoreCase) || stem.StartsWith("LPT", StringComparison.OrdinalIgnoreCase))
+                 && (char.IsAsciiDigit(stem[3]) || stem[3] is '¹' or '²' or '³'),
+            6 => stem.Equals("CONIN$", StringComparison.OrdinalIgnoreCase),
+            7 => stem.Equals("CONOUT$", StringComparison.OrdinalIgnoreCase),
+            _ => false,
+        };
     }
 
     /// <summary>Returns the content type for <paramref name="fileName"/>'s extension, or <see langword="null"/> when unknown and no default is configured.</summary>

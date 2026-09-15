@@ -35,8 +35,20 @@ public sealed class HttpResponse
     /// <summary>Status code; default 200.</summary>
     public int StatusCode { get; set; } = 200;
 
+    private string? _reasonPhrase;
+
     /// <summary>Reason phrase override; <see langword="null"/> uses <see cref="HttpReasonPhrases.Get"/>.</summary>
-    public string? ReasonPhrase { get; set; }
+    /// <exception cref="ArgumentException">The value contains a control character other than tab, or a character outside Latin-1 (response splitting guard).</exception>
+    public string? ReasonPhrase
+    {
+        get => _reasonPhrase;
+        set
+        {
+            if (value is not null && !HeaderTokens.IsFieldValue(value))
+                throw new ArgumentException("The reason phrase contains a control character or a character outside Latin-1.", nameof(value));
+            _reasonPhrase = value;
+        }
+    }
 
     /// <summary>Response headers. <c>Date</c>, <c>Server</c>, <c>Content-Length</c>, <c>Transfer-Encoding</c> and <c>Connection</c> are managed by the server and ignored here.</summary>
     public HttpHeaderCollection Headers { get; }
@@ -283,7 +295,9 @@ public sealed class HttpResponse
         {
             length = declared;
             _declaredLength = declared;
-            emitLength = status >= 200 && status != 204;   // 1xx/204 never carry Content-Length; 304 and HEAD may
+            // 1xx/204 never carry Content-Length. Neither does 304: the length handed to us for a 304 is not that of
+            // the selected representation (RFC 9110 §8.6). HEAD keeps the length the GET body would have.
+            emitLength = status >= 200 && status != 204 && status != 304;
         }
         else if (!statusAllowsBody || _isHead)
         {

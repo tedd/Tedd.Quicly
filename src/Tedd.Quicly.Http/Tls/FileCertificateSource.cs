@@ -70,7 +70,7 @@ public sealed class FileCertificateSource : ICertificateSource, IDisposable
         _lastWriteUtc = lastWrite;
     }
 
-    private void Poll()
+    internal void Poll()
     {
         try
         {

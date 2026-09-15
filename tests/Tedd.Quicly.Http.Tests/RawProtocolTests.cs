@@ -545,7 +545,7 @@ public class RawProtocolTests
         await raw.SendAsync("GET /nm HTTP/1.1\r\nHost: a\r\n\r\n");
         var nm = await raw.ReadResponseAsync();
         Assert.Equal(304, nm.StatusCode);
-        Assert.Equal("5", nm["Content-Length"]);
+        Assert.Null(nm["Content-Length"]); // RFC 9110 §8.6: a 304 must not advertise a length other than the representation's
         Assert.Equal(string.Empty, nm.Body);
         Assert.Equal("keep-alive-check", await SendAndRead(raw, "GET /nc HTTP/1.1\r\nHost: a\r\n\r\n") is { StatusCode: 204 } ? "keep-alive-check" : "broken");
 

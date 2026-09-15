@@ -90,7 +90,14 @@ public sealed class HttpServer : IAsyncDisposable
     /// <summary>Pre-rendered <c>Allow</c> header value for 405 responses.</summary>
     internal string AllowHeaderValue { get; private set; } = string.Empty;
 
+    /// <summary>The listening sockets, in endpoint order.</summary>
+    internal IReadOnlyList<Socket> Listeners => _listeners;
+
     /// <summary>Binds every endpoint and starts accepting. Throws when any bind fails (nothing stays bound).</summary>
+    /// <exception cref="InvalidOperationException">
+    /// The server was already started, or the options are inconsistent: no endpoint, no allowed method, a method that
+    /// is not an HTTP token, a <c>Server</c> value with control characters, or a TLS endpoint without certificates.
+    /// </exception>
     public void Start()
     {
         if (Interlocked.CompareExchange(ref _state, 1, 0) != 0)
@@ -102,6 +109,13 @@ public sealed class HttpServer : IAsyncDisposable
             _options.Limits.Validate();
             if (_options.AllowedMethods.Count == 0)
                 throw new InvalidOperationException("At least one request method must be allowed.");
+            foreach (var method in _options.AllowedMethods)
+            {
+                if (!Parsing.HeaderTokens.IsToken(method))
+                    throw new InvalidOperationException("Allowed method '" + method + "' is not a valid HTTP token.");
+            }
+            if (_options.AddServerHeader && (string.IsNullOrEmpty(_options.ServerHeaderValue) || !Parsing.HeaderTokens.IsFieldValue(_options.ServerHeaderValue)))
+                throw new InvalidOperationException("ServerHeaderValue must be a non-empty header value without control characters.");
             foreach (var ep in _options.Endpoints)
             {
                 if (ep.Tls is { } tls && tls.CertificateSelector is null && tls.CertificateProvider is null && tls.CertificateSource is null)
@@ -178,28 +192,20 @@ public sealed class HttpServer : IAsyncDisposable
             {
                 socket = await listener.AcceptAsync(token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or SocketException)
             {
                 slots.Release();
-                return;
-            }
-            catch (ObjectDisposedException)
-            {
-                slots.Release();
-                return;
-            }
-            catch (SocketException ex)
-            {
-                slots.Release();
-                if (token.IsCancellationRequested)
-                    return;
+                if (ex is not SocketException || token.IsCancellationRequested)
+                    return; // stopping, or the listener is gone
+                // A transient accept failure (a connection reset before accept completed, descriptor exhaustion):
+                // report it and back off briefly instead of spinning on a failing listener.
                 _options.OnError?.Invoke(ex);
+                await Task.Delay(20).ConfigureAwait(false);
                 continue;
             }
 
             var remote = socket.RemoteEndPoint as IPEndPoint;
-            var connection = new HttpConnection(this, socket, endpoint, remote);
-            if (!TryAdmit(connection, remote?.Address))
+            if (!TryReserveAddress(LimitKey(remote)))
             {
                 Interlocked.Increment(ref _rejected);
                 socket.Dispose();
@@ -207,47 +213,48 @@ public sealed class HttpServer : IAsyncDisposable
                 continue;
             }
 
+            // Only admitted sockets get a connection object (pooled buffers, cancellation sources), so a flood of
+            // rejected connects costs nothing beyond the accept itself.
+            var connection = new HttpConnection(this, socket, endpoint, remote);
+            lock (_lock)
+                _connections[connection.Id] = connection;
             Interlocked.Increment(ref _accepted);
-            try
-            {
-                socket.NoDelay = true;
-            }
-            catch (SocketException)
-            {
-            }
-            connection.Start();
+            connection.Start(); // socket options are applied inside the connection, where failures are contained
         }
     }
 
-    private bool TryAdmit(HttpConnection connection, IPAddress? address)
+    /// <summary>
+    /// The per-address limit key. IPv4-mapped IPv6 addresses (seen on dual-mode listeners) count as their IPv4
+    /// address, so one client cannot double its allowance by connecting to both an IPv4 and a dual-mode endpoint.
+    /// </summary>
+    internal static IPAddress LimitKey(IPEndPoint? remote)
+    {
+        var address = remote?.Address ?? IPAddress.None;
+        return address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
+    }
+
+    private bool TryReserveAddress(IPAddress address)
     {
         lock (_lock)
         {
-            if (address is not null)
-            {
-                _perAddress.TryGetValue(address, out int count);
-                if (count >= _options.Limits.MaxConnectionsPerAddress)
-                    return false;
-                _perAddress[address] = count + 1;
-            }
-            _connections[connection.Id] = connection;
+            _perAddress.TryGetValue(address, out int count);
+            if (count >= _options.Limits.MaxConnectionsPerAddress)
+                return false;
+            _perAddress[address] = count + 1;
             return true;
         }
     }
 
     internal void OnConnectionClosed(HttpConnection connection)
     {
+        var address = LimitKey(connection.RemoteEndPoint);
         lock (_lock)
         {
             _connections.Remove(connection.Id);
-            var address = connection.RemoteEndPoint?.Address;
-            if (address is not null && _perAddress.TryGetValue(address, out int count))
-            {
-                if (count <= 1)
-                    _perAddress.Remove(address);
-                else
-                    _perAddress[address] = count - 1;
-            }
+            if (_perAddress.TryGetValue(address, out int count) && count > 1)
+                _perAddress[address] = count - 1;
+            else
+                _perAddress.Remove(address);
         }
         _slots?.Release();
     }
@@ -283,6 +290,13 @@ public sealed class HttpServer : IAsyncDisposable
         }
     }
 
+    /// <summary>A point-in-time copy of the open connections.</summary>
+    internal HttpConnection[] SnapshotConnections()
+    {
+        lock (_lock)
+            return [.. _connections.Values];
+    }
+
     private async Task StopCoreAsync(CancellationToken cancellationToken)
     {
         _acceptCts.Cancel();
@@ -291,9 +305,7 @@ public sealed class HttpServer : IAsyncDisposable
         await Task.WhenAll(_acceptLoops).ConfigureAwait(false);
 
         _idleCts.Cancel();
-        HttpConnection[] connections;
-        lock (_lock)
-            connections = [.. _connections.Values];
+        var connections = SnapshotConnections();
         var tasks = new Task[connections.Length];
         for (int i = 0; i < connections.Length; i++)
             tasks[i] = connections[i].Completion;

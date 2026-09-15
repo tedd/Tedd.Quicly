@@ -42,7 +42,6 @@ internal sealed class HttpConnection
     private byte[]? _bodyBuffer;
     private ReadOnlyMemory<byte> _bodyMemory;
     private bool _bodyRead;
-    private int _closed;
 
     public HttpConnection(HttpServer server, Socket socket, HttpEndpointOptions endpoint, IPEndPoint? remoteEndPoint)
     {
@@ -94,26 +93,18 @@ internal sealed class HttpConnection
 
     public void Start() => Completion = RunAsync();
 
-    /// <summary>Closes the socket immediately, interrupting any pending I/O.</summary>
+    /// <summary>Closes the socket immediately, interrupting any pending I/O. Safe to call at any time, also after the connection closed.</summary>
     public void Abort()
     {
-        if (!_abortCts.IsCancellationRequested)
-        {
-            try
-            {
-                _abortCts.Cancel();
-            }
-            catch (ObjectDisposedException)
-            {
-            }
-        }
         try
         {
-            _socket.Dispose();
+            _abortCts.Cancel();
         }
         catch (ObjectDisposedException)
         {
+            // The connection already closed and released its resources.
         }
+        _socket.Dispose();
     }
 
     internal void MarkProtocolViolation() => _protocolViolation = true;
@@ -143,31 +134,25 @@ internal sealed class HttpConnection
         }
     }
 
-    private void Close()
+    /// <summary>Disposes <paramref name="disposable"/>, swallowing the I/O errors a stream may raise while a broken connection is torn down.</summary>
+    internal static void DisposeQuietly(IDisposable disposable)
     {
-        if (Interlocked.Exchange(ref _closed, 1) != 0)
-            return;
         try
         {
-            _abortCts.Cancel();
-        }
-        catch (ObjectDisposedException)
-        {
-        }
-        try
-        {
-            _stream.Dispose();
+            disposable.Dispose();
         }
         catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
         {
+            // Nothing useful can be done: the peer is gone or the stream already failed.
         }
-        try
-        {
-            _socket.Dispose();
-        }
-        catch (ObjectDisposedException)
-        {
-        }
+    }
+
+    /// <summary>Releases everything the connection owns. Runs exactly once, from <see cref="RunAsync"/>'s <c>finally</c>.</summary>
+    private void Close()
+    {
+        _abortCts.Cancel(); // only Close disposes this source, so it is still alive here
+        DisposeQuietly(_stream);
+        _socket.Dispose();
         ReleaseRequestResources();
         var buffer = _buffer;
         _buffer = [];
@@ -181,39 +166,53 @@ internal sealed class HttpConnection
 
     // ------------------------------------------------------------------ TLS
 
+    /// <summary>Initial size of the ClientHello peek buffer; it doubles (up to <see cref="ClientHelloParser.MaxPeekBytes"/>) only as bytes arrive.</summary>
+    internal const int InitialPeekBytes = 4 * 1024;
+
     private async ValueTask<Stream?> CreateStreamAsync()
     {
         var network = new NetworkStream(_socket, ownsSocket: true);
         _stream = network; // disposed by Close() whatever happens below
+        _socket.NoDelay = true;
+        // Socket timeouts only govern synchronous I/O: they bound the synchronous body-read path
+        // (HttpRequestBodyStream.Read and its 100-continue write) as cancellation bounds the async paths.
+        _socket.ReceiveTimeout = ToSocketTimeout(_limits.RequestBodyReadTimeout);
+        _socket.SendTimeout = ToSocketTimeout(_limits.ResponseWriteTimeout);
         var tls = _endpoint.Tls;
         if (tls is null)
             return network;
 
         // Peek the ClientHello so that ALPN acme-tls/1 can pick the challenge certificate (SslStream's own
         // selection callback only exposes the SNI host, not the offered protocols). The whole peek plus the
-        // handshake must finish within HeaderReadTimeout.
+        // handshake must finish within HeaderReadTimeout. The peek buffer starts small and grows with what the
+        // client actually sent, so a connection trickling a hello holds memory proportional to its own bytes.
         long deadline = Deadline(_limits.HeaderReadTimeout);
-        var rented = ArrayPool<byte>.Shared.Rent(ClientHelloParser.MaxPeekBytes);
-        var assembled = ArrayPool<byte>.Shared.Rent(ClientHelloParser.MaxClientHelloLength);
+        var rented = ArrayPool<byte>.Shared.Rent(InitialPeekBytes);
         bool handedOff = false;
         int filled = 0;
-        bool parsed = false;
-        ClientHelloInfo hello = default;
+        bool parsed;
+        ClientHelloInfo hello;
         try
         {
             while (true)
             {
-                var status = ClientHelloParser.TryAssemble(rented.AsSpan(0, filled), assembled.AsSpan(0, ClientHelloParser.MaxClientHelloLength), out int handshakeLength, out _);
+                var status = TryReadClientHello(rented.AsSpan(0, filled), out hello, out parsed);
                 if (status == ClientHelloAssembleStatus.Complete)
-                {
-                    parsed = ClientHelloParser.TryParse(assembled.AsSpan(0, handshakeLength), out hello);
                     break;
-                }
                 if (status != ClientHelloAssembleStatus.NeedMore || filled == ClientHelloParser.MaxPeekBytes)
                 {
                     // Not TLS, or a ClientHello we refuse to buffer: drop the connection without a handshake attempt.
                     _server.OnHandshakeFailure();
                     return null;
+                }
+                int capacity = Math.Min(rented.Length, ClientHelloParser.MaxPeekBytes);
+                if (filled == capacity)
+                {
+                    var larger = ArrayPool<byte>.Shared.Rent(Math.Min(ClientHelloParser.MaxPeekBytes, rented.Length * 2));
+                    rented.AsSpan(0, filled).CopyTo(larger);
+                    ArrayPool<byte>.Shared.Return(rented);
+                    rented = larger;
+                    capacity = Math.Min(rented.Length, ClientHelloParser.MaxPeekBytes);
                 }
                 var remaining = Remaining(deadline);
                 if (remaining <= TimeSpan.Zero)
@@ -224,7 +223,7 @@ internal sealed class HttpConnection
                 int n;
                 try
                 {
-                    n = await ReadWithTimeoutAsync(network, rented.AsMemory(filled, ClientHelloParser.MaxPeekBytes - filled), remaining, IoCts()).ConfigureAwait(false);
+                    n = await ReadWithTimeoutAsync(network, rented.AsMemory(filled, capacity - filled), remaining, IoCts()).ConfigureAwait(false);
                 }
                 catch (Exception)
                 {
@@ -243,7 +242,6 @@ internal sealed class HttpConnection
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(assembled);
             if (!handedOff)
                 ArrayPool<byte>.Shared.Return(rented);
         }
@@ -273,11 +271,6 @@ internal sealed class HttpConnection
         }
 
         var handshakeBudget = Remaining(deadline);
-        if (handshakeBudget <= TimeSpan.Zero)
-        {
-            _server.OnHandshakeFailure();
-            return null;
-        }
         var cts = IoCts();
         cts.CancelAfter(handshakeBudget);
         try
@@ -306,47 +299,26 @@ internal sealed class HttpConnection
 
     // ------------------------------------------------------------------ request loop
 
-    private enum HeaderBlockResult : byte
-    {
-        Found,
-        Eof,
-        TooLarge,
-        Timeout,
-    }
-
     private async Task ProcessRequestsAsync()
     {
         var handlers = _options.Handlers;
         int requests = 0;
         while (true)
         {
-            var read = await ReadHeaderBlockAsync(requests == 0).ConfigureAwait(false);
-            if (read == HeaderBlockResult.Eof)
-                return;
-            if (read == HeaderBlockResult.Timeout)
-            {
-                _server.OnRequestTimeout();
-                await SendErrorAsync(408).ConfigureAwait(false);
-                return;
-            }
-
-            var buffered = _buffer.AsSpan(_start, _end - _start);
-            var status = HttpParser.TryParse(buffered, _limits.MaxRequestLineBytes, _limits.MaxHeadersBytes, ref _parsed);
-            int error = status switch
-            {
-                HttpParseStatus.Ok => 0,
-                HttpParseStatus.Invalid => 400,
-                HttpParseStatus.RequestLineTooLong => 414,
-                HttpParseStatus.VersionNotSupported => 505,
-                _ => 431, // HeadersTooLarge, or NeedMore after the block limit was hit
-            };
+            int error = await ReadRequestHeadAsync(requests == 0).ConfigureAwait(false);
+            if (error < 0)
+                return; // clean end of stream between requests
             if (error != 0)
             {
-                _server.OnProtocolError();
+                if (error == 408)
+                    _server.OnRequestTimeout();
+                else
+                    _server.OnProtocolError();
                 await SendErrorAsync(error).ConfigureAwait(false);
                 return;
             }
 
+            var buffered = _buffer.AsSpan(_start, _end - _start);
             requests++;
             error = Materialize(buffered);
             _start += _parsed.Consumed;
@@ -416,20 +388,48 @@ internal sealed class HttpConnection
         }
     }
 
-    private async ValueTask<HeaderBlockResult> ReadHeaderBlockAsync(bool firstRequest)
+    /// <summary>
+    /// Reads until the request line and header section are complete and parses them into <see cref="_parsed"/>.
+    /// Returns 0 when a request is ready, -1 when the client closed the connection, or the status code to answer
+    /// with (400, 408, 414, 431, 505).
+    /// </summary>
+    private async ValueTask<int> ReadRequestHeadAsync(bool firstRequest)
     {
+        // The header deadline runs from accept for the first request and from the first byte of every later one;
+        // with pipelining those bytes may already be buffered. 0 means "idle, waiting for the next request".
+        long deadline = firstRequest || _end > _start ? Deadline(_limits.HeaderReadTimeout) : 0;
         int scanFrom = _start;
-        long deadline = firstRequest ? Deadline(_limits.HeaderReadTimeout) : 0;
         while (true)
         {
             int available = _end - _start;
             if (available > 0)
             {
+                // The parser only runs once a header terminator has arrived (or the size limit is reached), so a
+                // request trickled in small pieces is scanned once, not re-parsed per packet.
                 int idx = _buffer.AsSpan(scanFrom, _end - scanFrom).IndexOf(HttpParser.HeaderTerminator);
-                if (idx >= 0)
-                    return HeaderBlockResult.Found;
-                if (available >= _maxHeaderBlock)
-                    return HeaderBlockResult.TooLarge;
+                bool full = available >= _maxHeaderBlock;
+                if (idx >= 0 || full)
+                {
+                    switch (HttpParser.TryParse(_buffer.AsSpan(_start, available), _limits.MaxRequestLineBytes, _limits.MaxHeadersBytes, ref _parsed))
+                    {
+                        case HttpParseStatus.Ok:
+                            return 0;
+                        case HttpParseStatus.Invalid:
+                            return 400;
+                        case HttpParseStatus.RequestLineTooLong:
+                            return 414;
+                        case HttpParseStatus.VersionNotSupported:
+                            return 505;
+                        case HttpParseStatus.HeadersTooLarge:
+                            return 431;
+                    }
+                    if (full)
+                        return 431;
+                    // NeedMore although a terminator is buffered: it ended tolerated empty lines before the request
+                    // line, not the header section. Keep scanning after it.
+                    scanFrom += idx + 1;
+                    continue;
+                }
                 scanFrom = Math.Max(_start, _end - 2);
             }
 
@@ -444,7 +444,7 @@ internal sealed class HttpConnection
             int n;
             try
             {
-                if (available == 0 && !firstRequest)
+                if (deadline == 0)
                 {
                     // Waiting for the next request on a persistent connection: idle timeout, closable on shutdown.
                     n = await ReadWithTimeoutAsync(_stream, _buffer.AsMemory(_end), _limits.KeepAliveTimeout, _idleCts).ConfigureAwait(false);
@@ -454,17 +454,17 @@ internal sealed class HttpConnection
                 {
                     var remaining = Remaining(deadline);
                     if (remaining <= TimeSpan.Zero)
-                        return HeaderBlockResult.Timeout;
+                        return 408;
                     n = await ReadWithTimeoutAsync(_stream, _buffer.AsMemory(_end), remaining, available == 0 ? _idleCts : IoCts()).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) when (available > 0 && !AbortToken.IsCancellationRequested)
             {
                 // A partial request that stalled: answer 408 rather than dropping silently.
-                return HeaderBlockResult.Timeout;
+                return 408;
             }
             if (n == 0)
-                return HeaderBlockResult.Eof;
+                return -1;
             _end += n;
         }
     }
@@ -473,7 +473,7 @@ internal sealed class HttpConnection
         => timeout == Timeout.InfiniteTimeSpan ? long.MaxValue : Environment.TickCount64 + (long)timeout.TotalMilliseconds;
 
     private static TimeSpan Remaining(long deadline)
-        => deadline == long.MaxValue ? Timeout.InfiniteTimeSpan : TimeSpan.FromMilliseconds(deadline - Environment.TickCount64);
+        => deadline == long.MaxValue ? Timeout.InfiniteTimeSpan : TimeSpan.FromMilliseconds(Math.Max(0, deadline - Environment.TickCount64));
 
     /// <summary>Fills the request context from the parsed ranges. Returns 0 or the status code of the error to send.</summary>
     private int Materialize(ReadOnlySpan<byte> buffer)
@@ -668,8 +668,6 @@ internal sealed class HttpConnection
         while (_bodyRemaining > 0)
         {
             // The header buffer is free once the buffered bytes are consumed, so reuse it as scratch space.
-            if (_start != _end)
-                throw new InvalidOperationException("Unexpected buffered data while draining.");
             int want = (int)Math.Min(_buffer.Length, _bodyRemaining);
             int n = await ReadWithTimeoutAsync(_stream, _buffer.AsMemory(0, want), _limits.RequestBodyReadTimeout, IoCts()).ConfigureAwait(false);
             if (n == 0)
@@ -723,31 +721,73 @@ internal sealed class HttpConnection
     {
         if (_bodyRemaining <= 0 || destination.IsEmpty)
             return 0;
-        if (_expectContinue && !_continueSent)
-        {
-            _continueSent = true;
-            _stream.Write(ContinueResponse);
-        }
-        int toRead = (int)Math.Min(destination.Length, _bodyRemaining);
-        int buffered = _end - _start;
         int n;
-        if (buffered > 0)
+        try
         {
-            n = Math.Min(buffered, toRead);
-            _buffer.AsSpan(_start, n).CopyTo(destination);
-            _start += n;
-        }
-        else
-        {
-            n = _stream.Read(destination[..toRead]);
-            if (n == 0)
+            if (_expectContinue && !_continueSent)
             {
-                _bodyRemaining = -1;
-                throw new IOException("The client closed the connection before the request body was complete.");
+                _continueSent = true;
+                _stream.Write(ContinueResponse);
             }
+            int toRead = (int)Math.Min(destination.Length, _bodyRemaining);
+            int buffered = _end - _start;
+            if (buffered > 0)
+            {
+                n = Math.Min(buffered, toRead);
+                _buffer.AsSpan(_start, n).CopyTo(destination);
+                _start += n;
+            }
+            else
+            {
+                n = _stream.Read(destination[..toRead]);
+                if (n == 0)
+                    throw new IOException("The client closed the connection before the request body was complete.");
+            }
+        }
+        catch (IOException)
+        {
+            // Early close, reset, or the socket's ReceiveTimeout: how much of the body is still on the wire is
+            // unknown, so the connection cannot be reused.
+            _bodyRemaining = -1;
+            throw;
         }
         _bodyRemaining -= n;
         return n;
+    }
+
+    /// <summary>Converts a limit to a <see cref="Socket.ReceiveTimeout"/>/<see cref="Socket.SendTimeout"/> value (0 = infinite).</summary>
+    internal static int ToSocketTimeout(TimeSpan timeout)
+        => timeout == Timeout.InfiniteTimeSpan ? 0 : (int)Math.Min(int.MaxValue, Math.Ceiling(timeout.TotalMilliseconds));
+
+    /// <summary>
+    /// Reassembles and parses the ClientHello from the raw bytes received so far. The reassembly buffer is rented
+    /// only for the duration of the call and sized to the raw bytes (the handshake payload can never exceed them);
+    /// when the declared handshake length is larger, the attempt is repeated at full size so that "needs more bytes"
+    /// is told apart from "larger than <see cref="ClientHelloParser.MaxClientHelloLength"/>".
+    /// </summary>
+    internal static ClientHelloAssembleStatus TryReadClientHello(ReadOnlySpan<byte> raw, out ClientHelloInfo hello, out bool parsed)
+    {
+        hello = default;
+        parsed = false;
+        int size = Math.Min(raw.Length, ClientHelloParser.MaxClientHelloLength);
+        var scratch = ArrayPool<byte>.Shared.Rent(Math.Max(size, 256));
+        try
+        {
+            var status = ClientHelloParser.TryAssemble(raw, scratch.AsSpan(0, size), out int length, out _);
+            if (status == ClientHelloAssembleStatus.TooLarge && size < ClientHelloParser.MaxClientHelloLength)
+            {
+                ArrayPool<byte>.Shared.Return(scratch);
+                scratch = ArrayPool<byte>.Shared.Rent(ClientHelloParser.MaxClientHelloLength);
+                status = ClientHelloParser.TryAssemble(raw, scratch.AsSpan(0, ClientHelloParser.MaxClientHelloLength), out length, out _);
+            }
+            if (status == ClientHelloAssembleStatus.Complete)
+                parsed = ClientHelloParser.TryParse(scratch.AsSpan(0, length), out hello);
+            return status;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(scratch);
+        }
     }
 
     public async ValueTask<ReadOnlyMemory<byte>> ReadWholeBodyAsync(CancellationToken cancellationToken)

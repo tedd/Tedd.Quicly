@@ -111,8 +111,14 @@ public class RedirectToHttpsHandlerTests
 
         await raw.SendAsync("GET /x HTTP/1.1\r\nHost: [::1]:80\r\n\r\n");
         Assert.Equal("https://[::1]/x", (await raw.ReadResponseAsync())["Location"]);
-        await raw.SendAsync("GET /x HTTP/1.1\r\nHost: [::1\r\n\r\n");
-        Assert.Equal("https://[::1/x", (await raw.ReadResponseAsync())["Location"]);
+        // Hosts that are not a plain name or IP literal are refused rather than echoed into Location.
+        foreach (var hostile in new[] { "[::1", "user@evil.example", "evil.example/x", "a%2fb", "h:80x", "h:123456" })
+        {
+            await raw.SendAsync("GET /x HTTP/1.1\r\nHost: " + hostile + "\r\n\r\n");
+            var refused = await raw.ReadResponseAsync();
+            Assert.Equal(400, refused.StatusCode);
+            Assert.Null(refused["Location"]);
+        }
 
         await raw.SendAsync("GET http://abs.example/abs HTTP/1.1\r\n\r\n");
         Assert.Equal("https://abs.example/", (await raw.ReadResponseAsync())["Location"]); // absolute-form targets redirect to the root

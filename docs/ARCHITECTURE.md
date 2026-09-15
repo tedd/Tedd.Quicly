@@ -6,7 +6,9 @@ and large world-data transfers — with explicit buffer ownership, a minimal wir
 allocation-free hot path.
 
 This document describes the layering, the threading model, the memory model and the public API surface.
-The wire format lives in [PROTOCOL.md](PROTOCOL.md). Decisions and their rationale live in [adr/](adr/).
+The wire format lives in [PROTOCOL.md](PROTOCOL.md). Decisions and their rationale live in [adr/](adr/);
+ADR 0008 (hot-path memory and threading contract) and ADR 0009 (security and limits) are the two most
+important companions to this document.
 
 ## 1. Projects
 
@@ -14,11 +16,11 @@ The wire format lives in [PROTOCOL.md](PROTOCOL.md). Decisions and their rationa
 |---|---|---|
 | `Tedd.Quicly.Core` | anywhere (browser-safe: no P/Invoke, no sockets) | Channels, delivery modes, framing, scheduler, buffer pools, completions, session handshake, control protocol, diagnostics, time. Defines `ITransport`. |
 | `Tedd.Quicly.Client` | anywhere | `QuiclyClient`: connect, authenticate, reconnect policy, browser-suspend handling. Produces a `QuiclyPeer`. |
-| `Tedd.Quicly.Server` | native | `QuiclyServer`: listener, admission policy, per-client limits, HTTP hosting glue, certificate provisioning glue (ACME). Produces `QuiclyPeer`s. |
-| `Tedd.Quicly.Http3` | anywhere | Pure-managed HTTP/3 framing, QPACK (static table + Huffman), HTTP Datagrams (RFC 9297), WebTransport session framing (draft-ietf-webtrans-http3). Unit-testable without a network. |
-| `Tedd.Quicly.Transport.MsQuic` | native (Windows / Linux / macOS) | Hand-written MsQuic bindings (validated against the runtime-bundled library), safe handle wrappers, raw-QUIC transport (ALPN `quicly/1`) and WebTransport-over-HTTP/3 transport (ALPN `h3`) sharing one UDP port. Both client and server sides. |
-| `Tedd.Quicly.Transport.Browser` | browser-wasm (optional, experimental) | JS WebTransport adapter via `[JSImport]`. Same `ITransport` contract. |
-| `Tedd.Quicly.Http` | native | Small HTTP/1.1 server over TCP (plain + TLS via `SslStream`): routing, static files, ACME `http-01` responder and `tls-alpn-01` responder. |
+| `Tedd.Quicly.Server` | native | `QuiclyServer`: listener, admission policy, per-client limits, peer sets / broadcast, HTTP hosting glue, certificate provisioning glue (ACME). Produces `QuiclyPeer`s. |
+| `Tedd.Quicly.Http3` | anywhere | Pure-managed HTTP/3 framing, QPACK (static table + Huffman), HTTP Datagrams (RFC 9297), WebTransport session framing. Unit-testable without a network. Used only when HTTP/3 is enabled. |
+| `Tedd.Quicly.Transport.MsQuic` | native (Windows / Linux / macOS) | Hand-written MsQuic bindings (validated against the runtime-bundled library), wrappers, raw-QUIC transport (ALPN `quicly/1`) and, opt-in, WebTransport-over-HTTP/3 (ALPN `h3`) sharing one UDP port. Client and server sides. |
+| `Tedd.Quicly.Transport.Browser` | browser-wasm (optional, experimental, later) | JS WebTransport adapter via `[JSImport]`. Same `ITransport` contract. |
+| `Tedd.Quicly.Http` | native | Small HTTP/1.1 server over TCP (plain + TLS via `SslStream` with a ClientHello peek for ALPN): routing, static files, ACME `http-01` responder and `tls-alpn-01` responder. |
 | `Tedd.Quicly.Acme` | native | RFC 8555 ACME v2 client: any directory URL (Let's Encrypt, ZeroSSL, Buypass, Google Trust Services, SSL.com, …), External Account Binding, `http-01` / `tls-alpn-01` / `dns-01` challenge providers, renewal scheduling. |
 | `Tedd.Quicly.Testing` | anywhere | `SimulatedTransport`: in-memory link with deterministic loss / reorder / delay / jitter / bandwidth / disconnect models driven by a virtual clock. Certificate helpers. |
 | `Tedd.Quicly.Replication` | anywhere | Optional game-layer helpers: entity generations, snapshot ring with acknowledged baselines, delta encoding, input sequencing / reconciliation, event de-duplication window. |
@@ -35,131 +37,182 @@ Target frameworks: `net11.0` (primary) and `net10.0` for every library and test 
 ```
  game code
  ───────────────────────────────────────────────────────────────────────
- QuiclyPeer  (Core)          Send*, Poll, Flush, completions, channels
-   ├─ ChannelTable            static per-app channel definitions (ECS-style struct arrays)
-   ├─ SendScheduler           priority / budget / batching / packing / expiry
-   ├─ Delivery engines        DatagramSequencer, ReliableLatestEngine, OrderedStreamChannel,
-   │                          GroupStreamChannel, BulkTransferEngine, Fragmenter
-   ├─ ReceivePipeline         header parse → target selection → fill → publish (MPSC ring)
-   ├─ ControlProtocol         hello/ack, ping/RTT/clock, receipts, latest-acks, close
-   └─ Memory                  SlabAllocator (native, size classes, lock-free), leases, shared refcounts
+ QuiclyServer / QuiclyClient      accept / connect, admission, peer sets, PollAll
+ QuiclyPeer  (Core)               Send*, Poll, Flush, Drain, completions, channels
+   ├─ ChannelTable                static per-app channel definitions
+   ├─ SendScheduler               priority / bandwidth budget / packing / expiry / retries
+   ├─ Delivery engines            DatagramSequencer, ReliableLatestEngine, OrderedStreamChannel,
+   │                              GroupStreamChannel, BulkTransferEngine, Fragmenter, RequestTable
+   ├─ ReceivePipeline             header parse → limits → target selection → fill → publish (SPSC ring / key mailboxes)
+   ├─ ControlProtocol             hello/ack, ping/RTT/clock, latest-acks, key retirement, close
+   └─ Memory                      SlabAllocator (native, size classes, lock-free), leases, shared refcounts
  ───────────────────────────────────────────────────────────────────────
- ITransport (Core)            datagrams + streams + capabilities + events
-   ├─ MsQuicRawTransport      ALPN quicly/1 : QUIC streams & DATAGRAM frames directly
-   ├─ WebTransportH3Transport ALPN h3       : HTTP/3 + Extended CONNECT + WT stream/datagram framing
-   ├─ BrowserWebTransport     JS WebTransport (optional)
-   └─ SimulatedTransport      tests / benchmarks
+ ITransport (Core)                datagrams + streams + capabilities + events
+   ├─ MsQuicRawTransport          ALPN quicly/1 : QUIC streams & DATAGRAM frames directly
+   ├─ WebTransportH3Transport     ALPN h3       : HTTP/3 + Extended CONNECT + WT framing (opt-in)
+   ├─ BrowserWebTransport         JS WebTransport (optional, later)
+   └─ SimulatedTransport          tests / benchmarks
  ───────────────────────────────────────────────────────────────────────
- MsQuic (msquic.dll / libmsquic)   bundled with the .NET runtime on Windows; LibraryImport + function pointers
+ MsQuic (msquic.dll / libmsquic)  bundled with the .NET runtime on Windows; LibraryImport + function pointers
 ```
 
 ### 2.1 `ITransport` contract (Core)
 
-The transport is deliberately thin; all game semantics are above it.
+The transport is deliberately thin; all game semantics are above it. `TransportSegment` is bit-identical
+to MsQuic's `QUIC_BUFFER` (`uint Length` at offset 0, `byte* Buffer` at offset 8, 16 bytes) so gather arrays
+are handed to the native library without translation and receive arrays are reinterpreted in place.
 
 ```csharp
-public interface ITransport : IAsyncDisposable
+public interface ITransport : IDisposable
 {
-    TransportCapabilities Capabilities { get; }        // datagrams? max datagram payload (dynamic), gather send?, receive-in-place?, stream priority?
+    TransportCapabilities Capabilities { get; }   // Datagrams, DatagramSendState, MaxDatagramPayload (dynamic), StreamPriority, AppOwnedReceiveBuffers
     TransportState State { get; }
-    // Datagrams
-    TransportSendStatus SendDatagram(ReadOnlySpan<TransportSegment> segments, ulong context, TransportSendFlags flags);
-    // Streams
-    TransportStreamId OpenStream(StreamKind kind /*uni|bidi*/, ulong context, StreamPriority priority);
-    TransportSendStatus SendStream(TransportStreamId id, ReadOnlySpan<TransportSegment> segments, ulong context, bool fin, TransportSendFlags flags);
+    // Datagrams: one QUIC DATAGRAM frame per call. Buffers and the segment array MUST stay valid until OnDatagramSendStateChanged(Sent).
+    TransportStatus SendDatagram(TransportSegment* segments, int count, ulong context, TransportSendFlags flags);
+    // Streams. Buffers and the segment array MUST stay valid until OnStreamSendCompleted(context).
+    TransportStatus OpenStream(StreamKind kind, ulong context, ushort priority, out TransportStreamId id);
+    TransportStatus SendStream(TransportStreamId id, TransportSegment* segments, int count, ulong context, TransportSendFlags flags); // flags: Fin, DelaySend, CancelOnLoss, Start
     void AbortStream(TransportStreamId id, ulong errorCode, StreamAbortDirection dir);
-    void SetStreamPriority(TransportStreamId id, StreamPriority p);
-    void ResumeStreamReceive(TransportStreamId id);   // after a receive sink applied backpressure
-    // Connection
+    void SetStreamPriority(TransportStreamId id, ushort priority);
+    void ResumeStreamReceive(TransportStreamId id, int bytesConsumed);   // after a receive returned Pending
+    void UpdatePeerStreamLimits(ushort bidi, ushort uni);                // raised after admission
     void Close(ulong errorCode, ReadOnlySpan<byte> reason);
-    TransportStatistics GetStatistics();              // RTT, cwnd, bytes, loss — struct, no allocation
-    // Sink: the transport calls back into ITransportSink (implemented by Core) on its own threads
+    void GetStatistics(out TransportStatistics stats);                   // RTT/minRTT/variance, cwnd, bytes in flight, loss, path MTU — struct, no allocation
 }
 
-public interface ITransportSink
+public interface ITransportSink   // implemented by Core; called on transport threads, serialised per connection
 {
-    void OnConnected(in TransportConnectedInfo info);
-    void OnDatagramReceived(ReadOnlySpan<byte> payload);                      // buffer valid only during the call
+    void OnConnected(in TransportConnectedInfo info);                    // RemoteAddress, NegotiatedAlpn, SessionResumed, HandshakeInfo
+    void OnDatagramReceived(ReadOnlySpan<byte> payload);                 // valid only during the call
     void OnPeerStreamStarted(TransportStreamId id, StreamKind kind);
-    ReceiveConsumed OnStreamReceived(TransportStreamId id, ReadOnlySpan<TransportSegment> buffers, ulong absoluteOffset, bool fin);
-    void OnStreamSendCompleted(TransportStreamId id, ulong context, bool canceled);  // buffer released
-    void OnDatagramSendStateChanged(ulong context, DatagramSendState state);       // Sent / Lost / Acked / Canceled
+    ReceiveResult OnStreamReceived(TransportStreamId id, ReadOnlySpan<TransportSegment> buffers, ulong absoluteOffset, bool fin); // Consumed(n) | Pending(n)
+    void OnStreamSendCompleted(ulong context, bool canceled);            // segment array + buffers released
+    void OnDatagramSendStateChanged(ulong context, DatagramSendState state); // Sent (buffer released) … Acknowledged/Lost*/Canceled (final)
     void OnStreamAborted(TransportStreamId id, ulong errorCode, StreamAbortDirection dir);
     void OnStreamShutdownComplete(TransportStreamId id);
     void OnDatagramCapabilityChanged(bool enabled, int maxPayload);
+    void OnIdealSendBufferSize(TransportStreamId id, ulong bytes);
     void OnClosed(TransportCloseReason reason, ulong errorCode, int status);
 }
 ```
 
-`TransportSegment` is a `(byte* pointer, int length)` pair over pinned/native memory — this is what enables
-scatter/gather sends straight from the application's leases into MsQuic's `QUIC_BUFFER[]` with no copy.
+Contexts are `(generation << 32) | slot`; every callback validates the generation and ignores stale events
+(MsQuic keeps reporting datagram send state for a context after `Sent`). `DatagramSendState` is the full
+MsQuic enum (`Unknown, Sent, LostSuspect, LostDiscarded, Acknowledged, AcknowledgedSpurious, Canceled`):
+the payload block is released at `Sent`/`Canceled`, the slot only at a final state (`LostDiscarded`,
+`Acknowledged`, `AcknowledgedSpurious`, `Canceled`).
+
+Send-call semantics: if `SendDatagram`/`SendStream`/`OpenStream` returns a failure status **no completion
+follows** and the caller releases its lease; on success a completion **always** follows (`canceled = true`
+on abort/close) and it may arrive on the transport thread **before the call returns** on the game thread.
+Callers therefore publish everything the completion needs (state = InFlight, token, lease) *before* the
+call and never touch the slot afterwards. `TransportStreamId` is a local slot index valid immediately; the
+QUIC stream id (`QuicStreamId`, needed by the WebTransport carrier) is valid after the start-complete event.
+Group and bulk streams are started with the first send (`Start` flag) and closed with `Fin` on the last.
+
+Stream receive: a frame header may be split across the buffers of one receive event as well as across
+events; the sink parses across the buffer array, consumes whole frames when it can, returns
+`Consumed(n)` with `n` at a frame boundary otherwise, and uses `Pending` only for genuine back-pressure (while
+a receive is pending no further receive events arrive for that stream and unconsumed bytes are not credited
+back to the peer's flow control). Datagram buffers are valid only during the callback, so Direct-mode
+target selection for datagrams completes inline.
 
 ## 3. Threading model
 
-* **Transport threads** (MsQuic workers): MsQuic serialises all callbacks of one connection (and its streams)
-  onto one worker at a time, so per-connection receive-side state is mutated **without locks** on the
-  transport thread.
-* **Game thread**: calls `Send*`, `Flush`, `Poll`. The send-side state (queues, per-key latest tables,
-  completion slots) is owned by the game thread. Send admission is single-producer by default;
-  `PeerOptions.ThreadSafeSend = true` puts a lock-free MPSC ring in front for multi-threaded producers.
-* **Cross-thread hand-off**: two bounded lock-free rings per peer, both pre-allocated:
-  * `ReceiveRing` (MPSC → game thread): completed message descriptors (`ReceiveEntry`, 32 bytes).
-  * `CompletionRing` (MPSC → game thread): send completions (`CompletionEntry`, 16 bytes).
-  `Poll()` drains both and invokes the router / completes awaiters **on the game thread**.
-* **Acks / receipts** are transport-level; the receive side may emit them directly from the transport
-  thread through a dedicated small pool so the game thread's send arena is never touched from another
-  thread.
+* **Transport thread**: MsQuic serialises all callbacks of one connection (and its streams) onto one worker
+  at a time (the worker identity may change; ownership is "the current callback", never a thread id).
+  Receive-side state is mutated there **without locks**.
+* **Game thread**: calls `Send*`, `Flush`, `Poll`, `Drain`. Send-side state (queues, per-key send tables,
+  request table, completion slots) is owned by the game thread. All time-driven work (retries, expiry,
+  pings, heartbeat, group flush) runs inside `Flush`/`Poll`; there are no timers. `NextDeadline` tells a host
+  how long it may sleep. `now` is read once per `Flush`/`Poll`.
+* **Hand-off**: per peer, pre-allocated single-producer/single-consumer rings (the transport side has one
+  producer by construction): `ReceiveRing` (descriptors of complete messages, 32 bytes each) and
+  `CompletionRing` (sized to the send table + 1, so it can never overflow). Keyed channels with
+  `CoalesceOnReceive` bypass the ring: each key has a **mailbox** slot exchanged atomically (the transport
+  thread frees the lease the game thread never saw) and a per-channel dirty bitset the game thread scans.
+* **Send entries** cross threads: the game thread submits, the transport thread completes. The entry's
+  state is an `int` driven only by CAS transitions (Free → Submitted → [Cancelling] → Completed → Free); the
+  game thread reuses a slot only after observing its completion through the `CompletionRing`.
+* **Completion delivery** (`PeerOptions.CompletionMode`): `PollOnly` (default for games) completes
+  awaiters inside `Poll` with continuations inline on the game thread; `ThreadPool` signals from the transport
+  thread with `RunContinuationsAsynchronously` for hosts that never poll.
+* **Multi-producer sends** (`PeerOptions.ThreadSafeSend`): foreign threads enqueue 64-byte send requests
+  into a Vyukov MPSC ring drained by the game thread at `Flush`/`Poll`; `Immediate` from a foreign thread
+  means "at the next Flush".
+* **Callbacks never throw**: every `[UnmanagedCallersOnly]` body is wrapped; an escaping exception is
+  recorded, the peer is poisoned and shut down asynchronously (strict mode: fail fast). Application code on
+  the transport thread (`SelectTarget`) has a documented budget: no allocation, no locks, ≤ 1 µs.
 * Nothing in the hot path takes a lock; nothing in the hot path allocates on the GC heap after warm-up.
-  The transport's SEND_COMPLETE / DATAGRAM state events update slab free lists (lock-free stacks).
-* `Poll` never blocks. `FlushAsync` and completion awaits are `ValueTask`s backed by pooled
-  `ManualResetValueTaskSourceCore` slots. Synchronous waits (`WaitBufferReleased`) spin then park on a
-  lazily created event; they are unavailable in the browser (throw `PlatformNotSupportedException`).
 
 ## 4. Memory model
 
-* `SlabAllocator` (Core): a set of native memory slabs (`NativeMemory.AlignedAlloc`, 64-byte aligned)
-  partitioned into size classes (default: 64 B, 256 B, 1 536 B, 4 KiB, 16 KiB, 64 KiB, 256 KiB).
-  Each class keeps a lock-free free list (Treiber stack over indices with an ABA tag). Default reserve is
-  ~16 MiB per process; the server can size per-peer budgets. Exhaustion is an explicit, counted outcome
-  (`SendStatus.OutOfBuffers`), never a GC allocation.
-* `BufferLease` (struct: slab class, block index, offset, length) is the currency of ownership.
-  `SharedLease` adds an atomic reference count in a side table so a server can serialise a snapshot once
-  and send it to N peers with zero copies (`SendShared`).
-* Receive descriptors, send entries, key tables, channel state are all **struct arrays indexed by id**
-  (ECS style): `ChannelState[]`, `KeySlot[]` (open-addressing hash on `ulong` key → dense slot),
-  `SendEntry[]`, `ReceiveEntry[]`. Iteration is sequential; hot fields are packed together.
-* Sequence comparison, varint codec and header parsing are branch-light and vectorisable where it matters;
-  benchmarks keep them honest.
+* `SlabAllocator` (Core): native memory (`NativeMemory.AlignedAlloc`, 64-byte aligned) partitioned into
+  size classes (default 64 B, 256 B, 1 536 B, 4 KiB, 16 KiB, 64 KiB, 256 KiB) with lock-free free lists.
+  Default reserve is ~16 MiB per process; per-peer budgets bound what one peer can hold. Exhaustion is an
+  explicit, counted outcome (`SendStatus.OutOfBuffers`), never a GC allocation. Per-thread magazines with
+  SPSC return rings are the planned refinement once the benchmark in `docs/benchmarks/memory.md` justifies
+  them.
+* `BufferLease` (16-byte struct: class, block, offset, length, generation) is the currency of ownership.
+  `SharedLease` adds a padded atomic reference count so a server can serialise a snapshot once and send it
+  to N peers with zero copies (`SendShared`).
+* All hot state lives in **reference-free struct arrays in native memory**, split by owning thread and
+  padded to 64 bytes: `ChannelSendState[]`, `KeySendSlot[]`, `SendEntry[]` (game thread);
+  `ChannelRecvState[]`, `KeyRecvSlot[]`, `ReceiveEntry[]` (transport thread). Fields that are scanned every
+  tick (expiry deadlines, retry timestamps, dirty bits) are stored structure-of-arrays so `Vector256` scans
+  and popcounts apply. Keys are hashed with linear probing over SoA `keys[]`/`slots[]` (fmix64, power-of-two
+  capacity, load ≤ 0.5) or indexed directly for `KeySpace.Dense`.
+* `SendEntry` is 64 bytes and **contains** its `QUIC_BUFFER` pair (header scratch + payload pointer) so the
+  native library is handed pointers into the entry array; gather sends for one flush use contiguous
+  entries. Nothing the transport was given a pointer to moves or is reused before the matching completion.
 
 ### 4.1 Send ownership
 
 | API | Copy? | Buffer released when | Use for |
 |---|---|---|---|
-| `SendCopy(header, ReadOnlySpan<byte>)` | one memcpy into a slab block | immediately (caller's span is not retained) | locked / mutable game structures: lock → copy → unlock |
-| `RentBuffer(size)` + `SendOwned(header, lease)` | none | after the transport is done with it (datagram: sent; stream: acknowledged) | serialise directly into library memory — the true zero-copy path |
-| `SendBorrowed(header, ReadOnlyMemory<byte>)` | none (memory is pinned) | `BufferReleased` completion | stable caller memory (pinned arrays / native memory) |
-| `SendShared(peers, header, sharedLease)` | none | when every peer's send completed | broadcast one serialisation to many peers |
-| `SendGather(header, segments)` | none | `BufferReleased` | header + existing payload pages without concatenation |
+| `SendCopy(header, ReadOnlySpan<byte>)` | one memcpy into a slab block | the caller's span immediately; the slab block after the transport is done | locked / mutable game structures: lock → copy → unlock |
+| `RentBuffer(size)` + `SendOwned(header, lease, length)` | none | after the transport is done (datagram: sent; stream: acknowledged) | serialise directly into library memory — the true zero-copy path |
+| `SendPinned(header, byte* ptr, int length)` / `SendPinned(header, PinnedMemory)` | none, no handle | `BufferReleased` completion | native memory or `GC.AllocateArray(pinned: true)` |
+| `SendBorrowed(header, ReadOnlyMemory<byte>)` | none, but pins (`MemoryHandle` stored as `nint` in a side table) | `BufferReleased` completion | convenience path for ordinary arrays |
+| `SendShared(peerSet, header, sharedLease)` | none | when every peer's send completed | broadcast one serialisation to many peers |
+| `SendGather(header, ReadOnlySpan<BufferLease>)` / `(header, TransportSegment*, count)` | none | `BufferReleased` | header + existing payload pages (≤ 8 segments) |
 
-The library never promises "no copy anywhere": the receive side has exactly one copy (from the transport's
-receive buffer into the destination the application selected). MsQuic non-buffered sends are used by default
-(`SendBufferingEnabled = false`), so send is zero-copy down to the kernel.
+The library never promises "no copy anywhere": it promises **at most one application-level copy**. MsQuic
+performs its own copy of send bytes into the packet buffer during encryption, and copies stream data from
+the decrypted packet into its stream receive buffer before indicating it (datagrams are indicated straight
+from the packet buffer). MsQuic non-buffered sends are used by default (`SendBufferingEnabled = false`), which
+removes MsQuic's send-side buffer copy; the cost is that a reliable channel's blocks stay in flight for
+≥ 1 RTT, which bounds reliable throughput per peer to budget/RTT. App-owned stream receive buffers (MsQuic
+2.5 preview) are the future path to landing stream data directly in caller-chosen memory.
 
 ### 4.2 Receive targets
 
-Two-phase receive: the header is parsed on the transport thread, then the destination is chosen:
+Two-phase receive: the header is parsed on the transport thread, limits are checked, then the destination
+is chosen:
 
-* **Pooled mode** (default, simplest): the payload is copied into a slab lease and delivered via
-  `Poll()` to the channel's `MessageHandler(in ReceiveHeader, ReadOnlySpan<byte>)`; the lease is released
-  when the handler returns (or retained via `header.Retain()`).
-* **Direct mode**: the channel's `IReceiveRouter.SelectTarget(in ReceiveHeader)` runs on the transport
-  thread and returns a `ReceiveTarget` — caller `Memory<byte>`, an `IBufferWriter<byte>`, a pooled lease,
-  or `Reject`. The payload is written straight into that destination (for streams, progressively as bytes
-  arrive), and `OnMessage` is raised on the game thread when the message is complete. Partial messages
-  never reach live game state: on abort/cancel the router gets `OnAborted`.
-* **Latest semantics at the application boundary**: for sequenced / latest channels, if several versions
-  of the same key are queued before the game thread polls, only the newest is delivered; older entries are
-  marked superseded and their buffers recycled.
+* **Pooled mode** (default): the payload is copied into a slab lease and delivered via `Poll()` to the
+  channel's `MessageHandler(in ReceiveHeader, ReadOnlySpan<byte>)`, or drained in batches with
+  `Drain(channel, Span<ReceivedMessage>)` + `Release(...)` for data-oriented consumers. The lease is
+  released when the handler returns unless retained (`ReceiveLease Retain(in ReceiveHeader)`).
+* **Direct mode** (Bulk and large objects): `IReceiveRouter.SelectTarget(in ReceiveHeader)` runs on the
+  transport thread and returns a `ReceiveTarget` — pre-sized caller `Memory<byte>` (never grown, not touched
+  by the game thread until `OnMessage`), an `IBufferWriter<byte>` that never grows, a pooled lease, or
+  `Reject`. Payload bytes are written there as they arrive; `OnMessage` is raised on the game thread when
+  the message is complete; `OnAborted` on cancel. Compressed messages are staged compressed and decoded on
+  the game thread inside `Poll`; targets receive decoded bytes.
+* **Coalescing** (`CoalesceOnReceive`, forced on for `ReliableLatest`): only the newest queued version per
+  key is delivered; superseded versions are counted and their leases recycled without a ring entry.
+* **Overflow policy**: datagram channels drop the newest message and count it; stream channels return
+  `Pending` to the transport (QUIC flow control then bounds the peer) and resume from `Poll`.
+
+```csharp
+public readonly struct ReceiveHeader
+{
+    public ushort Channel; public ulong Key; public uint Sequence; public int Length; public int RawLength;
+    public long ReceivedMicros; public uint SenderTick; public uint Epoch; public int PeerIndex; public uint RequestId;
+    public ReceiveFlags Flags;   // Fragmented, Compressed, Superseded, IsRequest, IsResponse, KeyRetired
+}
+```
 
 ## 5. Channels and delivery modes
 
@@ -168,87 +221,172 @@ Channels are declared once in a `ChannelTable` (both sides must agree; the hands
 | Mode | Contract | Implementation |
 |---|---|---|
 | `UnreliableUnordered` | may be lost, may arrive in any order | QUIC DATAGRAM |
-| `UnreliableSequenced` | may be lost; only messages newer than the last accepted one per key are delivered | DATAGRAM + 16/32-bit serial sequence (per channel or per key) |
-| `ReliableOrdered` | every message, in order, per channel | one persistent unidirectional QUIC stream per channel per direction; length-prefixed frames |
+| `UnreliableSequenced` | may be lost; only messages newer than the last accepted one per key are delivered | DATAGRAM + 16/32-bit serial sequence (per-channel counter, compared per key) |
+| `ReliableOrdered` | every message, in order, per channel; optional request/response correlation | one persistent unidirectional QUIC stream per channel per direction; length-prefixed frames |
 | `ReliableUnordered` | every message; no message waits for another's retransmission | one unidirectional stream per *flush group*; groups are independent |
-| `ReliableLatest` | intermediate versions may be discarded; the latest version is eventually delivered while the session lives | versioned DATAGRAMs + application acks + retries (large values fall back to a per-key stream that aborts the previous one) |
-| `Bulk` | large objects with progress / cancel / resume | one stream per transfer, chunked, low priority, bounded concurrency |
+| `ReliableLatest` | intermediate versions may be discarded; the latest version is eventually delivered while the epoch lives | versioned DATAGRAMs + application acks + loss-driven/timed retries (large values: per-key stream that aborts the previous one) |
+| `Bulk` | large objects with progress / cancel / resume | one stream per transfer, chunked, low priority, bounded concurrency, SHA-256 identity |
 
 Ordering scope: session + direction + channel. Replacement scope: session + direction + channel + key.
 Channels are typed by the application (one channel per message kind); there is no message-type field.
+Keys can be retired (`RetireKey`) so per-key state is freed on both sides; sequence counters are per channel,
+so a reused key is never mistaken for its previous holder.
 
-Per-channel options: `Keyed`, `SequenceBits (16|32)`, `Priority`, `MaxMessageSize`, `QueueLimit`,
-`Expiry`, `Fragmentation` (unreliable messages larger than one datagram), `Compression`
-(`None | Lz4 | Brotli`, self-contained per message), `Receipts` (remote-accepted completions).
-
-Every send has three separable completion points: **BufferReleased**, **RemoteAccepted** (the remote
-library validated the complete message; requires receipts or latest-acks), **Applied** (explicit
-application acknowledgement). Only the first is guaranteed to occur; the others are opt-in per channel.
+Completion points: **BufferReleased** (always), **Delivered** (transport ack for datagrams/streams when the
+transport reports it; `LatestAck` for ReliableLatest; transfer complete for Bulk), and — the only
+application-level acknowledgement in v1 — the **response** on a `RequestResponse` channel.
 
 ## 6. Public API (Core)
 
 ```csharp
-public sealed class QuiclyPeer : IAsyncDisposable
+public sealed class QuiclyPeer : IDisposable
 {
-    public PeerId Id { get; }
-    public PeerState State { get; }
+    public int Index { get; }              // dense, generation-tagged slot in the owning server/client
+    public ulong Tag { get; set; }         // application data
+    public PeerState State { get; }        // Connecting, Handshaking, Connected, Reconnecting, Closing, Closed
+    public uint Epoch { get; }
+    public IPEndPoint RemoteEndPoint { get; }
     public TransportCapabilities Capabilities { get; }
     public ChannelTable Channels { get; }
-    public PeerStatistics Statistics { get; }                    // struct snapshot, no allocation
-    public TimeSpan Rtt { get; }  public long ClockOffsetMicros { get; }
+    public void GetStatistics(out PeerStatistics stats);          // fixed-layout struct: RTT (smoothed/min/max/variance, transport + application), one-way jitter, datagram loss %, bytes/packets per second each way, cwnd, bytes in flight, max datagram payload, ring occupancy high-water marks, per-channel counters (sent, received, dropped, superseded, expired, out-of-buffers, queue-full, too-large, ring-drops, retries, key-table-full)
+    public long EstimatedRemoteMicros();
+    public TimeSpan NextDeadline { get; }
 
     public BufferLease RentBuffer(int size);
     public SendResult SendCopy(in SendHeader h, ReadOnlySpan<byte> payload, SendOptions o = default);
     public SendResult SendOwned(in SendHeader h, BufferLease lease, int length, SendOptions o = default);
+    public unsafe SendResult SendPinned(in SendHeader h, byte* payload, int length, SendOptions o = default);
     public SendResult SendBorrowed(in SendHeader h, ReadOnlyMemory<byte> payload, SendOptions o = default);
-    public SendResult SendGather(in SendHeader h, ReadOnlySpan<ReadOnlyMemory<byte>> segments, SendOptions o = default);
+    public SendResult SendGather(in SendHeader h, ReadOnlySpan<BufferLease> segments, SendOptions o = default);
     public ValueTask<SendResult> SendAsync(in SendHeader h, ReadOnlyMemory<byte> payload, SendOptions o, CancellationToken ct); // waits for admission when a reliable queue is full
+    public ValueTask<ReceiveLease> SendRequestAsync(in SendHeader h, ReadOnlyMemory<byte> payload, TimeSpan timeout, CancellationToken ct);
+    public SendResult Respond(in ReceiveHeader request, ReadOnlySpan<byte> payload);
+    public void RetireKey(ushort channel, ulong key);
 
-    public ValueTask<BulkTransfer> BeginBulkSendAsync(BulkDescriptor d, CancellationToken ct);
-    public void RequestBulk(BulkRequest request);
+    public ValueTask<BulkTransfer> BeginBulkSendAsync(BulkDescriptor d, IBulkSource source, CancellationToken ct);
+    public void RequestBulk(in BulkRequest request);
 
-    public void Flush();                     // make everything buffered eligible for transmission now
-    public ValueTask FlushAsync(CancellationToken ct);   // completes when everything admitted before the call was handed to the transport
-    public int Poll(int maxItems = int.MaxValue);        // dispatch receives + completions on the calling thread
+    public void Flush(uint tick = 0);                // transmit everything buffered; run time-driven work
+    public ValueTask FlushAsync(CancellationToken ct);
+    public int Poll(int maxItems = int.MaxValue);    // dispatch receives + completions on the calling thread
+    public int Drain(ushort channel, Span<ReceivedMessage> into);   // batch alternative to handlers
+    public void Release(ReadOnlySpan<ReceivedMessage> messages);
 
-    public ValueTask WaitBufferReleasedAsync(SendToken t);   public void WaitBufferReleased(SendToken t);
-    public ValueTask<DeliveryStatus> WaitRemoteAcceptedAsync(SendToken t, CancellationToken ct);
-    public void AcknowledgeApplied(in ReceiveHeader h);
-    public bool TryCancel(SendToken t);      // best effort; never releases the payload by itself
+    public ValueTask<DeliveryStatus> WaitAsync(SendToken t, CompletionStage stage, CancellationToken ct);
+    public DeliveryStatus Wait(SendToken t, CompletionStage stage, TimeSpan timeout);   // native hosts only
+    public bool TryCancel(SendToken t);              // best effort; never releases the payload by itself
 
-    public ValueTask CloseAsync(CloseReason reason, CancellationToken ct);
-    public event Action<QuiclyPeer, PeerState>? StateChanged;
+    public void Close(CloseReason reason);           // graceful; completes through Poll with PeerState.Closed
+    public event Action<QuiclyPeer, PeerState, PeerState>? StateChanged;   // raised from Poll
 }
 
 public readonly record struct SendHeader(ushort Channel, ulong Key = 0);
-public readonly struct SendOptions { SendMode Mode /*Buffered|Immediate*/; bool Track; TimeSpan Expiry; }
+public readonly struct SendOptions { public SendMode Mode; /* Buffered | Immediate */ public bool Track; public ulong Context; public long ExpiryMicros; }
 public readonly record struct SendResult(SendStatus Status, SendToken Token);
-public enum SendStatus { Admitted, QueueFull, TooLarge, OutOfBuffers, ChannelClosed, NotConnected, Superseded, InvalidChannel }
+public enum SendStatus { Admitted, QueueFull, TooLarge, OutOfBuffers, ChannelClosed, NotConnected, KeyTableFull, InvalidChannel, NotSupported }
+public enum DeliveryStatus { Pending, Delivered, Superseded, Failed, Canceled, Expired, Lost, Disconnected }
 ```
 
-## 7. Server / client
+### 6.1 Server and client
 
-* `QuiclyServer` owns one listener (raw QUIC + HTTP/3/WebTransport on one port), an `IAdmissionPolicy`
-  (auth token, per-IP limits, capacity), per-peer limits, and an optional HTTP/1.1 endpoint for ACME
-  `http-01` / static files / health. `ICertificateSource` supplies the TLS certificate; `AcmeCertificateSource`
-  obtains and renews it (any ACME v2 directory) using the HTTP endpoint or `tls-alpn-01` or a DNS hook.
-* `QuiclyClient` connects with a transport factory, performs the session handshake, and applies a
-  `ReconnectPolicy` (new epoch, resumable bulk transfers, pending reliable operations fail with `Disconnected`).
+```csharp
+public sealed class QuiclyServer : IAsyncDisposable
+{
+    public QuiclyServer(ServerOptions options, ITransportListenerFactory listener);
+    public ValueTask StartAsync(CancellationToken ct);
+    public int PollAll(int maxItems = int.MaxValue);          // drains every peer with pending work (tracked by a work queue, idle peers cost nothing)
+    public ReadOnlySpan<PeerSlot> Peers { get; }               // dense, generation-tagged
+    public QuiclyPeer? GetPeer(int index);
+    public PeerSet CreateSet();                                 // bitset over peer indices
+    public SharedSendResult SendShared(PeerSet set, in SendHeader h, SharedLease lease, int length, SendOptions o = default); // admitted/rejected masks
+    public event Action<QuiclyPeer>? PeerAdmitted;             // raised from PollAll
+    public event Action<QuiclyPeer, CloseReason>? PeerClosed;  // raised from PollAll
+}
+
+public interface IAdmissionPolicy
+{
+    PreHandshakeDecision PreHandshake(in NewConnectionInfo info);      // remote address, SNI, ALPN — before TLS work
+    AdmissionDecision Admit(in HelloInfo hello, QuiclyPeer peer);      // auth token, session resume, capacity
+}
+
+public sealed class QuiclyClient
+{
+    public ValueTask<QuiclyPeer> ConnectAsync(EndPoint endpoint, ClientOptions options, CancellationToken ct);
+    // ReconnectPolicy: attempts, back-off, browser-suspend awareness; raises PeerState.Reconnecting → Connected with a new epoch
+}
+```
+
+## 7. Transport defaults (MsQuic)
+
+| Setting | Default | Why |
+|---|---|---|
+| `PeerBidiStreamCount` | 1 before admission | the control stream only |
+| `PeerUnidiStreamCount` | 0 before admission; after: channels + Σ MaxGroups + bulk concurrency (≤ 4 096) | per-channel streams and flush groups |
+| `StreamRecvWindowUnidiDefault` | 2 MiB | one Bulk stream per RTT must not be capped at 64 KiB |
+| `ConnFlowControlWindow` | 16 MiB | bulk throughput |
+| `IdleTimeoutMs` | 30 000 | dead-client detection when nothing is in flight |
+| `KeepAliveIntervalMs` | 0 on the server; 10 000 on the client (below common NAT binding timeouts; the 1 s application ping usually makes it moot) | |
+| `DisconnectTimeoutMs` | 6 000 | detection when data is in flight |
+| `HandshakeIdleTimeoutMs` | 5 000 | |
+| `MinimumMtu` / `MaximumMtu` | 1 248 / 1 500 | datagram payload starts near 1 200 B and grows with PMTUD; it can shrink on migration |
+| `MaxAckDelayMs` | 5 | faster loss detection and `BufferReleased` |
+| `PacingEnabled` | true (benchmarked; configurable) | |
+| `MigrationEnabled` | true | Wi-Fi → LTE without reconnect |
+| `DatagramReceiveEnabled` | true | |
+| `SendBufferingEnabled` | false | zero-copy sends |
+| `ServerResumptionLevel` | NO_RESUME | see PROTOCOL §4.2 |
+| `CongestionControlAlgorithm` | CUBIC (BBR option) | |
+| `StreamSchedulingScheme` | ROUND_ROBIN | Bulk must not starve ordered channels |
+| execution profile | LOW_LATENCY (REAL_TIME option) | |
+| datagram flags | Buffered → `DELAY_SEND`; Immediate/high priority → `DGRAM_PRIORITY`; unreliable → `CANCEL_ON_BLOCKED` | packing and stale-data control |
+
+Bulk sends are windowed on the transport's `IdealSendBufferSize` and additionally capped to a fraction of
+the congestion window (`BulkShareOfCongestionWindow`, default 50 %, re-evaluated per completion) — stream
+priority alone cannot protect datagram latency because datagrams and streams share one congestion window.
+Group/bulk streams are started with `FailBlocked | ShutdownOnFail`; a stream-limit failure surfaces as
+`SendStatus.QueueFull` and `PeerNeedsStreams` raises the local limit at runtime. Stream credit is returned
+to the peer only at shutdown-complete, so the receive engine consumes FIN promptly and closes streams
+immediately. `PeerAddressChanged` (migration, NAT rebind) re-runs the per-address admission check and
+treats path MTU and congestion state as reset. Platforms: Windows 11 / Server 2022+ (Schannel build bundled
+with .NET: no ChaCha20, no 0-RTT), Linux with `libmsquic` (OpenSSL build; PKCS12/file credentials), macOS
+only with a user-installed `libmsquic`. The `Microsoft.Native.Quic.MsQuic.OpenSSL` package is an alternative
+on Windows when OpenSSL features are wanted.
+Version gating: the binding reads the library version at open, refuses < 2.4, and exposes API-table entries
+beyond the 2.2 set only when the loaded library has them; preview entries (app-owned receive buffers,
+execution polling) are behind an explicit opt-in.
 
 ## 8. Security defaults
 
-TLS 1.3 is mandatory in QUIC; "encryption as an option" therefore means: certificate validation policy
-(system roots / pinned hash / custom callback / insecure-for-dev), client authentication token, origin
-validation for browser sessions, 0-RTT **disabled** by default, admission and resource limits, decompression
-bombs bounded by `MaxMessageSize` before any buffer is chosen.
+TLS 1.3 is mandatory in QUIC; "encryption as an option" therefore means certificate validation policy:
+`SystemRoots` (default), `PinnedSpki` (SHA-256 of SubjectPublicKeyInfo; requires `AcmeOptions.ReuseKey` on
+the server), `Callback` (portable DER chain, platform validation still performed unless the callback opts
+out), `DangerousAcceptAnyServerCertificate` (throws outside DEBUG unless an environment variable is set,
+logs a warning per connection). Session/auth token rules, admission timeouts, receive-side limits,
+0-RTT policy and error handling are specified in PROTOCOL §4, §6, §7 and ADR 0009.
 
-## 9. Testing & measurement
+## 9. Memory sizing
+
+| Item | Per | Default | Notes |
+|---|---|---|---|
+| slab reserve | process | 16 MiB | shared by all peers, bounded per peer by the budgets below |
+| receive byte budget | peer | 256 KiB | pooled leases + reassembly + stream staging |
+| send byte budget | peer | 256 KiB | blocks in flight; reliable throughput ≤ budget / RTT |
+| send table | peer | 1 024 entries × 64 B | tracked and untracked sends in flight |
+| rings | peer | 4 096 × 32 B receive, (send table + 1) × 16 B completion | |
+| channel state | peer × channel | 2 × 64 B | send + receive halves |
+| key slots | peer × keyed channel | `MaxKeys` × 64 B (+ mailbox) | dense or hashed |
+
+`ServerOptions.ExpectedPeers` scales the defaults; the numbers are published from the benchmark in
+`docs/benchmarks/memory.md`.
+
+## 10. Testing & measurement
 
 * Unit tests target ~100 % line coverage of `Core`, `Http3`, `Acme`, `Http`, `Testing`, `Replication`.
-* `SimulatedTransport` makes every delivery-mode property testable deterministically: lost final update,
-  lost ack, sequence roll-over, disconnect during a borrowed send, cancel mid-receive, movement latency while a
-  bulk transfer saturates the link.
-* End-to-end tests run real MsQuic loopback (raw and WebTransport), the ACME client against an in-process
-  mock CA, and `HttpClient` (HTTP/3) against our HTTP/3 server.
-* Every optimisation follows hypothesis → benchmark (BenchmarkDotNet, `Archive` baseline) → decision, recorded
-  in `docs/benchmarks/`.
+* `SimulatedTransport` shares the peer's `IClock`, so every delivery-mode property is deterministic: lost
+  final update, lost ack, sequence roll-over, key reuse after retirement, disconnect during a borrowed send,
+  cancel mid-receive, coalescing on/off, movement latency while a bulk transfer saturates a capped link.
+* End-to-end tests run real MsQuic loopback (raw and, when enabled, WebTransport), the ACME client against
+  an in-process mock CA, and `HttpClient` (HTTP/3) against our HTTP/3 server.
+* Every optimisation follows hypothesis → benchmark (BenchmarkDotNet, `Archive` baseline, both runtimes) →
+  decision, recorded in `docs/benchmarks/`. E2E benchmarks also report GC pause totals and DatagramSend calls
+  per tick.

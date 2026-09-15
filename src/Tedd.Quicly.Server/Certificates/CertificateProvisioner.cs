@@ -28,7 +28,8 @@ namespace Tedd.Quicly.Server.Certificates;
 /// <para><b>Failures.</b> <see cref="StartAsync"/> throws for configuration and environment errors that retrying cannot
 /// fix: an endpoint that cannot be bound, a missing or unreadable PFX file, invalid options. A CA that cannot issue a
 /// certificate does not make it throw: the status becomes <see cref="CertificateState.Failed"/> with the reason and the
-/// provisioner keeps trying in the background; <see cref="WaitForCertificateAsync"/> completes once a certificate exists.</para>
+/// provisioner orders again after <see cref="RenewalSchedulerOptions.RetryDelay"/> until it succeeds;
+/// <see cref="WaitForCertificateAsync"/> completes once a certificate exists.</para>
 /// <para><b>Ownership.</b> Certificates the provisioner loads or obtains are disposed by <see cref="DisposeAsync"/>; a
 /// superseded one is disposed earlier when bound through a <see cref="CertificateBinder"/> (after its grace period). A
 /// <see cref="ServerCertificateSourceKind.Static"/> certificate stays the application's. Stop the consumers before
@@ -76,8 +77,11 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     private RenewalScheduler? _scheduler;
     private HttpClient? _ownedHttp;
     private byte[]? _currentPfx;
-    private CancellationTokenSource? _schedulerRun;
-    private RenewalRequest? _renewal;
+
+    // Renewal loop coordination, guarded by _lock.
+    private RenewalRequest? _pendingRenewal;
+    private RenewalRequest? _activeRenewal;
+    private CancellationTokenSource? _interrupt;
 
     /// <summary>Creates a provisioner; nothing is bound or loaded until <see cref="StartAsync"/>.</summary>
     /// <exception cref="ArgumentException">The ACME options are incomplete or inconsistent (they are validated again here because they are mutable).</exception>
@@ -146,6 +150,24 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     /// <summary>Loads the served certificate from PKCS#12 bytes (test seam for load failures).</summary>
     internal Func<byte[], string?, X509KeyStorageFlags, X509Certificate2> CertificateLoader { get; set; } = LoadServedCertificate;
 
+    /// <summary>Number of certificates held for disposal; superseded ones a binder has disposed are dropped (tests).</summary>
+    internal int OwnedCertificateCount
+    {
+        get
+        {
+            lock (_publishLock)
+            {
+                return _owned.Count;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Key storage for the throw-away copy the renewal scheduler is seeded with: it only reads the public certificate, so
+    /// the key stays in memory where the platform supports that (macOS does not).
+    /// </summary>
+    private static X509KeyStorageFlags SeedKeyStorageFlags => OperatingSystem.IsMacOS() ? X509KeyStorageFlags.DefaultKeySet : X509KeyStorageFlags.EphemeralKeySet;
+
     /// <summary>
     /// Starts the source: loads the static or file certificate, or for ACME starts the challenge endpoints, serves or
     /// obtains the first certificate and starts the renewal loop. Returns once the first attempt has finished; check
@@ -186,10 +208,10 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
                     break;
             }
 
-            linked.Token.ThrowIfCancellationRequested();
-            if (Interlocked.CompareExchange(ref _state, StateRunning, StateStarting) != StateStarting)
+            // Cancelled, or stopped through StopAsync, while starting: nothing started may keep running.
+            if (linked.Token.IsCancellationRequested || Interlocked.CompareExchange(ref _state, StateRunning, StateStarting) != StateStarting)
             {
-                throw new OperationCanceledException("The certificate provisioner was stopped during start-up.");
+                throw new OperationCanceledException("The certificate provisioner was cancelled or stopped during start-up.", cancellationToken);
             }
 
             if (_options.Kind == ServerCertificateSourceKind.Acme)
@@ -215,6 +237,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
 
     /// <summary>Completes with <see cref="Current"/> once a certificate is available (at once when one already is).</summary>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> fired, or the provisioner stopped before any certificate was available.</exception>
+    /// <exception cref="ObjectDisposedException">The provisioner was disposed.</exception>
     public async Task<X509Certificate2> WaitForCertificateAsync(CancellationToken cancellationToken = default)
     {
         await _firstCertificate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -222,45 +245,43 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     }
 
     /// <summary>
-    /// Orders a replacement certificate now, whatever the renewal schedule says (names changed, key compromise, manual
-    /// rotation), and completes when it is being served. The renewal schedule then continues from the new certificate.
+    /// Orders a replacement certificate now, whatever the renewal schedule says (key compromise, manual rotation, a
+    /// certificate revoked by the CA), and completes when it is being served. A wait for the next retry, or for a
+    /// scheduled renewal, is cut short; calls made while an on-demand order is queued or running share its outcome. The
+    /// renewal schedule then continues from the new certificate.
     /// </summary>
-    /// <exception cref="InvalidOperationException">The source is not ACME, or the provisioner is not running.</exception>
-    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> fired (the order still completes in the background) or the provisioner stopped.</exception>
-    /// <exception cref="Exception">The order failed (the exception from <see cref="AcmeCertificateManager"/>); the status is <see cref="CertificateState.Failed"/>.</exception>
+    /// <returns>
+    /// A task that completes when the new certificate is current. It faults with <see cref="InvalidOperationException"/>
+    /// when the source is not ACME or the provisioner is not running, with the order's exception (usually an
+    /// <see cref="AcmeException"/>; the status is then <see cref="CertificateState.Failed"/>) when the order fails, and is
+    /// cancelled when <paramref name="cancellationToken"/> fires (the order still completes in the background) or the
+    /// provisioner stops first.
+    /// </returns>
     public Task RenewNowAsync(CancellationToken cancellationToken = default)
     {
         if (_options.Kind != ServerCertificateSourceKind.Acme)
         {
-            throw new InvalidOperationException("Only ACME certificates can be renewed on demand.");
+            return Task.FromException(new InvalidOperationException("Only ACME certificates can be renewed on demand."));
         }
 
-        if (Volatile.Read(ref _state) != StateRunning)
-        {
-            throw new InvalidOperationException("The certificate provisioner is not running.");
-        }
-
-        TaskCompletionSource completion;
-        CancellationTokenSource? run;
+        TaskCompletionSource completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenSource? interrupt;
         lock (_lock)
         {
-            if (_renewal?.Completion is null)
+            // Checked under the lock: the loop cancels the queued requests under this lock when it exits.
+            if (Volatile.Read(ref _state) != StateRunning)
             {
-                _renewal = new RenewalRequest(TimeSpan.Zero, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously), "Renewal requested.");
+                return Task.FromException(new InvalidOperationException("The certificate provisioner is not running."));
             }
 
-            completion = _renewal.Completion!;
-            run = _schedulerRun;
+            RenewalRequest request = _pendingRenewal ?? _activeRenewal ?? (_pendingRenewal = new RenewalRequest("Renewal requested.", DateTimeOffset.MinValue, retryUntilSuccess: false));
+            request.NotBefore = DateTimeOffset.MinValue; // a retry waiting for its delay starts at once
+            request.Requested = true;
+            request.Waiters.Add(completion);
+            interrupt = _interrupt;
         }
 
-        CancelQuietly(run);
-
-        // The loop cancels pending requests when it exits; one queued after that must not wait forever.
-        if (Volatile.Read(ref _state) != StateRunning)
-        {
-            completion.TrySetCanceled(CancellationToken.None);
-        }
-
+        CancelQuietly(interrupt);
         return completion.Task.WaitAsync(cancellationToken);
     }
 
@@ -309,8 +330,10 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         {
             int previous = Interlocked.Exchange(ref _state, StateStopped);
             _stopCts.Cancel();
-            if (previous == StateStarting)
+            if (previous is StateStarting or StateRunning)
             {
+                // StartAsync may still be between becoming Running and starting the loop: let it finish, so that the loop
+                // (and everything else it started) is seen and released below.
                 await _startCompleted.Task.ConfigureAwait(false);
             }
 
@@ -503,9 +526,11 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
         catch (Exception e) when (!(e is OperationCanceledException && cancellationToken.IsCancellationRequested))
         {
-            // Not fatal for start-up: the background loop keeps trying, and a persisted certificate (if any) is served meanwhile.
-            string serving = persisted ? " The persisted certificate is served until a renewal succeeds." : " Retrying after " + o.Renewal.RetryDelay + ".";
-            SetStatus(CertificateStatus.Failed("Ordering a certificate from " + o.DirectoryUrl + " failed: " + e.Message + serving, e));
+            // Not fatal for start-up: the background loop orders again after the retry delay until an order succeeds, and
+            // a persisted certificate (if any) is served meanwhile.
+            string serving = persisted ? " The persisted certificate is served meanwhile; ordering again after " : " Ordering again after ";
+            SetStatus(CertificateStatus.Failed("Ordering a certificate from " + o.DirectoryUrl + " failed: " + e.Message + serving + o.Renewal.RetryDelay + ".", e));
+            QueueRetry(persisted ? "Renewing the persisted certificate, which is due, after the start-up order failed." : "Ordering again after the start-up order failed.");
         }
     }
 
@@ -598,6 +623,11 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     }
 
     // ---- ACME background loop ---------------------------------------------------------------------------------------
+    //
+    // One loop task does all background work, one step at a time: it runs a queued order (RenewNowAsync, or an internal
+    // retry after a failure), waits for a queued retry to become due, or runs the RenewalScheduler until something is
+    // queued. Waits and scheduler runs register an interrupt that RenewNowAsync cancels, so a request never waits for
+    // a timer. Every exception is caught and reported; the loop only ends when the provisioner stops.
 
     private void StartLoop()
     {
@@ -617,9 +647,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     private async Task RunLoopAsync(CancellationToken stop)
     {
         RenewalSchedulerOptions renewal = _options.AcmeOptions!.Renewal;
-
-        // Without any certificate the start-up order has just failed: wait before ordering again.
-        TimeSpan delay = Current is null ? renewal.RetryDelay : TimeSpan.Zero;
+        TimeSpan delay = TimeSpan.Zero;
         try
         {
             while (!stop.IsCancellationRequested)
@@ -628,13 +656,20 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
                 {
                     if (delay > TimeSpan.Zero)
                     {
-                        await DelayAsync(delay, stop).ConfigureAwait(false);
+                        TimeSpan wait = delay;
                         delay = TimeSpan.Zero;
+                        await WaitAsync(wait, stop).ConfigureAwait(false);
+                        continue;
                     }
 
-                    if (TakeRenewalRequest() is { } request)
+                    RenewalRequest? request = TakeDueRenewal(out TimeSpan untilDue);
+                    if (request is not null)
                     {
-                        await RenewNowCoreAsync(request, stop).ConfigureAwait(false);
+                        await RenewOnRequestAsync(request, stop).ConfigureAwait(false);
+                    }
+                    else if (untilDue > TimeSpan.Zero)
+                    {
+                        await WaitAsync(untilDue, stop).ConfigureAwait(false);
                     }
                     else
                     {
@@ -647,8 +682,9 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
                 }
                 catch (Exception e)
                 {
-                    // RenewalScheduler reports order failures through its callback and throws only when cancelled, so this is
-                    // unexpected; keep renewing rather than let the loop die.
+                    // Order failures are reported by the scheduler and by RenewOnRequestAsync, so this is unexpected (the
+                    // scheduler's copy of the certificate could not be loaded, say); keep renewing rather than let the
+                    // loop die.
                     SetStatus(CertificateStatus.Failed("The renewal loop failed unexpectedly and restarts after " + renewal.RetryDelay + ": " + e.Message, e));
                     delay = renewal.RetryDelay;
                 }
@@ -656,44 +692,35 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
         finally
         {
-            TakeRenewalRequest()?.Completion?.TrySetCanceled(CancellationToken.None);
+            CancelQueuedRenewals();
         }
     }
 
+    /// <summary>Runs the renewal scheduler from the current certificate until it is interrupted by a queued order, or stopped.</summary>
     private async Task RunSchedulerAsync(CancellationToken stop)
     {
         AcmeProvisioningOptions o = _options.AcmeOptions!;
         using CancellationTokenSource run = CancellationTokenSource.CreateLinkedTokenSource(stop);
-        lock (_lock)
+
+        // Not registered when an order was queued since the loop looked: the loop runs that first.
+        if (TrySetInterrupt(run, refuseWhenAnyQueued: true))
         {
-            if (_renewal is not null)
+            IssuedCertificate? seed = null;
+            try
             {
-                return; // requested since the loop looked: handle it first
+                byte[]? pfx = Volatile.Read(ref _currentPfx);
+                seed = pfx is null ? null : IssuedCertificate.Load(pfx, o.CertificatePassword, SeedKeyStorageFlags);
+                await _scheduler!.RunAsync(seed, OnRenewedAsync, OnRenewalFailed, run.Token).ConfigureAwait(false);
             }
-
-            _schedulerRun = run;
-        }
-
-        byte[]? pfx = Volatile.Read(ref _currentPfx);
-        IssuedCertificate? seed = null;
-        try
-        {
-            // The scheduler only reads the public certificate; the key is loaded because IssuedCertificate requires one.
-            seed = pfx is null ? null : IssuedCertificate.Load(pfx, o.CertificatePassword, X509KeyStorageFlags.DefaultKeySet);
-            await _scheduler!.RunAsync(seed, OnRenewedAsync, OnRenewalFailed, run.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (run.IsCancellationRequested && !stop.IsCancellationRequested)
-        {
-            // Interrupted by a renewal request; the loop handles it.
-        }
-        finally
-        {
-            lock (_lock)
+            catch (OperationCanceledException) when (run.IsCancellationRequested && !stop.IsCancellationRequested)
             {
-                _schedulerRun = null;
+                // Interrupted by a queued order; the loop runs it.
             }
-
-            seed?.Dispose();
+            finally
+            {
+                ClearInterrupt(run);
+                seed?.Dispose();
+            }
         }
     }
 
@@ -708,9 +735,8 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         {
             // The scheduler now tracks a certificate that is not being served: interrupt it and order again after the
             // retry delay, so the served certificate cannot silently run out.
-            TimeSpan retry = _options.AcmeOptions!.Renewal.RetryDelay;
-            SetStatus(CertificateStatus.Failed("A renewed certificate could not be loaded (" + e.Message + "); ordering again after " + retry + ".", e));
-            QueueRenewal(new RenewalRequest(retry, null, "Ordering again after a renewed certificate could not be loaded."));
+            SetStatus(CertificateStatus.Failed("A renewed certificate could not be loaded (" + e.Message + "); ordering again after " + _options.AcmeOptions!.Renewal.RetryDelay + ".", e));
+            QueueRetry("Ordering again after a renewed certificate could not be loaded.");
             return Task.CompletedTask;
         }
 
@@ -723,58 +749,189 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         SetStatus(CertificateStatus.Failed("Renewal failed; retrying after " + _options.AcmeOptions!.Renewal.RetryDelay + ": " + exception.Message, exception));
     }
 
-    private async Task RenewNowCoreAsync(RenewalRequest request, CancellationToken stop)
+    /// <summary>Runs a queued order and completes its waiters; a failed internal retry is queued again after the retry delay.</summary>
+    private async Task RenewOnRequestAsync(RenewalRequest request, CancellationToken stop)
     {
+        AcmeProvisioningOptions o = _options.AcmeOptions!;
+        bool hadCertificate = Current is not null;
         try
         {
-            if (request.Delay > TimeSpan.Zero)
-            {
-                await DelayAsync(request.Delay, stop).ConfigureAwait(false);
-            }
-
             SetStatus(new CertificateStatus(CertificateState.Renewing, request.Reason));
             IssuedCertificate issued = await _manager!.OrderCertificateAsync(stop).ConfigureAwait(false);
             X509Certificate2 served = ApplyIssued(issued);
-            SetStatus(new CertificateStatus(CertificateState.Valid, "Renewed on request: " + CertificateIdentity.Describe(served) + "."));
-            request.Completion?.TrySetResult();
+            string message = !hadCertificate ? "Obtained " + CertificateIdentity.Describe(served) + " from " + o.DirectoryUrl + "."
+                : (request.Requested ? "Renewed on request: " : "Renewed: ") + CertificateIdentity.Describe(served) + ".";
+            SetStatus(new CertificateStatus(CertificateState.Valid, message));
+            Complete(request, error: null, cancelled: false);
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested)
         {
-            request.Completion?.TrySetCanceled(stop);
+            Complete(request, error: null, cancelled: true);
             throw;
         }
         catch (Exception e)
         {
-            SetStatus(CertificateStatus.Failed("Renewal failed: " + e.Message, e));
-            request.Completion?.TrySetException(e);
+            bool retry = request.RetryUntilSuccess;
+            SetStatus(CertificateStatus.Failed("Renewal failed" + (retry ? "; retrying after " + o.Renewal.RetryDelay : string.Empty) + ": " + e.Message, e));
+            Complete(request, e, cancelled: false);
+            if (retry)
+            {
+                QueueRetry(request.Reason);
+            }
         }
     }
 
-    private void QueueRenewal(RenewalRequest request)
+    /// <summary>Queues an internal order that starts after the retry delay (and is retried until it succeeds), and interrupts the scheduler.</summary>
+    private void QueueRetry(string reason)
     {
-        CancellationTokenSource? run;
+        RenewalSchedulerOptions renewal = _options.AcmeOptions!.Renewal;
+        DateTimeOffset notBefore = renewal.TimeProvider.GetUtcNow() + renewal.RetryDelay;
+        CancellationTokenSource? interrupt;
         lock (_lock)
         {
-            _renewal ??= request;
-            run = _schedulerRun;
+            // A request queued already keeps its own (earlier) start, and is retried until it succeeds as well.
+            RenewalRequest queued = _pendingRenewal ??= new RenewalRequest(reason, notBefore, retryUntilSuccess: true);
+            queued.RetryUntilSuccess = true;
+            interrupt = _interrupt;
         }
 
-        CancelQuietly(run);
+        CancelQuietly(interrupt);
     }
 
-    private RenewalRequest? TakeRenewalRequest()
+    /// <summary>Takes the queued order when it is due; otherwise <paramref name="untilDue"/> is the time left (zero when nothing is queued).</summary>
+    private RenewalRequest? TakeDueRenewal(out TimeSpan untilDue)
     {
+        DateTimeOffset now = _options.AcmeOptions!.Renewal.TimeProvider.GetUtcNow();
         lock (_lock)
         {
-            RenewalRequest? request = _renewal;
-            _renewal = null;
+            untilDue = TimeSpan.Zero;
+            RenewalRequest? request = _pendingRenewal;
+            if (request is null)
+            {
+                return null;
+            }
+
+            if (request.NotBefore > now)
+            {
+                untilDue = request.NotBefore - now;
+                return null;
+            }
+
+            _pendingRenewal = null;
+            _activeRenewal = request;
             return request;
+        }
+    }
+
+    private void Complete(RenewalRequest request, Exception? error, bool cancelled)
+    {
+        TaskCompletionSource[] waiters;
+        lock (_lock)
+        {
+            if (ReferenceEquals(_activeRenewal, request))
+            {
+                _activeRenewal = null;
+            }
+
+            waiters = [.. request.Waiters];
+            request.Waiters.Clear();
+        }
+
+        foreach (TaskCompletionSource waiter in waiters)
+        {
+            if (cancelled)
+            {
+                waiter.TrySetCanceled(CancellationToken.None);
+            }
+            else if (error is not null)
+            {
+                waiter.TrySetException(error);
+            }
+            else
+            {
+                waiter.TrySetResult();
+            }
+        }
+    }
+
+    /// <summary>The loop is ending: callers of <see cref="RenewNowAsync"/> still waiting get a cancelled task.</summary>
+    private void CancelQueuedRenewals()
+    {
+        RenewalRequest? queued;
+        lock (_lock)
+        {
+            queued = _pendingRenewal;
+            _pendingRenewal = null;
+            _activeRenewal = null;
+        }
+
+        if (queued is not null)
+        {
+            Complete(queued, error: null, cancelled: true);
+        }
+    }
+
+    /// <summary>Waits <paramref name="delay"/> on the renewal clock; returns early when an order is queued that is due.</summary>
+    private async Task WaitAsync(TimeSpan delay, CancellationToken stop)
+    {
+        using CancellationTokenSource interrupt = CancellationTokenSource.CreateLinkedTokenSource(stop);
+
+        // Not registered when an order became due since the loop looked: then there is nothing to wait for.
+        if (TrySetInterrupt(interrupt, refuseWhenAnyQueued: false))
+        {
+            try
+            {
+                await DelayAsync(delay, interrupt.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!stop.IsCancellationRequested)
+            {
+                // Interrupted by RenewNowAsync; the loop runs the order.
+            }
+            finally
+            {
+                ClearInterrupt(interrupt);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Registers the loop's current wait or scheduler run so that <see cref="RenewNowAsync"/> can cut it short. Returns
+    /// false, registering nothing, when a queued order is due (or, with <paramref name="refuseWhenAnyQueued"/>, when any
+    /// order is queued), so a request made just before the registration is not missed.
+    /// </summary>
+    private bool TrySetInterrupt(CancellationTokenSource interrupt, bool refuseWhenAnyQueued)
+    {
+        DateTimeOffset now = _options.AcmeOptions!.Renewal.TimeProvider.GetUtcNow();
+        lock (_lock)
+        {
+            if (_pendingRenewal is { } queued && (refuseWhenAnyQueued || queued.NotBefore <= now))
+            {
+                return false;
+            }
+
+            _interrupt = interrupt;
+            return true;
+        }
+    }
+
+    private void ClearInterrupt(CancellationTokenSource interrupt)
+    {
+        lock (_lock)
+        {
+            if (ReferenceEquals(_interrupt, interrupt))
+            {
+                _interrupt = null;
+            }
         }
     }
 
     private Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
     {
-        return Task.Delay(delay > MaxDelay ? MaxDelay : delay, _options.AcmeOptions!.Renewal.TimeProvider, cancellationToken);
+        // Rounded up to a whole millisecond (timers truncate: a wait that ends a fraction of a millisecond early would
+        // make the loop spin until the due time) and clamped to the longest wait a timer accepts.
+        long milliseconds = (delay.Ticks + TimeSpan.TicksPerMillisecond - 1) / TimeSpan.TicksPerMillisecond;
+        TimeSpan rounded = TimeSpan.FromMilliseconds(Math.Clamp(milliseconds, 0, (long)MaxDelay.TotalMilliseconds));
+        return Task.Delay(rounded, _options.AcmeOptions!.Renewal.TimeProvider, cancellationToken);
     }
 
     private static void CancelQuietly(CancellationTokenSource? source)
@@ -785,7 +942,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
         catch (ObjectDisposedException)
         {
-            // The scheduler run ended between reading and cancelling it; the request is picked up by the loop anyway.
+            // The wait or run ended between reading and cancelling it; the loop looks at the queue next anyway.
         }
     }
 
@@ -871,6 +1028,8 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
 
             if (owned)
             {
+                // Superseded certificates a CertificateBinder has disposed after their grace period need no tracking.
+                _owned.RemoveAll(static c => c.Handle == IntPtr.Zero);
                 _owned.Add(certificate);
             }
 
@@ -938,5 +1097,22 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
     }
 
-    private sealed record RenewalRequest(TimeSpan Delay, TaskCompletionSource? Completion, string Reason);
+    /// <summary>An order the loop runs outside the renewal schedule: requested through <see cref="RenewNowAsync"/>, or an internal retry.</summary>
+    private sealed class RenewalRequest(string reason, DateTimeOffset notBefore, bool retryUntilSuccess)
+    {
+        /// <summary>Why the order runs (the <see cref="CertificateState.Renewing"/> status reason).</summary>
+        public string Reason { get; } = reason;
+
+        /// <summary>Earliest start on the renewal clock; <see cref="DateTimeOffset.MinValue"/> for at once.</summary>
+        public DateTimeOffset NotBefore { get; set; } = notBefore;
+
+        /// <summary>When the order fails, queue another attempt after the retry delay (internal retries).</summary>
+        public bool RetryUntilSuccess { get; set; } = retryUntilSuccess;
+
+        /// <summary>Whether a caller of <see cref="RenewNowAsync"/> asked for it.</summary>
+        public bool Requested { get; set; }
+
+        /// <summary>Callers of <see cref="RenewNowAsync"/> waiting for the outcome.</summary>
+        public List<TaskCompletionSource> Waiters { get; } = [];
+    }
 }

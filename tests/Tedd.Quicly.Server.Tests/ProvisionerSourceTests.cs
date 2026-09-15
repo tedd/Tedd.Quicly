@@ -43,7 +43,7 @@ public sealed class ProvisionerSourceTests : IDisposable
         Assert.Same(certificate, await provisioner.WaitForCertificateAsync());
         Assert.Null(provisioner.HttpChallengeEndPoint);
         Assert.Null(provisioner.TlsEndPoint);
-        Assert.Throws<InvalidOperationException>(() => provisioner.RenewNowAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => provisioner.RenewNowAsync());
 
         await provisioner.DisposeAsync();
         Assert.False(Certs.IsDisposed(certificate));
@@ -175,5 +175,18 @@ public sealed class ProvisionerSourceTests : IDisposable
         Assert.Equal(CertificateState.Failed, provisioner.Status.State);
         Assert.StartsWith("Start-up failed", provisioner.Status.Reason, StringComparison.Ordinal);
         Assert.IsType<FileNotFoundException>(provisioner.Status.Error);
+    }
+
+    [Fact]
+    public async Task StartAsync_WithACancelledToken_Throws_AndStops()
+    {
+        using X509Certificate2 certificate = Certs.Create();
+        await using CertificateProvisioner provisioner = new(ServerCertificateOptions.Static(certificate));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => provisioner.StartAsync(new CancellationToken(canceled: true)));
+
+        Assert.Equal(CertificateState.Stopped, provisioner.Status.State);
+        InvalidOperationException again = await Assert.ThrowsAsync<InvalidOperationException>(() => provisioner.StartAsync());
+        Assert.Contains("has been stopped", again.Message, StringComparison.Ordinal);
     }
 }

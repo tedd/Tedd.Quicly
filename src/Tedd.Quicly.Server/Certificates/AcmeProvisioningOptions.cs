@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Tedd.Quicly.Acme;
 using Tedd.Quicly.Acme.Challenges;
@@ -45,6 +46,10 @@ public sealed class AcmeProvisioningOptions
 {
     /// <summary>Default path of the health endpoint.</summary>
     public const string DefaultHealthPath = "/healthz";
+
+    private const int MinRsaKeySizeBits = 2048;
+    private const int MaxRsaKeySizeBits = 8192;
+    private static readonly TimeSpan MaxTimeout = TimeSpan.FromDays(30);
 
     /// <summary>
     /// The CA's directory URL. Default: Let's Encrypt production (<see cref="AcmeDirectories.LetsEncrypt"/>). Use
@@ -354,6 +359,50 @@ public sealed class AcmeProvisioningOptions
                 throw Invalid("Contacts contains an empty entry.");
             }
         }
+
+        if (!Enum.IsDefined(KeyAlgorithm))
+        {
+            throw Invalid("KeyAlgorithm " + ((int)KeyAlgorithm).ToString(CultureInfo.InvariantCulture) + " is not supported.");
+        }
+
+        if (KeyAlgorithm == AcmeKeyAlgorithm.RS256 && RsaKeySizeBits is < MinRsaKeySizeBits or > MaxRsaKeySizeBits)
+        {
+            throw Invalid("RsaKeySizeBits must be between 2048 and 8192.");
+        }
+
+        if (ExternalAccountKeyId is not null)
+        {
+            ValidateExternalAccountBinding(ExternalAccountKeyId, ExternalAccountHmacKey!);
+        }
+
+        if (ChallengeCleanupTimeout <= TimeSpan.Zero || ChallengeCleanupTimeout > MaxTimeout)
+        {
+            throw Invalid("ChallengeCleanupTimeout must be positive and at most 30 days.");
+        }
+
+        try
+        {
+            Retry.Validate();
+        }
+        catch (ArgumentException e)
+        {
+            throw Invalid("Retry is out of range: " + e.Message);
+        }
+
+        ValidateRenewal(Renewal);
+
+        foreach (IHttpHandler? handler in TlsEndpointHandlers)
+        {
+            if (handler is null)
+            {
+                throw Invalid("TlsEndpointHandlers contains null.");
+            }
+        }
+
+        if (kinds.Contains(AcmeChallengeKind.Http01) && kinds.Contains(AcmeChallengeKind.TlsAlpn01) && SharePort(HttpChallengeEndpoint, TlsAlpnEndpoint))
+        {
+            throw Invalid("HttpChallengeEndpoint and TlsAlpnEndpoint both use TCP port " + HttpChallengeEndpoint.Port.ToString(CultureInfo.InvariantCulture) + "; the HTTP and TLS challenge servers need separate ports.");
+        }
     }
 
     private static void ValidateDnsName(string name, bool dns01)
@@ -372,6 +421,62 @@ public sealed class AcmeProvisioningOptions
         {
             throw Invalid("The wildcard name '" + name + "' can only be validated with Dns01, which is not in ChallengeTypes.");
         }
+    }
+
+    /// <summary>Checks the EAB credentials without ever quoting the HMAC key (a secret) in the message.</summary>
+    private static void ValidateExternalAccountBinding(string keyId, string hmacKey)
+    {
+        if (string.IsNullOrWhiteSpace(keyId))
+        {
+            throw Invalid("ExternalAccountKeyId must not be empty.");
+        }
+
+        byte[] key;
+        try
+        {
+            key = new ExternalAccountBinding(keyId, hmacKey).DecodeHmacKey();
+        }
+        catch (Exception e) when (e is FormatException or ArgumentException)
+        {
+            throw Invalid("ExternalAccountHmacKey is not valid base64url; copy it exactly as the CA shows it.");
+        }
+
+        bool empty = key.Length == 0;
+        CryptographicOperations.ZeroMemory(key);
+        if (empty)
+        {
+            throw Invalid("ExternalAccountHmacKey is empty.");
+        }
+    }
+
+    /// <summary>The ranges <see cref="RenewalScheduler"/> enforces, checked before anything is bound; a zero retry delay is refused too.</summary>
+    private static void ValidateRenewal(RenewalSchedulerOptions renewal)
+    {
+        if (renewal.RenewBefore < TimeSpan.Zero
+            || renewal.MinimumRenewalInterval < TimeSpan.Zero
+            || renewal.StartupDelay < TimeSpan.Zero
+            || renewal.ImmediateRenewalThreshold < TimeSpan.Zero)
+        {
+            throw Invalid("Renewal.RenewBefore, MinimumRenewalInterval, StartupDelay and ImmediateRenewalThreshold must not be negative.");
+        }
+
+        if (renewal.CheckInterval <= TimeSpan.Zero || renewal.RetryDelay <= TimeSpan.Zero || renewal.RenewalInfoRefreshInterval <= TimeSpan.Zero)
+        {
+            throw Invalid("Renewal.CheckInterval, RetryDelay and RenewalInfoRefreshInterval must be positive (a zero RetryDelay would order again back to back after every failure).");
+        }
+
+        if (renewal.TimeProvider is null || renewal.Random is null)
+        {
+            throw Invalid("Renewal.TimeProvider and Renewal.Random must not be null.");
+        }
+    }
+
+    /// <summary>True when two listen endpoints would claim the same TCP port (same address, or either is a wildcard address).</summary>
+    private static bool SharePort(IPEndPoint a, IPEndPoint b)
+    {
+        return a.Port != 0 && a.Port == b.Port && (a.Address.Equals(b.Address) || IsWildcard(a.Address) || IsWildcard(b.Address));
+
+        static bool IsWildcard(IPAddress address) => address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any);
     }
 
     private static ArgumentException Invalid(string message) => new("Invalid ACME provisioning options: " + message, "options");

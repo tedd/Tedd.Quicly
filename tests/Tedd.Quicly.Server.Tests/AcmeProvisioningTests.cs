@@ -433,7 +433,7 @@ public sealed class AcmeProvisioningTests : IAsyncDisposable
         X509Certificate2 first = provisioner.Current!;
 
         await Wait.ForAsync(() => recorder.HasStatus(CertificateState.Failed, "could not be loaded"), LongWait, "the load failure to be reported");
-        await Wait.ForAsync(() => recorder.HasStatus(CertificateState.Valid, "Renewed on request"), LongWait, "the certificate to be ordered again");
+        await Wait.ForAsync(() => recorder.HasStatus(CertificateState.Valid, "Renewed: "), LongWait, "the certificate to be ordered again");
         Assert.NotSame(first, provisioner.Current);
         Assert.True(_env.Ca.IssuedCount >= 3);
     }
@@ -459,7 +459,7 @@ public sealed class AcmeProvisioningTests : IAsyncDisposable
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => provisioner.WaitForCertificateAsync());
         InvalidOperationException restart = await Assert.ThrowsAsync<InvalidOperationException>(() => provisioner.StartAsync());
         Assert.Contains("stopped", restart.Message, StringComparison.Ordinal);
-        Assert.Throws<InvalidOperationException>(() => provisioner.RenewNowAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(() => provisioner.RenewNowAsync());
     }
 
     [Fact]

@@ -9,28 +9,35 @@ public sealed class FastTimeProvider : TimeProvider
     private readonly object _lock = new();
     private DateTimeOffset _now;
 
+    /// <summary>Creates a clock that starts at <paramref name="start"/> (default 2026-09-15 12:00 UTC).</summary>
     public FastTimeProvider(DateTimeOffset? start = null)
     {
         _now = start ?? new DateTimeOffset(2026, 9, 15, 12, 0, 0, TimeSpan.Zero);
     }
 
+    /// <summary>Every timer due time requested, in order.</summary>
     public List<TimeSpan> Delays { get; } = [];
 
+    /// <summary>The simulated current time.</summary>
     public DateTimeOffset Now
     {
         get { lock (_lock) { return _now; } }
         set { lock (_lock) { _now = value; } }
     }
 
+    /// <inheritdoc/>
     public override DateTimeOffset GetUtcNow() => Now;
 
     // The timestamp must follow the simulated clock too: .NET 11's Task.Delay measures elapsed time with
     // GetTimestamp and re-arms the timer when the real stopwatch says the delay has not elapsed yet, which with
     // synchronously-firing timers would spin forever.
+    /// <inheritdoc/>
     public override long GetTimestamp() => Now.UtcTicks;
 
+    /// <inheritdoc/>
     public override long TimestampFrequency => TimeSpan.TicksPerSecond;
 
+    /// <summary>Records the due time, advances the clock by it and runs the callback at once. The returned timer never fires again.</summary>
     public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
     {
         lock (_lock)

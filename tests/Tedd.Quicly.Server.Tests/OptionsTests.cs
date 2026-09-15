@@ -52,6 +52,49 @@ public sealed class OptionsTests
         ["propagation-delay"] = o => o.ChallengePropagationDelay = TimeSpan.FromSeconds(-1),
         ["renewal-null"] = o => o.Renewal = null!,
         ["empty-contact"] = o => o.Contacts.Add(" "),
+        ["key-algorithm-unknown"] = o => o.KeyAlgorithm = (AcmeKeyAlgorithm)42,
+        ["rsa-key-too-small"] = o =>
+        {
+            o.KeyAlgorithm = AcmeKeyAlgorithm.RS256;
+            o.RsaKeySizeBits = 1024;
+        },
+        ["eab-blank-key-id"] = o =>
+        {
+            o.ExternalAccountKeyId = " ";
+            o.ExternalAccountHmacKey = "c2VjcmV0LWtleQ";
+        },
+        ["eab-hmac-not-base64url"] = o =>
+        {
+            o.ExternalAccountKeyId = "kid";
+            o.ExternalAccountHmacKey = "not base64url!";
+        },
+        ["eab-hmac-blank"] = o =>
+        {
+            o.ExternalAccountKeyId = "kid";
+            o.ExternalAccountHmacKey = string.Empty;
+        },
+        ["eab-hmac-padding-only"] = o =>
+        {
+            o.ExternalAccountKeyId = "kid";
+            o.ExternalAccountHmacKey = "==";
+        },
+        ["cleanup-timeout-zero"] = o => o.ChallengeCleanupTimeout = TimeSpan.Zero,
+        ["cleanup-timeout-too-long"] = o => o.ChallengeCleanupTimeout = TimeSpan.FromDays(31),
+        ["retry-out-of-range"] = o => o.Retry = new AcmeRetryOptions { MaxAttempts = 0 },
+        ["renewal-negative-lead"] = o => o.Renewal = new RenewalSchedulerOptions { RenewBefore = TimeSpan.FromDays(-1) },
+        ["renewal-zero-retry-delay"] = o => o.Renewal = new RenewalSchedulerOptions { RetryDelay = TimeSpan.Zero },
+        ["renewal-null-clock"] = o => o.Renewal = new RenewalSchedulerOptions { TimeProvider = null! },
+        ["tls-handler-null"] = o => o.TlsEndpointHandlers.Add(null!),
+        ["same-endpoint"] = o =>
+        {
+            o.HttpChallengeEndpoint = new IPEndPoint(IPAddress.Loopback, 8080);
+            o.TlsAlpnEndpoint = new IPEndPoint(IPAddress.Loopback, 8080);
+        },
+        ["same-port-wildcard"] = o =>
+        {
+            o.HttpChallengeEndpoint = new IPEndPoint(IPAddress.Loopback, 8080);
+            o.TlsAlpnEndpoint = new IPEndPoint(IPAddress.IPv6Any, 8080);
+        },
     };
 
     public static TheoryData<string> InvalidCaseNames => [.. InvalidCases.Keys];
@@ -195,5 +238,45 @@ public sealed class OptionsTests
         Assert.False(CertificateIdentity.Covers(withoutSan, [AcmeIdentifier.Dns("no-san")]));
         Assert.True(CertificateIdentity.Covers(withSan, [AcmeIdentifier.Dns("LOBBY.example.test")]));
         Assert.False(CertificateIdentity.Covers(withSan, [AcmeIdentifier.Ip("127.0.0.1")]));
+    }
+
+    [Fact]
+    public void AnInvalidEabKey_IsNeverQuotedInTheMessage()
+    {
+        AcmeProvisioningOptions options = Valid();
+        options.ExternalAccountKeyId = "kid";
+        options.ExternalAccountHmacKey = "s3cr3t value!";
+
+        ArgumentException error = Assert.Throws<ArgumentException>(() => ServerCertificateOptions.Acme(options));
+
+        Assert.DoesNotContain("s3cr3t", error.Message, StringComparison.Ordinal);
+        Assert.Contains("ExternalAccountHmacKey", error.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("127.0.0.1", 0, "127.0.0.1", 0)]
+    [InlineData("0.0.0.0", 80, "0.0.0.0", 443)]
+    [InlineData("127.0.0.1", 8080, "127.0.0.2", 8080)]
+    public void ChallengeEndpointsOnSeparatePorts_AreAccepted(string httpAddress, int httpPort, string tlsAddress, int tlsPort)
+    {
+        AcmeProvisioningOptions options = Valid();
+        options.HttpChallengeEndpoint = new IPEndPoint(IPAddress.Parse(httpAddress), httpPort);
+        options.TlsAlpnEndpoint = new IPEndPoint(IPAddress.Parse(tlsAddress), tlsPort);
+
+        Assert.Equal(ServerCertificateSourceKind.Acme, ServerCertificateOptions.Acme(options).Kind);
+    }
+
+    [Fact]
+    public void RsaKeys_AndEabKeysInEitherBase64Alphabet_AreAccepted()
+    {
+        AcmeProvisioningOptions options = Valid();
+        options.KeyAlgorithm = AcmeKeyAlgorithm.RS256;
+        options.RsaKeySizeBits = 3072;
+        options.ExternalAccountKeyId = "kid";
+        foreach (string key in new[] { "c2VjcmV0LWtleS1ieXRlcw", "c2VjcmV0LWtleS1ieXRlcw==", "+/+/c2VjcmV0" })
+        {
+            options.ExternalAccountHmacKey = key;
+            Assert.Equal(ServerCertificateSourceKind.Acme, ServerCertificateOptions.Acme(options).Kind);
+        }
     }
 }

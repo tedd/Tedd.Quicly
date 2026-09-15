@@ -132,7 +132,9 @@ On start, a persisted certificate at `CertificatePath` is served without contact
 configured name, has not expired, and is not due for renewal. A restart therefore costs no rate limit. A persisted
 certificate that is valid but due is served while a replacement is ordered. After that, `RenewalScheduler` renews at
 the CA's ARI window, or when one third of the lifetime remains (`Renewal.RenewBefore` overrides this). `RenewNowAsync`
-forces a renewal, for example after changing names or on key compromise.
+forces a renewal, for example on key compromise or after the CA revoked the certificate. It cuts a pending retry wait
+short, and calls made while such an order is queued or running share its outcome. (Changed names need a restart: the
+persisted certificate then no longer covers them and a new one is ordered.)
 
 ### Ports
 

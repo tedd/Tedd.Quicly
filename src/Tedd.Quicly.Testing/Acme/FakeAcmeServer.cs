@@ -49,6 +49,7 @@ public sealed class FakeAcmeServer : IAsyncDisposable
     private int _nextId;
     private Task? _loop;
 
+    /// <summary>Creates the CA and binds its loopback listener to a free port; call <see cref="Start"/> to begin answering.</summary>
     public FakeAcmeServer()
     {
         // The listener is started here (not in Start) so a port race with a parallel test class is resolved before the URLs are handed out.
@@ -59,22 +60,30 @@ public sealed class FakeAcmeServer : IAsyncDisposable
         AlternateCa = new TestCa("Fake Alternate Root CA");
     }
 
+    /// <summary>Base URL of the CA (<c>http://127.0.0.1:{port}/</c>).</summary>
     public Uri BaseUri { get; }
 
+    /// <summary>The ACME directory URL to hand to clients.</summary>
     public Uri DirectoryUrl { get; }
 
+    /// <summary>The root that signs the default chain.</summary>
     public TestCa Ca { get; }
 
+    /// <summary>The root of the alternate chain (<c>Link: rel="alternate"</c>).</summary>
     public TestCa AlternateCa { get; }
 
     // ---- configuration -------------------------------------------------------------------------------------------
 
+    /// <summary>Require External Account Binding on newAccount, verified against <see cref="EabKid"/> and <see cref="EabHmacKey"/>.</summary>
     public bool RequireEab { get; set; }
 
+    /// <summary>The EAB key id the CA accepts.</summary>
     public string EabKid { get; set; } = "eab-kid-1";
 
+    /// <summary>The EAB HMAC key the CA verifies with (random per instance).</summary>
     public byte[] EabHmacKey { get; set; }
 
+    /// <summary><see cref="EabHmacKey"/> in base64url, the way a CA dashboard hands it out.</summary>
     public string EabHmacKeyBase64Url => System.Buffers.Text.Base64Url.EncodeToString(EabHmacKey);
 
     /// <summary>Respond with badNonce to this many POSTs (each still consumes the nonce and issues a fresh one).</summary>
@@ -98,23 +107,31 @@ public sealed class FakeAcmeServer : IAsyncDisposable
     /// <summary>Force every challenge validation to fail.</summary>
     public bool FailValidation { get; set; }
 
+    /// <summary>Answer newNonce without a <c>Replay-Nonce</c> header.</summary>
     public bool OmitNonceOnNewNonce { get; set; }
 
+    /// <summary>Answer newAccount without a <c>Location</c> header.</summary>
     public bool OmitLocationOnNewAccount { get; set; }
 
+    /// <summary>Answer newOrder without a <c>Location</c> header.</summary>
     public bool OmitLocationOnNewOrder { get; set; }
 
     /// <summary>Finalize responses carry no Location header (RFC 8555 does not require one).</summary>
     public bool OmitLocationOnFinalize { get; set; }
 
+    /// <summary>Leave <c>revokeCert</c> out of the directory.</summary>
     public bool OmitRevokeCertFromDirectory { get; set; }
 
+    /// <summary>Leave the <c>certificate</c> URL out of valid orders.</summary>
     public bool OmitCertificateUrlOnValidOrder { get; set; }
 
+    /// <summary>Serve an empty certificate chain.</summary>
     public bool ReturnEmptyPemChain { get; set; }
 
+    /// <summary>Serve a certificate chain whose PEM does not decode to a certificate.</summary>
     public bool ReturnInvalidPem { get; set; }
 
+    /// <summary>Do not advertise the alternate chain.</summary>
     public bool OmitAlternateChainLink { get; set; }
 
     /// <summary>Additional raw Link header value appended to certificate responses (to exercise the client's parser).</summary>
@@ -190,8 +207,10 @@ public sealed class FakeAcmeServer : IAsyncDisposable
     /// <summary>Alternative direct http-01 lookup: (domain, token) → key authorization.</summary>
     public Func<string, string, string?>? Http01Lookup { get; set; }
 
+    /// <summary><c>dns-01</c> validation: returns the TXT values of a record name, for example <see cref="InMemoryDns01Provider.Lookup"/>. Real DNS is never queried.</summary>
     public Func<string, IReadOnlyList<string>>? DnsTxtLookup { get; set; }
 
+    /// <summary>Callback <c>tls-alpn-01</c> validation: the certificate the responder would present for a domain. Takes precedence over <see cref="TlsAlpnValidationHost"/>.</summary>
     public Func<string, X509Certificate2?>? TlsAlpnLookup { get; set; }
 
     /// <summary>
@@ -235,28 +254,37 @@ public sealed class FakeAcmeServer : IAsyncDisposable
 
     // ---- observability -------------------------------------------------------------------------------------------
 
+    /// <summary>Every request as <c>METHOD /path</c>, in arrival order.</summary>
     public List<string> RequestLog { get; } = [];
 
+    /// <summary><c>User-Agent</c> of the last request.</summary>
     public string? LastUserAgent { get; private set; }
 
+    /// <summary><c>Accept</c> header of the last request.</summary>
     public string? LastAccept { get; private set; }
 
+    /// <summary><c>Content-Type</c> of the last request.</summary>
     public string? LastContentType { get; private set; }
 
+    /// <summary>Number of newNonce requests.</summary>
     public int NewNonceRequests { get; private set; }
 
+    /// <summary>The key authorization of every successful validation.</summary>
     public List<string> ValidatedKeyAuthorizations { get; } = [];
 
+    /// <summary>Number of accounts created.</summary>
     public int AccountCount
     {
         get { lock (_lock) { return _accounts.Count; } }
     }
 
+    /// <summary>Number of certificates revoked.</summary>
     public int RevokedCount
     {
         get { lock (_lock) { return _revoked.Count; } }
     }
 
+    /// <summary>The status of the account at <paramref name="accountUrl"/>, or <see langword="null"/> when there is none.</summary>
     public string? GetAccountStatus(Uri accountUrl)
     {
         lock (_lock)
@@ -273,6 +301,7 @@ public sealed class FakeAcmeServer : IAsyncDisposable
         }
     }
 
+    /// <summary>The contacts of the account at <paramref name="accountUrl"/>, or <see langword="null"/> when there is none.</summary>
     public IReadOnlyList<string>? GetAccountContacts(Uri accountUrl)
     {
         lock (_lock)
@@ -289,11 +318,13 @@ public sealed class FakeAcmeServer : IAsyncDisposable
         }
     }
 
+    /// <summary>Starts answering requests.</summary>
     public void Start()
     {
         _loop = Task.Run(LoopAsync);
     }
 
+    /// <summary>Stops the listener and releases the CA keys.</summary>
     public async ValueTask DisposeAsync()
     {
         _cts.Cancel();

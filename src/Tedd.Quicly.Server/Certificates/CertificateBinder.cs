@@ -51,20 +51,25 @@ public sealed record CertificateConsumerFailure(ICertificateConsumer Consumer, X
 /// </summary>
 /// <remarks>
 /// <para>Consumers are updated serially, in the order they were added, never concurrently; one that throws is reported
-/// through <see cref="ConsumerFailed"/> and the others are still updated (the failing one keeps its previous certificate
-/// until the next change). A source raising the certificate that is already applied is ignored.</para>
-/// <para>The certificate that was replaced is disposed after <see cref="CertificateBinderOptions.SupersededCertificateGracePeriod"/>
-/// (see there for why it is not disposed at once). A certificate that the source raises again within its grace period
-/// is kept. Bind each source through one binder: two binders would each dispose the certificates it replaces.</para>
+/// through <see cref="ConsumerFailed"/> and the others are still updated. A source raising the certificate that is
+/// already applied is ignored.</para>
+/// <para>The binder tracks which certificate each consumer presents: the last one it accepted. A replaced certificate is
+/// disposed <see cref="CertificateBinderOptions.SupersededCertificateGracePeriod"/> after the last consumer stopped
+/// presenting it (see there for why it is not disposed at once). A consumer that threw keeps presenting its previous
+/// certificate, so that certificate is kept (<see cref="RetainedCertificateCount"/>) until the consumer accepts a newer
+/// one (its grace period starts then), the consumer is removed, or the binder is disposed. A certificate that the source
+/// raises again within its grace period is kept. Bind each source through one binder: two binders would each dispose
+/// the certificates they replace.</para>
 /// <para>Disposing the binder unsubscribes from the source and immediately disposes the certificates still in their
-/// grace period, so dispose it after the consumers have stopped. The current certificate belongs to the source and is
-/// never disposed by the binder.</para>
+/// grace period or retained for a consumer, so dispose it after the consumers have stopped. The current certificate
+/// belongs to the source and is never disposed by the binder.</para>
 /// </remarks>
 public sealed class CertificateBinder : IDisposable, IAsyncDisposable
 {
     private readonly Lock _lock = new();
-    private readonly List<ICertificateConsumer> _consumers = [];
-    private readonly Dictionary<X509Certificate2, ITimer?> _pending = new(ReferenceEqualityComparer.Instance);
+    private readonly List<Binding> _bindings = [];
+    private readonly Dictionary<X509Certificate2, PendingDisposal> _pending = new(ReferenceEqualityComparer.Instance);
+    private readonly HashSet<X509Certificate2> _retained = new(ReferenceEqualityComparer.Instance);
     private X509Certificate2? _applied;
     private bool _disposed;
 
@@ -90,14 +95,18 @@ public sealed class CertificateBinder : IDisposable, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(Options.TimeProvider, nameof(options));
         foreach (ICertificateConsumer consumer in consumers)
         {
-            _consumers.Add(consumer ?? throw new ArgumentException("The consumer list contains null.", nameof(consumers)));
+            _bindings.Add(new Binding(consumer ?? throw new ArgumentException("The consumer list contains null.", nameof(consumers))));
         }
 
         Source = source;
         source.Changed += OnChanged;
+
+        // Read outside the lock (a source may raise Changed while holding a lock of its own). A certificate the source
+        // raised between the subscription and this read is newer than the one read here, so the value read is applied
+        // only while nothing has been applied yet: applying it afterwards would roll the consumers back.
         if (source.Current is { } current)
         {
-            Apply(current);
+            Apply(current, onlyIfNothingApplied: true);
         }
     }
 
@@ -126,7 +135,7 @@ public sealed class CertificateBinder : IDisposable, IAsyncDisposable
         {
             lock (_lock)
             {
-                return [.. _consumers];
+                return [.. _bindings.Select(static b => b.Consumer)];
             }
         }
     }
@@ -139,6 +148,21 @@ public sealed class CertificateBinder : IDisposable, IAsyncDisposable
             lock (_lock)
             {
                 return _pending.Count;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Number of superseded certificates kept alive because a consumer that failed to switch (see
+    /// <see cref="ConsumerFailed"/>) still presents them. Non-zero means a consumer is serving an old certificate.
+    /// </summary>
+    public int RetainedCertificateCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _retained.Count;
             }
         }
     }
@@ -157,10 +181,11 @@ public sealed class CertificateBinder : IDisposable, IAsyncDisposable
         lock (_lock)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            _consumers.Add(consumer);
+            Binding binding = new(consumer);
+            _bindings.Add(binding);
             if (_applied is { } certificate)
             {
-                Update(consumer, certificate);
+                Update(binding, certificate);
             }
         }
     }
@@ -173,19 +198,37 @@ public sealed class CertificateBinder : IDisposable, IAsyncDisposable
         return consumer;
     }
 
-    /// <summary>Stops updating <paramref name="consumer"/>. Returns <see langword="false"/> when it was not bound.</summary>
+    /// <summary>
+    /// Stops updating <paramref name="consumer"/>. Returns <see langword="false"/> when it was not bound. A superseded
+    /// certificate that was kept only because this consumer still presented it starts its grace period, so remove a
+    /// consumer once it has stopped presenting the binder's certificates.
+    /// </summary>
     public bool Remove(ICertificateConsumer consumer)
     {
         lock (_lock)
         {
-            return _consumers.Remove(consumer);
+            int index = _bindings.FindIndex(b => Equals(b.Consumer, consumer));
+            if (index < 0)
+            {
+                return false;
+            }
+
+            X509Certificate2? held = _bindings[index].Held;
+            _bindings.RemoveAt(index);
+            if (held is not null)
+            {
+                Release(held);
+            }
+
+            return true;
         }
     }
 
-    /// <summary>Unsubscribes from the source and disposes the certificates still in their grace period. Idempotent.</summary>
+    /// <summary>Unsubscribes from the source and disposes the certificates still in their grace period or retained for a consumer. Idempotent.</summary>
     public void Dispose()
     {
-        KeyValuePair<X509Certificate2, ITimer?>[] pending;
+        KeyValuePair<X509Certificate2, PendingDisposal>[] pending;
+        X509Certificate2[] retained;
         lock (_lock)
         {
             if (_disposed)
@@ -197,11 +240,18 @@ public sealed class CertificateBinder : IDisposable, IAsyncDisposable
             Source.Changed -= OnChanged;
             pending = [.. _pending];
             _pending.Clear();
+            retained = [.. _retained];
+            _retained.Clear();
         }
 
-        foreach ((X509Certificate2 certificate, ITimer? timer) in pending)
+        foreach ((X509Certificate2 certificate, PendingDisposal entry) in pending)
         {
-            timer?.Dispose();
+            entry.Timer?.Dispose();
+            certificate.Dispose();
+        }
+
+        foreach (X509Certificate2 certificate in retained)
+        {
             certificate.Dispose();
         }
     }
@@ -218,50 +268,109 @@ public sealed class CertificateBinder : IDisposable, IAsyncDisposable
         // A misbehaving source raising null must not reach the consumers.
         if (certificate is not null)
         {
-            Apply(certificate);
+            Apply(certificate, onlyIfNothingApplied: false);
         }
     }
 
-    private void Apply(X509Certificate2 certificate)
+    private void Apply(X509Certificate2 certificate, bool onlyIfNothingApplied)
     {
         lock (_lock)
         {
-            if (_disposed || ReferenceEquals(certificate, _applied))
+            if (_disposed || ReferenceEquals(certificate, _applied) || (onlyIfNothingApplied && _applied is not null))
             {
                 return;
             }
 
-            // A certificate that comes back within its grace period is in use again and must not be disposed.
-            if (_pending.Remove(certificate, out ITimer? timer))
+            // A certificate that comes back within its grace period (or while retained) is in use again: keep it.
+            if (_pending.Remove(certificate, out PendingDisposal? entry))
             {
-                timer?.Dispose();
+                entry.Timer?.Dispose();
             }
 
+            _retained.Remove(certificate);
             X509Certificate2? previous = _applied;
             _applied = certificate;
-            foreach (ICertificateConsumer consumer in _consumers.ToArray())
+            List<X509Certificate2>? released = null;
+            foreach (Binding binding in _bindings.ToArray())
             {
-                Update(consumer, certificate);
+                X509Certificate2? before = binding.Held;
+                if (Update(binding, certificate) && before is not null && !ReferenceEquals(before, certificate))
+                {
+                    (released ??= []).Add(before);
+                }
             }
 
             Raise(CertificateApplied, certificate);
-            if (previous is not null && Options.DisposeSupersededCertificates)
+            if (previous is not null)
             {
-                ScheduleDisposal(previous);
+                Release(previous);
+            }
+
+            if (released is not null)
+            {
+                foreach (X509Certificate2 stale in released)
+                {
+                    Release(stale);
+                }
             }
         }
     }
 
-    private void Update(ICertificateConsumer consumer, X509Certificate2 certificate)
+    /// <summary>Hands <paramref name="certificate"/> to one consumer; true when it accepted it (it presents it from then on).</summary>
+    private bool Update(Binding binding, X509Certificate2 certificate)
     {
         try
         {
-            consumer.UpdateCertificate(certificate);
+            binding.Consumer.UpdateCertificate(certificate);
+            binding.Held = certificate;
+            return true;
         }
         catch (Exception e)
         {
-            Raise(ConsumerFailed, new CertificateConsumerFailure(consumer, certificate, e));
+            // By contract the consumer keeps presenting what it had, so Held stays as it was.
+            Raise(ConsumerFailed, new CertificateConsumerFailure(binding.Consumer, certificate, e));
+            return false;
         }
+    }
+
+    /// <summary>
+    /// Called under the lock for a certificate that may no longer be needed: starts its grace period when no consumer
+    /// presents it, or keeps it (retained) while one still does. The current certificate is never released.
+    /// </summary>
+    private void Release(X509Certificate2 certificate)
+    {
+        if (!Options.DisposeSupersededCertificates || ReferenceEquals(certificate, _applied) || _pending.ContainsKey(certificate))
+        {
+            return;
+        }
+
+        if (IsHeld(certificate))
+        {
+            _retained.Add(certificate);
+            return;
+        }
+
+        _retained.Remove(certificate);
+        ScheduleDisposal(certificate);
+    }
+
+    private bool IsHeld(X509Certificate2 certificate)
+    {
+        foreach (Binding binding in _bindings)
+        {
+            if (ReferenceEquals(binding.Held, certificate))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>True while the certificate is current, waiting for its grace period, retained, or presented by a consumer.</summary>
+    private bool IsInUse(X509Certificate2 certificate)
+    {
+        return ReferenceEquals(certificate, _applied) || _pending.ContainsKey(certificate) || _retained.Contains(certificate) || IsHeld(certificate);
     }
 
     private void ScheduleDisposal(X509Certificate2 certificate)
@@ -274,19 +383,20 @@ public sealed class CertificateBinder : IDisposable, IAsyncDisposable
         }
 
         // Registered before the timer exists: a time provider may fire the callback synchronously inside CreateTimer.
-        _pending[certificate] = null;
+        PendingDisposal entry = new();
+        _pending[certificate] = entry;
         ITimer created = Options.TimeProvider.CreateTimer(
             static state =>
             {
-                (CertificateBinder binder, X509Certificate2 cert) = ((CertificateBinder, X509Certificate2))state!;
-                binder.OnGraceElapsed(cert);
+                (CertificateBinder binder, X509Certificate2 cert, PendingDisposal registration) = ((CertificateBinder, X509Certificate2, PendingDisposal))state!;
+                binder.OnGraceElapsed(cert, registration);
             },
-            (this, certificate),
+            (this, certificate, entry),
             grace,
             Timeout.InfiniteTimeSpan);
-        if (_pending.ContainsKey(certificate))
+        if (IsPending(certificate, entry))
         {
-            _pending[certificate] = created;
+            entry.Timer = created;
         }
         else
         {
@@ -294,20 +404,36 @@ public sealed class CertificateBinder : IDisposable, IAsyncDisposable
         }
     }
 
-    private void OnGraceElapsed(X509Certificate2 certificate)
+    private bool IsPending(X509Certificate2 certificate, PendingDisposal entry)
     {
-        ITimer? timer;
+        return _pending.TryGetValue(certificate, out PendingDisposal? current) && ReferenceEquals(current, entry);
+    }
+
+    private void OnGraceElapsed(X509Certificate2 certificate, PendingDisposal entry)
+    {
         lock (_lock)
         {
-            // Gone when the certificate was applied again or the binder was disposed in the meantime.
-            if (!_pending.Remove(certificate, out timer))
+            // Not this registration any more when the certificate was applied again (and perhaps superseded again, with a
+            // new timer) or the binder was disposed in the meantime: a callback already on its way when its timer was
+            // stopped must not end the new grace period early.
+            if (!IsPending(certificate, entry))
             {
                 return;
             }
+
+            _pending.Remove(certificate);
         }
 
-        timer?.Dispose();
-        certificate.Dispose();
+        // The timer is released outside the lock, so other threads may run meanwhile and the source may raise this
+        // certificate again: it is disposed only if it is still unused once the lock is held again.
+        entry.Timer?.Dispose();
+        lock (_lock)
+        {
+            if (!IsInUse(certificate))
+            {
+                certificate.Dispose();
+            }
+        }
     }
 
     private static void Raise<T>(Action<T>? handlers, T value)
@@ -328,5 +454,19 @@ public sealed class CertificateBinder : IDisposable, IAsyncDisposable
                 // Observers must not be able to break the binding.
             }
         }
+    }
+
+    /// <summary>A consumer and the certificate it presents (the last one it accepted), or <see langword="null"/> before it accepted any.</summary>
+    private sealed class Binding(ICertificateConsumer consumer)
+    {
+        public ICertificateConsumer Consumer { get; } = consumer;
+
+        public X509Certificate2? Held { get; set; }
+    }
+
+    /// <summary>One grace period: identifies the timer callback that may end it (a certificate can be scheduled more than once).</summary>
+    private sealed class PendingDisposal
+    {
+        public ITimer? Timer { get; set; }
     }
 }

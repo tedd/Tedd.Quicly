@@ -287,4 +287,125 @@ public sealed class CertificateBinderTests : IDisposable
         Assert.Throws<ArgumentNullException>(() => CertificateConsumers.FromSource(null!));
         Assert.Throws<ArgumentNullException>(() => CertificateConsumers.FromDelegate(null!));
     }
+
+    [Fact]
+    public void FailedConsumer_KeepsItsCertificate_UntilItAcceptsANewerOne_ThenTheGracePeriodStarts()
+    {
+        X509Certificate2 a = NewCertificate();
+        X509Certificate2 b = NewCertificate();
+        X509Certificate2 c = NewCertificate();
+        TestSource source = new() { Current = a };
+        RecordingConsumer quic = new();
+        RecordingConsumer https = new();
+        using CertificateBinder binder = new(source, [quic, https], Grace(TimeSpan.FromMinutes(2)));
+
+        quic.ThrowOnUpdate = new InvalidOperationException("credential rejected");
+        source.Raise(b);
+        _time.Advance(TimeSpan.FromMinutes(5));
+
+        Assert.False(Certs.IsDisposed(a)); // quic still presents it
+        Assert.Equal(1, binder.RetainedCertificateCount);
+        Assert.Equal(0, binder.PendingDisposalCount);
+
+        quic.ThrowOnUpdate = null;
+        source.Raise(c);
+
+        // quic left a, https left b: both start their grace period now.
+        Assert.Equal(0, binder.RetainedCertificateCount);
+        Assert.Equal(2, binder.PendingDisposalCount);
+        _time.Advance(TimeSpan.FromMinutes(1));
+        Assert.False(Certs.IsDisposed(a));
+        _time.Advance(TimeSpan.FromMinutes(1));
+        Assert.True(Certs.IsDisposed(a));
+        Assert.True(Certs.IsDisposed(b));
+        Assert.False(Certs.IsDisposed(c));
+        Assert.Equal([a, b, c], quic.Received);
+    }
+
+    [Fact]
+    public void RemovingAFailedConsumer_StartsTheGracePeriodOfTheCertificateItKept()
+    {
+        X509Certificate2 a = NewCertificate();
+        X509Certificate2 b = NewCertificate();
+        TestSource source = new() { Current = a };
+        RecordingConsumer quic = new();
+        RecordingConsumer neverAccepted = new() { ThrowOnUpdate = new InvalidOperationException("always fails") };
+        using CertificateBinder binder = new(source, [quic, neverAccepted], Grace(TimeSpan.FromMinutes(1)));
+        quic.ThrowOnUpdate = new InvalidOperationException("credential rejected");
+        source.Raise(b);
+        Assert.Equal(1, binder.RetainedCertificateCount);
+
+        Assert.True(binder.Remove(neverAccepted)); // presented nothing of ours: nothing to release
+        Assert.Equal(1, binder.RetainedCertificateCount);
+        Assert.True(binder.Remove(quic));
+
+        Assert.Equal(0, binder.RetainedCertificateCount);
+        Assert.Equal(1, binder.PendingDisposalCount);
+        _time.Advance(TimeSpan.FromMinutes(1));
+        Assert.True(Certs.IsDisposed(a));
+        Assert.False(Certs.IsDisposed(b));
+    }
+
+    [Fact]
+    public void Dispose_DisposesCertificatesRetainedForAFailedConsumer()
+    {
+        X509Certificate2 a = NewCertificate();
+        X509Certificate2 b = NewCertificate();
+        TestSource source = new() { Current = a };
+        RecordingConsumer quic = new();
+        CertificateBinder binder = new(source, [quic], Grace(TimeSpan.FromMinutes(1)));
+        quic.ThrowOnUpdate = new InvalidOperationException("credential rejected");
+        source.Raise(b);
+
+        binder.Dispose();
+
+        Assert.True(Certs.IsDisposed(a));
+        Assert.False(Certs.IsDisposed(b));
+    }
+
+    [Fact]
+    public void RetainedCertificateRaisedAgain_IsInUseAgain_AndItsSuccessorIsReleased()
+    {
+        X509Certificate2 a = NewCertificate();
+        X509Certificate2 b = NewCertificate();
+        TestSource source = new() { Current = a };
+        RecordingConsumer quic = new();
+        RecordingConsumer https = new();
+        using CertificateBinder binder = new(source, [quic, https], Grace(TimeSpan.FromMinutes(1)));
+        quic.ThrowOnUpdate = new InvalidOperationException("credential rejected");
+        source.Raise(b);
+        quic.ThrowOnUpdate = null;
+
+        source.Raise(a); // rolled back: quic never left a, https returns to it
+
+        Assert.Equal(0, binder.RetainedCertificateCount);
+        Assert.Equal(1, binder.PendingDisposalCount);
+        _time.Advance(TimeSpan.FromMinutes(1));
+        Assert.False(Certs.IsDisposed(a));
+        Assert.True(Certs.IsDisposed(b));
+    }
+
+    [Fact]
+    public void GraceCallback_ForACertificateSupersededAgainMeanwhile_LeavesItToTheNewTimer()
+    {
+        _time.FireDisposedTimers = true; // the first callback was already on its way when a came back
+        X509Certificate2 a = NewCertificate();
+        X509Certificate2 b = NewCertificate();
+        X509Certificate2 c = NewCertificate();
+        TestSource source = new() { Current = a };
+        using CertificateBinder binder = new(source, [new RecordingConsumer()], Grace(TimeSpan.FromMinutes(2)));
+
+        source.Raise(b);  // a: grace ends at +2 min
+        _time.Advance(TimeSpan.FromMinutes(1));
+        source.Raise(a);  // a in use again, b: grace ends at +3 min
+        source.Raise(c);  // a superseded again: grace ends at +3 min
+        _time.Advance(TimeSpan.FromMinutes(1)); // the stale first timer of a fires at +2 min
+
+        Assert.False(Certs.IsDisposed(a));
+        Assert.Equal(2, binder.PendingDisposalCount);
+        _time.Advance(TimeSpan.FromMinutes(1));
+        Assert.True(Certs.IsDisposed(a));
+        Assert.True(Certs.IsDisposed(b));
+        Assert.False(Certs.IsDisposed(c));
+    }
 }

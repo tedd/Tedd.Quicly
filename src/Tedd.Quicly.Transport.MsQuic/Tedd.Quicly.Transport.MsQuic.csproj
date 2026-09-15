@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Tedd.Quicly.Transport.MsQuic</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..$r$r.csproj" />
+    <ProjectReference Include="..$r$r.csproj" />
+  </ItemGroup>
+</Project>

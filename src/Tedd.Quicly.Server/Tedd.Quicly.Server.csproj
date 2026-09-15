@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Tedd.Quicly.Server</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..$r$r.csproj" />
+    <ProjectReference Include="..$r$r.csproj" />
+    <ProjectReference Include="..$r$r.csproj" />
+  </ItemGroup>
+</Project>

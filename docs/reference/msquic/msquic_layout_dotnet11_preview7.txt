@@ -1,0 +1,629 @@
+// Dumped from C:\Program Files\dotnet\shared\Microsoft.NETCore.App\11.0.0-preview.7.26381.103\System.Net.Quic.dll
+CLASS Microsoft.Quic.MsQuic
+  prop System.Int32 QUIC_STATUS_SUCCESS = 0
+  prop System.Int32 QUIC_STATUS_PENDING = 459749
+  prop System.Int32 QUIC_STATUS_CONTINUE = 459998
+  prop System.Int32 QUIC_STATUS_OUT_OF_MEMORY = -2147024882
+  prop System.Int32 QUIC_STATUS_INVALID_PARAMETER = -2147024809
+  prop System.Int32 QUIC_STATUS_INVALID_STATE = -2147019873
+  prop System.Int32 QUIC_STATUS_NOT_SUPPORTED = -2147467262
+  prop System.Int32 QUIC_STATUS_NOT_FOUND = -2147023728
+  prop System.Int32 QUIC_STATUS_BUFFER_TOO_SMALL = -2147024774
+  prop System.Int32 QUIC_STATUS_HANDSHAKE_FAILURE = -2143223808
+  prop System.Int32 QUIC_STATUS_ABORTED = -2147467260
+  prop System.Int32 QUIC_STATUS_ADDRESS_IN_USE = -2147014848
+  prop System.Int32 QUIC_STATUS_INVALID_ADDRESS = -2147014847
+  prop System.Int32 QUIC_STATUS_CONNECTION_TIMEOUT = -2143223802
+  prop System.Int32 QUIC_STATUS_CONNECTION_IDLE = -2143223803
+  prop System.Int32 QUIC_STATUS_UNREACHABLE = -2147023664
+  prop System.Int32 QUIC_STATUS_INTERNAL_ERROR = -2143223805
+  prop System.Int32 QUIC_STATUS_CONNECTION_REFUSED = -2147023671
+  prop System.Int32 QUIC_STATUS_PROTOCOL_ERROR = -2143223804
+  prop System.Int32 QUIC_STATUS_VER_NEG_ERROR = -2143223807
+  prop System.Int32 QUIC_STATUS_TLS_ERROR = -2147013864
+  prop System.Int32 QUIC_STATUS_USER_CANCELED = -2143223806
+  prop System.Int32 QUIC_STATUS_ALPN_NEG_FAILURE = -2143223801
+  prop System.Int32 QUIC_STATUS_STREAM_LIMIT_REACHED = -2143223800
+  prop System.Int32 QUIC_STATUS_ALPN_IN_USE = -2143223799
+  prop System.Int32 QUIC_STATUS_CLOSE_NOTIFY = -2143223552
+  prop System.Int32 QUIC_STATUS_BAD_CERTIFICATE = -2143223510
+  prop System.Int32 QUIC_STATUS_UNSUPPORTED_CERTIFICATE = -2143223509
+  prop System.Int32 QUIC_STATUS_REVOKED_CERTIFICATE = -2143223508
+  prop System.Int32 QUIC_STATUS_EXPIRED_CERTIFICATE = -2143223507
+  prop System.Int32 QUIC_STATUS_UNKNOWN_CERTIFICATE = -2143223506
+  prop System.Int32 QUIC_STATUS_REQUIRED_CERTIFICATE = -2143223436
+  prop System.Int32 QUIC_STATUS_CERT_EXPIRED = -2146762495
+  prop System.Int32 QUIC_STATUS_CERT_UNTRUSTED_ROOT = -2146762487
+  prop System.Int32 QUIC_STATUS_CERT_NO_CERT = -2146893042
+  prop System.Int32 QUIC_STATUS_ADDRESS_NOT_AVAILABLE = -2147014849
+  prop System.Int32 QUIC_ADDRESS_FAMILY_UNSPEC = 0
+  method System.Boolean StatusSucceeded(System.Int32 status)
+  method System.Boolean StatusFailed(System.Int32 status)
+  method System.Int32 get_QUIC_STATUS_SUCCESS()
+  method System.Int32 get_QUIC_STATUS_PENDING()
+  method System.Int32 get_QUIC_STATUS_CONTINUE()
+  method System.Int32 get_QUIC_STATUS_OUT_OF_MEMORY()
+  method System.Int32 get_QUIC_STATUS_INVALID_PARAMETER()
+  method System.Int32 get_QUIC_STATUS_INVALID_STATE()
+  method System.Int32 get_QUIC_STATUS_NOT_SUPPORTED()
+  method System.Int32 get_QUIC_STATUS_NOT_FOUND()
+  method System.Int32 get_QUIC_STATUS_BUFFER_TOO_SMALL()
+  method System.Int32 get_QUIC_STATUS_HANDSHAKE_FAILURE()
+  method System.Int32 get_QUIC_STATUS_ABORTED()
+  method System.Int32 get_QUIC_STATUS_ADDRESS_IN_USE()
+  method System.Int32 get_QUIC_STATUS_INVALID_ADDRESS()
+  method System.Int32 get_QUIC_STATUS_CONNECTION_TIMEOUT()
+  method System.Int32 get_QUIC_STATUS_CONNECTION_IDLE()
+  method System.Int32 get_QUIC_STATUS_UNREACHABLE()
+  method System.Int32 get_QUIC_STATUS_INTERNAL_ERROR()
+  method System.Int32 get_QUIC_STATUS_CONNECTION_REFUSED()
+  method System.Int32 get_QUIC_STATUS_PROTOCOL_ERROR()
+  method System.Int32 get_QUIC_STATUS_VER_NEG_ERROR()
+  method System.Int32 get_QUIC_STATUS_TLS_ERROR()
+  method System.Int32 get_QUIC_STATUS_USER_CANCELED()
+  method System.Int32 get_QUIC_STATUS_ALPN_NEG_FAILURE()
+  method System.Int32 get_QUIC_STATUS_STREAM_LIMIT_REACHED()
+  method System.Int32 get_QUIC_STATUS_ALPN_IN_USE()
+  method System.Int32 get_QUIC_STATUS_CLOSE_NOTIFY()
+  method System.Int32 get_QUIC_STATUS_BAD_CERTIFICATE()
+  method System.Int32 get_QUIC_STATUS_UNSUPPORTED_CERTIFICATE()
+  method System.Int32 get_QUIC_STATUS_REVOKED_CERTIFICATE()
+  method System.Int32 get_QUIC_STATUS_EXPIRED_CERTIFICATE()
+  method System.Int32 get_QUIC_STATUS_UNKNOWN_CERTIFICATE()
+  method System.Int32 get_QUIC_STATUS_REQUIRED_CERTIFICATE()
+  method System.Int32 get_QUIC_STATUS_CERT_EXPIRED()
+  method System.Int32 get_QUIC_STATUS_CERT_UNTRUSTED_ROOT()
+  method System.Int32 get_QUIC_STATUS_CERT_NO_CERT()
+  method System.Int32 get_QUIC_STATUS_ADDRESS_NOT_AVAILABLE()
+  method System.Int32 get_QUIC_ADDRESS_FAMILY_UNSPEC()
+ENUM Microsoft.Quic.QUIC_ALLOWED_CIPHER_SUITE_FLAGS : Int32
+  NONE = 0
+  AES_128_GCM_SHA256 = 1
+  AES_256_GCM_SHA384 = 2
+  CHACHA20_POLY1305_SHA256 = 4
+STRUCT Microsoft.Quic.QUIC_API_TABLE size=248 kind=Sequential pack=0 explicitSize=0
+  [0] delegate* unmanaged[]<QUIC_HANDLE*, System.Void*, System.Void> SetContext
+  [8] delegate* unmanaged[]<QUIC_HANDLE*, System.Void*> GetContext
+  [16] delegate* unmanaged[]<QUIC_HANDLE*, System.Void*, System.Void*, System.Void> SetCallbackHandler
+  [24] delegate* unmanaged[]<QUIC_HANDLE*, System.UInt32, System.UInt32, System.Void*, System.Int32> SetParam
+  [32] delegate* unmanaged[]<QUIC_HANDLE*, System.UInt32, System.UInt32*, System.Void*, System.Int32> GetParam
+  [40] delegate* unmanaged[]<QUIC_REGISTRATION_CONFIG*, QUIC_HANDLE**, System.Int32> RegistrationOpen
+  [48] delegate* unmanaged[]<QUIC_HANDLE*, System.Void> RegistrationClose
+  [56] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_CONNECTION_SHUTDOWN_FLAGS, System.UInt64, System.Void> RegistrationShutdown
+  [64] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_BUFFER*, System.UInt32, QUIC_SETTINGS*, System.UInt32, System.Void*, QUIC_HANDLE**, System.Int32> ConfigurationOpen
+  [72] delegate* unmanaged[]<QUIC_HANDLE*, System.Void> ConfigurationClose
+  [80] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_CREDENTIAL_CONFIG*, System.Int32> ConfigurationLoadCredential
+  [88] delegate* unmanaged[]<QUIC_HANDLE*, delegate* unmanaged[]<QUIC_HANDLE*, System.Void*, QUIC_LISTENER_EVENT*, System.Int32>, System.Void*, QUIC_HANDLE**, System.Int32> ListenerOpen
+  [96] delegate* unmanaged[]<QUIC_HANDLE*, System.Void> ListenerClose
+  [104] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_BUFFER*, System.UInt32, QuicAddr*, System.Int32> ListenerStart
+  [112] delegate* unmanaged[]<QUIC_HANDLE*, System.Void> ListenerStop
+  [120] delegate* unmanaged[]<QUIC_HANDLE*, delegate* unmanaged[]<QUIC_HANDLE*, System.Void*, QUIC_CONNECTION_EVENT*, System.Int32>, System.Void*, QUIC_HANDLE**, System.Int32> ConnectionOpen
+  [128] delegate* unmanaged[]<QUIC_HANDLE*, System.Void> ConnectionClose
+  [136] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_CONNECTION_SHUTDOWN_FLAGS, System.UInt64, System.Void> ConnectionShutdown
+  [144] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_HANDLE*, System.UInt16, System.SByte*, System.UInt16, System.Int32> ConnectionStart
+  [152] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_HANDLE*, System.Int32> ConnectionSetConfiguration
+  [160] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_SEND_RESUMPTION_FLAGS, System.UInt16, System.Byte*, System.Int32> ConnectionSendResumptionTicket
+  [168] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_STREAM_OPEN_FLAGS, delegate* unmanaged[]<QUIC_HANDLE*, System.Void*, QUIC_STREAM_EVENT*, System.Int32>, System.Void*, QUIC_HANDLE**, System.Int32> StreamOpen
+  [176] delegate* unmanaged[]<QUIC_HANDLE*, System.Void> StreamClose
+  [184] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_STREAM_START_FLAGS, System.Int32> StreamStart
+  [192] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_STREAM_SHUTDOWN_FLAGS, System.UInt64, System.Int32> StreamShutdown
+  [200] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_BUFFER*, System.UInt32, QUIC_SEND_FLAGS, System.Void*, System.Int32> StreamSend
+  [208] delegate* unmanaged[]<QUIC_HANDLE*, System.UInt64, System.Void> StreamReceiveComplete
+  [216] delegate* unmanaged[]<QUIC_HANDLE*, System.Byte, System.Int32> StreamReceiveSetEnabled
+  [224] delegate* unmanaged[]<QUIC_HANDLE*, QUIC_BUFFER*, System.UInt32, QUIC_SEND_FLAGS, System.Void*, System.Int32> DatagramSend
+  [232] delegate* unmanaged[]<QUIC_HANDLE*, System.Byte, System.Int32> ConnectionResumptionTicketValidationComplete
+  [240] delegate* unmanaged[]<QUIC_HANDLE*, System.Byte, QUIC_TLS_ALERT_CODES, System.Int32> ConnectionCertificateValidationComplete
+STRUCT Microsoft.Quic.QUIC_BUFFER size=16 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt32 Length
+  [8] System.Byte* Buffer
+  prop Span`1<System.Byte> Span
+STRUCT Microsoft.Quic.QUIC_CERTIFICATE_FILE size=16 kind=Sequential pack=0 explicitSize=0
+  [0] System.SByte* PrivateKeyFile
+  [8] System.SByte* CertificateFile
+STRUCT Microsoft.Quic.QUIC_CERTIFICATE_FILE_PROTECTED size=24 kind=Sequential pack=0 explicitSize=0
+  [0] System.SByte* PrivateKeyFile
+  [8] System.SByte* CertificateFile
+  [16] System.SByte* PrivateKeyPassword
+STRUCT Microsoft.Quic.QUIC_CERTIFICATE_HASH size=20 kind=Sequential pack=0 explicitSize=0
+  [0] QUIC_CERTIFICATE_HASH+<ShaHash>e__FixedBuffer ShaHash (fixed Byte[20])
+STRUCT Microsoft.Quic.QUIC_CERTIFICATE_HASH_STORE size=152 kind=Sequential pack=0 explicitSize=0
+  [0] QUIC_CERTIFICATE_HASH_STORE_FLAGS Flags
+  [4] QUIC_CERTIFICATE_HASH_STORE+<ShaHash>e__FixedBuffer ShaHash (fixed Byte[20])
+  [24] QUIC_CERTIFICATE_HASH_STORE+<StoreName>e__FixedBuffer StoreName (fixed SByte[128])
+ENUM Microsoft.Quic.QUIC_CERTIFICATE_HASH_STORE_FLAGS : Int32
+  NONE = 0
+  MACHINE_STORE = 1
+STRUCT Microsoft.Quic.QUIC_CERTIFICATE_HASH_STORE+<ShaHash>e__FixedBuffer size=20 kind=Sequential pack=0 explicitSize=20
+  [0] System.Byte FixedElementField
+STRUCT Microsoft.Quic.QUIC_CERTIFICATE_HASH_STORE+<StoreName>e__FixedBuffer size=128 kind=Sequential pack=0 explicitSize=128
+  [0] System.SByte FixedElementField
+STRUCT Microsoft.Quic.QUIC_CERTIFICATE_HASH+<ShaHash>e__FixedBuffer size=20 kind=Sequential pack=0 explicitSize=20
+  [0] System.Byte FixedElementField
+STRUCT Microsoft.Quic.QUIC_CERTIFICATE_PKCS12 size=24 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte* Asn1Blob
+  [8] System.UInt32 Asn1BlobLength
+  [16] System.SByte* PrivateKeyPassword
+ENUM Microsoft.Quic.QUIC_CIPHER_ALGORITHM : Int32
+  NONE = 0
+  AES_128 = 26126
+  AES_256 = 26128
+  CHACHA20 = 26130
+ENUM Microsoft.Quic.QUIC_CIPHER_SUITE : Int32
+  TLS_AES_128_GCM_SHA256 = 4865
+  TLS_AES_256_GCM_SHA384 = 4866
+  TLS_CHACHA20_POLY1305_SHA256 = 4867
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT size=32 kind=Sequential pack=0 explicitSize=0
+  [0] QUIC_CONNECTION_EVENT_TYPE Type
+  [8] QUIC_CONNECTION_EVENT+_Anonymous_e__Union Anonymous
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_CONNECTED_e__Struct& CONNECTED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_SHUTDOWN_INITIATED_BY_TRANSPORT_e__Struct& SHUTDOWN_INITIATED_BY_TRANSPORT
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_SHUTDOWN_INITIATED_BY_PEER_e__Struct& SHUTDOWN_INITIATED_BY_PEER
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_SHUTDOWN_COMPLETE_e__Struct& SHUTDOWN_COMPLETE
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_LOCAL_ADDRESS_CHANGED_e__Struct& LOCAL_ADDRESS_CHANGED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_ADDRESS_CHANGED_e__Struct& PEER_ADDRESS_CHANGED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_STREAM_STARTED_e__Struct& PEER_STREAM_STARTED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_STREAMS_AVAILABLE_e__Struct& STREAMS_AVAILABLE
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_NEEDS_STREAMS_e__Struct& PEER_NEEDS_STREAMS
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_IDEAL_PROCESSOR_CHANGED_e__Struct& IDEAL_PROCESSOR_CHANGED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_DATAGRAM_STATE_CHANGED_e__Struct& DATAGRAM_STATE_CHANGED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_DATAGRAM_RECEIVED_e__Struct& DATAGRAM_RECEIVED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_DATAGRAM_SEND_STATE_CHANGED_e__Struct& DATAGRAM_SEND_STATE_CHANGED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_RESUMED_e__Struct& RESUMED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_RESUMPTION_TICKET_RECEIVED_e__Struct& RESUMPTION_TICKET_RECEIVED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_CERTIFICATE_RECEIVED_e__Struct& PEER_CERTIFICATE_RECEIVED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_RELIABLE_RESET_NEGOTIATED_e__Struct& RELIABLE_RESET_NEGOTIATED
+  prop QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_ONE_WAY_DELAY_NEGOTIATED_e__Struct& ONE_WAY_DELAY_NEGOTIATED
+ENUM Microsoft.Quic.QUIC_CONNECTION_EVENT_TYPE : Int32
+  CONNECTED = 0
+  SHUTDOWN_INITIATED_BY_TRANSPORT = 1
+  SHUTDOWN_INITIATED_BY_PEER = 2
+  SHUTDOWN_COMPLETE = 3
+  LOCAL_ADDRESS_CHANGED = 4
+  PEER_ADDRESS_CHANGED = 5
+  PEER_STREAM_STARTED = 6
+  STREAMS_AVAILABLE = 7
+  PEER_NEEDS_STREAMS = 8
+  IDEAL_PROCESSOR_CHANGED = 9
+  DATAGRAM_STATE_CHANGED = 10
+  DATAGRAM_RECEIVED = 11
+  DATAGRAM_SEND_STATE_CHANGED = 12
+  RESUMED = 13
+  RESUMPTION_TICKET_RECEIVED = 14
+  PEER_CERTIFICATE_RECEIVED = 15
+  RELIABLE_RESET_NEGOTIATED = 16
+  ONE_WAY_DELAY_NEGOTIATED = 17
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union size=24 kind=Explicit pack=0 explicitSize=0
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_CONNECTED_e__Struct CONNECTED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_SHUTDOWN_INITIATED_BY_TRANSPORT_e__Struct SHUTDOWN_INITIATED_BY_TRANSPORT (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_SHUTDOWN_INITIATED_BY_PEER_e__Struct SHUTDOWN_INITIATED_BY_PEER (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_SHUTDOWN_COMPLETE_e__Struct SHUTDOWN_COMPLETE (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_LOCAL_ADDRESS_CHANGED_e__Struct LOCAL_ADDRESS_CHANGED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_ADDRESS_CHANGED_e__Struct PEER_ADDRESS_CHANGED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_STREAM_STARTED_e__Struct PEER_STREAM_STARTED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_STREAMS_AVAILABLE_e__Struct STREAMS_AVAILABLE (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_NEEDS_STREAMS_e__Struct PEER_NEEDS_STREAMS (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_IDEAL_PROCESSOR_CHANGED_e__Struct IDEAL_PROCESSOR_CHANGED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_DATAGRAM_STATE_CHANGED_e__Struct DATAGRAM_STATE_CHANGED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_DATAGRAM_RECEIVED_e__Struct DATAGRAM_RECEIVED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_DATAGRAM_SEND_STATE_CHANGED_e__Struct DATAGRAM_SEND_STATE_CHANGED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_RESUMED_e__Struct RESUMED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_RESUMPTION_TICKET_RECEIVED_e__Struct RESUMPTION_TICKET_RECEIVED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_CERTIFICATE_RECEIVED_e__Struct PEER_CERTIFICATE_RECEIVED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_RELIABLE_RESET_NEGOTIATED_e__Struct RELIABLE_RESET_NEGOTIATED (FieldOffset 0)
+  [0] QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_ONE_WAY_DELAY_NEGOTIATED_e__Struct ONE_WAY_DELAY_NEGOTIATED (FieldOffset 0)
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_CONNECTED_e__Struct size=16 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte SessionResumed
+  [1] System.Byte NegotiatedAlpnLength
+  [8] System.Byte* NegotiatedAlpn
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_DATAGRAM_RECEIVED_e__Struct size=16 kind=Sequential pack=0 explicitSize=0
+  [0] QUIC_BUFFER* Buffer
+  [8] QUIC_RECEIVE_FLAGS Flags
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_DATAGRAM_SEND_STATE_CHANGED_e__Struct size=16 kind=Sequential pack=0 explicitSize=0
+  [0] System.Void* ClientContext
+  [8] QUIC_DATAGRAM_SEND_STATE State
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_DATAGRAM_STATE_CHANGED_e__Struct size=4 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte SendEnabled
+  [2] System.UInt16 MaxSendLength
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_IDEAL_PROCESSOR_CHANGED_e__Struct size=4 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt16 IdealProcessor
+  [2] System.UInt16 PartitionIndex
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_LOCAL_ADDRESS_CHANGED_e__Struct size=8 kind=Sequential pack=0 explicitSize=0
+  [0] QuicAddr* Address
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_ONE_WAY_DELAY_NEGOTIATED_e__Struct size=2 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte SendNegotiated
+  [1] System.Byte ReceiveNegotiated
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_ADDRESS_CHANGED_e__Struct size=8 kind=Sequential pack=0 explicitSize=0
+  [0] QuicAddr* Address
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_CERTIFICATE_RECEIVED_e__Struct size=24 kind=Sequential pack=0 explicitSize=0
+  [0] System.Void* Certificate
+  [8] System.UInt32 DeferredErrorFlags
+  [12] System.Int32 DeferredStatus
+  [16] System.Void* Chain
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_NEEDS_STREAMS_e__Struct size=1 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte Bidirectional
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_PEER_STREAM_STARTED_e__Struct size=16 kind=Sequential pack=0 explicitSize=0
+  [0] QUIC_HANDLE* Stream
+  [8] QUIC_STREAM_OPEN_FLAGS Flags
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_RELIABLE_RESET_NEGOTIATED_e__Struct size=1 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte IsNegotiated
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_RESUMED_e__Struct size=16 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt16 ResumptionStateLength
+  [8] System.Byte* ResumptionState
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_RESUMPTION_TICKET_RECEIVED_e__Struct size=16 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt32 ResumptionTicketLength
+  [8] System.Byte* ResumptionTicket
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_SHUTDOWN_COMPLETE_e__Struct size=1 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte _bitfield
+  prop System.Byte HandshakeCompleted
+  prop System.Byte PeerAcknowledgedShutdown
+  prop System.Byte AppCloseInProgress
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_SHUTDOWN_INITIATED_BY_PEER_e__Struct size=8 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt64 ErrorCode
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_SHUTDOWN_INITIATED_BY_TRANSPORT_e__Struct size=16 kind=Sequential pack=0 explicitSize=0
+  [0] System.Int32 Status
+  [8] System.UInt64 ErrorCode
+STRUCT Microsoft.Quic.QUIC_CONNECTION_EVENT+_Anonymous_e__Union+_STREAMS_AVAILABLE_e__Struct size=4 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt16 BidirectionalCount
+  [2] System.UInt16 UnidirectionalCount
+ENUM Microsoft.Quic.QUIC_CONNECTION_SHUTDOWN_FLAGS : Int32
+  NONE = 0
+  SILENT = 1
+STRUCT Microsoft.Quic.QUIC_CREDENTIAL_CONFIG size=56 kind=Sequential pack=0 explicitSize=0
+  [0] QUIC_CREDENTIAL_TYPE Type
+  [4] QUIC_CREDENTIAL_FLAGS Flags
+  [8] QUIC_CREDENTIAL_CONFIG+_Anonymous_e__Union Anonymous
+  [16] System.SByte* Principal
+  [24] System.Void* Reserved
+  [32] delegate* unmanaged[]<QUIC_HANDLE*, System.Void*, System.Int32, System.Void> AsyncHandler
+  [40] QUIC_ALLOWED_CIPHER_SUITE_FLAGS AllowedCipherSuites
+  [48] System.SByte* CaCertificateFile
+  prop System.Void*& CertificateContext
+  prop QUIC_CERTIFICATE_PKCS12*& CertificatePkcs12
+STRUCT Microsoft.Quic.QUIC_CREDENTIAL_CONFIG+_Anonymous_e__Union size=8 kind=Explicit pack=0 explicitSize=0
+  [0] QUIC_CERTIFICATE_HASH* CertificateHash (FieldOffset 0)
+  [0] QUIC_CERTIFICATE_HASH_STORE* CertificateHashStore (FieldOffset 0)
+  [0] System.Void* CertificateContext (FieldOffset 0)
+  [0] QUIC_CERTIFICATE_FILE* CertificateFile (FieldOffset 0)
+  [0] QUIC_CERTIFICATE_FILE_PROTECTED* CertificateFileProtected (FieldOffset 0)
+  [0] QUIC_CERTIFICATE_PKCS12* CertificatePkcs12 (FieldOffset 0)
+ENUM Microsoft.Quic.QUIC_CREDENTIAL_FLAGS : Int32
+  NONE = 0
+  CLIENT = 1
+  LOAD_ASYNCHRONOUS = 2
+  NO_CERTIFICATE_VALIDATION = 4
+  ENABLE_OCSP = 8
+  INDICATE_CERTIFICATE_RECEIVED = 16
+  DEFER_CERTIFICATE_VALIDATION = 32
+  REQUIRE_CLIENT_AUTHENTICATION = 64
+  USE_TLS_BUILTIN_CERTIFICATE_VALIDATION = 128
+  REVOCATION_CHECK_END_CERT = 256
+  REVOCATION_CHECK_CHAIN = 512
+  REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT = 1024
+  IGNORE_NO_REVOCATION_CHECK = 2048
+  IGNORE_REVOCATION_OFFLINE = 4096
+  SET_ALLOWED_CIPHER_SUITES = 8192
+  USE_PORTABLE_CERTIFICATES = 16384
+  USE_SUPPLIED_CREDENTIALS = 32768
+  USE_SYSTEM_MAPPER = 65536
+  CACHE_ONLY_URL_RETRIEVAL = 131072
+  REVOCATION_CHECK_CACHE_ONLY = 262144
+  INPROC_PEER_CERTIFICATE = 524288
+  SET_CA_CERTIFICATE_FILE = 1048576
+ENUM Microsoft.Quic.QUIC_CREDENTIAL_TYPE : Int32
+  NONE = 0
+  CERTIFICATE_HASH = 1
+  CERTIFICATE_HASH_STORE = 2
+  CERTIFICATE_CONTEXT = 3
+  CERTIFICATE_FILE = 4
+  CERTIFICATE_FILE_PROTECTED = 5
+  CERTIFICATE_PKCS12 = 6
+ENUM Microsoft.Quic.QUIC_DATAGRAM_SEND_STATE : Int32
+  UNKNOWN = 0
+  SENT = 1
+  LOST_SUSPECT = 2
+  LOST_DISCARDED = 3
+  ACKNOWLEDGED = 4
+  ACKNOWLEDGED_SPURIOUS = 5
+  CANCELED = 6
+ENUM Microsoft.Quic.QUIC_EXECUTION_PROFILE : Int32
+  LOW_LATENCY = 0
+  MAX_THROUGHPUT = 1
+  SCAVENGER = 2
+  REAL_TIME = 3
+STRUCT Microsoft.Quic.QUIC_HANDLE size=1 kind=Sequential pack=0 explicitSize=1
+STRUCT Microsoft.Quic.QUIC_HANDSHAKE_INFO size=32 kind=Sequential pack=0 explicitSize=0
+  [0] QUIC_TLS_PROTOCOL_VERSION TlsProtocolVersion
+  [4] QUIC_CIPHER_ALGORITHM CipherAlgorithm
+  [8] System.Int32 CipherStrength
+  [12] QUIC_HASH_ALGORITHM Hash
+  [16] System.Int32 HashStrength
+  [20] QUIC_KEY_EXCHANGE_ALGORITHM KeyExchangeAlgorithm
+  [24] System.Int32 KeyExchangeStrength
+  [28] QUIC_CIPHER_SUITE CipherSuite
+ENUM Microsoft.Quic.QUIC_HASH_ALGORITHM : Int32
+  NONE = 0
+  SHA_256 = 32780
+  SHA_384 = 32781
+ENUM Microsoft.Quic.QUIC_KEY_EXCHANGE_ALGORITHM : Int32
+  NONE = 0
+STRUCT Microsoft.Quic.QUIC_LISTENER_EVENT size=24 kind=Sequential pack=0 explicitSize=0
+  [0] QUIC_LISTENER_EVENT_TYPE Type
+  [8] QUIC_LISTENER_EVENT+_Anonymous_e__Union Anonymous
+  prop QUIC_LISTENER_EVENT+_Anonymous_e__Union+_NEW_CONNECTION_e__Struct& NEW_CONNECTION
+ENUM Microsoft.Quic.QUIC_LISTENER_EVENT_TYPE : Int32
+  NEW_CONNECTION = 0
+  STOP_COMPLETE = 1
+STRUCT Microsoft.Quic.QUIC_LISTENER_EVENT+_Anonymous_e__Union size=16 kind=Explicit pack=0 explicitSize=0
+  [0] QUIC_LISTENER_EVENT+_Anonymous_e__Union+_NEW_CONNECTION_e__Struct NEW_CONNECTION (FieldOffset 0)
+  [0] QUIC_LISTENER_EVENT+_Anonymous_e__Union+_STOP_COMPLETE_e__Struct STOP_COMPLETE (FieldOffset 0)
+STRUCT Microsoft.Quic.QUIC_LISTENER_EVENT+_Anonymous_e__Union+_NEW_CONNECTION_e__Struct size=16 kind=Sequential pack=0 explicitSize=0
+  [0] QUIC_NEW_CONNECTION_INFO* Info
+  [8] QUIC_HANDLE* Connection
+STRUCT Microsoft.Quic.QUIC_LISTENER_EVENT+_Anonymous_e__Union+_STOP_COMPLETE_e__Struct size=1 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte _bitfield
+STRUCT Microsoft.Quic.QUIC_NEW_CONNECTION_INFO size=72 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt32 QuicVersion
+  [8] QuicAddr* LocalAddress
+  [16] QuicAddr* RemoteAddress
+  [24] System.UInt32 CryptoBufferLength
+  [28] System.UInt16 ClientAlpnListLength
+  [30] System.UInt16 ServerNameLength
+  [32] System.Byte NegotiatedAlpnLength
+  [40] System.Byte* CryptoBuffer
+  [48] System.Byte* ClientAlpnList
+  [56] System.Byte* NegotiatedAlpn
+  [64] System.SByte* ServerName
+ENUM Microsoft.Quic.QUIC_PERFORMANCE_COUNTERS : Int32
+  CONN_CREATED = 0
+  CONN_HANDSHAKE_FAIL = 1
+  CONN_APP_REJECT = 2
+  CONN_RESUMED = 3
+  CONN_ACTIVE = 4
+  CONN_CONNECTED = 5
+  CONN_PROTOCOL_ERRORS = 6
+  CONN_NO_ALPN = 7
+  STRM_ACTIVE = 8
+  PKTS_SUSPECTED_LOST = 9
+  PKTS_DROPPED = 10
+  PKTS_DECRYPTION_FAIL = 11
+  UDP_RECV = 12
+  UDP_SEND = 13
+  UDP_RECV_BYTES = 14
+  UDP_SEND_BYTES = 15
+  UDP_RECV_EVENTS = 16
+  UDP_SEND_CALLS = 17
+  APP_SEND_BYTES = 18
+  APP_RECV_BYTES = 19
+  CONN_QUEUE_DEPTH = 20
+  CONN_OPER_QUEUE_DEPTH = 21
+  CONN_OPER_QUEUED = 22
+  CONN_OPER_COMPLETED = 23
+  WORK_OPER_QUEUE_DEPTH = 24
+  WORK_OPER_QUEUED = 25
+  WORK_OPER_COMPLETED = 26
+  PATH_VALIDATED = 27
+  PATH_FAILURE = 28
+  SEND_STATELESS_RESET = 29
+  SEND_STATELESS_RETRY = 30
+  CONN_LOAD_REJECT = 31
+  MAX = 32
+ENUM Microsoft.Quic.QUIC_RECEIVE_FLAGS : Int32
+  NONE = 0
+  ZERO_RTT = 1
+  FIN = 2
+STRUCT Microsoft.Quic.QUIC_REGISTRATION_CONFIG size=16 kind=Sequential pack=0 explicitSize=0
+  [0] System.SByte* AppName
+  [8] QUIC_EXECUTION_PROFILE ExecutionProfile
+ENUM Microsoft.Quic.QUIC_SEND_FLAGS : Int32
+  NONE = 0
+  ALLOW_0_RTT = 1
+  START = 2
+  FIN = 4
+  DGRAM_PRIORITY = 8
+  DELAY_SEND = 16
+ENUM Microsoft.Quic.QUIC_SEND_RESUMPTION_FLAGS : Int32
+  NONE = 0
+  FINAL = 1
+STRUCT Microsoft.Quic.QUIC_SETTINGS size=144 kind=Sequential pack=0 explicitSize=0
+  [0] QUIC_SETTINGS+_Anonymous1_e__Union Anonymous1
+  [8] System.UInt64 MaxBytesPerKey
+  [16] System.UInt64 HandshakeIdleTimeoutMs
+  [24] System.UInt64 IdleTimeoutMs
+  [32] System.UInt64 MtuDiscoverySearchCompleteTimeoutUs
+  [40] System.UInt32 TlsClientMaxSendBuffer
+  [44] System.UInt32 TlsServerMaxSendBuffer
+  [48] System.UInt32 StreamRecvWindowDefault
+  [52] System.UInt32 StreamRecvBufferDefault
+  [56] System.UInt32 ConnFlowControlWindow
+  [60] System.UInt32 MaxWorkerQueueDelayUs
+  [64] System.UInt32 MaxStatelessOperations
+  [68] System.UInt32 InitialWindowPackets
+  [72] System.UInt32 SendIdleTimeoutMs
+  [76] System.UInt32 InitialRttMs
+  [80] System.UInt32 MaxAckDelayMs
+  [84] System.UInt32 DisconnectTimeoutMs
+  [88] System.UInt32 KeepAliveIntervalMs
+  [92] System.UInt16 CongestionControlAlgorithm
+  [94] System.UInt16 PeerBidiStreamCount
+  [96] System.UInt16 PeerUnidiStreamCount
+  [98] System.UInt16 MaxBindingStatelessOperations
+  [100] System.UInt16 StatelessOperationExpirationMs
+  [102] System.UInt16 MinimumMtu
+  [104] System.UInt16 MaximumMtu
+  [106] System.Byte _bitfield
+  [107] System.Byte MaxOperationsPerDrain
+  [108] System.Byte MtuDiscoveryMissingProbeCount
+  [112] System.UInt32 DestCidUpdateIdleTimeoutMs
+  [120] QUIC_SETTINGS+_Anonymous2_e__Union Anonymous2
+  [128] System.UInt32 StreamRecvWindowBidiLocalDefault
+  [132] System.UInt32 StreamRecvWindowBidiRemoteDefault
+  [136] System.UInt32 StreamRecvWindowUnidiDefault
+  prop QUIC_SETTINGS+_Anonymous1_e__Union+_IsSet_e__Struct& IsSet
+STRUCT Microsoft.Quic.QUIC_SETTINGS+_Anonymous1_e__Union size=8 kind=Explicit pack=0 explicitSize=0
+  [0] System.UInt64 IsSetFlags (FieldOffset 0)
+  [0] QUIC_SETTINGS+_Anonymous1_e__Union+_IsSet_e__Struct IsSet (FieldOffset 0)
+STRUCT Microsoft.Quic.QUIC_SETTINGS+_Anonymous1_e__Union+_IsSet_e__Struct size=8 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt64 _bitfield
+  prop System.UInt64 HandshakeIdleTimeoutMs
+  prop System.UInt64 IdleTimeoutMs
+  prop System.UInt64 ConnFlowControlWindow
+  prop System.UInt64 KeepAliveIntervalMs
+  prop System.UInt64 PeerBidiStreamCount
+  prop System.UInt64 PeerUnidiStreamCount
+  prop System.UInt64 StreamRecvWindowBidiLocalDefault
+  prop System.UInt64 StreamRecvWindowBidiRemoteDefault
+  prop System.UInt64 StreamRecvWindowUnidiDefault
+STRUCT Microsoft.Quic.QUIC_SETTINGS+_Anonymous2_e__Union size=8 kind=Explicit pack=0 explicitSize=0
+  [0] System.UInt64 Flags (FieldOffset 0)
+  [0] QUIC_SETTINGS+_Anonymous2_e__Union+_Anonymous_e__Struct Anonymous (FieldOffset 0)
+STRUCT Microsoft.Quic.QUIC_SETTINGS+_Anonymous2_e__Union+_Anonymous_e__Struct size=8 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt64 _bitfield
+STRUCT Microsoft.Quic.QUIC_STREAM_EVENT size=40 kind=Sequential pack=0 explicitSize=0
+  [0] QUIC_STREAM_EVENT_TYPE Type
+  [8] QUIC_STREAM_EVENT+_Anonymous_e__Union Anonymous
+  prop QUIC_STREAM_EVENT+_Anonymous_e__Union+_START_COMPLETE_e__Struct& START_COMPLETE
+  prop QUIC_STREAM_EVENT+_Anonymous_e__Union+_RECEIVE_e__Struct& RECEIVE
+  prop QUIC_STREAM_EVENT+_Anonymous_e__Union+_SEND_COMPLETE_e__Struct& SEND_COMPLETE
+  prop QUIC_STREAM_EVENT+_Anonymous_e__Union+_PEER_SEND_ABORTED_e__Struct& PEER_SEND_ABORTED
+  prop QUIC_STREAM_EVENT+_Anonymous_e__Union+_PEER_RECEIVE_ABORTED_e__Struct& PEER_RECEIVE_ABORTED
+  prop QUIC_STREAM_EVENT+_Anonymous_e__Union+_SEND_SHUTDOWN_COMPLETE_e__Struct& SEND_SHUTDOWN_COMPLETE
+  prop QUIC_STREAM_EVENT+_Anonymous_e__Union+_SHUTDOWN_COMPLETE_e__Struct& SHUTDOWN_COMPLETE
+  prop QUIC_STREAM_EVENT+_Anonymous_e__Union+_IDEAL_SEND_BUFFER_SIZE_e__Struct& IDEAL_SEND_BUFFER_SIZE
+ENUM Microsoft.Quic.QUIC_STREAM_EVENT_TYPE : Int32
+  START_COMPLETE = 0
+  RECEIVE = 1
+  SEND_COMPLETE = 2
+  PEER_SEND_SHUTDOWN = 3
+  PEER_SEND_ABORTED = 4
+  PEER_RECEIVE_ABORTED = 5
+  SEND_SHUTDOWN_COMPLETE = 6
+  SHUTDOWN_COMPLETE = 7
+  IDEAL_SEND_BUFFER_SIZE = 8
+  PEER_ACCEPTED = 9
+STRUCT Microsoft.Quic.QUIC_STREAM_EVENT+_Anonymous_e__Union size=32 kind=Explicit pack=0 explicitSize=0
+  [0] QUIC_STREAM_EVENT+_Anonymous_e__Union+_START_COMPLETE_e__Struct START_COMPLETE (FieldOffset 0)
+  [0] QUIC_STREAM_EVENT+_Anonymous_e__Union+_RECEIVE_e__Struct RECEIVE (FieldOffset 0)
+  [0] QUIC_STREAM_EVENT+_Anonymous_e__Union+_SEND_COMPLETE_e__Struct SEND_COMPLETE (FieldOffset 0)
+  [0] QUIC_STREAM_EVENT+_Anonymous_e__Union+_PEER_SEND_ABORTED_e__Struct PEER_SEND_ABORTED (FieldOffset 0)
+  [0] QUIC_STREAM_EVENT+_Anonymous_e__Union+_PEER_RECEIVE_ABORTED_e__Struct PEER_RECEIVE_ABORTED (FieldOffset 0)
+  [0] QUIC_STREAM_EVENT+_Anonymous_e__Union+_SEND_SHUTDOWN_COMPLETE_e__Struct SEND_SHUTDOWN_COMPLETE (FieldOffset 0)
+  [0] QUIC_STREAM_EVENT+_Anonymous_e__Union+_SHUTDOWN_COMPLETE_e__Struct SHUTDOWN_COMPLETE (FieldOffset 0)
+  [0] QUIC_STREAM_EVENT+_Anonymous_e__Union+_IDEAL_SEND_BUFFER_SIZE_e__Struct IDEAL_SEND_BUFFER_SIZE (FieldOffset 0)
+STRUCT Microsoft.Quic.QUIC_STREAM_EVENT+_Anonymous_e__Union+_IDEAL_SEND_BUFFER_SIZE_e__Struct size=8 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt64 ByteCount
+STRUCT Microsoft.Quic.QUIC_STREAM_EVENT+_Anonymous_e__Union+_PEER_RECEIVE_ABORTED_e__Struct size=8 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt64 ErrorCode
+STRUCT Microsoft.Quic.QUIC_STREAM_EVENT+_Anonymous_e__Union+_PEER_SEND_ABORTED_e__Struct size=8 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt64 ErrorCode
+STRUCT Microsoft.Quic.QUIC_STREAM_EVENT+_Anonymous_e__Union+_RECEIVE_e__Struct size=32 kind=Sequential pack=0 explicitSize=0
+  [0] System.UInt64 AbsoluteOffset
+  [8] System.UInt64 TotalBufferLength
+  [16] QUIC_BUFFER* Buffers
+  [24] System.UInt32 BufferCount
+  [28] QUIC_RECEIVE_FLAGS Flags
+STRUCT Microsoft.Quic.QUIC_STREAM_EVENT+_Anonymous_e__Union+_SEND_COMPLETE_e__Struct size=16 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte Canceled
+  [8] System.Void* ClientContext
+STRUCT Microsoft.Quic.QUIC_STREAM_EVENT+_Anonymous_e__Union+_SEND_SHUTDOWN_COMPLETE_e__Struct size=1 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte Graceful
+STRUCT Microsoft.Quic.QUIC_STREAM_EVENT+_Anonymous_e__Union+_SHUTDOWN_COMPLETE_e__Struct size=24 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte ConnectionShutdown
+  [1] System.Byte _bitfield
+  [8] System.UInt64 ConnectionErrorCode
+  [16] System.Int32 ConnectionCloseStatus
+  prop System.Byte ConnectionShutdownByApp
+  prop System.Byte ConnectionClosedRemotely
+STRUCT Microsoft.Quic.QUIC_STREAM_EVENT+_Anonymous_e__Union+_START_COMPLETE_e__Struct size=24 kind=Sequential pack=0 explicitSize=0
+  [0] System.Int32 Status
+  [8] System.UInt64 ID
+  [16] System.Byte _bitfield
+  prop System.Byte PeerAccepted
+ENUM Microsoft.Quic.QUIC_STREAM_OPEN_FLAGS : Int32
+  NONE = 0
+  UNIDIRECTIONAL = 1
+  ZERO_RTT = 2
+  DELAY_ID_FC_UPDATES = 4
+ENUM Microsoft.Quic.QUIC_STREAM_SHUTDOWN_FLAGS : Int32
+  NONE = 0
+  GRACEFUL = 1
+  ABORT_SEND = 2
+  ABORT_RECEIVE = 4
+  ABORT = 6
+  IMMEDIATE = 8
+  INLINE = 16
+ENUM Microsoft.Quic.QUIC_STREAM_START_FLAGS : Int32
+  NONE = 0
+  IMMEDIATE = 1
+  FAIL_BLOCKED = 2
+  SHUTDOWN_ON_FAIL = 4
+  INDICATE_PEER_ACCEPT = 8
+ENUM Microsoft.Quic.QUIC_TLS_ALERT_CODES : Int32
+  UNEXPECTED_MESSAGE = 10
+  BAD_CERTIFICATE = 42
+  UNSUPPORTED_CERTIFICATE = 43
+  CERTIFICATE_REVOKED = 44
+  CERTIFICATE_EXPIRED = 45
+  CERTIFICATE_UNKNOWN = 46
+  ILLEGAL_PARAMETER = 47
+  UNKNOWN_CA = 48
+  ACCESS_DENIED = 49
+  INSUFFICIENT_SECURITY = 71
+  INTERNAL_ERROR = 80
+  USER_CANCELED = 90
+  CERTIFICATE_REQUIRED = 116
+  MAX = 255
+  SUCCESS = 65535
+ENUM Microsoft.Quic.QUIC_TLS_PROTOCOL_VERSION : Int32
+  UNKNOWN = 0
+  TLS_1_3 = 12288
+ENUM Microsoft.Quic.QUIC_TLS_PROVIDER : Int32
+  SCHANNEL = 0
+  OPENSSL = 1
+STRUCT Microsoft.Quic.QUIC_TLS_SECRETS size=354 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte SecretLength
+  [1] QUIC_TLS_SECRETS+_IsSet_e__Struct IsSet
+  [2] QUIC_TLS_SECRETS+<ClientRandom>e__FixedBuffer ClientRandom (fixed Byte[32])
+  [34] QUIC_TLS_SECRETS+<ClientEarlyTrafficSecret>e__FixedBuffer ClientEarlyTrafficSecret (fixed Byte[64])
+  [98] QUIC_TLS_SECRETS+<ClientHandshakeTrafficSecret>e__FixedBuffer ClientHandshakeTrafficSecret (fixed Byte[64])
+  [162] QUIC_TLS_SECRETS+<ServerHandshakeTrafficSecret>e__FixedBuffer ServerHandshakeTrafficSecret (fixed Byte[64])
+  [226] QUIC_TLS_SECRETS+<ClientTrafficSecret0>e__FixedBuffer ClientTrafficSecret0 (fixed Byte[64])
+  [290] QUIC_TLS_SECRETS+<ServerTrafficSecret0>e__FixedBuffer ServerTrafficSecret0 (fixed Byte[64])
+STRUCT Microsoft.Quic.QUIC_TLS_SECRETS+_IsSet_e__Struct size=1 kind=Sequential pack=0 explicitSize=0
+  [0] System.Byte _bitfield
+  prop System.Byte ClientRandom
+  prop System.Byte ClientEarlyTrafficSecret
+  prop System.Byte ClientHandshakeTrafficSecret
+  prop System.Byte ServerHandshakeTrafficSecret
+  prop System.Byte ClientTrafficSecret0
+  prop System.Byte ServerTrafficSecret0
+STRUCT Microsoft.Quic.QUIC_TLS_SECRETS+<ClientEarlyTrafficSecret>e__FixedBuffer size=64 kind=Sequential pack=0 explicitSize=64
+  [0] System.Byte FixedElementField
+STRUCT Microsoft.Quic.QUIC_TLS_SECRETS+<ClientHandshakeTrafficSecret>e__FixedBuffer size=64 kind=Sequential pack=0 explicitSize=64
+  [0] System.Byte FixedElementField
+STRUCT Microsoft.Quic.QUIC_TLS_SECRETS+<ClientRandom>e__FixedBuffer size=32 kind=Sequential pack=0 explicitSize=32
+  [0] System.Byte FixedElementField
+STRUCT Microsoft.Quic.QUIC_TLS_SECRETS+<ClientTrafficSecret0>e__FixedBuffer size=64 kind=Sequential pack=0 explicitSize=64
+  [0] System.Byte FixedElementField
+STRUCT Microsoft.Quic.QUIC_TLS_SECRETS+<ServerHandshakeTrafficSecret>e__FixedBuffer size=64 kind=Sequential pack=0 explicitSize=64
+  [0] System.Byte FixedElementField
+STRUCT Microsoft.Quic.QUIC_TLS_SECRETS+<ServerTrafficSecret0>e__FixedBuffer size=64 kind=Sequential pack=0 explicitSize=64
+  [0] System.Byte FixedElementField
+STRUCT Microsoft.Quic.QuicAddr size=28 kind=Explicit pack=0 explicitSize=0
+  [0] QuicAddrIn Ipv4 (FieldOffset 0)
+  [0] QuicAddrIn6 Ipv6 (FieldOffset 0)
+  [0] QuicAddrFamilyAndLen FamilyLen (FieldOffset 0)
+  prop System.Int32 Family
+STRUCT Microsoft.Quic.QuicAddrFamilyAndLen size=2 kind=Explicit pack=0 explicitSize=0
+  [0] System.UInt16 sin_family (FieldOffset 0)
+  [0] System.Byte sin_len (FieldOffset 0)
+  [1] System.Byte sin_family_bsd (FieldOffset 1)
+STRUCT Microsoft.Quic.QuicAddrIn size=8 kind=Sequential pack=0 explicitSize=0
+  [0] QuicAddrFamilyAndLen sin_family
+  [2] System.UInt16 sin_port
+  [4] InlineArray4`1<System.Byte> sin_addr
+STRUCT Microsoft.Quic.QuicAddrIn6 size=28 kind=Sequential pack=0 explicitSize=0
+  [0] QuicAddrFamilyAndLen sin6_family
+  [2] System.UInt16 sin6_port
+  [4] System.UInt32 sin6_flowinfo
+  [8] InlineArray16`1<System.Byte> sin6_addr
+  [24] System.UInt32 sin6_scope_id

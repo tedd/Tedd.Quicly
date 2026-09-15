@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Client\Tedd.Quicly.Client.csproj" />
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Server\Tedd.Quicly.Server.csproj" />
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Transport.MsQuic\Tedd.Quicly.Transport.MsQuic.csproj" />
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Http\Tedd.Quicly.Http.csproj" />
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Acme\Tedd.Quicly.Acme.csproj" />
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Testing\Tedd.Quicly.Testing.csproj" />
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Replication\Tedd.Quicly.Replication.csproj" />
+  </ItemGroup>
+</Project>

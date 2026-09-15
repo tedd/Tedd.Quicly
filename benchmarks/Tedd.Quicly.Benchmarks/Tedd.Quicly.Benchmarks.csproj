@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+    <NoWarn>$(NoWarn);CA1822;CA1812</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Http3\Tedd.Quicly.Http3.csproj" />
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Transport.MsQuic\Tedd.Quicly.Transport.MsQuic.csproj" />
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Testing\Tedd.Quicly.Testing.csproj" />
+    <ProjectReference Include="..\Tedd.Quicly.Archive\Tedd.Quicly.Archive.csproj" />
+  </ItemGroup>
+</Project>

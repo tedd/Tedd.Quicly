@@ -1,0 +1,41 @@
+<Project>
+  <PropertyGroup>
+    <TargetFrameworks>net11.0;net10.0</TargetFrameworks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <WarningsAsErrors>nullable</WarningsAsErrors>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <Authors>Tedd Hansen</Authors>
+    <Company>Tedd Hansen</Company>
+    <Product>Tedd.QUICLY</Product>
+    <RepositoryUrl>https://github.com/tedd/Tedd.QUICLY</RepositoryUrl>
+    <RootNamespace>$(MSBuildProjectName)</RootNamespace>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <IsSrcProject Condition="$(MSBuildProjectDirectory.Contains('\src\')) Or $(MSBuildProjectDirectory.Contains('/src/'))">true</IsSrcProject>
+    <IsTestProject Condition="$(MSBuildProjectDirectory.Contains('\tests\')) Or $(MSBuildProjectDirectory.Contains('/tests/'))">true</IsTestProject>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(IsSrcProject)' == 'true'">
+    <IsPackable>true</IsPackable>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(IsTestProject)' == 'true'">
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+    <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+    <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CA1707;CA2007;CA1861;xUnit1051;CA1515;CA1822</NoWarn>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(IsTestProject)' == 'true'">
+    <Using Include="Xunit" />
+  </ItemGroup>
+</Project>

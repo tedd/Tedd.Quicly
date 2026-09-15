@@ -1,0 +1,26 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Tedd.Quicly.Archive/Tedd.Quicly.Archive.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Tedd.Quicly.Acme/Tedd.Quicly.Acme.csproj" />
+    <Project Path="src/Tedd.Quicly.Client/Tedd.Quicly.Client.csproj" />
+    <Project Path="src/Tedd.Quicly.Core/Tedd.Quicly.Core.csproj" />
+    <Project Path="src/Tedd.Quicly.Http/Tedd.Quicly.Http.csproj" />
+    <Project Path="src/Tedd.Quicly.Http3/Tedd.Quicly.Http3.csproj" />
+    <Project Path="src/Tedd.Quicly.Replication/Tedd.Quicly.Replication.csproj" />
+    <Project Path="src/Tedd.Quicly.Server/Tedd.Quicly.Server.csproj" />
+    <Project Path="src/Tedd.Quicly.Testing/Tedd.Quicly.Testing.csproj" />
+    <Project Path="src/Tedd.Quicly.Transport.MsQuic/Tedd.Quicly.Transport.MsQuic.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Tedd.Quicly.Acme.Tests/Tedd.Quicly.Acme.Tests.csproj" />
+    <Project Path="tests/Tedd.Quicly.Core.Tests/Tedd.Quicly.Core.Tests.csproj" />
+    <Project Path="tests/Tedd.Quicly.EndToEnd.Tests/Tedd.Quicly.EndToEnd.Tests.csproj" />
+    <Project Path="tests/Tedd.Quicly.Http.Tests/Tedd.Quicly.Http.Tests.csproj" />
+    <Project Path="tests/Tedd.Quicly.Http3.Tests/Tedd.Quicly.Http3.Tests.csproj" />
+    <Project Path="tests/Tedd.Quicly.Replication.Tests/Tedd.Quicly.Replication.Tests.csproj" />
+    <Project Path="tests/Tedd.Quicly.Testing.Tests/Tedd.Quicly.Testing.Tests.csproj" />
+    <Project Path="tests/Tedd.Quicly.Transport.MsQuic.Tests/Tedd.Quicly.Transport.MsQuic.Tests.csproj" />
+  </Folder>
+</Solution>

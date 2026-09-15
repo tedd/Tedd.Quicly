@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Tedd.Quicly.Replication</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..$r$r.csproj" />
+  </ItemGroup>
+</Project>

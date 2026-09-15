@@ -1,8 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <Description>Tedd.Quicly.Replication</Description>
+    <Description>Tedd.Quicly.Replication — optional, transport-agnostic game-replication helpers: entity ids with generations, bit packing and quantization, snapshot delta coding, snapshot history with acknowledged baselines, input redundancy, prediction, interpolation, de-duplication and tick clocks.</Description>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Tedd.Quicly.Replication.Tests" />
+    <!-- The benchmarks compare the forced Vector128 path of DeltaCodec with the dispatching one. -->
+    <InternalsVisibleTo Include="Tedd.Quicly.Benchmarks" />
   </ItemGroup>
 </Project>

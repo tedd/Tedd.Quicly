@@ -107,6 +107,7 @@ public sealed class HttpServer : IAsyncDisposable
             if (_options.Endpoints.Count == 0)
                 throw new InvalidOperationException("At least one endpoint is required.");
             _options.Limits.Validate();
+            HttpServerLimits.ValidateTimeout(_options.ShutdownTimeout, allowZero: true, nameof(HttpServerOptions.ShutdownTimeout));
             if (_options.AllowedMethods.Count == 0)
                 throw new InvalidOperationException("At least one request method must be allowed.");
             foreach (var method in _options.AllowedMethods)
@@ -154,11 +155,16 @@ public sealed class HttpServer : IAsyncDisposable
                 _listeners.Add(socket);
                 _bound.Add((IPEndPoint)socket.LocalEndPoint!);
             }
-            for (int i = 0; i < _listeners.Count; i++)
+            // The caller's ExecutionContext (AsyncLocals such as Activity.Current) must not leak into every
+            // connection the server will ever accept.
+            using (ExecutionContext.SuppressFlow())
             {
-                var listener = _listeners[i];
-                var endpoint = _options.Endpoints[i];
-                _acceptLoops.Add(Task.Run(() => AcceptLoopAsync(listener, endpoint)));
+                for (int i = 0; i < _listeners.Count; i++)
+                {
+                    var listener = _listeners[i];
+                    var endpoint = _options.Endpoints[i];
+                    _acceptLoops.Add(Task.Run(() => AcceptLoopAsync(listener, endpoint)));
+                }
             }
         }
         catch
@@ -199,27 +205,65 @@ public sealed class HttpServer : IAsyncDisposable
                     return; // stopping, or the listener is gone
                 // A transient accept failure (a connection reset before accept completed, descriptor exhaustion):
                 // report it and back off briefly instead of spinning on a failing listener.
-                _options.OnError?.Invoke(ex);
+                ReportError(ex);
                 await Task.Delay(20).ConfigureAwait(false);
                 continue;
             }
 
-            var remote = socket.RemoteEndPoint as IPEndPoint;
-            if (!TryReserveAddress(LimitKey(remote)))
+            IPEndPoint? remote = null;
+            IPAddress? key = null;
+            HttpConnection connection;
+            try
             {
-                Interlocked.Increment(ref _rejected);
+                remote = socket.RemoteEndPoint as IPEndPoint;
+                key = LimitKey(remote);
+                if (!TryReserveAddress(key))
+                {
+                    Interlocked.Increment(ref _rejected);
+                    socket.Dispose();
+                    slots.Release();
+                    continue;
+                }
+
+                // Only admitted sockets get a connection object (pooled buffers, cancellation sources), so a flood of
+                // rejected connects costs nothing beyond the accept itself.
+                BeforeConnectionCreated?.Invoke(socket);
+                connection = new HttpConnection(this, socket, endpoint, remote);
+            }
+            catch (Exception ex)
+            {
+                // getsockname on a socket the peer already reset, or resource exhaustion: drop this socket, undo its
+                // reservation and keep accepting. The accept loop must never fault.
+                if (key is not null)
+                    ReleaseAddress(key);
                 socket.Dispose();
                 slots.Release();
+                ReportError(ex);
                 continue;
             }
-
-            // Only admitted sockets get a connection object (pooled buffers, cancellation sources), so a flood of
-            // rejected connects costs nothing beyond the accept itself.
-            var connection = new HttpConnection(this, socket, endpoint, remote);
             lock (_lock)
                 _connections[connection.Id] = connection;
             Interlocked.Increment(ref _accepted);
-            connection.Start(); // socket options are applied inside the connection, where failures are contained
+            connection.Start(); // hands off to the thread pool; socket options are applied inside the connection
+        }
+    }
+
+    /// <summary>Test seam: invoked for every admitted socket just before its connection object is created.</summary>
+    internal Action<Socket>? BeforeConnectionCreated { get; set; }
+
+    /// <summary>
+    /// Reports an unexpected error to <see cref="HttpServerOptions.OnError"/>. A callback that throws is ignored: user
+    /// code must not be able to fault an accept loop or a connection's teardown.
+    /// </summary>
+    internal void ReportError(Exception exception)
+    {
+        try
+        {
+            _options.OnError?.Invoke(exception);
+        }
+        catch (Exception)
+        {
+            // Nowhere left to report it; swallowing keeps the server alive.
         }
     }
 
@@ -245,18 +289,35 @@ public sealed class HttpServer : IAsyncDisposable
         }
     }
 
-    internal void OnConnectionClosed(HttpConnection connection)
+    private void ReleaseAddress(IPAddress address)
     {
-        var address = LimitKey(connection.RemoteEndPoint);
         lock (_lock)
         {
-            _connections.Remove(connection.Id);
             if (_perAddress.TryGetValue(address, out int count) && count > 1)
                 _perAddress[address] = count - 1;
             else
                 _perAddress.Remove(address);
         }
+    }
+
+    internal void OnConnectionClosed(HttpConnection connection)
+    {
+        lock (_lock)
+        {
+            _connections.Remove(connection.Id);
+            ReleaseAddress(LimitKey(connection.RemoteEndPoint)); // Lock is reentrant
+        }
         _slots?.Release();
+    }
+
+    /// <summary>Number of remote addresses currently holding at least one connection (tests).</summary>
+    internal int TrackedAddressCount
+    {
+        get
+        {
+            lock (_lock)
+                return _perAddress.Count;
+        }
     }
 
     internal void OnAcmeTlsAlpnHandshake() => Interlocked.Increment(ref _acmeHandshakes);

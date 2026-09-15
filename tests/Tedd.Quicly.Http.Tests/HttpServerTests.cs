@@ -442,7 +442,7 @@ public class HttpServerTests
                 using var own = new CancellationTokenSource();
                 own.Cancel();
                 var buffer = new byte[16];
-                await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await ctx.Body.ReadAsync(buffer, own.Token));
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await ctx.Body.ReadExactlyAsync(buffer.AsMemory(0, 4), own.Token));
                 // the connection's own timeout source was replaced, so the response can still be written
                 await ctx.Response.SendTextAsync("recovered", cancellationToken: ct);
             })

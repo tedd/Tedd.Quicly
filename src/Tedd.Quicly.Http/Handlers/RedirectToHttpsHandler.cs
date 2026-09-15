@@ -1,8 +1,9 @@
 namespace Tedd.Quicly.Http.Handlers;
 
 /// <summary>
-/// Redirects every plain-HTTP request to the same target on HTTPS. Requests that already arrived over TLS are
-/// left to the next handler. Place it after <see cref="Http01ChallengeHandler"/> so challenges stay on port 80.
+/// Redirects every plain-HTTP request to the same path and query on HTTPS (an absolute-form target keeps its path
+/// and query; its authority has already replaced <c>Host</c>). Requests that already arrived over TLS are left to
+/// the next handler. Place it after <see cref="Http01ChallengeHandler"/> so challenges stay on port 80.
 /// </summary>
 public sealed class RedirectToHttpsHandler : IHttpHandler
 {
@@ -32,9 +33,7 @@ public sealed class RedirectToHttpsHandler : IHttpHandler
             await response.SendTextAsync("400 Bad Request", cancellationToken: cancellationToken).ConfigureAwait(false);
             return true;
         }
-        string target = context.RawTarget;
-        if (target.Length == 0 || target[0] != '/')
-            target = "/";
+        string target = ToOriginForm(context.RawTarget);
         string location = _httpsPort == 443
             ? "https://" + host + target
             : "https://" + host + ":" + _httpsPort.ToString(System.Globalization.CultureInfo.InvariantCulture) + target;
@@ -43,6 +42,22 @@ public sealed class RedirectToHttpsHandler : IHttpHandler
         response.Headers.Set("Location", location);
         await response.SendStatusAsync(response.StatusCode, cancellationToken).ConfigureAwait(false);
         return true;
+    }
+
+    /// <summary>
+    /// The path and query of a request target: origin-form is returned as is; for absolute-form
+    /// (<c>http://host/p?q</c>, already validated by the server) the part after the authority, or <c>/</c> when
+    /// there is none; anything else (<c>*</c>) becomes <c>/</c>.
+    /// </summary>
+    internal static string ToOriginForm(string rawTarget)
+    {
+        if (rawTarget.Length > 0 && rawTarget[0] == '/')
+            return rawTarget;
+        int scheme = rawTarget.IndexOf("://", StringComparison.Ordinal);
+        if (scheme < 0)
+            return "/";
+        int path = rawTarget.IndexOf('/', scheme + 3);
+        return path < 0 ? "/" : rawTarget[path..];
     }
 
     private static readonly System.Buffers.SearchValues<char> RegNameChars =

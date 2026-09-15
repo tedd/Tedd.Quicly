@@ -120,8 +120,10 @@ public class RedirectToHttpsHandlerTests
             Assert.Null(refused["Location"]);
         }
 
-        await raw.SendAsync("GET http://abs.example/abs HTTP/1.1\r\n\r\n");
-        Assert.Equal("https://abs.example/", (await raw.ReadResponseAsync())["Location"]); // absolute-form targets redirect to the root
+        await raw.SendAsync("GET http://abs.example/abs?x=1 HTTP/1.1\r\n\r\n");
+        Assert.Equal("https://abs.example/abs?x=1", (await raw.ReadResponseAsync())["Location"]); // absolute-form targets keep path and query
+        await raw.SendAsync("GET http://abs.example HTTP/1.1\r\nHost: ignored.example\r\n\r\n");
+        Assert.Equal("https://abs.example/", (await raw.ReadResponseAsync())["Location"]); // the authority replaces Host
 
         await raw.SendAsync("GET / HTTP/1.0\r\n\r\n");
         var noHost = await raw.ReadResponseAsync();
@@ -155,7 +157,7 @@ public class RedirectToHttpsHandlerTests
 public class RouteTableTests
 {
     [Fact]
-    public void Validates_registrations()
+    public async Task Validates_registrations()
     {
         var t = new RouteTable();
         Assert.Throws<ArgumentException>(() => t.Map("GET", "", (_, _) => default));
@@ -171,7 +173,7 @@ public class RouteTableTests
             t.MapPrefix(null, "/p" + new string('x', i % 5), (_, _) => default);
         }
         Assert.Equal(40, t.Count);
-        Assert.ThrowsAsync<ArgumentNullException>(async () => await t.TryHandleAsync(null!, CancellationToken.None)).GetAwaiter().GetResult();
+        await Assert.ThrowsAsync<ArgumentNullException>(async () => await t.TryHandleAsync(null!, CancellationToken.None));
     }
 
     [Fact]

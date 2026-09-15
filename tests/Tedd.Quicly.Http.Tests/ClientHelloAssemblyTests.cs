@@ -4,7 +4,7 @@ using Tedd.Quicly.Http.Tls;
 
 namespace Tedd.Quicly.Http.Tests;
 
-/// <summary>Cross-record reassembly of a ClientHello (<see cref="ClientHelloParser.TryAssemble"/>).</summary>
+/// <summary>Cross-record reassembly of a ClientHello (<see cref="ClientHelloParser.TryAssemble(ReadOnlySpan{byte}, Span{byte}, out int, out int)"/>).</summary>
 public class ClientHelloAssemblyTests
 {
     /// <summary>Builds the handshake message (type + length + body) for a ClientHello with the given SNI/ALPN.</summary>

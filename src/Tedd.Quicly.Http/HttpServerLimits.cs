@@ -40,19 +40,35 @@ public sealed class HttpServerLimits
     /// <summary>Maximum number of requests served on one connection before the server closes it. Default 1000.</summary>
     public int MaxRequestsPerConnection { get; set; } = 1000;
 
+    /// <summary>
+    /// Largest finite timeout accepted: every timeout ends up in <see cref="CancellationTokenSource.CancelAfter(TimeSpan)"/>,
+    /// which refuses delays above <c>uint.MaxValue - 1</c> ms (about 49.7 days). Use <see cref="Timeout.InfiniteTimeSpan"/>
+    /// for "no timeout".
+    /// </summary>
+    internal static readonly TimeSpan MaxTimeout = TimeSpan.FromMilliseconds(4_294_967_294L);
+
+    /// <summary>Upper bound for <see cref="MaxRequestLineBytes"/> and <see cref="MaxHeadersBytes"/>; the header buffer is pre-allocated per connection.</summary>
+    internal const int MaxHeaderBufferLimit = 1024 * 1024;
+
+    /// <summary>Upper bound for <see cref="MaxHeaderCount"/>; the header offset table is pre-allocated per connection.</summary>
+    internal const int MaxHeaderCountLimit = 1024;
+
     internal void Validate()
     {
-        ArgumentOutOfRangeException.ThrowIfLessThan(MaxRequestLineBytes, 16);
-        ArgumentOutOfRangeException.ThrowIfLessThan(MaxHeadersBytes, 2);
-        ArgumentOutOfRangeException.ThrowIfLessThan(MaxHeaderCount, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxRequestLineBytes, 16, nameof(MaxRequestLineBytes));
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(MaxRequestLineBytes, MaxHeaderBufferLimit, nameof(MaxRequestLineBytes));
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxHeadersBytes, 2, nameof(MaxHeadersBytes));
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(MaxHeadersBytes, MaxHeaderBufferLimit, nameof(MaxHeadersBytes));
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxHeaderCount, 1, nameof(MaxHeaderCount));
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(MaxHeaderCount, MaxHeaderCountLimit, nameof(MaxHeaderCount));
         ValidateBodyLimit(MaxRequestBodyBytes);
-        ArgumentOutOfRangeException.ThrowIfLessThan(MaxConnections, 1);
-        ArgumentOutOfRangeException.ThrowIfLessThan(MaxConnectionsPerAddress, 1);
-        ArgumentOutOfRangeException.ThrowIfLessThan(MaxRequestsPerConnection, 1);
-        ValidateTimeout(HeaderReadTimeout);
-        ValidateTimeout(KeepAliveTimeout);
-        ValidateTimeout(RequestBodyReadTimeout);
-        ValidateTimeout(ResponseWriteTimeout);
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxConnections, 1, nameof(MaxConnections));
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxConnectionsPerAddress, 1, nameof(MaxConnectionsPerAddress));
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxRequestsPerConnection, 1, nameof(MaxRequestsPerConnection));
+        ValidateTimeout(HeaderReadTimeout, allowZero: false, nameof(HeaderReadTimeout));
+        ValidateTimeout(KeepAliveTimeout, allowZero: false, nameof(KeepAliveTimeout));
+        ValidateTimeout(RequestBodyReadTimeout, allowZero: false, nameof(RequestBodyReadTimeout));
+        ValidateTimeout(ResponseWriteTimeout, allowZero: false, nameof(ResponseWriteTimeout));
     }
 
     internal static void ValidateBodyLimit(long value)
@@ -61,9 +77,17 @@ public sealed class HttpServerLimits
         ArgumentOutOfRangeException.ThrowIfGreaterThan(value, int.MaxValue);
     }
 
-    private static void ValidateTimeout(TimeSpan t)
+    /// <summary>
+    /// Accepts <see cref="Timeout.InfiniteTimeSpan"/> or a positive (or, with <paramref name="allowZero"/>, zero)
+    /// duration no longer than <see cref="MaxTimeout"/>.
+    /// </summary>
+    internal static void ValidateTimeout(TimeSpan value, bool allowZero, string paramName)
     {
-        if (t != Timeout.InfiniteTimeSpan)
-            ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(t, TimeSpan.Zero);
+        if (value == Timeout.InfiniteTimeSpan)
+            return;
+        if (value < TimeSpan.Zero || (!allowZero && value == TimeSpan.Zero))
+            throw new ArgumentOutOfRangeException(paramName, value, "A timeout must be positive or Timeout.InfiniteTimeSpan.");
+        if (value > MaxTimeout)
+            throw new ArgumentOutOfRangeException(paramName, value, "A finite timeout cannot exceed " + MaxTimeout + "; use Timeout.InfiniteTimeSpan for no timeout.");
     }
 }

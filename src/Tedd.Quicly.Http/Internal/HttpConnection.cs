@@ -22,13 +22,13 @@ internal sealed class HttpConnection
     private readonly HttpEndpointOptions _endpoint;
     private readonly Socket _socket;
     private readonly CancellationTokenSource _abortCts;
-    private readonly CancellationTokenSource _idleCts;
     private readonly HttpRequestContext _context;
     private readonly HttpResponse _response;
     private readonly HttpRequestBodyStream _bodyStream;
     private readonly int _maxHeaderBlock;
 
     private CancellationTokenSource _ioCts;
+    private CancellationTokenSource _idleCts;
     private Stream _stream = Stream.Null;
     private byte[] _buffer;
     private int _start;
@@ -54,7 +54,8 @@ internal sealed class HttpConnection
         _abortCts = CancellationTokenSource.CreateLinkedTokenSource(server.AbortToken);
         _idleCts = CancellationTokenSource.CreateLinkedTokenSource(server.IdleToken, _abortCts.Token);
         _ioCts = CancellationTokenSource.CreateLinkedTokenSource(_abortCts.Token);
-        _maxHeaderBlock = _limits.MaxRequestLineBytes + 2 + _limits.MaxHeadersBytes;
+        // Request line + CRLF + header section, plus the empty lines the parser tolerates before the request line.
+        _maxHeaderBlock = (HttpParser.MaxLeadingEmptyLines * 2) + _limits.MaxRequestLineBytes + 2 + _limits.MaxHeadersBytes;
         _buffer = ArrayPool<byte>.Shared.Rent(_maxHeaderBlock);
         _parsed = new ParsedRequest(_limits.MaxHeaderCount);
         _response = new HttpResponse(this);
@@ -91,6 +92,10 @@ internal sealed class HttpConnection
     /// <summary>Completes when the connection has been fully closed and released.</summary>
     public Task Completion { get; private set; } = Task.CompletedTask;
 
+    /// <summary>
+    /// Starts processing on the thread pool. <see cref="Completion"/> is set before this returns, and no connection
+    /// code runs on the caller (the accept loop), even when the first read would complete synchronously.
+    /// </summary>
     public void Start() => Completion = RunAsync();
 
     /// <summary>Closes the socket immediately, interrupting any pending I/O. Safe to call at any time, also after the connection closed.</summary>
@@ -111,6 +116,9 @@ internal sealed class HttpConnection
 
     private async Task RunAsync()
     {
+        // Leave the accept loop at once: without this, a request already buffered at accept time would be parsed,
+        // handled (TLS handshake included) and answered inline, and no other connection would be accepted meanwhile.
+        await Task.Yield();
         try
         {
             var stream = await CreateStreamAsync().ConfigureAwait(false);
@@ -126,7 +134,7 @@ internal sealed class HttpConnection
         }
         catch (Exception ex)
         {
-            _options.OnError?.Invoke(ex);
+            _server.ReportError(ex);
         }
         finally
         {
@@ -192,11 +200,14 @@ internal sealed class HttpConnection
         int filled = 0;
         bool parsed;
         ClientHelloInfo hello;
+        // Reassembles incrementally: each read only walks the records it completed, so a hello trickled as
+        // thousands of tiny records costs linear, not quadratic, CPU.
+        var reader = default(ClientHelloReader);
         try
         {
             while (true)
             {
-                var status = TryReadClientHello(rented.AsSpan(0, filled), out hello, out parsed);
+                var status = reader.Read(rented.AsSpan(0, filled), out hello, out parsed);
                 if (status == ClientHelloAssembleStatus.Complete)
                     break;
                 if (status != ClientHelloAssembleStatus.NeedMore || filled == ClientHelloParser.MaxPeekBytes)
@@ -242,6 +253,7 @@ internal sealed class HttpConnection
         }
         finally
         {
+            reader.Dispose();
             if (!handedOff)
                 ArrayPool<byte>.Shared.Return(rented);
         }
@@ -358,7 +370,7 @@ internal sealed class HttpConnection
             }
             catch (Exception ex) when (ex is not (IOException or SocketException or ObjectDisposedException or OperationCanceledException))
             {
-                _options.OnError?.Invoke(ex);
+                _server.ReportError(ex);
                 if (_response.HasStarted)
                     return;
                 await SendErrorAsync(500).ConfigureAwait(false);
@@ -421,10 +433,11 @@ internal sealed class HttpConnection
                         case HttpParseStatus.VersionNotSupported:
                             return 505;
                         case HttpParseStatus.HeadersTooLarge:
+                        // The whole block (empty lines + request line + headers) is buffered, so the parser reports a
+                        // limit itself; should it still want more, refuse rather than read past the budget.
+                        case HttpParseStatus.NeedMore when full:
                             return 431;
                     }
-                    if (full)
-                        return 431;
                     // NeedMore although a terminator is buffered: it ended tolerated empty lines before the request
                     // line, not the header section. Keep scanning after it.
                     scanFrom += idx + 1;
@@ -447,7 +460,7 @@ internal sealed class HttpConnection
                 if (deadline == 0)
                 {
                     // Waiting for the next request on a persistent connection: idle timeout, closable on shutdown.
-                    n = await ReadWithTimeoutAsync(_stream, _buffer.AsMemory(_end), _limits.KeepAliveTimeout, _idleCts).ConfigureAwait(false);
+                    n = await ReadWithTimeoutAsync(_stream, _buffer.AsMemory(_end), _limits.KeepAliveTimeout, IdleCts()).ConfigureAwait(false);
                     deadline = Deadline(_limits.HeaderReadTimeout);
                 }
                 else
@@ -455,7 +468,7 @@ internal sealed class HttpConnection
                     var remaining = Remaining(deadline);
                     if (remaining <= TimeSpan.Zero)
                         return 408;
-                    n = await ReadWithTimeoutAsync(_stream, _buffer.AsMemory(_end), remaining, available == 0 ? _idleCts : IoCts()).ConfigureAwait(false);
+                    n = await ReadWithTimeoutAsync(_stream, _buffer.AsMemory(_end), remaining, available == 0 ? IdleCts() : IoCts()).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) when (available > 0 && !AbortToken.IsCancellationRequested)
@@ -552,12 +565,17 @@ internal sealed class HttpConnection
         }
         if (hostCount > 1)
             return 400;
-        if (hostCount == 0)
+        if (authority is not null)
         {
-            if (authority is not null)
-                headers.AddUnchecked("Host", authority);
-            else if (ctx.Version == HttpProtocolVersion.Http11)
-                return 400;
+            // RFC 9112 §3.2.2: with an absolute-form target the received Host is ignored and replaced by the
+            // target's authority.
+            if (hostCount != 0)
+                headers.Remove("Host");
+            headers.AddUnchecked("Host", authority);
+        }
+        else if (hostCount == 0 && ctx.Version == HttpProtocolVersion.Http11)
+        {
+            return 400;
         }
         if (transferEncoding is not null)
         {
@@ -598,8 +616,8 @@ internal sealed class HttpConnection
         int authorityEnd = rest.IndexOfAny((byte)'/', (byte)'?');
         if (authorityEnd < 0)
             authorityEnd = rest.Length;
-        if (authorityEnd == 0)
-            return false;
+        if (authorityEnd == 0 || rest[..authorityEnd].Contains((byte)'@'))
+            return false; // empty authority, or userinfo (RFC 9110 §4.2.4: a recipient should treat it as an error)
         authority = Encoding.Latin1.GetString(rest[..authorityEnd]);
         if (authorityEnd == rest.Length)
         {
@@ -759,34 +777,17 @@ internal sealed class HttpConnection
     internal static int ToSocketTimeout(TimeSpan timeout)
         => timeout == Timeout.InfiniteTimeSpan ? 0 : (int)Math.Min(int.MaxValue, Math.Ceiling(timeout.TotalMilliseconds));
 
-    /// <summary>
-    /// Reassembles and parses the ClientHello from the raw bytes received so far. The reassembly buffer is rented
-    /// only for the duration of the call and sized to the raw bytes (the handshake payload can never exceed them);
-    /// when the declared handshake length is larger, the attempt is repeated at full size so that "needs more bytes"
-    /// is told apart from "larger than <see cref="ClientHelloParser.MaxClientHelloLength"/>".
-    /// </summary>
+    /// <summary>One-shot <see cref="ClientHelloReader.Read"/> over <paramref name="raw"/> (tests).</summary>
     internal static ClientHelloAssembleStatus TryReadClientHello(ReadOnlySpan<byte> raw, out ClientHelloInfo hello, out bool parsed)
     {
-        hello = default;
-        parsed = false;
-        int size = Math.Min(raw.Length, ClientHelloParser.MaxClientHelloLength);
-        var scratch = ArrayPool<byte>.Shared.Rent(Math.Max(size, 256));
+        var reader = default(ClientHelloReader);
         try
         {
-            var status = ClientHelloParser.TryAssemble(raw, scratch.AsSpan(0, size), out int length, out _);
-            if (status == ClientHelloAssembleStatus.TooLarge && size < ClientHelloParser.MaxClientHelloLength)
-            {
-                ArrayPool<byte>.Shared.Return(scratch);
-                scratch = ArrayPool<byte>.Shared.Rent(ClientHelloParser.MaxClientHelloLength);
-                status = ClientHelloParser.TryAssemble(raw, scratch.AsSpan(0, ClientHelloParser.MaxClientHelloLength), out length, out _);
-            }
-            if (status == ClientHelloAssembleStatus.Complete)
-                parsed = ClientHelloParser.TryParse(scratch.AsSpan(0, length), out hello);
-            return status;
+            return reader.Read(raw, out hello, out parsed);
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(scratch);
+            reader.Dispose();
         }
     }
 
@@ -833,13 +834,23 @@ internal sealed class HttpConnection
     /// The per-operation timeout source. A source that has fired stays cancelled, so after a timeout (or its timer
     /// racing the completion of the operation it guarded) it is replaced; this only allocates on the error path.
     /// </summary>
-    private CancellationTokenSource IoCts()
+    private CancellationTokenSource IoCts() => Renew(ref _ioCts, idle: false);
+
+    /// <summary>
+    /// The idle/first-byte timeout source. Like <see cref="IoCts"/> it is replaced once its own timer has fired (a
+    /// timer racing the completion of the read it guarded would otherwise fail the next idle read at once), but it
+    /// stays cancelled when the server is closing idle connections or the connection is aborted.
+    /// </summary>
+    private CancellationTokenSource IdleCts() => Renew(ref _idleCts, idle: true);
+
+    /// <summary>Returns <paramref name="source"/>, replacing it first when only its own timer (not abort or shutdown) cancelled it.</summary>
+    private CancellationTokenSource Renew(ref CancellationTokenSource source, bool idle)
     {
-        var cts = _ioCts;
-        if (cts.IsCancellationRequested && !_abortCts.IsCancellationRequested)
+        var cts = source;
+        if (cts.IsCancellationRequested && !_abortCts.IsCancellationRequested && !(idle && _server.IdleToken.IsCancellationRequested))
         {
             cts.Dispose();
-            _ioCts = cts = CancellationTokenSource.CreateLinkedTokenSource(_abortCts.Token);
+            source = cts = idle ? CancellationTokenSource.CreateLinkedTokenSource(_server.IdleToken, _abortCts.Token) : CancellationTokenSource.CreateLinkedTokenSource(_abortCts.Token);
         }
         return cts;
     }

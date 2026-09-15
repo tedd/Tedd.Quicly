@@ -280,7 +280,7 @@ public class RawProtocolTests
         await raw.SendAsync("GET http://proxy.example:8080/abs?x HTTP/1.1\r\n\r\n");
         Assert.Equal("path=/abs;host=proxy.example:8080;v=1", (await raw.ReadResponseAsync()).Body);
         await raw.SendAsync("GET HTTPS://other.example HTTP/1.1\r\nHost: real\r\n\r\n");
-        Assert.Equal("path=/;host=real;v=1", (await raw.ReadResponseAsync()).Body);
+        Assert.Equal("path=/;host=other.example;v=1", (await raw.ReadResponseAsync()).Body); // RFC 9112 §3.2.2: the absolute-form authority replaces Host
         await raw.SendAsync("\r\n\r\nOPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n");
         Assert.Equal("path=*", (await raw.ReadResponseAsync()).Body);
         await raw.SendAsync("GET /café HTTP/1.1\r\nHost: a\r\n\r\n");

@@ -52,7 +52,7 @@ public class ServerLifecycleTests
     }
 
     [Fact]
-    public void Limits_are_validated()
+    public async Task Limits_are_validated()
     {
         static void Check(Action<HttpServerLimits> mutate)
         {
@@ -74,13 +74,35 @@ public class ServerLifecycleTests
         Check(l => l.KeepAliveTimeout = TimeSpan.FromSeconds(-1));
         Check(l => l.RequestBodyReadTimeout = TimeSpan.Zero);
         Check(l => l.ResponseWriteTimeout = TimeSpan.Zero);
+        // CancellationTokenSource.CancelAfter refuses anything above uint.MaxValue - 1 ms (~49.7 days)
+        Check(l => l.HeaderReadTimeout = TimeSpan.FromDays(60));
+        Check(l => l.KeepAliveTimeout = HttpServerLimits.MaxTimeout + TimeSpan.FromMilliseconds(1));
+        Check(l => l.RequestBodyReadTimeout = TimeSpan.MaxValue);
+        Check(l => l.ResponseWriteTimeout = TimeSpan.FromDays(50));
+        // per-connection pre-allocations are bounded
+        Check(l => l.MaxRequestLineBytes = HttpServerLimits.MaxHeaderBufferLimit + 1);
+        Check(l => l.MaxHeadersBytes = HttpServerLimits.MaxHeaderBufferLimit + 1);
+        Check(l => l.MaxHeaderCount = HttpServerLimits.MaxHeaderCountLimit + 1);
+
+        foreach (var shutdown in new[] { TimeSpan.FromSeconds(-2), HttpServerLimits.MaxTimeout + TimeSpan.FromMilliseconds(1) })
+        {
+            var options = new HttpServerOptions().Listen(IPAddress.Loopback, 0);
+            options.ShutdownTimeout = shutdown;
+            var ex = Assert.Throws<ArgumentOutOfRangeException>(new HttpServer(options).Start);
+            Assert.Equal(nameof(HttpServerOptions.ShutdownTimeout), ex.ParamName);
+        }
 
         var infinite = new HttpServerOptions().Listen(IPAddress.Loopback, 0);
         infinite.Limits.KeepAliveTimeout = Timeout.InfiniteTimeSpan;
         infinite.Limits.HeaderReadTimeout = Timeout.InfiniteTimeSpan;
+        infinite.Limits.RequestBodyReadTimeout = HttpServerLimits.MaxTimeout; // the largest finite value is accepted
+        infinite.Limits.MaxRequestLineBytes = HttpServerLimits.MaxHeaderBufferLimit;
+        infinite.Limits.MaxHeadersBytes = HttpServerLimits.MaxHeaderBufferLimit;
+        infinite.Limits.MaxHeaderCount = HttpServerLimits.MaxHeaderCountLimit;
+        infinite.ShutdownTimeout = TimeSpan.Zero;
         var ok = new HttpServer(infinite);
         ok.Start();
-        ok.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        await ok.DisposeAsync();
     }
 
     [Fact]

@@ -4,8 +4,16 @@ namespace Tedd.Quicly.Http.Tls;
 
 /// <summary>
 /// Loads a PKCS#12 (PFX) file and optionally polls its last-write time to reload it in place. The private key is
-/// imported as exportable into a (non-persisted) key container so that SChannel can use it (ADR 0006).
+/// imported with the default key storage flags: not exportable (ADR 0009) and not ephemeral, because SChannel cannot
+/// use an ephemeral key. On Windows that means a per-certificate key container, which is removed when the
+/// certificate is disposed or finalized.
 /// </summary>
+/// <remarks>
+/// A reload whose file holds the same certificate keeps the existing instance and disposes the fresh import, so
+/// touching the file does not accumulate key containers. A certificate that has been replaced is not disposed: TLS
+/// session caches, handshakes in progress and <see cref="Changed"/> subscribers may still hold it, so it is left to
+/// finalization.
+/// </remarks>
 public sealed class FileCertificateSource : ICertificateSource, IDisposable
 {
     private readonly string _path;
@@ -27,7 +35,7 @@ public sealed class FileCertificateSource : ICertificateSource, IDisposable
             ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero);
         _path = Path.GetFullPath(path);
         _password = password;
-        Load();
+        _current = Load(out _lastWriteUtc);
         if (reloadInterval is { } iv)
             _timer = new Timer(static s => ((FileCertificateSource)s!).Poll(), this, iv, iv);
     }
@@ -50,24 +58,27 @@ public sealed class FileCertificateSource : ICertificateSource, IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         lock (_reloadLock)
         {
-            var previous = _current;
-            Load();
-            bool changed = previous is null || !previous.RawDataMemory.Span.SequenceEqual(_current!.RawDataMemory.Span);
-            if (changed)
-                Changed?.Invoke(_current!);
-            return changed;
+            var previous = _current!;
+            var loaded = Load(out var lastWrite);
+            _lastWriteUtc = lastWrite;
+            if (previous.RawDataMemory.Span.SequenceEqual(loaded.RawDataMemory.Span))
+            {
+                loaded.Dispose(); // same certificate: keep the instance in use, release the duplicate key container
+                return false;
+            }
+            Volatile.Write(ref _current, loaded);
+            Changed?.Invoke(loaded);
+            return true;
         }
     }
 
-    private void Load()
+    private X509Certificate2 Load(out DateTime lastWriteUtc)
     {
         var info = new FileInfo(_path);
         if (!info.Exists)
             throw new FileNotFoundException("Certificate file not found.", _path);
-        var lastWrite = info.LastWriteTimeUtc;
-        var cert = X509CertificateLoader.LoadPkcs12FromFile(_path, _password, X509KeyStorageFlags.Exportable);
-        Volatile.Write(ref _current, cert);
-        _lastWriteUtc = lastWrite;
+        lastWriteUtc = info.LastWriteTimeUtc;
+        return X509CertificateLoader.LoadPkcs12FromFile(_path, _password, X509KeyStorageFlags.DefaultKeySet);
     }
 
     internal void Poll()

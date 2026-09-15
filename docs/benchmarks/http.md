@@ -88,8 +88,17 @@ disappears on .NET 11. V1 stays in the archive, and the benchmark keeps both run
 * **TLS ClientHello peek.** The first implementation rented 80 KiB of peek buffer plus 64 KiB of reassembly
   buffer for every TLS connection before the first byte arrived, so 2 048 slow-loris connections pinned about
   288 MiB of pooled arrays. The peek buffer now starts at 4 KiB and doubles only as bytes arrive (bounded by
-  `ClientHelloParser.MaxPeekBytes`). The reassembly buffer is rented per attempt and returned immediately. A
-  connection that trickles a hello therefore holds memory in proportion to what it has actually sent.
+  `ClientHelloParser.MaxPeekBytes`). The reassembly buffer (`ClientHelloReader`) starts at the size of the
+  first bytes and grows only as handshake payload arrives, bounded by `ClientHelloParser.MaxClientHelloLength`.
+  A connection that trickles a hello therefore holds memory in proportion to what it has actually sent.
+* **TLS ClientHello CPU.** Reassembly used to restart from the first record on every read, so a hello sent
+  as thousands of one-byte records, one per TCP segment, cost CPU quadratic in the record count (about
+  n²/2 record visits per connection, ~450 million for a 12 KiB hello). The resumable
+  `ClientHelloParser.TryAssemble(..., ref ClientHelloAssemblyState, ...)` walks each record once, so the cost is
+  linear in the bytes received. `ReviewFollowUpTests.Client_hello_reader_is_linear_for_a_hello_trickled_as_one_byte_records`
+  feeds such a hello one byte per call (~73 000 calls) and finishes in milliseconds. This is a
+  complexity fix, not a micro-optimisation, so it was not benchmarked; the request parser measured above is
+  unchanged.
 * Connections rejected by the per-address limit are refused before any per-connection state is created. No
   buffers or linked cancellation sources are allocated, so a connect flood from one address costs only the
   accept.

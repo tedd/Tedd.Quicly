@@ -86,10 +86,12 @@ public sealed class StaticFileHandler : IHttpHandler
     public StaticFileHandler(string rootDirectory, StaticFileOptions? options = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(rootDirectory);
-        _root = Path.GetFullPath(rootDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        // TrimEndingDirectorySeparator keeps the separator of a filesystem root ("C:\", "/"): trimming it would turn
+        // "C:\" into the drive-relative "C:" and "/" into "".
+        _root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(rootDirectory));
         if (!Directory.Exists(_root))
             throw new DirectoryNotFoundException("Static file root not found: " + _root);
-        _rootWithSeparator = _root + Path.DirectorySeparatorChar;
+        _rootWithSeparator = Path.EndsInDirectorySeparator(_root) ? _root : _root + Path.DirectorySeparatorChar;
         _options = options ?? new StaticFileOptions();
         ArgumentException.ThrowIfNullOrEmpty(_options.RequestPathPrefix);
         if (_options.RequestPathPrefix[0] != '/')
@@ -133,7 +135,8 @@ public sealed class StaticFileHandler : IHttpHandler
         }
 
         var combined = new System.Text.StringBuilder(_rootWithSeparator.Length + rel.Length);
-        combined.Append(_root);
+        combined.Append(_rootWithSeparator);
+        bool first = true;
         while (!rel.IsEmpty)
         {
             int slash = rel.IndexOf('/');
@@ -145,11 +148,14 @@ public sealed class StaticFileHandler : IHttpHandler
                 return false;
             if (segment[^1] == '.' || segment[^1] == ' ')
                 return false; // Windows would silently trim these
-            combined.Append(Path.DirectorySeparatorChar).Append(segment);
+            if (!first)
+                combined.Append(Path.DirectorySeparatorChar);
+            combined.Append(segment);
+            first = false;
         }
 
         // Defence in depth: the segment rules above already make escaping impossible; verify the canonical path anyway.
-        string candidate = Path.GetFullPath(combined.ToString());
+        string candidate = first ? _root : Path.GetFullPath(combined.ToString());
         bool inside = candidate.StartsWith(_rootWithSeparator, StringComparison.Ordinal) || string.Equals(candidate, _root, StringComparison.Ordinal);
         fullPath = inside ? candidate : string.Empty;
         return inside;

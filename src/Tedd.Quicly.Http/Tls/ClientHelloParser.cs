@@ -31,7 +31,7 @@ internal readonly struct ClientHelloInfo
     }
 }
 
-/// <summary>Outcome of <see cref="ClientHelloParser.TryAssemble"/>.</summary>
+/// <summary>Outcome of <see cref="ClientHelloParser.TryAssemble(ReadOnlySpan{byte}, Span{byte}, ref ClientHelloAssemblyState, out int, out int)"/>.</summary>
 internal enum ClientHelloAssembleStatus : byte
 {
     /// <summary>More bytes are needed to complete the ClientHello.</summary>
@@ -47,9 +47,29 @@ internal enum ClientHelloAssembleStatus : byte
     TooLarge,
 }
 
+/// <summary>Progress of a resumable <see cref="ClientHelloParser.TryAssemble(ReadOnlySpan{byte}, Span{byte}, ref ClientHelloAssemblyState, out int, out int)"/>.</summary>
+internal readonly struct ClientHelloAssemblyState
+{
+    public ClientHelloAssemblyState(int recordOffset, int assembled, int needed)
+    {
+        RecordOffset = recordOffset;
+        Assembled = assembled;
+        Needed = needed;
+    }
+
+    /// <summary>Raw offset of the first record not yet copied out.</summary>
+    public int RecordOffset { get; }
+
+    /// <summary>Handshake bytes copied out so far.</summary>
+    public int Assembled { get; }
+
+    /// <summary>Total handshake message length (header included), or 0 while not yet known.</summary>
+    public int Needed { get; }
+}
+
 /// <summary>
 /// Minimal TLS ClientHello parser: extracts <c>server_name</c> (type 0) and <c>application_layer_protocol_negotiation</c>
-/// (type 16). <see cref="TryAssemble"/> reassembles a ClientHello that the client fragmented over several handshake
+/// (type 16). <see cref="TryAssemble(ReadOnlySpan{byte}, Span{byte}, out int, out int)"/> reassembles a ClientHello that the client fragmented over several handshake
 /// records; <see cref="TryParse"/> then reads the extensions from the assembled message.
 /// </summary>
 internal static class ClientHelloParser
@@ -95,41 +115,77 @@ internal static class ClientHelloParser
     /// <param name="recordBytes">Number of raw bytes belonging to the records that were consumed on <see cref="ClientHelloAssembleStatus.Complete"/>.</param>
     public static ClientHelloAssembleStatus TryAssemble(ReadOnlySpan<byte> buffered, Span<byte> handshake, out int handshakeLength, out int recordBytes)
     {
+        var state = default(ClientHelloAssemblyState);
+        return TryAssemble(buffered, handshake, ref state, out handshakeLength, out recordBytes);
+    }
+
+    /// <summary>
+    /// Resumable form of <see cref="TryAssemble(ReadOnlySpan{byte}, Span{byte}, out int, out int)"/>: records already
+    /// copied into <paramref name="handshake"/> by an earlier call with the same <paramref name="state"/> are not walked
+    /// again, so feeding a trickled hello costs time linear in its size rather than quadratic in its record count.
+    /// <paramref name="buffered"/> must start with the same bytes on every call and <paramref name="handshake"/> must
+    /// keep its first <see cref="ClientHelloAssemblyState.Assembled"/> bytes (it may grow between calls, e.g. after
+    /// <see cref="ClientHelloAssembleStatus.TooLarge"/>, which leaves the state resumable).
+    /// </summary>
+    public static ClientHelloAssembleStatus TryAssemble(ReadOnlySpan<byte> buffered, Span<byte> handshake, ref ClientHelloAssemblyState state, out int handshakeLength, out int recordBytes)
+    {
         handshakeLength = 0;
         recordBytes = 0;
-        int pos = 0;
-        int assembled = 0;
-        int needed = -1;
+        int pos = state.RecordOffset;
+        int assembled = state.Assembled;
+        int needed = state.Needed; // 0 = not known yet (a known length is at least HandshakeHeaderLength)
+        var status = ClientHelloAssembleStatus.NeedMore;
         while (true)
         {
+            // Checked before reading another record, so a call resuming after the buffer grew (or after Complete)
+            // re-evaluates what it already has.
+            if (needed != 0)
+            {
+                if (needed > handshake.Length)
+                {
+                    status = ClientHelloAssembleStatus.TooLarge;
+                    break;
+                }
+                if (assembled >= needed)
+                {
+                    handshakeLength = needed;
+                    recordBytes = pos;
+                    status = ClientHelloAssembleStatus.Complete;
+                    break;
+                }
+            }
+
             int recordLength = GetRecordLength(buffered[pos..]);
             if (recordLength < 0)
-                return ClientHelloAssembleStatus.NotTls;
+            {
+                status = ClientHelloAssembleStatus.NotTls;
+                break;
+            }
             if (recordLength == 0 || buffered.Length - pos < recordLength)
-                return ClientHelloAssembleStatus.NeedMore;
+                break; // NeedMore
 
             var payload = buffered.Slice(pos + RecordHeaderLength, recordLength - RecordHeaderLength);
             if (assembled + payload.Length > handshake.Length)
-                return ClientHelloAssembleStatus.TooLarge;
+            {
+                status = ClientHelloAssembleStatus.TooLarge;
+                break;
+            }
             payload.CopyTo(handshake[assembled..]);
             assembled += payload.Length;
             pos += recordLength;
 
-            if (needed < 0 && assembled >= HandshakeHeaderLength)
+            if (needed == 0 && assembled >= HandshakeHeaderLength)
             {
                 if (handshake[0] != 0x01)
-                    return ClientHelloAssembleStatus.NotTls;
+                {
+                    status = ClientHelloAssembleStatus.NotTls;
+                    break;
+                }
                 needed = HandshakeHeaderLength + ((handshake[1] << 16) | (handshake[2] << 8) | handshake[3]);
-                if (needed > handshake.Length)
-                    return ClientHelloAssembleStatus.TooLarge;
-            }
-            if (needed >= 0 && assembled >= needed)
-            {
-                handshakeLength = needed;
-                recordBytes = pos;
-                return ClientHelloAssembleStatus.Complete;
             }
         }
+        state = new ClientHelloAssemblyState(pos, assembled, needed);
+        return status;
     }
 
     /// <summary>Parses an assembled ClientHello handshake message (starting at the handshake type byte).</summary>

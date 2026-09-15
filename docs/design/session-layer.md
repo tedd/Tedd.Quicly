@@ -199,3 +199,46 @@ SimulatedTransport: handshake (accept/reject/timeout/table mismatch/datagrams re
 key reuse after RetireKey, ReliableLatest lost final update / lost ack / rollover / retry budget / large value stream supersede,
 fragmentation loss, expiry under a bandwidth cap, group streams with a stream limit of 1, bulk transfer with resume, request/response
 with timeout, ring overflow policies, ping/RTT/offset, close/epoch/reconnect resync, zero-allocation steady state for send/poll.
+
+## 7. Engine boundary and implementation waves
+
+The peer never contains mode-specific logic. It owns the shared tables (send entries, receive ring, mailboxes,
+key tables, stream table, completion table) and dispatches to **one engine instance per delivery mode per
+peer**. An engine owns the SoA state of *all* channels of its mode (indexed by a dense per-mode channel
+index), which keeps the data layout ECS-like and lets engines be written in parallel without touching the
+peer's files.
+
+```csharp
+internal abstract class ChannelEngine            // one sealed subclass per ChannelMode
+{
+    public abstract ChannelMode Mode { get; }
+    public abstract void Initialize(PeerCore core, ReadOnlySpan<ChannelDefinition> channelsOfMode);
+
+    // game thread
+    public abstract SendStatus Admit(ref SendRequest request);        // validate, fill entry, enqueue (no transport call)
+    public abstract void Flush(ref FlushContext flush);               // submit queued work within the flush budget
+    public abstract void Tick(long nowMicros, ref long nextDeadline);  // retries, expiry, timers
+    public abstract void OnSendCompleted(int entrySlot, in CompletionEntry completion);  // drained from the CompletionRing
+    public abstract void OnEpochReset(bool resumed);                   // reconnect semantics (PROTOCOL 4.1)
+
+    // transport thread
+    public abstract void OnDatagram(in MessageHeader header, ReadOnlySpan<byte> payload, long nowMicros);
+    public abstract StreamAccept OnStreamOpened(TransportStreamId id, ushort channel, ulong groupId);
+    public abstract StreamConsume OnStreamMessage(ref StreamMessageContext message);   // start / chunk / end
+    public abstract void OnStreamClosed(TransportStreamId id, bool aborted, ulong errorCode);
+}
+```
+
+`PeerCore` is the engine-facing façade: allocate/publish/free send entries, rent/return leases, enqueue
+receive entries or mailbox exchanges, open/send/abort streams through the transport, submit datagrams through
+the packer, record counters, read `now`, request a connection close (executed in `Poll`).
+
+Waves:
+
+| Wave | Content | Depends on |
+|---|---|---|
+| C1 | `PeerCore`, `QuiclyPeer` public API, handshake/control/ping, packer + scheduler, `ChannelEngine` base, engines for `UnreliableUnordered`, `UnreliableSequenced` (incl. coalescing mailboxes), `ReliableOrdered` (persistent stream, gather send), Poll/Drain/handlers, completions, statistics | State, Framing, Channels, Control, SimulatedTransport |
+| C2 (parallel) | `ReliableLatestEngine`; `GroupStreamEngine` (`ReliableUnordered`); `BulkEngine`; fragmentation in the unreliable engines; request/response in the ordered engine | C1 |
+| C3 | `MsQuicTransport` (ITransport over the MsQuic wrappers) + listener/connector; `QuiclyServer` / `QuiclyClient`; admission; reconnect | C1, msquic bindings |
+| C4 | WebTransport-over-HTTP/3 carrier (opt-in), HTTP/3 static responder | C3, Http3 |
+| C5 | End-to-end tests (MsQuic loopback, ACME mock CA + HTTP server + QUIC listener cert swap), samples, E2E benchmarks | all |

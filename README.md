@@ -24,7 +24,7 @@ Google Trust Services, …).
 
 ## Status
 
-Under construction. Targets `net11.0` (primary) and `net10.0`. Windows 11 / Server 2022+ (Schannel QUIC),
+Under construction; see [docs/STATUS.md](docs/STATUS.md) for what is merged, what is in progress and the test and coverage numbers. Targets `net11.0` (primary) and `net10.0`. Windows 11 / Server 2022+ (Schannel QUIC),
 Linux with `libmsquic`, macOS with `libmsquic`. Browser (WebAssembly) client support is optional and experimental.
 
 ## Layout

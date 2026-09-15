@@ -317,6 +317,21 @@ public sealed unsafe partial class MsQuicTransport
         }
     }
 
+    /// <summary>Reads <c>QUIC_PARAM_STREAM_PRIORITY</c> of a stream (for tests; waits for the worker). -1 for an unknown id or a failed query.</summary>
+    internal int QueryStreamPriority(TransportStreamId id)
+    {
+        StreamSlot? slot = Enter(id, allowAppClosed: true);
+        if (slot is null) return -1;
+        try
+        {
+            return MsQuicStatus.Succeeded(slot.Stream!.GetParam(MsQuicParam.QUIC_PARAM_STREAM_PRIORITY, out ushort priority)) ? priority : -1;
+        }
+        finally
+        {
+            Exit(slot);
+        }
+    }
+
     /// <inheritdoc/>
     /// <remarks>
     /// Ignored unless a receive on the stream is pending (or its callback is still running and then returns

@@ -10,6 +10,8 @@ namespace Tedd.Quicly.Transport.MsQuic.Tests.Transport;
 /// <see cref="ITransportTestHarness"/> over MsQuic loopback: one test registration per harness (closed with a deadline so a
 /// leak fails the test instead of hanging the run), one <see cref="MsQuicTransportListener"/> + <see cref="MsQuicTransportConnector"/>
 /// per pair on 127.0.0.1:0, and a self-signed certificate the client pins (<see cref="ServerCertificateValidationMode.PinnedSpki"/>).
+/// <see cref="ConformancePairOptions.TransportCloseAfter"/> becomes the idle timeout of both ends (keep-alives off);
+/// <see cref="ConformancePairOptions.FailHandshake"/> gives the client a pin that matches no certificate.
 /// </summary>
 internal sealed class MsQuicTransportHarness : ITransportTestHarness
 {
@@ -47,6 +49,7 @@ internal sealed class MsQuicTransportHarness : ITransportTestHarness
     {
         options ??= new ConformancePairOptions();
         var server = new MsQuicTransportOptions { ServerPeerBidiStreamCount = options.ServerPeerBidiStreams, ServerPeerUnidiStreamCount = options.ServerPeerUnidiStreams };
+        ApplyTransportClose(server, options);
         _configure?.Invoke(server);
         return server;
     }
@@ -59,10 +62,20 @@ internal sealed class MsQuicTransportHarness : ITransportTestHarness
             ClientPeerBidiStreamCount = options.ClientPeerBidiStreams,
             ClientPeerUnidiStreamCount = options.ClientPeerUnidiStreams,
             ServerCertificateValidation = ServerCertificateValidationMode.PinnedSpki,
-            PinnedSpkiSha256 = [Pin],
+            PinnedSpkiSha256 = [options.FailHandshake ? new byte[32] : Pin],
         };
+        ApplyTransportClose(client, options);
         _configure?.Invoke(client);
         return client;
+    }
+
+    /// <summary><see cref="ConformancePairOptions.TransportCloseAfter"/>: an idle timeout that closes the connection once the scenario leaves it alone.</summary>
+    private static void ApplyTransportClose(MsQuicTransportOptions transport, ConformancePairOptions options)
+    {
+        if (options.TransportCloseAfter is not TimeSpan after) return;
+        transport.IdleTimeout = after;
+        transport.ClientKeepAliveInterval = TimeSpan.Zero;
+        transport.ServerKeepAliveInterval = TimeSpan.Zero;
     }
 
     public MsQuicTransportListener StartListener(MsQuicTransportOptions options, PreHandshakeCallback preHandshake, AcceptCallback accept, X509Certificate2? certificate = null, IPEndPoint? endPoint = null)
@@ -103,6 +116,20 @@ internal sealed class MsQuicTransportHarness : ITransportTestHarness
         if (!accepted.Wait(DefaultTimeout)) throw new ConformanceException($"[{Name}] the listener never accepted the connection.");
         listener.Stop();
         return new ConformancePair(client, server!);
+    }
+
+    public ITransport Connect(ITransportSink clientSink, PreHandshakeCallback preHandshake, AcceptCallback accept, ConformancePairOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(clientSink);
+        ArgumentNullException.ThrowIfNull(preHandshake);
+        ArgumentNullException.ThrowIfNull(accept);
+        options ??= new ConformancePairOptions();
+        MsQuicTransportListener listener = StartListener(ServerOptions(options), preHandshake, (ITransport transport, in NewConnectionInfo info) =>
+        {
+            Track((MsQuicTransport)transport);
+            return accept(transport, in info);
+        });
+        return Track(CreateConnector(ClientOptions(options)).Connect(listener.LocalEndPoint, "localhost", clientSink));
     }
 
     public bool Pump(Func<bool> condition, TimeSpan timeout)

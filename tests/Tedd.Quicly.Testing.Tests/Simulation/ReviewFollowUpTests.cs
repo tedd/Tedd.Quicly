@@ -99,7 +99,9 @@ public class ReviewFollowUpTests
             Assert.Equal(TransportStatus.Success, server.StartStream(id));
         }
         Assert.Equal(TransportStatus.Success, server.OpenStream(StreamKind.Bidirectional, 9, 0, out TransportStreamId fourth));
-        Assert.Equal(TransportStatus.StreamLimitReached, server.StartStream(fourth));
+        Assert.Equal(TransportStatus.Success, server.StartStream(fourth)); // beyond the limit: refused asynchronously, as MsQuic does
+        Assert.True(network.RunUntilIdle(1_000_000));
+        Assert.Equal(TransportStatus.StreamLimitReached, Assert.Single(serverSink.OfKind(RecordedEventKind.StreamStarted), e => e.StreamId == fourth).Status);
     }
 
     // ------------------------------------------------------------------ aborts are causal

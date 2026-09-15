@@ -73,8 +73,12 @@ public sealed unsafe partial class SimulatedTransport
 
     /// <inheritdoc/>
     /// <remarks>
-    /// <see cref="TransportStatus.StreamLimitReached"/> when the peer's concurrent-stream allowance is used up (the stream
-    /// stays open and may be started after <see cref="ITransportSink.OnStreamsAvailable"/>).
+    /// A start beyond the peer's concurrent-stream allowance is refused the way MsQuic refuses it: the call returns
+    /// <see cref="TransportStatus.Success"/>, and the next advance step raises <see cref="ITransportSink.OnStreamStarted"/>
+    /// with <see cref="TransportStatus.StreamLimitReached"/>, then <see cref="ITransportSink.OnStreamShutdownComplete"/>.
+    /// The refused stream never starts (a later start returns <see cref="TransportStatus.InvalidState"/>, it takes no credit
+    /// and the peer never hears of it): release it with <see cref="CloseStream"/> and open a new stream after
+    /// <see cref="ITransportSink.OnStreamsAvailable"/>.
     /// </remarks>
     public TransportStatus StartStream(TransportStreamId id)
     {
@@ -82,7 +86,9 @@ public sealed unsafe partial class SimulatedTransport
         {
             if (_state != TransportState.Connected || !TryGetStream(id, out SimStream s) || !s.Local || s.Started)
                 return TransportStatus.InvalidState;
-            return TryStart(id.Slot, s);
+            StartOrRefuse(id.Slot, s);
+            CheckShutdown(id.Slot, s); // a refused stream shuts down right after its OnStreamStarted
+            return TransportStatus.Success;
         }
     }
 
@@ -102,9 +108,25 @@ public sealed unsafe partial class SimulatedTransport
             {
                 if (!s.Local || (flags & TransportSendFlags.Start) == 0)
                     return TransportStatus.InvalidState;
-                TransportStatus started = TryStart(id.Slot, s);
-                if (started != TransportStatus.Success)
-                    return started;
+                StartOrRefuse(id.Slot, s);
+                if (s.StartRefused)
+                {
+                    // As with MsQuic: the send is accepted together with the refused start and completes canceled, after
+                    // OnStreamStarted(StreamLimitReached) and before OnStreamShutdownComplete.
+                    int refused = AllocSend(out _);
+                    ref SendRecord canceled = ref _sends[refused];
+                    canceled.Stream = id.Slot;
+                    canceled.StreamGeneration = s.Generation;
+                    canceled.Context = context;
+                    canceled.Length = 0;
+                    canceled.Buffer = null;
+                    canceled.Fin = false;
+                    canceled.StreamOffset = 0;
+                    canceled.ChunksRemaining = 0;
+                    s.EnqueueSend(refused);
+                    CancelPendingSends(id.Slot, s, inline: false);
+                    return TransportStatus.Success;
+                }
             }
 
             bool fin = (flags & TransportSendFlags.Fin) != 0;
@@ -234,7 +256,9 @@ public sealed unsafe partial class SimulatedTransport
     /// A peer that has not connected yet reads the new limits when it connects (they travel with the handshake). A
     /// peer that is already connected sees them one one-way delay later through
     /// <see cref="ITransportSink.OnStreamsAvailable"/>, whether or not this end has finished connecting. A peer that
-    /// connects while the update is in flight reads it at connect and then also gets the (redundant) callback.
+    /// connects while the update is in flight reads it at connect and then also gets the (redundant) callback. Once either
+    /// end is connected (the old limit can have reached the peer), a lower limit is ignored: QUIC never takes granted stream
+    /// credit back (MsQuic only limits the credit it grants later); before that the values replace the initial ones.
     /// </remarks>
     public void UpdatePeerStreamLimits(ushort bidirectional, ushort unidirectional)
     {
@@ -242,10 +266,17 @@ public sealed unsafe partial class SimulatedTransport
         {
             if (_state is TransportState.Closing or TransportState.Closed)
                 return;
+            SimulatedTransport? peer = Peer;
+            bool advertised = _state == TransportState.Connected || peer?._state == TransportState.Connected;
+            if (advertised)
+            {
+                // QUIC never takes granted stream credit back: once the old limit can have reached the peer, lowering is ignored.
+                bidirectional = Math.Max(bidirectional, AllowPeerBidi);
+                unidirectional = Math.Max(unidirectional, AllowPeerUni);
+            }
             AllowPeerBidi = bidirectional;
             AllowPeerUni = unidirectional;
-            SimulatedTransport? peer = Peer;
-            if (peer is not null && (_state == TransportState.Connected || peer._state == TransportState.Connected))
+            if (peer is not null && advertised)
                 Post(SimEventKind.StreamsAvailable, _network.NowMicros + Link.Options.DelayMicros, peer, bidirectional, 0, unidirectional);
         }
     }
@@ -335,17 +366,30 @@ public sealed unsafe partial class SimulatedTransport
 
     // ------------------------------------------------------------------ start / send / receive
 
-    private TransportStatus TryStart(int slot, SimStream s)
+    /// <summary>
+    /// Starts a local stream, or refuses the start when the peer's concurrent-stream allowance is used up, as MsQuic does
+    /// with <c>FAIL_BLOCKED | SHUTDOWN_ON_FAIL</c>: OnStreamStarted reports StreamLimitReached at the next step and the stream
+    /// is dead (it never starts, takes no credit and the peer never hears of it). The caller schedules the refused stream's
+    /// shutdown (<see cref="CheckShutdown"/> runs once any send accepted with the start is queued behind the report).
+    /// </summary>
+    private void StartOrRefuse(int slot, SimStream s)
     {
         bool bidi = s.Kind == StreamKind.Bidirectional;
+        s.Started = true;
         if (bidi ? _localOpenBidi >= _peerAllowsBidi : _localOpenUni >= _peerAllowsUni)
-            return TransportStatus.StreamLimitReached;
+        {
+            s.StartRefused = true;
+            s.SendDone = true;
+            s.FinQueued = true;
+            s.RecvDone = true;
+            Post(SimEventKind.StreamStarted, _network.NowMicros, this, slot, s.Generation, b0: (byte)TransportStatus.StreamLimitReached);
+            return;
+        }
         if (bidi)
             _localOpenBidi++;
         else
             _localOpenUni++;
         SimulatedTransport peer = Peer!;
-        s.Started = true;
         s.CountsTowardLimit = true;
         long index = bidi ? _nextBidiIndex++ : _nextUniIndex++;
         s.QuicId = index * 4 + (bidi ? 0 : 2) + (IsClient ? 0 : 1);
@@ -367,7 +411,6 @@ public sealed unsafe partial class SimulatedTransport
         long now = _network.NowMicros;
         Post(SimEventKind.StreamStarted, now, this, slot, s.Generation);
         Post(SimEventKind.PeerStreamStarted, now + Link.Options.DelayMicros, peer, peerSlot, ps.Generation);
-        return TransportStatus.Success;
     }
 
     private void DepartChunk(int record, uint generation, int bufferOffset, int length, long streamOffset, bool fin, long now)
@@ -664,7 +707,7 @@ public sealed unsafe partial class SimulatedTransport
         {
             case SimEventKind.StreamStarted:
                 if (!s.AppClosed)
-                    Sink!.OnStreamStarted(id, s.OpenContext, TransportStatus.Success);
+                    Sink!.OnStreamStarted(id, s.OpenContext, (TransportStatus)e.B0);
                 break;
             case SimEventKind.PeerStreamStarted:
                 s.Announced = true;

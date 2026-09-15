@@ -36,6 +36,6 @@ public class SimulatedConformanceTests
     {
         using var harness = new SimulatedTransportHarness();
         Assert.Throws<ArgumentException>(() => TransportConformance.Run("NoSuchScenario", harness));
-        Assert.Equal(13, TransportConformance.ScenarioNames.Count);
+        Assert.Equal(24, TransportConformance.ScenarioNames.Count);
     }
 }

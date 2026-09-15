@@ -14,9 +14,12 @@ namespace Tedd.Quicly.Testing.Conformance;
 /// The scenarios encode the contract, not one implementation. Where transports legitimately differ, every allowed outcome is
 /// accepted: callbacks may run inline inside an API call (MsQuic) or only later (simulator); a stream-limit failure may be
 /// returned by <see cref="ITransport.StartStream"/> or reported through <see cref="ITransportSink.OnStreamStarted"/>; a
-/// capability report may come before or after <see cref="ITransportSink.OnConnected"/>.
+/// capability report may come before or after <see cref="ITransportSink.OnConnected"/>; when both ends close at once either
+/// may win. Scenarios that need a listener's callbacks, a failing handshake or a connection that ends on its own use
+/// <see cref="ITransportTestHarness.Connect"/>, <see cref="ConformancePairOptions.FailHandshake"/> and
+/// <see cref="ConformancePairOptions.TransportCloseAfter"/>.
 /// </remarks>
-public static unsafe class TransportConformance
+public static unsafe partial class TransportConformance
 {
     private static readonly (string Name, Action<ITransportTestHarness> Run)[] s_scenarios =
     [
@@ -33,6 +36,17 @@ public static unsafe class TransportConformance
         (nameof(CloseReportsLocalAndPeerWithCode), CloseReportsLocalAndPeerWithCode),
         (nameof(NoCallbacksAfterOnClosed), NoCallbacksAfterOnClosed),
         (nameof(InFlightSendsCompleteCanceledAtClose), InFlightSendsCompleteCanceledAtClose),
+        (nameof(RefusedStreamNeverStartsAndIsRetriedOnANewStream), RefusedStreamNeverStartsAndIsRetriedOnANewStream),
+        (nameof(StartRefusedInsideACallbackIsReportedOnce), StartRefusedInsideACallbackIsReportedOnce),
+        (nameof(AbortingANeverStartedStreamReleasesItWithoutCallbacks), AbortingANeverStartedStreamReleasesItWithoutCallbacks),
+        (nameof(CloseStreamBeforeShutdownAbortsWithCodeZero), CloseStreamBeforeShutdownAbortsWithCodeZero),
+        (nameof(DatagramsInFlightAtCloseReachAFinalStateBeforeOnClosed), DatagramsInFlightAtCloseReachAFinalStateBeforeOnClosed),
+        (nameof(ResumeRacingTheReceiveCallbackIsApplied), ResumeRacingTheReceiveCallbackIsApplied),
+        (nameof(RefusedConnectionsCloseTheClientOnceAndLeaveTheRefusedTransportClosed), RefusedConnectionsCloseTheClientOnceAndLeaveTheRefusedTransportClosed),
+        (nameof(HandshakeFailureClosesBothEndsWithoutConnecting), HandshakeFailureClosesBothEndsWithoutConnecting),
+        (nameof(CloseWhileConnecting), CloseWhileConnecting),
+        (nameof(BothEndsClosingAtOnce), BothEndsClosingAtOnce),
+        (nameof(TransportInitiatedCloseReportsTransport), TransportInitiatedCloseReportsTransport),
     ];
 
     /// <summary>Names of every scenario, in a stable order.</summary>

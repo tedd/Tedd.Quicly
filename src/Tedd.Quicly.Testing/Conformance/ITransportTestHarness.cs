@@ -23,9 +23,20 @@ public interface ITransportTestHarness : IDisposable
     /// <summary>
     /// Starts a connection from a new client transport (callbacks to <paramref name="clientSink"/>) to a listener whose
     /// accept callback returns <paramref name="serverSink"/>. Returns once the server side exists; the handshake may still
-    /// be running. The harness owns both transports and disposes them in <see cref="IDisposable.Dispose"/>.
+    /// be running (or fail, with <see cref="ConformancePairOptions.FailHandshake"/>). The harness owns both transports and
+    /// disposes them in <see cref="IDisposable.Dispose"/>.
     /// </summary>
     ConformancePair CreatePair(ITransportSink clientSink, ITransportSink serverSink, ConformancePairOptions? options = null);
+
+    /// <summary>
+    /// Starts a client connection (callbacks to <paramref name="clientSink"/>) to a new listener that runs
+    /// <paramref name="preHandshake"/> and then <paramref name="accept"/> for it, and returns the client transport at once:
+    /// the handshake runs in the background (driven by <see cref="Pump"/>), so the client is still connecting when the call
+    /// returns. The callbacks run where the transport runs them (inside <see cref="Pump"/> for a simulator, on transport
+    /// threads otherwise). The harness owns the client, the listener and every transport handed to <paramref name="accept"/>
+    /// (refused ones included) and disposes them.
+    /// </summary>
+    ITransport Connect(ITransportSink clientSink, PreHandshakeCallback preHandshake, AcceptCallback accept, ConformancePairOptions? options = null);
 
     /// <summary>
     /// Lets the transports make progress until <paramref name="condition"/> is true or <paramref name="timeout"/> has
@@ -39,7 +50,7 @@ public interface ITransportTestHarness : IDisposable
 /// <param name="Server">The accepted end.</param>
 public sealed record ConformancePair(ITransport Client, ITransport Server);
 
-/// <summary>Initial stream limits of a pair created by <see cref="ITransportTestHarness.CreatePair"/>.</summary>
+/// <summary>Initial stream limits and connection behaviour of a pair created by <see cref="ITransportTestHarness.CreatePair"/>.</summary>
 public sealed class ConformancePairOptions
 {
     /// <summary>Bidirectional streams the server lets the client have open (the pre-admission default is 1). Default 16.</summary>
@@ -53,6 +64,21 @@ public sealed class ConformancePairOptions
 
     /// <summary>Unidirectional streams the client lets the server have open. Default 16.</summary>
     public ushort ClientPeerUnidiStreams { get; set; } = 16;
+
+    /// <summary>
+    /// When set, the transports close on their own (<see cref="TransportCloseReason.Transport"/>) about this long after the
+    /// connection was made, provided the scenario leaves it idle: the MsQuic harness uses it as the idle timeout of both
+    /// ends with keep-alives off, the simulator cuts the link that long after it was created
+    /// (<see cref="Simulation.LinkOptions.DisconnectAtMicros"/>). Default null (never).
+    /// </summary>
+    public TimeSpan? TransportCloseAfter { get; set; }
+
+    /// <summary>
+    /// When true, the handshake fails after the listener accepted the connection: neither end connects and both report
+    /// <see cref="TransportCloseReason.Transport"/> (MsQuic: the client rejects the server certificate; the simulator:
+    /// <see cref="Simulation.LinkOptions.FailHandshake"/>). Default false.
+    /// </summary>
+    public bool FailHandshake { get; set; }
 }
 
 /// <summary>Thrown by a <see cref="TransportConformance"/> scenario when a transport breaks the <see cref="ITransport"/> contract.</summary>

@@ -33,7 +33,10 @@ namespace Tedd.Quicly.Testing.Simulation;
 /// <see cref="StreamAbortDirection.Send"/> (reset: our receive side is dead) or <see cref="StreamAbortDirection.Receive"/>
 /// (stop-sending: our pending sends are canceled). Aborts are causal: the peer keeps delivering data it already holds
 /// until the reset arrives one one-way delay later. Peer stream limits count concurrently open streams, like MsQuic: a
-/// stream's credit returns to its opener when the peer's side has shut down.
+/// stream's credit returns to its opener when the peer's side has shut down. A start beyond the limit is refused as MsQuic
+/// refuses it (asynchronously): the call returns Success, then OnStreamStarted(StreamLimitReached), a canceled completion
+/// for a send made with the start and OnStreamShutdownComplete follow; the refused stream never starts. A lower
+/// <see cref="ITransport.UpdatePeerStreamLimits"/> is ignored once the old limit can have reached the peer.
 /// </para>
 /// <para>
 /// Fault injection: <see cref="DropNextDatagrams"/> and <see cref="LoseNextStreamPackets"/> hit specific packets without
@@ -55,6 +58,9 @@ public sealed unsafe partial class SimulatedTransport : ITransport
 
     /// <summary><c>transportStatus</c> of <see cref="ITransportSink.OnClosed"/> when no listener was started at the endpoint.</summary>
     public const int StatusUnreachable = 3;
+
+    /// <summary><c>transportStatus</c> of <see cref="ITransportSink.OnClosed"/> when the handshake failed after the accept (<see cref="LinkOptions.FailHandshake"/>).</summary>
+    public const int StatusHandshakeFailed = 4;
 
     /// <summary>Bytes added to the maximum datagram payload to report <see cref="TransportStatistics.PathMtu"/>.</summary>
     public const int PathOverheadBytes = 52;

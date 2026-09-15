@@ -303,4 +303,33 @@ public unsafe class MsQuicTransportUnitTests
         Assert.Equal(32, expected.Length);
         Assert.Throws<ArgumentNullException>(() => SpkiPin.Compute((X509Certificate2)null!));
     }
+
+    [Fact]
+    public void A_throwing_diagnostic_callback_never_escapes_the_certificate_policy()
+    {
+        using X509Certificate2 certificate = TestCertificates.CreateSelfSigned("CN=localhost", TimeSpan.FromDays(1), ecdsa: true, "localhost");
+        TransportDiagnosticCallback throwing = static (_, _, _) => throw new InvalidOperationException("diagnostics sink failure");
+        var pinned = new ServerCertificatePolicy(new MsQuicTransportOptions
+        {
+            ServerCertificateValidation = ServerCertificateValidationMode.PinnedSpki,
+            PinnedSpkiSha256 = [new byte[32]],
+            Diagnostic = throwing,
+        });
+        Assert.Equal(MsQuicCertificateDecision.Reject, Decide(pinned, certificate.RawData, MsQuicStatus.QUIC_STATUS_SUCCESS));
+        var validator = new ServerCertificatePolicy(new MsQuicTransportOptions
+        {
+            ServerCertificateValidation = ServerCertificateValidationMode.Callback,
+            ServerCertificateValidator = static (in ServerCertificateContext _) => throw new InvalidOperationException("validator failure"),
+            Diagnostic = throwing,
+        });
+        Assert.Equal(MsQuicCertificateDecision.Reject, Decide(validator, certificate.RawData, MsQuicStatus.QUIC_STATUS_SUCCESS));
+    }
+
+    [Fact]
+    public void The_segment_layout_guard_accepts_this_64_bit_process()
+    {
+        Assert.True(Environment.Is64BitProcess);
+        Assert.True(MsQuicTransport.SegmentLayoutMatchesQuicBuffer);
+        MsQuicTransport.ThrowIfSegmentLayoutUnsupported();
+    }
 }

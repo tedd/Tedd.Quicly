@@ -14,7 +14,11 @@ public enum TransportStatus : byte
     TooLarge,
     /// <summary>The operation is not supported by this transport (capability missing).</summary>
     NotSupported,
-    /// <summary>The peer's stream limit is exhausted; try again after <see cref="ITransportSink.OnStreamsAvailable"/>.</summary>
+    /// <summary>
+    /// The peer's stream limit is exhausted. The refused stream never starts: release it with
+    /// <see cref="ITransport.CloseStream"/> and open a new stream after <see cref="ITransportSink.OnStreamsAvailable"/> (see
+    /// <see cref="ITransport.StartStream"/>).
+    /// </summary>
     StreamLimitReached,
     /// <summary>The transport could not allocate internal resources.</summary>
     OutOfMemory,
@@ -112,7 +116,10 @@ public enum TransportCloseReason : byte
     Local = 0,
     /// <summary>The peer closed it with an application error code.</summary>
     Peer,
-    /// <summary>The transport closed it (idle timeout, handshake failure, protocol error).</summary>
+    /// <summary>
+    /// The transport closed it (idle timeout, handshake failure, refused connection, protocol error, link loss); the error code
+    /// and status reported with it are transport-specific (see <see cref="ITransportSink.OnClosed"/>).
+    /// </summary>
     Transport,
 }
 

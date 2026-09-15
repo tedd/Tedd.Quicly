@@ -8,13 +8,16 @@ namespace Tedd.Quicly.Testing.Conformance;
 /// <summary>
 /// <see cref="ITransportTestHarness"/> over a <see cref="SimulatedNetwork"/>: pairs are made through a
 /// <see cref="SimulatedConnector"/> and a <see cref="SimulatedListener"/> (so the connector/listener path is exercised too),
-/// and <see cref="Pump"/> advances virtual time in small steps.
+/// and <see cref="Pump"/> advances virtual time in small steps. <see cref="ConformancePairOptions.TransportCloseAfter"/> cuts
+/// the link (<see cref="LinkOptions.DisconnectAtMicros"/>); <see cref="ConformancePairOptions.FailHandshake"/> sets
+/// <see cref="LinkOptions.FailHandshake"/>.
 /// </summary>
 public sealed class SimulatedTransportHarness : ITransportTestHarness
 {
     private const long StepMicros = 250;
     private readonly LinkOptions _link;
     private readonly List<ITransport> _transports = [];
+    private readonly List<SimulatedListener> _listeners = [];
 
     /// <summary>Creates a harness whose links use <paramref name="link"/> (default: 2 ms one-way delay, no loss).</summary>
     /// <param name="link">Link conditions of every pair; copied per connection.</param>
@@ -43,23 +46,40 @@ public sealed class SimulatedTransportHarness : ITransportTestHarness
         ArgumentNullException.ThrowIfNull(clientSink);
         ArgumentNullException.ThrowIfNull(serverSink);
         options ??= new ConformancePairOptions();
-        using var listener = new SimulatedListener(Network, new IPEndPoint(IPAddress.Loopback, 0));
         ITransport? server = null;
-        listener.Start(
-            static (in NewConnectionInfo _) => PreHandshakeDecision.Accept,
-            (ITransport transport, in NewConnectionInfo _) =>
-            {
-                server = transport;
-                transport.UpdatePeerStreamLimits(options.ServerPeerBidiStreams, options.ServerPeerUnidiStreams);
-                return serverSink;
-            });
-        var connector = new SimulatedConnector(Network, _link);
-        ITransport client = connector.Connect(listener.LocalEndPoint, "localhost", clientSink);
-        _transports.Add(client);
+        ITransport client = Connect(clientSink, static (in NewConnectionInfo _) => PreHandshakeDecision.Accept, (ITransport transport, in NewConnectionInfo _) =>
+        {
+            server = transport;
+            return serverSink;
+        }, options);
         client.UpdatePeerStreamLimits(options.ClientPeerBidiStreams, options.ClientPeerUnidiStreams);
         if (!Pump(() => server is not null, DefaultTimeout)) throw new ConformanceException("The simulated listener never accepted the connection.");
-        _transports.Add(server!);
-        return new ConformancePair(client, server!);
+        // After the accept callback, which must not call the new transport: the client is still connecting and reads these
+        // limits when it connects (a client that connected already gets them through OnStreamsAvailable).
+        server!.UpdatePeerStreamLimits(options.ServerPeerBidiStreams, options.ServerPeerUnidiStreams);
+        return new ConformancePair(client, server);
+    }
+
+    /// <inheritdoc/>
+    public ITransport Connect(ITransportSink clientSink, PreHandshakeCallback preHandshake, AcceptCallback accept, ConformancePairOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(clientSink);
+        ArgumentNullException.ThrowIfNull(preHandshake);
+        ArgumentNullException.ThrowIfNull(accept);
+        options ??= new ConformancePairOptions();
+        LinkOptions link = _link.Clone();
+        if (options.TransportCloseAfter is TimeSpan after) link.DisconnectAtMicros = (long)(after.TotalMilliseconds * 1000);
+        if (options.FailHandshake) link.FailHandshake = true;
+        var listener = new SimulatedListener(Network, new IPEndPoint(IPAddress.Loopback, 0));
+        _listeners.Add(listener);
+        listener.Start(preHandshake, (ITransport transport, in NewConnectionInfo info) =>
+        {
+            _transports.Add(transport);
+            return accept(transport, in info);
+        });
+        ITransport client = new SimulatedConnector(Network, link).Connect(listener.LocalEndPoint, "localhost", clientSink);
+        _transports.Add(client);
+        return client;
     }
 
     /// <inheritdoc/>
@@ -76,11 +96,12 @@ public sealed class SimulatedTransportHarness : ITransportTestHarness
         return true;
     }
 
-    /// <summary>Closes every transport, lets the closes run and disposes the network.</summary>
+    /// <summary>Closes every transport, lets the closes run, stops the listeners and disposes the network.</summary>
     public void Dispose()
     {
-        foreach (ITransport transport in _transports) transport.Dispose();
+        foreach (ITransport transport in _transports.ToArray()) transport.Dispose();
         if (!Network.IsDisposed) Network.RunUntilIdle(10_000_000);
+        foreach (SimulatedListener listener in _listeners) listener.Dispose();
         Network.Dispose();
     }
 }

@@ -130,6 +130,8 @@ public unsafe class MsQuicTransportFailureTests
             Assert.True(Spin.Until(() => client.SinkExceptionCount + server.SinkExceptionCount >= 1, Timeout), $"the injected fault in {fault} never fired");
             Exception? recorded = client.LastSinkException ?? server.LastSinkException;
             Assert.IsType<InvalidOperationException>(recorded);
+            // Every exception stays in the transport (InternalError); none reaches the wrapper's poison path (0xFFFFFFFF).
+            Assert.False(client.Connection.IsPoisoned || server.Connection.IsPoisoned, "an exception escaped to the wrapper's poison path");
             if (fault == SinkFault.OverclaimedReceive) Assert.Contains("consumed", recorded!.Message, StringComparison.Ordinal);
             if (fault is not (SinkFault.Closed or SinkFault.StreamShutdownComplete))
             {

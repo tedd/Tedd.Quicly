@@ -185,6 +185,31 @@ public unsafe class MsQuicTransportTests
     }
 
     [Fact]
+    public void A_stream_priority_set_before_the_start_is_applied_when_the_stream_starts()
+    {
+        using var scope = new Scope();
+        (MsQuicTransport client, _, RecordingSink cs, _) = Connect(scope);
+        NativeBlock block = scope.Block(16);
+        TransportSegment* segment = scope.Segments(1);
+        *segment = new TransportSegment(block.Pointer, 16);
+        Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Bidirectional, 1, 100, out TransportStreamId opened));
+        Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Bidirectional, 2, 32767, out TransportStreamId changed));
+        client.SetStreamPriority(changed, 200); // not started yet: stored, applied at the start
+        Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Bidirectional, 3, 32767, out TransportStreamId plain));
+        Assert.Equal(TransportStatus.Success, client.StartStream(opened));
+        Assert.Equal(TransportStatus.Success, client.SendStream(changed, segment, 1, 7, TransportSendFlags.Start));
+        Assert.Equal(TransportStatus.Success, client.StartStream(plain));
+        Assert.True(Spin.Until(() => cs.CountOf(RecordedEventKind.StreamStarted) == 3, Timeout));
+        Assert.Equal(100, client.QueryStreamPriority(opened));
+        Assert.Equal(200, client.QueryStreamPriority(changed));
+        Assert.Equal(32767, client.QueryStreamPriority(plain));
+        client.SetStreamPriority(plain, 300); // started: a parameter call
+        Assert.Equal(300, client.QueryStreamPriority(plain));
+        Assert.Equal(-1, client.QueryStreamPriority(TransportStreamId.None));
+        scope.Finish();
+    }
+
+    [Fact]
     public void Peer_streams_beyond_the_stream_table_are_refused_and_counted()
     {
         var diagnostics = new ConcurrentQueue<string>();

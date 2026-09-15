@@ -7,18 +7,19 @@ namespace Tedd.Quicly.Testing.Certificates;
 /// Self-signed certificates for tests and development.
 /// </summary>
 /// <remarks>
-/// <para>Every certificate returned here goes through a PKCS#12 round trip and is re-imported with
-/// <see cref="X509KeyStorageFlags.Exportable"/> (never <c>EphemeralKeySet</c>): the key ends up in a real,
-/// non-ephemeral key container that lives exactly as long as the certificate object (no <c>PersistKeySet</c>, so
-/// disposing the certificate deletes it again), which is what MsQuic needs on Windows.</para>
-/// <para>On Windows the msquic.dll bundled with .NET (2.5.10, Schannel) rejects
-/// <c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c> with <c>QUIC_STATUS_NOT_SUPPORTED</c>, so the server credential
-/// path that works is <c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT</c>, and Schannel can only sign with a key in a
-/// non-ephemeral container: these certificates are used through a certificate context as they are, with no
-/// further re-import. On OpenSSL builds (Linux, macOS) the PKCS#12 path is taken, which re-exports the key — hence
-/// <c>Exportable</c>. Certificates created directly with <c>CertificateRequest.CreateSelfSigned</c> carry an
-/// ephemeral CNG key that Schannel cannot use; <c>MsQuicConfiguration</c> re-imports those itself.</para>
-/// <para>Keep the certificate alive (undisposed) until every MsQuic configuration that loaded it is closed.</para>
+/// <para>Every certificate returned here goes through an in-memory PKCS#12 round trip and is re-imported with
+/// <see cref="X509KeyStorageFlags.DefaultKeySet"/>: on Windows the key lands in a real, non-ephemeral CNG key
+/// container (Schannel can only sign with such a key) that is not persisted beyond the certificate object:
+/// disposing the certificate deletes the container again. Neither <c>Exportable</c> nor <c>EphemeralKeySet</c> is
+/// used (ADR 0006 as amended, ADR 0009), so on Windows the key cannot be exported again.</para>
+/// <para>Consequences for MsQuic: the Schannel msquic.dll bundled with .NET (2.5.x) rejects
+/// <c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c> with <c>QUIC_STATUS_NOT_SUPPORTED</c> anyway; because these keys
+/// are not exportable, <c>MsQuicServerCredentialMode.Auto</c> goes straight to
+/// <c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT</c> on Windows and uses the certificate as it is (no further
+/// re-import, nothing persisted). On OpenSSL platforms (Linux, macOS) private keys can always be exported, so the
+/// preferred PKCS#12 path is taken there.</para>
+/// <para>Keep the certificate alive (undisposed) until every MsQuic configuration that loaded it is closed and every
+/// connection created with those configurations is closed.</para>
 /// </remarks>
 public static class TestCertificates
 {
@@ -106,7 +107,8 @@ public static class TestCertificates
         byte[] pfx = ephemeral.Export(X509ContentType.Pkcs12);
         try
         {
-            return X509CertificateLoader.LoadPkcs12(pfx, null, X509KeyStorageFlags.Exportable);
+            // DefaultKeySet: non-ephemeral (Schannel can sign with it), not persisted (deleted on Dispose), not exportable.
+            return X509CertificateLoader.LoadPkcs12(pfx, null, X509KeyStorageFlags.DefaultKeySet);
         }
         finally
         {

@@ -41,14 +41,15 @@ public enum MsQuicServerCredentialMode
 
 /// <summary>
 /// An MsQuic configuration: ALPN list + <see cref="QUIC_SETTINGS"/> + credential. Shared by any number of
-/// connections (MsQuic reference-counts it). Close it after the connections that use it. A credential can be
-/// loaded exactly once per configuration; certificate renewal means opening a new configuration and letting the
-/// listener callback pick it (ADR 0009).
+/// connections (MsQuic reference-counts it). A credential can be loaded exactly once per configuration;
+/// certificate renewal follows ADR 0009: open a new configuration, swap the configuration the listener callback
+/// returns, then close the old one. Closing it while its connections live on is safe: MsQuic keeps its own
+/// reference, and a key container this configuration persisted stays until those connections are closed too.
 /// </summary>
 public sealed unsafe class MsQuicConfiguration : IDisposable
 {
     private QUIC_HANDLE* _handle;
-    private X509Certificate2? _ownedCertificate;
+    private MsQuicOwnedCredential? _ownedCredential;
 
     /// <summary>Owning registration.</summary>
     public MsQuicRegistration Registration { get; }
@@ -111,13 +112,13 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
         }
     }
 
-    /// <summary>Creates a server configuration with a certificate loaded.</summary>
-    public static MsQuicConfiguration CreateServer(MsQuicRegistration registration, ReadOnlySpan<string> alpns, X509Certificate2 certificate, MsQuicSettings? settings = null, MsQuicServerCredentialMode mode = MsQuicServerCredentialMode.Auto)
+    /// <summary>Creates a server configuration with a certificate loaded (see <see cref="LoadServerCredential"/>).</summary>
+    public static MsQuicConfiguration CreateServer(MsQuicRegistration registration, ReadOnlySpan<string> alpns, X509Certificate2 certificate, MsQuicSettings? settings = null, MsQuicServerCredentialMode mode = MsQuicServerCredentialMode.Auto, MsQuicKeyStorage keyStorage = MsQuicKeyStorage.User)
     {
         var config = new MsQuicConfiguration(registration, alpns, settings);
         try
         {
-            config.LoadServerCredential(certificate, mode);
+            config.LoadServerCredential(certificate, mode, keyStorage);
             return config;
         }
         catch
@@ -174,8 +175,11 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
         set => s_pkcs12Unsupported = value;
     }
 
-    /// <summary>The re-imported certificate this configuration owns (certificate-context path with an ephemeral key), else null.</summary>
-    internal X509Certificate2? OwnedCertificate => _ownedCertificate;
+    /// <summary>The re-imported certificate this configuration owns (certificate-context path with an ephemeral key), else null. Null after <see cref="Close"/>.</summary>
+    internal X509Certificate2? OwnedCertificate => Volatile.Read(ref _ownedCredential)?.Certificate;
+
+    /// <summary>The reference-counted owner of <see cref="OwnedCertificate"/>; connections take a reference when they use this configuration.</summary>
+    internal MsQuicOwnedCredential? OwnedCredential => Volatile.Read(ref _ownedCredential);
 
     /// <summary>
     /// Loads a server certificate (must carry a private key). Throws <see cref="MsQuicException"/> on failure.
@@ -189,22 +193,31 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
     /// PKCS#12 credential, with or without a password. Auto mode therefore falls back to
     /// <c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT</c> on Windows, which works (covered by the loopback tests). The
     /// verdict is cached per process, so later Auto loads skip the PKCS#12 attempt.</para>
-    /// <para>Schannel can only sign with a key in a persisted, non-ephemeral container. When the certificate's key is
+    /// <para>A certificate whose key is not exportable (for example one imported without <c>Exportable</c>, as
+    /// ADR 0009 prescribes, or from <c>TestCertificates</c>) cannot become a PKCS#12 blob, so Auto goes straight to
+    /// the certificate-context path on Windows.</para>
+    /// <para>Schannel can only sign with a key in a non-ephemeral container. When the certificate's key is
     /// ephemeral (e.g. straight from <c>CertificateRequest.CreateSelfSigned</c>) it is re-imported with
-    /// <c>PersistKeySet | UserKeySet</c> — never <c>Exportable</c>, never <c>EphemeralKeySet</c> — into a certificate
-    /// owned by this configuration; <see cref="Close"/> deletes that key container again. Close the configuration
-    /// only after the connections created with it have completed their handshakes (the key is used for the
-    /// handshake signature). A certificate whose key is already persisted is used as is and never deleted.</para>
+    /// <c>PersistKeySet | UserKeySet</c> (<paramref name="keyStorage"/> <see cref="MsQuicKeyStorage.User"/>,
+    /// interactive processes) or <c>PersistKeySet | MachineKeySet</c> (<see cref="MsQuicKeyStorage.Machine"/>,
+    /// services) — never <c>Exportable</c>, never <c>EphemeralKeySet</c> — into a certificate owned by this
+    /// configuration. That key container is reference counted (ADR 0009): this configuration holds one reference
+    /// until <see cref="Close"/>, and every connection started or configured with it holds one until
+    /// <see cref="MsQuicConnection.Close"/>; the last release deletes the container. So the renewal sequence
+    /// "open new, swap, close old" is safe while old connections are still alive or mid-handshake. A process that
+    /// dies before the last release leaves the container behind in the user's or machine's CNG key store; nothing
+    /// sweeps such leftovers. A certificate whose key is already persisted is used as is and never deleted.</para>
     /// <para><see cref="MsQuicServerCredentialMode.Pkcs12"/> never falls back (it throws the library's status);
     /// <see cref="MsQuicServerCredentialMode.CertificateContext"/> skips PKCS#12 (Windows only).
     /// <see cref="CredentialType"/> records which path was used.</para>
     /// </remarks>
-    public void LoadServerCredential(X509Certificate2 certificate, MsQuicServerCredentialMode mode = MsQuicServerCredentialMode.Auto)
+    public void LoadServerCredential(X509Certificate2 certificate, MsQuicServerCredentialMode mode = MsQuicServerCredentialMode.Auto, MsQuicKeyStorage keyStorage = MsQuicKeyStorage.User)
     {
         ArgumentNullException.ThrowIfNull(certificate);
         ObjectDisposedException.ThrowIf(_handle == null, this);
         if (!certificate.HasPrivateKey) throw new ArgumentException("The server certificate must have a private key.", nameof(certificate));
         if (mode is < MsQuicServerCredentialMode.Auto or > MsQuicServerCredentialMode.CertificateContext) throw new ArgumentOutOfRangeException(nameof(mode));
+        if (keyStorage is < MsQuicKeyStorage.User or > MsQuicKeyStorage.Machine) throw new ArgumentOutOfRangeException(nameof(keyStorage));
         ThrowIfCredentialLoaded();
 
         bool tryPkcs12 = mode == MsQuicServerCredentialMode.Pkcs12
@@ -238,7 +251,7 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
         {
             throw new PlatformNotSupportedException("CERTIFICATE_CONTEXT credentials are Windows only; provide a certificate with an exportable private key.");
         }
-        LoadCertificateContextCredential(certificate, pkcs12Status);
+        LoadCertificateContextCredential(certificate, pkcs12Status, keyStorage);
     }
 
     private int LoadPkcs12Credential(byte[] pfx)
@@ -254,9 +267,9 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
         }
     }
 
-    private void LoadCertificateContextCredential(X509Certificate2 certificate, int pkcs12Status)
+    private void LoadCertificateContextCredential(X509Certificate2 certificate, int pkcs12Status, MsQuicKeyStorage keyStorage)
     {
-        X509Certificate2 usable = MsQuicCertificateHelper.EnsurePersistedPrivateKey(certificate);
+        X509Certificate2 usable = MsQuicCertificateHelper.EnsurePersistedPrivateKey(certificate, keyStorage);
         bool owned = !ReferenceEquals(usable, certificate);
         QUIC_CREDENTIAL_CONFIG cred = default;
         cred.Type = QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT;
@@ -272,7 +285,7 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
                 : "ConfigurationLoadCredential(CERTIFICATE_CONTEXT after CERTIFICATE_PKCS12 failed with " + MsQuicStatus.GetName(pkcs12Status) + ")";
             throw new MsQuicException(status, operation);
         }
-        if (owned) _ownedCertificate = usable;
+        if (owned) Volatile.Write(ref _ownedCredential, new MsQuicOwnedCredential(usable));
     }
 
     /// <summary>
@@ -315,7 +328,9 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
 
     /// <summary>
     /// Closes the configuration. Idempotent. MsQuic keeps its own reference for connections that still use the
-    /// configuration. A key container this configuration persisted for the certificate-context path is deleted here.
+    /// configuration. This drops the configuration's reference on a key container it persisted for the
+    /// certificate-context path; the container is deleted when the last connection started or configured with this
+    /// configuration is closed as well (immediately when there is none), per ADR 0009.
     /// </summary>
     public void Close()
     {
@@ -323,9 +338,7 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
         if (handle == null) return;
         _handle = null;
         Registration.Api.Table->ConfigurationClose(handle);
-        X509Certificate2? owned = _ownedCertificate;
-        _ownedCertificate = null;
-        if (owned is not null) ReleaseOwnedCertificate(owned);
+        Interlocked.Exchange(ref _ownedCredential, null)?.Release();
     }
 
     /// <inheritdoc cref="Close"/>

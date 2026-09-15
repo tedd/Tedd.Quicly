@@ -21,7 +21,15 @@ namespace Tedd.Quicly.Transport.MsQuic;
 /// <c>QUIC_STATUS_PENDING</c>; test acceptance with <see cref="MsQuicStatus.Succeeded"/>, never against
 /// <c>QUIC_STATUS_SUCCESS</c>.</para>
 /// <para><b>Failure.</b> An exception escaping <see cref="Events"/> is recorded in <see cref="LastCallbackException"/>
-/// and poisons the owning connection (see <see cref="MsQuicConnection.Poison"/>).</para>
+/// and poisons the owning connection (see <see cref="MsQuicConnection.Poison"/>). So does a
+/// <see cref="IMsQuicStreamEvents.Receive"/> result that claims more bytes than were indicated; MsQuic is then told
+/// that nothing was consumed.</para>
+/// <para><b>Per-stream cost.</b> Every stream, local or peer-opened, allocates one managed <see cref="MsQuicStream"/>
+/// (about 100 bytes) plus one <see cref="GCHandle"/> (not GC heap) as its native context; send, receive and event
+/// dispatch then allocate nothing. For workloads that churn thousands of short-lived streams without GC
+/// allocations (ARCHITECTURE §7 per-channel unidirectional streams), bypass the wrapper and call the raw table
+/// with a caller-owned callback and context, e.g. a generation-tagged slot index (ADR 0008 §2):
+/// <c>connection.Api.Table-&gt;StreamOpen(connection.Handle, flags, callback, context, &amp;handle)</c>.</para>
 /// </remarks>
 public sealed unsafe class MsQuicStream : IDisposable
 {
@@ -64,8 +72,13 @@ public sealed unsafe class MsQuicStream : IDisposable
     /// <summary>Free slot for the owner's state; never touched by the wrapper.</summary>
     public object? Tag { get; set; }
 
-    /// <summary>The last exception thrown by <see cref="Events"/> (callbacks never propagate; the wrapper records and poisons the connection).</summary>
-    public Exception? LastCallbackException { get; private set; }
+    private Exception? _lastCallbackException;
+
+    /// <summary>
+    /// The last exception thrown by <see cref="Events"/> (callbacks never propagate; the wrapper records and poisons
+    /// the connection). Written on MsQuic worker threads with a volatile write, so any thread may read it.
+    /// </summary>
+    public Exception? LastCallbackException => Volatile.Read(ref _lastCallbackException);
 
     internal MsQuicStream(MsQuicConnection connection, QUIC_HANDLE* handle, QUIC_STREAM_OPEN_FLAGS flags, bool peerStarted)
     {
@@ -142,9 +155,10 @@ public sealed unsafe class MsQuicStream : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int Send(QUIC_BUFFER* buffers, uint bufferCount, QUIC_SEND_FLAGS flags, void* clientContext)
     {
-        if (_handle == null) ThrowDisposed();
+        QUIC_HANDLE* handle = _handle;
+        if (handle == null) ThrowDisposed();
         if ((flags & ~_api.SupportedSendFlags) != 0) return MsQuicStatus.QUIC_STATUS_NOT_SUPPORTED;
-        return _api.Table->StreamSend(_handle, buffers, bufferCount, flags, clientContext);
+        return _api.Table->StreamSend(handle, buffers, bufferCount, flags, clientContext);
     }
 
     /// <summary>
@@ -161,8 +175,9 @@ public sealed unsafe class MsQuicStream : IDisposable
     /// <summary>Completes a receive that returned <see cref="MsQuicReceiveResult.Pending"/>, consuming <paramref name="bufferLength"/> bytes.</summary>
     public void ReceiveComplete(ulong bufferLength)
     {
-        ObjectDisposedException.ThrowIf(_handle == null, this);
-        _api.Table->StreamReceiveComplete(_handle, bufferLength);
+        QUIC_HANDLE* handle = _handle;
+        ObjectDisposedException.ThrowIf(handle == null, this);
+        _api.Table->StreamReceiveComplete(handle, bufferLength);
     }
 
     /// <summary>Enables or disables RECEIVE events.</summary>
@@ -227,22 +242,30 @@ public sealed unsafe class MsQuicStream : IDisposable
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static int NativeCallback(QUIC_HANDLE* handle, void* context, QUIC_STREAM_EVENT* evt)
     {
-        var stream = (MsQuicStream)GCHandle.FromIntPtr((nint)context).Target!;
+        MsQuicStream? stream = null;
         MsQuicCallbackScope.Enter();
         try
         {
+            stream = MsQuicCallbackScope.ResolveContext<MsQuicStream>(context);
+            if (stream is null) return MsQuicStatus.QUIC_STATUS_INTERNAL_ERROR;
             return stream.HandleEvent(evt);
         }
         catch (Exception ex)
         {
-            stream.LastCallbackException = ex;
-            stream.Connection.Poison(ex);
+            if (stream is not null) stream.RecordHandlerFailure(ex);
+            else MsQuicCallbackScope.OnEscapedException(ex);
             return MsQuicStatus.QUIC_STATUS_INTERNAL_ERROR;
         }
         finally
         {
             MsQuicCallbackScope.Exit();
         }
+    }
+
+    private void RecordHandlerFailure(Exception exception)
+    {
+        Volatile.Write(ref _lastCallbackException, exception);
+        Connection.Poison(exception);
     }
 
     private int HandleEvent(QUIC_STREAM_EVENT* evt)
@@ -257,8 +280,17 @@ public sealed unsafe class MsQuicStream : IDisposable
                 return MsQuicStatus.QUIC_STATUS_SUCCESS;
             case QUIC_STREAM_EVENT_TYPE.RECEIVE:
                 ref var recv = ref evt->RECEIVE;
-                MsQuicReceiveResult result = events.Receive(this, recv.Buffers, recv.BufferCount, recv.AbsoluteOffset, recv.TotalBufferLength, recv.Flags);
+                ulong offered = recv.TotalBufferLength;
+                MsQuicReceiveResult result = events.Receive(this, recv.Buffers, recv.BufferCount, recv.AbsoluteOffset, offered, recv.Flags);
                 if (result.IsPending) return MsQuicStatus.QUIC_STATUS_PENDING;
+                if (result.BytesConsumed > offered)
+                {
+                    // MsQuic must never be told more than it indicated (asserts in debug builds, undefined in release):
+                    // report nothing consumed and treat it as a handler failure.
+                    recv.TotalBufferLength = 0;
+                    RecordHandlerFailure(new InvalidOperationException($"The Receive handler consumed {result.BytesConsumed} bytes but only {offered} were indicated."));
+                    return MsQuicStatus.QUIC_STATUS_SUCCESS;
+                }
                 recv.TotalBufferLength = result.BytesConsumed;
                 return MsQuicStatus.QUIC_STATUS_SUCCESS;
             case QUIC_STREAM_EVENT_TYPE.SEND_COMPLETE:

@@ -3,6 +3,8 @@ using System.Security.Cryptography.X509Certificates;
 using Tedd.Quicly.Testing.Certificates;
 using Tedd.Quicly.Transport.MsQuic.Interop;
 
+using System.Security.Cryptography;
+
 namespace Tedd.Quicly.Transport.MsQuic.Tests;
 
 /// <summary>Registration / configuration / listener handle rules: explicit lifetimes, idempotent Close, no use after Close.</summary>
@@ -99,12 +101,14 @@ public class LifetimeTests
     /// Records which server credential path the loaded library accepts. Observed on Windows with the msquic.dll
     /// 2.5.10 bundled in the .NET shared framework (Schannel): CERTIFICATE_PKCS12 is answered with
     /// QUIC_STATUS_NOT_SUPPORTED, so Auto falls back to CERTIFICATE_CONTEXT. OpenSSL builds take PKCS#12.
+    /// The PKCS#12 attempt needs an exportable key, so this uses an ephemeral key straight from CertificateRequest
+    /// (TestCertificates keys are deliberately not exportable).
     /// </summary>
     [Fact]
     public void Server_credential_prefers_pkcs12_and_records_the_path()
     {
         using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
-        using X509Certificate2 withKey = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
+        using X509Certificate2 withKey = CreateExportable();
         using X509Certificate2 publicOnly = X509CertificateLoader.LoadCertificate(withKey.Export(X509ContentType.Cert));
         bool schannel = MsQuicApi.Instance.TlsProvider == QUIC_TLS_PROVIDER.SCHANNEL;
 
@@ -138,19 +142,31 @@ public class LifetimeTests
         }
     }
 
+    private static X509Certificate2 CreateExportable()
+    {
+        using ECDsa key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        return new CertificateRequest("CN=x", key, HashAlgorithmName.SHA256).CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(1));
+    }
+
+    /// <summary>
+    /// Recorded path for ADR 0009 keys (no Exportable): the PKCS#12 blob cannot be produced, so Auto goes straight to
+    /// CERTIFICATE_CONTEXT on Windows without attempting PKCS#12 and without re-importing (nothing persisted).
+    /// </summary>
     [Fact]
     public void Non_exportable_key_falls_back_to_certificate_context_on_windows()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "key containers are a Windows concept");
         using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
-        using X509Certificate2 exportable = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
-        byte[] pfx = exportable.Export(X509ContentType.Pkcs12);
-        using X509Certificate2 nonExportable = X509CertificateLoader.LoadPkcs12(pfx, null, X509KeyStorageFlags.UserKeySet);
+        using X509Certificate2 nonExportable = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
         Assert.False(MsQuicCertificateHelper.TryExportPkcs12(nonExportable, out _));
 
+        MsQuicConfiguration.Pkcs12KnownUnsupported = false;
         using var auto = MsQuicConfiguration.CreateServer(registration, ["a"], nonExportable);
         Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT, auto.CredentialType);
+        Assert.Null(auto.OwnedCertificate);
+        Assert.False(MsQuicConfiguration.Pkcs12KnownUnsupported); // no PKCS#12 attempt was made
 
+        using X509Certificate2 exportable = CreateExportable();
         using var forcedContext = MsQuicConfiguration.CreateServer(registration, ["a"], exportable, mode: MsQuicServerCredentialMode.CertificateContext);
         Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT, forcedContext.CredentialType);
 

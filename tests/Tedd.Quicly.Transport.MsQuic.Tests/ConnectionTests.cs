@@ -350,8 +350,13 @@ public class ConnectionTests
         ConnectionRecorder clientEvents;
         if (MsQuicApi.Instance.TlsProvider == QUIC_TLS_PROVIDER.SCHANNEL)
         {
-            // Recorded behaviour: the Schannel msquic bundled with .NET refuses PKCS#12 outright.
-            MsQuicException ex = Assert.Throws<MsQuicException>(() => new Loopback(credentialMode: MsQuicServerCredentialMode.Pkcs12));
+            // Recorded behaviour: the Schannel msquic bundled with .NET refuses PKCS#12 outright. The attempt needs an
+            // exportable key (TestCertificates keys are not, ADR 0009), so use an ephemeral one.
+            using var registrationScope = new TestRegistration();
+            using System.Security.Cryptography.ECDsa key = System.Security.Cryptography.ECDsa.Create(System.Security.Cryptography.ECCurve.NamedCurves.nistP256);
+            using X509Certificate2 exportable = new System.Security.Cryptography.X509Certificates.CertificateRequest("CN=localhost", key, System.Security.Cryptography.HashAlgorithmName.SHA256)
+                .CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddHours(1));
+            MsQuicException ex = Assert.Throws<MsQuicException>(() => MsQuicConfiguration.CreateServer(registrationScope.Registration, [Loopback.Alpn], exportable, mode: MsQuicServerCredentialMode.Pkcs12));
             Assert.Equal(MsQuicStatus.QUIC_STATUS_NOT_SUPPORTED, ex.Status);
         }
         else

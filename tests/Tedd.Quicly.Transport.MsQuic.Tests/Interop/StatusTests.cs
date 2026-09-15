@@ -32,6 +32,28 @@ public class StatusTests
         Assert.Equal(unchecked((int)0x80070002), MsQuicStatus.QUIC_STATUS_FILE_NOT_FOUND);
     }
 
+    /// <summary>
+    /// msquic_posix.h (UNVERIFIED here, the header is not in docs/reference): ERROR_BASE = 200000000,
+    /// TLS_ERROR_BASE = 256 + ERROR_BASE, CERT_ERROR_BASE = 512 + ERROR_BASE, QUIC_STATUS_TLS_ALERT(a) =
+    /// TLS_ERROR_BASE + (a &amp; 0xFF), QUIC_STATUS_CERT_* = CERT_ERROR_BASE + 1..3. Pinned on every OS through the
+    /// internal posix helpers; on posix the public fields must agree.
+    /// </summary>
+    [Fact]
+    public void Posix_tls_and_certificate_statuses_follow_msquic_posix_h()
+    {
+        Assert.Equal(0xBEBC200, MsQuicStatus.PosixErrorBase);
+        Assert.Equal(0xBEBC300, MsQuicStatus.PosixTlsErrorBase);
+        Assert.Equal(0xBEBC400, MsQuicStatus.PosixCertErrorBase);
+        Assert.Equal(0xBEBC300 + 42, MsQuicStatus.PosixTlsAlert(42));
+        Assert.Equal(0xBEBC300 + 0x78, MsQuicStatus.PosixTlsAlert(0x178));
+        if (OperatingSystem.IsWindows()) return;
+        Assert.Equal(MsQuicStatus.PosixTlsAlert(42), MsQuicStatus.QUIC_STATUS_BAD_CERTIFICATE);
+        Assert.Equal(MsQuicStatus.PosixTlsErrorBase, MsQuicStatus.QUIC_STATUS_CLOSE_NOTIFY);
+        Assert.Equal(0xBEBC401, MsQuicStatus.QUIC_STATUS_CERT_EXPIRED);
+        Assert.Equal(0xBEBC402, MsQuicStatus.QUIC_STATUS_CERT_UNTRUSTED_ROOT);
+        Assert.Equal(0xBEBC403, MsQuicStatus.QUIC_STATUS_CERT_NO_CERT);
+    }
+
     [Fact]
     public void Get_name_knows_every_status_and_formats_unknown_ones()
     {

@@ -104,6 +104,12 @@ public unsafe interface IMsQuicConnectionEvents
     /// The peer opened a stream. Set <see cref="MsQuicStream.Events"/> and return true to accept; return false to
     /// reject (the wrapper closes the stream and no events follow). Default: reject.
     /// </summary>
+    /// <remarks>
+    /// Do not call any MsQuic API on <paramref name="stream"/> (Send, Shutdown, ReceiveSetEnabled, SetPriority, ...)
+    /// from inside this callback: the wrapper attaches the stream's callback handler only after the handler returns
+    /// true, and MsQuic silently drops any event it would indicate inline before then. Record the stream and act on
+    /// it from its own events or from another thread.
+    /// </remarks>
     bool PeerStreamStarted(MsQuicConnection connection, MsQuicStream stream, QUIC_STREAM_OPEN_FLAGS flags) => false;
 
     /// <summary>The peer raised the number of streams we may open.</summary>

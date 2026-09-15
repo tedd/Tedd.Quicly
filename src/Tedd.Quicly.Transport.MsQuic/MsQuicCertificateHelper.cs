@@ -5,6 +5,15 @@ using System.Security.Cryptography.X509Certificates;
 
 namespace Tedd.Quicly.Transport.MsQuic;
 
+/// <summary>Where a key container persisted for the <c>CERTIFICATE_CONTEXT</c> path lives (ADR 0009).</summary>
+public enum MsQuicKeyStorage
+{
+    /// <summary><c>PersistKeySet | UserKeySet</c>: the current user's key store (interactive processes; needs a loaded user profile).</summary>
+    User = 0,
+    /// <summary><c>PersistKeySet | MachineKeySet</c>: the machine key store (services, whose account often has no loaded profile).</summary>
+    Machine = 1,
+}
+
 /// <summary>
 /// Certificate plumbing for the two server credential paths (ADR 0009).
 /// </summary>
@@ -15,13 +24,18 @@ namespace Tedd.Quicly.Transport.MsQuic;
 /// .NET (msquic.dll 2.5.10) answers <c>QUIC_STATUS_NOT_SUPPORTED</c>, which is why Windows falls back (see
 /// <c>MsQuicConfiguration.LoadServerCredential</c>). It needs an exportable private key; certificates whose key
 /// container forbids export make <see cref="TryExportPkcs12"/> return false.</para>
-/// <para><b>Fallback: CERTIFICATE_CONTEXT.</b> Schannel can only sign with a key that lives in a persisted, non-
-/// ephemeral container. Ephemeral CNG keys (from <c>CertificateRequest.CreateSelfSigned</c> or an
+/// <para><b>Fallback: CERTIFICATE_CONTEXT.</b> Schannel can only sign with a key that lives in a non-ephemeral
+/// container. Ephemeral CNG keys (from <c>CertificateRequest.CreateSelfSigned</c> or an
 /// <see cref="X509KeyStorageFlags.EphemeralKeySet"/> import) are re-imported through PKCS#12 with
-/// <see cref="X509KeyStorageFlags.PersistKeySet"/> | <see cref="X509KeyStorageFlags.UserKeySet"/> — never
-/// <c>Exportable</c> (irrelevant to Schannel, needlessly weakens the key) and never <c>EphemeralKeySet</c>. A
-/// persisted container outlives the certificate object; delete it with <see cref="DeletePersistedPrivateKey"/>
-/// once no configuration uses it any more.</para>
+/// <see cref="X509KeyStorageFlags.PersistKeySet"/> plus <see cref="X509KeyStorageFlags.UserKeySet"/>
+/// (<see cref="MsQuicKeyStorage.User"/>, interactive processes) or <see cref="X509KeyStorageFlags.MachineKeySet"/>
+/// (<see cref="MsQuicKeyStorage.Machine"/>, services whose account has no loaded profile) — never
+/// <c>Exportable</c> (irrelevant to Schannel, needlessly weakens the key) and never <c>EphemeralKeySet</c>
+/// (ADR 0009). A persisted container outlives the certificate object; delete it with
+/// <see cref="DeletePersistedPrivateKey"/> once no configuration and no connection uses it any more
+/// (<see cref="MsQuicConfiguration"/> does this itself, reference counted). A persisted container is a file in the
+/// user's or machine's CNG key store: if the process dies before it is deleted, it is left behind; nothing sweeps
+/// such leftovers.</para>
 /// </remarks>
 public static class MsQuicCertificateHelper
 {
@@ -69,7 +83,7 @@ public static class MsQuicCertificateHelper
     /// by a persisted user key container is returned and the caller owns it (dispose it and, when the key is no
     /// longer needed, <see cref="DeletePersistedPrivateKey"/> it).
     /// </summary>
-    public static X509Certificate2 EnsurePersistedPrivateKey(X509Certificate2 certificate)
+    public static X509Certificate2 EnsurePersistedPrivateKey(X509Certificate2 certificate, MsQuicKeyStorage storage = MsQuicKeyStorage.User)
     {
         ArgumentNullException.ThrowIfNull(certificate);
         if (!certificate.HasPrivateKey)
@@ -80,20 +94,28 @@ public static class MsQuicCertificateHelper
         {
             return certificate;
         }
-        return ReimportWithPersistedKey(certificate);
+        return ReimportWithPersistedKey(certificate, storage);
     }
 
     /// <summary>
-    /// Exports to PKCS#12 and re-imports with <see cref="X509KeyStorageFlags.PersistKeySet"/> |
-    /// <see cref="X509KeyStorageFlags.UserKeySet"/> (no <c>Exportable</c>, no <c>EphemeralKeySet</c>).
+    /// Exports to PKCS#12 and re-imports with <see cref="X509KeyStorageFlags.PersistKeySet"/> plus
+    /// <see cref="X509KeyStorageFlags.UserKeySet"/> (<see cref="MsQuicKeyStorage.User"/>) or
+    /// <see cref="X509KeyStorageFlags.MachineKeySet"/> (<see cref="MsQuicKeyStorage.Machine"/>); no <c>Exportable</c>,
+    /// no <c>EphemeralKeySet</c>. The source key must be exportable (ephemeral CNG keys are).
     /// </summary>
-    public static X509Certificate2 ReimportWithPersistedKey(X509Certificate2 certificate)
+    public static X509Certificate2 ReimportWithPersistedKey(X509Certificate2 certificate, MsQuicKeyStorage storage = MsQuicKeyStorage.User)
     {
         ArgumentNullException.ThrowIfNull(certificate);
+        X509KeyStorageFlags flags = storage switch
+        {
+            MsQuicKeyStorage.User => X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.UserKeySet,
+            MsQuicKeyStorage.Machine => X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.MachineKeySet,
+            _ => throw new ArgumentOutOfRangeException(nameof(storage)),
+        };
         byte[] pfx = certificate.Export(X509ContentType.Pkcs12);
         try
         {
-            return X509CertificateLoader.LoadPkcs12(pfx, null, X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.UserKeySet);
+            return X509CertificateLoader.LoadPkcs12(pfx, null, flags);
         }
         finally
         {

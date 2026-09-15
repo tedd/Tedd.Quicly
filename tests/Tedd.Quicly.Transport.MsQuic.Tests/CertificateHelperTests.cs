@@ -47,14 +47,68 @@ public class CertificateHelperTests
         }
     }
 
+    /// <summary>
+    /// TestCertificates import without <c>Exportable</c> (ADR 0006/0009): not ephemeral, used as is on the context path,
+    /// and not exportable on Windows (OpenSSL platforms can always export, so PKCS#12 stays available there).
+    /// </summary>
     [Fact]
-    public void Test_certificates_are_exportable_and_not_ephemeral()
+    public void Test_certificates_are_not_ephemeral_and_not_exportable_on_windows()
     {
         using X509Certificate2 cert = TestCertificates.CreateSelfSigned("CN=t", TimeSpan.FromHours(1));
         Assert.False(MsQuicCertificateHelper.HasEphemeralPrivateKey(cert));
         Assert.Same(cert, MsQuicCertificateHelper.EnsurePersistedPrivateKey(cert));
-        Assert.True(MsQuicCertificateHelper.TryExportPkcs12(cert, out byte[]? pfx));
-        Assert.NotEmpty(pfx);
+        Assert.Equal(!OperatingSystem.IsWindows(), MsQuicCertificateHelper.TryExportPkcs12(cert, out byte[]? pfx));
+        Assert.Equal(!OperatingSystem.IsWindows(), pfx is { Length: > 0 });
+    }
+
+    [Fact]
+    public void Key_storage_is_validated()
+    {
+        using X509Certificate2 ephemeral = CreateEphemeral(ecdsa: true);
+        Assert.Throws<ArgumentOutOfRangeException>(() => MsQuicCertificateHelper.ReimportWithPersistedKey(ephemeral, (MsQuicKeyStorage)5));
+        using var registrationScope = new TestRegistration();
+        using var config = new MsQuicConfiguration(registrationScope.Registration, ["x"]);
+        Assert.Throws<ArgumentOutOfRangeException>(() => config.LoadServerCredential(ephemeral, MsQuicServerCredentialMode.Auto, (MsQuicKeyStorage)(-1)));
+        Assert.False(config.HasCredential);
+    }
+
+    /// <summary>
+    /// ADR 0009: services persist into the machine key store. Creating a machine key may need rights the test account
+    /// lacks; the test then skips instead of failing.
+    /// </summary>
+    [Fact]
+    public void Machine_key_storage_persists_into_the_machine_store()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Skip("key containers are a Windows concept");
+            return;
+        }
+        using X509Certificate2 ephemeral = CreateEphemeral(ecdsa: true);
+        X509Certificate2 machine;
+        try
+        {
+            machine = MsQuicCertificateHelper.EnsurePersistedPrivateKey(ephemeral, MsQuicKeyStorage.Machine);
+        }
+        catch (CryptographicException ex)
+        {
+            Assert.Skip("this account cannot create machine keys: " + ex.Message);
+            return;
+        }
+        try
+        {
+            Assert.NotSame(ephemeral, machine);
+            using ECDsa? key = machine.GetECDsaPrivateKey();
+            ECDsaCng cng = Assert.IsType<ECDsaCng>(key);
+            Assert.True(cng.Key.IsMachineKey);
+            Assert.False(cng.Key.IsEphemeral);
+            Assert.Equal(CngExportPolicies.None, cng.Key.ExportPolicy & (CngExportPolicies.AllowExport | CngExportPolicies.AllowPlaintextExport));
+        }
+        finally
+        {
+            Assert.True(MsQuicCertificateHelper.DeletePersistedPrivateKey(machine));
+            machine.Dispose();
+        }
     }
 
     [Fact]
@@ -79,7 +133,8 @@ public class CertificateHelperTests
     public void Delete_persisted_key_removes_a_reimported_container()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "key containers are a Windows concept");
-        using X509Certificate2 cert = TestCertificates.CreateSelfSigned("CN=t", TimeSpan.FromHours(1), ecdsa: false);
+        // The source must be exportable: an ephemeral CNG key is (TestCertificates keys are not, by design).
+        using X509Certificate2 cert = CreateEphemeral(ecdsa: false);
         using X509Certificate2 copy = MsQuicCertificateHelper.ReimportWithPersistedKey(cert);
         Assert.NotSame(cert, copy);
         Assert.Equal(cert.Thumbprint, copy.Thumbprint);

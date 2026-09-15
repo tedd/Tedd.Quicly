@@ -41,8 +41,23 @@ public static class MsQuicStatus
     public static readonly int QUIC_STATUS_ALPN_IN_USE = Pick(unchecked((int)0x80410009), 91, 41);              // EPROTOTYPE
     public static readonly int QUIC_STATUS_ADDRESS_NOT_AVAILABLE = Pick(unchecked((int)0x8007273F), 99, 49);    // EADDRNOTAVAIL
 
-    /// <summary>Builds the status for a TLS alert (<c>QUIC_STATUS_TLS_ALERT(Alert)</c>).</summary>
-    public static int TlsAlert(int alert) => s_windows ? unchecked((int)0x80410100) | (alert & 0xFF) : (alert & 0xFF) | 0xFF00;
+    /// <summary><c>ERROR_BASE</c> of msquic_posix.h (200 000 000 = 0xBEBC200). UNVERIFIED: the header is not in docs/reference.</summary>
+    internal const int PosixErrorBase = 200000000;
+
+    /// <summary><c>TLS_ERROR_BASE</c> of msquic_posix.h (<c>256 + ERROR_BASE</c> = 0xBEBC300). UNVERIFIED.</summary>
+    internal const int PosixTlsErrorBase = 256 + PosixErrorBase;
+
+    /// <summary><c>CERT_ERROR_BASE</c> of msquic_posix.h (<c>512 + ERROR_BASE</c> = 0xBEBC400). UNVERIFIED.</summary>
+    internal const int PosixCertErrorBase = 512 + PosixErrorBase;
+
+    /// <summary>
+    /// Builds the status for a TLS alert (<c>QUIC_STATUS_TLS_ALERT(Alert)</c>): <c>0x80410100 | alert</c> on Windows
+    /// (verified), <c>TLS_ERROR_BASE + (alert &amp; 0xFF)</c> on posix (UNVERIFIED, transcribed from msquic_posix.h).
+    /// </summary>
+    public static int TlsAlert(int alert) => s_windows ? unchecked((int)0x80410100) | (alert & 0xFF) : PosixTlsAlert(alert);
+
+    /// <summary>The posix form of <see cref="TlsAlert"/>, available on every OS so it can be pinned by tests.</summary>
+    internal static int PosixTlsAlert(int alert) => PosixTlsErrorBase + (alert & 0xFF);
 
     public static readonly int QUIC_STATUS_CLOSE_NOTIFY = TlsAlert(0);
     public static readonly int QUIC_STATUS_BAD_CERTIFICATE = TlsAlert(42);
@@ -52,9 +67,9 @@ public static class MsQuicStatus
     public static readonly int QUIC_STATUS_UNKNOWN_CERTIFICATE = TlsAlert(46);
     public static readonly int QUIC_STATUS_REQUIRED_CERTIFICATE = TlsAlert(116);
 
-    public static readonly int QUIC_STATUS_CERT_EXPIRED = Pick(unchecked((int)0x800B0101), 0xBEBC301, 0xBEBC301);        // UNVERIFIED on posix
-    public static readonly int QUIC_STATUS_CERT_UNTRUSTED_ROOT = Pick(unchecked((int)0x800B0109), 0xBEBC302, 0xBEBC302); // UNVERIFIED on posix
-    public static readonly int QUIC_STATUS_CERT_NO_CERT = Pick(unchecked((int)0x8009030E), 0xBEBC303, 0xBEBC303);        // UNVERIFIED on posix
+    public static readonly int QUIC_STATUS_CERT_EXPIRED = Pick(unchecked((int)0x800B0101), PosixCertErrorBase + 1, PosixCertErrorBase + 1);        // CERT_ERROR_BASE + 1 (UNVERIFIED on posix)
+    public static readonly int QUIC_STATUS_CERT_UNTRUSTED_ROOT = Pick(unchecked((int)0x800B0109), PosixCertErrorBase + 2, PosixCertErrorBase + 2); // CERT_ERROR_BASE + 2 (UNVERIFIED on posix)
+    public static readonly int QUIC_STATUS_CERT_NO_CERT = Pick(unchecked((int)0x8009030E), PosixCertErrorBase + 3, PosixCertErrorBase + 3);        // CERT_ERROR_BASE + 3 (UNVERIFIED on posix)
 
     /// <summary><c>QUIC_SUCCEEDED</c>: HRESULT sign test on Windows, <c>status &lt;= 0</c> on posix (where PENDING/CONTINUE are negative).</summary>
     public static bool Succeeded(int status) => s_windows ? status >= 0 : status <= 0;

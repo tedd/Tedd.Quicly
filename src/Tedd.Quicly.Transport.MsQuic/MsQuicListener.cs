@@ -53,6 +53,12 @@ public interface IMsQuicListenerEvents
     /// configuration to accept with (one per ALPN when several are hosted), or null to reject. On rejection MsQuic
     /// drops the connection and the wrapper is released; the app must not use it afterwards.
     /// </summary>
+    /// <remarks>
+    /// Do not call any MsQuic API on <paramref name="connection"/> (streams, datagrams, parameters, Shutdown, ...)
+    /// from inside this callback: the wrapper sets the returned configuration and attaches the connection's
+    /// callback handler only after the handler returns, and MsQuic silently drops any event it would indicate
+    /// inline before then (and a rejected connection must never have been used).
+    /// </remarks>
     MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, in MsQuicNewConnectionInfo info);
 
     /// <summary>The listener has fully stopped (after <see cref="MsQuicListener.Stop"/> or <see cref="MsQuicListener.Close"/>).</summary>
@@ -94,8 +100,17 @@ public sealed unsafe class MsQuicListener : IDisposable
     /// <summary>Free slot for the owner's state; never touched by the wrapper.</summary>
     public object? Tag { get; set; }
 
-    /// <summary>The last exception thrown by the event sink (callbacks never propagate; the wrapper records and rejects).</summary>
-    public Exception? LastCallbackException { get; private set; }
+    private Exception? _lastCallbackException;
+
+    /// <summary>
+    /// The last exception thrown by the event sink (callbacks never propagate; the wrapper records and rejects).
+    /// Written on MsQuic worker threads with a volatile write, so any thread may read it.
+    /// </summary>
+    public Exception? LastCallbackException
+    {
+        get => Volatile.Read(ref _lastCallbackException);
+        private set => Volatile.Write(ref _lastCallbackException, value);
+    }
 
     /// <summary>Opens a listener (not yet started).</summary>
     public MsQuicListener(MsQuicRegistration registration, IMsQuicListenerEvents events)
@@ -192,15 +207,17 @@ public sealed unsafe class MsQuicListener : IDisposable
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static int NativeCallback(QUIC_HANDLE* handle, void* context, QUIC_LISTENER_EVENT* evt)
     {
-        var listener = (MsQuicListener)GCHandle.FromIntPtr((nint)context).Target!;
+        MsQuicListener? listener = null;
         MsQuicCallbackScope.Enter();
         try
         {
+            listener = MsQuicCallbackScope.ResolveContext<MsQuicListener>(context);
+            if (listener is null) return MsQuicStatus.QUIC_STATUS_INTERNAL_ERROR;
             return listener.HandleEvent(evt);
         }
         catch (Exception ex)
         {
-            listener.LastCallbackException = ex;
+            if (listener is not null) listener.LastCallbackException = ex;
             MsQuicCallbackScope.OnEscapedException(ex);
             return MsQuicStatus.QUIC_STATUS_INTERNAL_ERROR;
         }

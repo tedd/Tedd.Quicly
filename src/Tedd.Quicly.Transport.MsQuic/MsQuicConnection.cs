@@ -36,6 +36,12 @@ public sealed unsafe class MsQuicConnection : IDisposable
     private IMsQuicConnectionEvents _events;
     private bool _portableCertificate;
     private bool _defersCertificateValidation;
+    private Exception? _lastCallbackException;
+    private int _poisoned;
+    private MsQuicOwnedCredential? _credential;
+
+    /// <summary>Longest server name <see cref="Start"/> accepts, in UTF-8 bytes (the SNI / DNS name limit).</summary>
+    public const int MaxServerNameLength = 255;
 
     /// <summary>The native handle (null after <see cref="Close"/>).</summary>
     public QUIC_HANDLE* Handle => _handle;
@@ -59,11 +65,14 @@ public sealed unsafe class MsQuicConnection : IDisposable
     /// <summary>Free slot for the owner's state; never touched by the wrapper.</summary>
     public object? Tag { get; set; }
 
-    /// <summary>The last exception thrown by an event handler of this connection or one of its streams.</summary>
-    public Exception? LastCallbackException { get; private set; }
+    /// <summary>
+    /// The last exception thrown by an event handler of this connection or one of its streams. Written on MsQuic
+    /// worker threads and published with a volatile write, so any thread may read it.
+    /// </summary>
+    public Exception? LastCallbackException => Volatile.Read(ref _lastCallbackException);
 
-    /// <summary>True once a handler exception has poisoned the connection (it is being shut down).</summary>
-    public bool IsPoisoned { get; private set; }
+    /// <summary>True once a handler exception has poisoned the connection (it is being shut down). Thread-safe.</summary>
+    public bool IsPoisoned => Volatile.Read(ref _poisoned) != 0;
 
     /// <summary>Creates an unstarted client connection.</summary>
     public MsQuicConnection(MsQuicRegistration registration, IMsQuicConnectionEvents? events = null)
@@ -103,29 +112,74 @@ public sealed unsafe class MsQuicConnection : IDisposable
     {
         _handle = null;
         if (_gcHandle.IsAllocated) _gcHandle.Free();
+        Interlocked.Exchange(ref _credential, null)?.Release();
     }
 
-    /// <summary>Client: starts the handshake to <paramref name="serverName"/>:<paramref name="serverPort"/>. Returns the status (asynchronous completion via events).</summary>
+    /// <summary>
+    /// Client: starts the handshake to <paramref name="serverName"/>:<paramref name="serverPort"/>. Returns the status
+    /// (asynchronous completion via events). <paramref name="serverName"/> is limited to
+    /// <see cref="MaxServerNameLength"/> UTF-8 bytes. Returns <c>QUIC_STATUS_INVALID_STATE</c> without calling MsQuic
+    /// when the configuration's owned credential has already been released (the configuration was closed).
+    /// </summary>
     public int Start(MsQuicConfiguration configuration, string serverName, ushort serverPort, int addressFamily = QuicAddressFamily.UNSPEC)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentException.ThrowIfNullOrEmpty(serverName);
-        ObjectDisposedException.ThrowIf(_handle == null, this);
-        RememberCredentialFlags(configuration);
-        int byteCount = Encoding.UTF8.GetByteCount(serverName) + 1;
-        byte* name = stackalloc byte[byteCount];
-        int written = Encoding.UTF8.GetBytes(serverName, new Span<byte>(name, byteCount));
+        QUIC_HANDLE* handle = _handle;
+        ObjectDisposedException.ThrowIf(handle == null, this);
+        if (Encoding.UTF8.GetByteCount(serverName) > MaxServerNameLength)
+        {
+            throw new ArgumentException($"The server name must be at most {MaxServerNameLength} UTF-8 bytes.", nameof(serverName));
+        }
+        byte* name = stackalloc byte[MaxServerNameLength + 1];
+        int written = Encoding.UTF8.GetBytes(serverName, new Span<byte>(name, MaxServerNameLength));
         name[written] = 0;
-        return _api.Table->ConnectionStart(_handle, configuration.Handle, (ushort)addressFamily, (sbyte*)name, serverPort);
+        if (!TryAcquireCredential(configuration, out MsQuicOwnedCredential? lease)) return MsQuicStatus.QUIC_STATUS_INVALID_STATE;
+        RememberCredentialFlags(configuration);
+        int status = _api.Table->ConnectionStart(handle, configuration.Handle, (ushort)addressFamily, (sbyte*)name, serverPort);
+        CommitCredential(lease, status);
+        return status;
     }
 
-    /// <summary>Server: sets the configuration (normally done by the listener from the NewConnection result).</summary>
+    /// <summary>
+    /// Server: sets the configuration (normally done by the listener from the NewConnection result). Returns
+    /// <c>QUIC_STATUS_INVALID_STATE</c> without calling MsQuic when the configuration's owned credential has already
+    /// been released (the configuration was closed).
+    /// </summary>
     public int SetConfiguration(MsQuicConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
-        ObjectDisposedException.ThrowIf(_handle == null, this);
+        QUIC_HANDLE* handle = _handle;
+        ObjectDisposedException.ThrowIf(handle == null, this);
+        if (!TryAcquireCredential(configuration, out MsQuicOwnedCredential? lease)) return MsQuicStatus.QUIC_STATUS_INVALID_STATE;
         RememberCredentialFlags(configuration);
-        return _api.Table->ConnectionSetConfiguration(_handle, configuration.Handle);
+        int status = _api.Table->ConnectionSetConfiguration(handle, configuration.Handle);
+        CommitCredential(lease, status);
+        return status;
+    }
+
+    /// <summary>
+    /// Takes a reference on the key container the configuration persisted (if any), so it outlives
+    /// <see cref="MsQuicConfiguration.Close"/> for as long as this connection exists (ADR 0009). False when the
+    /// credential is already gone.
+    /// </summary>
+    private static bool TryAcquireCredential(MsQuicConfiguration configuration, out MsQuicOwnedCredential? lease)
+    {
+        lease = configuration.OwnedCredential;
+        if (lease is null || lease.TryAddRef()) return true;
+        lease = null;
+        return false;
+    }
+
+    /// <summary>Keeps the reference when MsQuic accepted the configuration, drops it otherwise.</summary>
+    private void CommitCredential(MsQuicOwnedCredential? lease, int status)
+    {
+        if (MsQuicStatus.Failed(status))
+        {
+            lease?.Release();
+            return;
+        }
+        Interlocked.Exchange(ref _credential, lease)?.Release();
     }
 
     private void RememberCredentialFlags(MsQuicConfiguration configuration)
@@ -146,9 +200,10 @@ public sealed unsafe class MsQuicConnection : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int SendDatagram(QUIC_BUFFER* buffers, uint bufferCount, QUIC_SEND_FLAGS flags, void* clientContext)
     {
-        if (_handle == null) ThrowDisposed();
+        QUIC_HANDLE* handle = _handle;
+        if (handle == null) ThrowDisposed();
         if ((flags & ~_api.SupportedSendFlags) != 0) return MsQuicStatus.QUIC_STATUS_NOT_SUPPORTED;
-        return _api.Table->DatagramSend(_handle, buffers, bufferCount, flags, clientContext);
+        return _api.Table->DatagramSend(handle, buffers, bufferCount, flags, clientContext);
     }
 
     /// <summary>Opens a locally-initiated stream (not started). Returns the status; <paramref name="stream"/> is set on success.</summary>
@@ -291,6 +346,8 @@ public sealed unsafe class MsQuicConnection : IDisposable
     /// Closes the handle (<c>ConnectionClose</c>) and frees the context. Idempotent. Blocks until no callback is
     /// running, which is why it throws <see cref="InvalidOperationException"/> when called from an MsQuic callback
     /// thread (ADR 0008 §7). MsQuic keeps the native connection alive until every stream handle is closed too.
+    /// Also drops this connection's reference on a key container its configuration persisted; the container is
+    /// deleted once the configuration and every connection that used it are closed (ADR 0009).
     /// </summary>
     public void Close()
     {
@@ -300,6 +357,7 @@ public sealed unsafe class MsQuicConnection : IDisposable
         _handle = null;
         _api.Table->ConnectionClose(handle);
         if (_gcHandle.IsAllocated) _gcHandle.Free();
+        Interlocked.Exchange(ref _credential, null)?.Release();
     }
 
     /// <inheritdoc cref="Close"/>
@@ -310,11 +368,13 @@ public sealed unsafe class MsQuicConnection : IDisposable
     /// <summary>Records a handler exception (from this connection or one of its streams) and shuts the connection down once.</summary>
     internal void Poison(Exception exception)
     {
-        LastCallbackException = exception;
+        Volatile.Write(ref _lastCallbackException, exception);
         MsQuicCallbackScope.OnEscapedException(exception);
-        if (IsPoisoned || _handle == null) return;
-        IsPoisoned = true;
-        _api.Table->ConnectionShutdown(_handle, QUIC_CONNECTION_SHUTDOWN_FLAGS.NONE, CallbackFailureErrorCode);
+        // Read the handle once: Close on the owner thread may clear the field concurrently (it then blocks in
+        // ConnectionClose until this callback returns, so the local copy stays valid).
+        QUIC_HANDLE* handle = _handle;
+        if (handle == null || Interlocked.Exchange(ref _poisoned, 1) != 0) return;
+        _api.Table->ConnectionShutdown(handle, QUIC_CONNECTION_SHUTDOWN_FLAGS.NONE, CallbackFailureErrorCode);
     }
 
     /// <summary>The native callback, so tests can dispatch synthetic events through the full callback path.</summary>
@@ -326,15 +386,18 @@ public sealed unsafe class MsQuicConnection : IDisposable
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static int NativeCallback(QUIC_HANDLE* handle, void* context, QUIC_CONNECTION_EVENT* evt)
     {
-        var connection = (MsQuicConnection)GCHandle.FromIntPtr((nint)context).Target!;
+        MsQuicConnection? connection = null;
         MsQuicCallbackScope.Enter();
         try
         {
+            connection = MsQuicCallbackScope.ResolveContext<MsQuicConnection>(context);
+            if (connection is null) return MsQuicStatus.QUIC_STATUS_INTERNAL_ERROR;
             return connection.HandleEvent(evt);
         }
         catch (Exception ex)
         {
-            connection.Poison(ex);
+            if (connection is not null) connection.Poison(ex);
+            else MsQuicCallbackScope.OnEscapedException(ex);
             return MsQuicStatus.QUIC_STATUS_INTERNAL_ERROR;
         }
         finally

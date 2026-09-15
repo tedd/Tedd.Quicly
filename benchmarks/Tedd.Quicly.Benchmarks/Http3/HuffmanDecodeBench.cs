@@ -6,8 +6,7 @@ using Tedd.Quicly.Http3.Qpack;
 namespace Tedd.Quicly.Benchmarks.Http3;
 
 /// <summary>Huffman decode of a 40-byte header value: V0 bit-by-bit tree walk vs V1 nibble transition table.</summary>
-[MemoryDiagnoser]
-[ShortRunJob]
+[Config(typeof(Http3BenchConfig))]
 public class HuffmanDecodeBench
 {
     private byte[] _encoded = [];

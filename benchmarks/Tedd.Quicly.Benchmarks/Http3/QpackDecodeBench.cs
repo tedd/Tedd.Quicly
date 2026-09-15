@@ -5,8 +5,7 @@ using Tedd.Quicly.Http3.Qpack;
 namespace Tedd.Quicly.Benchmarks.Http3;
 
 /// <summary>QPACK decode (and encode) of a Chrome-like WebTransport Extended CONNECT header block.</summary>
-[MemoryDiagnoser]
-[ShortRunJob]
+[Config(typeof(Http3BenchConfig))]
 public class QpackDecodeBench
 {
     private byte[] _block = [];

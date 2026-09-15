@@ -14,6 +14,9 @@ public class Http3SettingsTests
             H3Datagram = 1,
             EnableWebTransport = 1,
             WebTransportMaxSessions = 64,
+            WebTransportInitialMaxData = 1UL << 20,
+            WebTransportInitialMaxStreamsUni = 100,
+            WebTransportInitialMaxStreamsBidi = 1UL << 60,
         };
         Span<byte> dst = stackalloc byte[128];
         int n = s.WritePayload(dst);
@@ -54,7 +57,7 @@ public class Http3SettingsTests
         Assert.Equal(1UL, back.H3Datagram);
         Assert.Equal(1UL, back.EnableWebTransport);
         Assert.Equal(16UL, back.WebTransportMaxSessions);
-        Assert.Null(back.MaxFieldSectionSize);
+        Assert.Equal(16384UL, back.MaxFieldSectionSize);
     }
 
     [Fact]
@@ -96,8 +99,8 @@ public class Http3SettingsTests
         Assert.Equal(100UL, s.MaxFieldSectionSize);
         Assert.Null(s.QpackMaxTableCapacity);
 
-        // Unknown identifiers on every side of the known ones: 0x0a, 0x32, 0x34, 0x2b603741, 0x2b603743, 0xc6717069, 0xc671706b, 2^62-1.
-        byte[] more = TestUtil.Hex("0a01 3201 3401 ab60374101 ab60374301 c0000000c671706901 c0000000c671706b01 ffffffffffffffff01");
+        // Unknown identifiers on every side of the known ones: 0x0a, 0x32, 0x34, 0x2b603741, 0x2b603743, 0xc6717069, 0xc671706e, 2^62-1.
+        byte[] more = TestUtil.Hex("0a01 3201 3401 ab60374101 ab60374301 c0000000c671706901 c0000000c671706e01 ffffffffffffffff01");
         Assert.Equal(Http3SettingsDecodeStatus.Ok, Http3Settings.Decode(more, out s));
         Assert.Equal(default, s);
     }
@@ -121,6 +124,9 @@ public class Http3SettingsTests
     [InlineData("3301 3301")]
     [InlineData("ab60374201 ab60374201")]
     [InlineData("c0000000c671706a01 c0000000c671706a01")]
+    [InlineData("c0000000c671706b01 c0000000c671706b01")]
+    [InlineData("c0000000c671706c01 c0000000c671706c01")]
+    [InlineData("c0000000c671706d01 c0000000c671706d01")]
     public void Duplicate_Known_Identifiers_Are_Errors(string hex)
     {
         Assert.Equal(Http3SettingsDecodeStatus.DuplicateSetting, Http3Settings.Decode(TestUtil.Hex(hex), out _));
@@ -130,6 +136,8 @@ public class Http3SettingsTests
     [InlineData("0802")]
     [InlineData("3302")]
     [InlineData("ab60374202")]
+    [InlineData("c0000000c671706c d000000000000001")] // WT_INITIAL_MAX_STREAMS_UNI = 2^60 + 1
+    [InlineData("c0000000c671706d ffffffffffffffff")] // WT_INITIAL_MAX_STREAMS_BIDI = 2^62 - 1
     public void Boolean_Settings_Reject_Values_Above_One(string hex)
     {
         Assert.Equal(Http3SettingsDecodeStatus.InvalidValue, Http3Settings.Decode(TestUtil.Hex(hex), out _));
@@ -156,5 +164,74 @@ public class Http3SettingsTests
         Assert.NotEqual(a, a with { EnableWebTransport = 0 });
         Assert.NotEqual(a, a with { WebTransportMaxSessions = 2 });
         Assert.False(a.Equals("not settings"));
+    }
+}
+
+public class Http3SettingsWebTransportFlowControlTests
+{
+    [Fact]
+    public void Server_Defaults_Match_Protocol_Section_5()
+    {
+        Http3Settings s = Http3Settings.CreateWebTransportServerDefaults(1);
+        Assert.Equal(0UL, s.QpackMaxTableCapacity);
+        Assert.Equal(0UL, s.QpackBlockedStreams);
+        Assert.Equal(Http3Settings.DefaultMaxFieldSectionSize, s.MaxFieldSectionSize);
+        Assert.Equal(16384UL, Http3Settings.DefaultMaxFieldSectionSize);
+        Assert.Equal(1UL, s.EnableConnectProtocol);
+        Assert.Equal(1UL, s.H3Datagram);
+        Assert.Equal(1UL, s.EnableWebTransport);
+        Assert.Equal(1UL, s.WebTransportMaxSessions);
+        Assert.Null(s.WebTransportInitialMaxData);
+        Assert.Null(s.WebTransportInitialMaxStreamsUni);
+        Assert.Null(s.WebTransportInitialMaxStreamsBidi);
+    }
+
+    [Fact]
+    public void Initial_Flow_Control_Settings_Wire_Format()
+    {
+        var s = new Http3Settings
+        {
+            WebTransportInitialMaxData = 65536,
+            WebTransportInitialMaxStreamsUni = 8,
+            WebTransportInitialMaxStreamsBidi = 1UL << 60,
+        };
+        Span<byte> dst = stackalloc byte[64];
+        int n = s.WritePayload(dst);
+        Assert.Equal(s.GetPayloadLength(), n);
+        // 0xc671706b -> 8-byte varint c0000000c671706b, 65536 -> 4-byte 80010000
+        // 0xc671706c, 8 -> 08; 0xc671706d, 2^60 -> d000000000000000
+        Assert.Equal("c0000000c671706b80010000" + "c0000000c671706c08" + "c0000000c671706dd000000000000000", TestUtil.ToHex(dst.Slice(0, n)));
+        Assert.Equal(Http3SettingsDecodeStatus.Ok, Http3Settings.Decode(dst.Slice(0, n), out Http3Settings back));
+        Assert.Equal(s, back);
+        Assert.Equal(65536UL, back.WebTransportInitialMaxData);
+        Assert.Equal(8UL, back.WebTransportInitialMaxStreamsUni);
+        Assert.Equal(1UL << 60, back.WebTransportInitialMaxStreamsBidi);
+        Assert.Equal(1UL << 60, Http3Settings.MaxStreamCredit);
+
+        // Truncated destinations fail at every prefix length.
+        for (int size = 0; size < n; size++) Assert.Equal(-1, s.WritePayload(dst.Slice(0, size)));
+    }
+
+    [Fact]
+    public void Draft13_Codepoints_Are_Ignored_As_Unknown()
+    {
+        // SETTINGS_WT_MAX_SESSIONS 0x14e9cd29, WT_INITIAL_MAX_DATA 0x2b61, *_STREAMS_UNI 0x2b64, *_STREAMS_BIDI 0x2b65
+        byte[] payload = TestUtil.Hex("94e9cd2901 6b6101 6b6401 6b6501");
+        Assert.Equal(Http3SettingsDecodeStatus.Ok, Http3Settings.Decode(payload, out Http3Settings s));
+        Assert.Equal(default, s);
+    }
+
+    [Fact]
+    public void Equality_Covers_Flow_Control_Fields()
+    {
+        var a = new Http3Settings { WebTransportInitialMaxData = 1 };
+        var b = new Http3Settings { WebTransportInitialMaxStreamsUni = 1 };
+        var c = new Http3Settings { WebTransportInitialMaxStreamsBidi = 1 };
+        Assert.NotEqual(a, b);
+        Assert.NotEqual(b, c);
+        Assert.NotEqual(a, c);
+        Assert.NotEqual(a.GetHashCode(), b.GetHashCode());
+        Assert.Equal(a, new Http3Settings { WebTransportInitialMaxData = 1 });
+        Assert.False(a.Equals("x"));
     }
 }

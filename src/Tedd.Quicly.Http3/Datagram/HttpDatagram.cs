@@ -41,11 +41,12 @@ public static class HttpDatagram
     }
 
     /// <summary>
-    /// Parses a received HTTP Datagram. Returns false when the prefix is truncated (H3_DATAGRAM_ERROR).
+    /// Parses a received HTTP Datagram. Returns false when the prefix is truncated or the Quarter Stream ID maps
+    /// to a stream id above the varint maximum, 2^62-1 (H3_DATAGRAM_ERROR).
     /// </summary>
     public static bool TryRead(ReadOnlySpan<byte> datagram, out ulong streamId, out ReadOnlySpan<byte> payload)
     {
-        if (!Http3VarInt.TryRead(datagram, out ulong quarter, out int n))
+        if (!Http3VarInt.TryRead(datagram, out ulong quarter, out int n) || quarter > (Http3VarInt.MaxValue >> 2))
         {
             streamId = 0;
             payload = default;

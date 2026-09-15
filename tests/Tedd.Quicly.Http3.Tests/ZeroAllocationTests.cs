@@ -106,6 +106,10 @@ public class ZeroAllocationTests
             n = CapsuleWriter.WriteCloseSession(buffer, 1, "bye"u8);
             if (!CapsuleReader.TryRead(buffer.AsSpan(0, n), out _, out ReadOnlySpan<byte> p, out _)) throw new InvalidOperationException();
             if (!CapsuleReader.TryParseCloseSession(p, out _, out _)) throw new InvalidOperationException();
+            n = CapsuleWriter.WriteFlowControl(buffer, CapsuleType.WebTransportMaxStreamsBidi, 64);
+            if (!CapsuleReader.TryRead(buffer.AsSpan(0, n), out ulong t, out p, out _)) throw new InvalidOperationException();
+            if (!CapsuleReader.TryParseFlowControl((CapsuleType)t, p, out ulong credit) || credit != 64) throw new InvalidOperationException();
+            if (!Http3FrameReader.TryPeekType(buffer.AsSpan(0, n), out _, out _)) throw new InvalidOperationException();
             n = WebTransportFraming.WriteUnidirectionalPreamble(buffer, 4);
             if (WebTransportFraming.TryReadUnidirectionalPreamble(buffer.AsSpan(0, n), out _, out _) != WebTransportPreambleStatus.Ok) throw new InvalidOperationException();
             if (!WebTransportErrorCode.TryFromHttp3(WebTransportErrorCode.ToHttp3(77), out uint app) || app != 77) throw new InvalidOperationException();
@@ -124,6 +128,7 @@ public class ZeroAllocationTests
             if (WebTransportRequest.Validate(headers, out _) != WebTransportRequestStatus.Ok) throw new InvalidOperationException();
             if (WebTransportRequest.EncodeConnectRequest(block, "example.com"u8, "/game"u8, "https://example.com"u8) <= 0) throw new InvalidOperationException();
             if (WebTransportRequest.EncodeConnectResponse(block) <= 0) throw new InvalidOperationException();
+            if (WebTransportRequest.EncodeConnectResponse(block, includeLegacyDraftHeader: true, includeCapsuleProtocol: true) <= 0) throw new InvalidOperationException();
             if (WebTransportRequest.EncodeResponse(block, 200, "text/plain"u8, 42) <= 0) throw new InvalidOperationException();
             headers.Clear();
             if (!WebTransportRequest.TryBuildResponse(headers, 404, "text/plain"u8, 0)) throw new InvalidOperationException();

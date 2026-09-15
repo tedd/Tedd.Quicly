@@ -17,7 +17,13 @@ public enum Http3FrameType : ulong
     GoAway = 0x07,
     /// <summary>MAX_PUSH_ID (0x0d).</summary>
     MaxPushId = 0x0d,
-    /// <summary>WEBTRANSPORT_STREAM (0x41): signal value opening a WebTransport bidirectional stream.</summary>
+    /// <summary>
+    /// WEBTRANSPORT_STREAM (0x41): signal value opening a WebTransport bidirectional stream. It is not a proper
+    /// length-prefixed frame (the varint that follows is the session id, not a length), so
+    /// <see cref="Http3FrameTypeExtensions.IsKnown"/> is false for it: dispatch a client bidirectional stream by
+    /// <see cref="Http3FrameReader.TryPeekType"/> and hand 0x41 to <c>WebTransportFraming</c> before the stream
+    /// ever reaches an <see cref="Http3FrameReader"/>.
+    /// </summary>
     WebTransportStream = 0x41,
 }
 
@@ -41,7 +47,10 @@ public static class Http3FrameTypeExtensions
         return t == 0x02 || t == 0x06 || t == 0x08 || t == 0x09;
     }
 
-    /// <summary>True when the frame type is one this library knows how to interpret.</summary>
+    /// <summary>
+    /// True when the frame type is a proper length-prefixed HTTP/3 frame this library knows how to interpret.
+    /// <see cref="Http3FrameType.WebTransportStream"/> is excluded: it is a stream signal value, not a frame.
+    /// </summary>
     public static bool IsKnown(this Http3FrameType type)
     {
         switch (type)
@@ -53,7 +62,6 @@ public static class Http3FrameTypeExtensions
             case Http3FrameType.PushPromise:
             case Http3FrameType.GoAway:
             case Http3FrameType.MaxPushId:
-            case Http3FrameType.WebTransportStream:
                 return true;
             default:
                 return false;

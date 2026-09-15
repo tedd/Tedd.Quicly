@@ -7,8 +7,7 @@ namespace Tedd.Quicly.Benchmarks.Http3;
 /// Frame reader throughput: a 1 MiB stream of DATA frames (1200-byte payloads, i.e. one per QUIC packet)
 /// interleaved with small HEADERS frames, consumed either as one contiguous buffer or in 1200-byte receive chunks.
 /// </summary>
-[MemoryDiagnoser]
-[ShortRunJob]
+[Config(typeof(Http3BenchConfig))]
 public class FrameReaderBench
 {
     private const int ChunkSize = 1200;

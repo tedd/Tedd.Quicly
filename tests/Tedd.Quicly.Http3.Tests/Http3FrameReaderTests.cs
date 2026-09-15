@@ -32,7 +32,6 @@ public class Http3FrameReaderTests
             new Frame((ulong)Http3FrameType.Data, Rand(300)), // 2-byte length varint
             new Frame((ulong)Http3FrameType.GoAway, Rand(2)),
             new Frame((ulong)Http3FrameType.Data, Rand(17000)), // 4-byte length varint
-            new Frame((ulong)Http3FrameType.WebTransportStream, []),
         ];
     }
 
@@ -248,5 +247,31 @@ public class Http3FrameReaderTests
         Assert.False(Http3FrameReader.TryReadFrame(new byte[] { 0x04 }, out _, out _, out _));
         Assert.False(Http3FrameReader.TryReadFrame(new byte[] { 0x04, 0x03, 0x01 }, out _, out _, out consumed));
         Assert.Equal(0, consumed);
+    }
+
+    [Fact]
+    public void TryPeekType_Routes_WebTransport_Signal_Without_Length_Parse()
+    {
+        // A WebTransport bidirectional stream: 0x41 (2-byte varint), session id 4. Not a length-prefixed frame.
+        byte[] wt = [0x40, 0x41, 0x04];
+        Assert.True(Http3FrameReader.TryPeekType(wt, out ulong type, out int consumed));
+        Assert.Equal((ulong)Http3FrameType.WebTransportStream, type);
+        Assert.Equal(2, consumed);
+        Assert.False(((Http3FrameType)type).IsKnown());
+        Assert.Equal(WebTransport.WebTransportPreambleStatus.Ok, WebTransport.WebTransportFraming.TryReadBidirectionalPreamble(wt, out ulong session, out int preamble));
+        Assert.Equal(4UL, session);
+        Assert.Equal(3, preamble);
+
+        // A request stream: HEADERS with a 3-byte payload.
+        byte[] headers = [0x01, 0x03, 0xaa, 0xbb, 0xcc];
+        Assert.True(Http3FrameReader.TryPeekType(headers, out type, out consumed));
+        Assert.Equal((ulong)Http3FrameType.Headers, type);
+        Assert.Equal(1, consumed);
+
+        // Truncated varint: nothing consumed.
+        Assert.False(Http3FrameReader.TryPeekType(new byte[] { 0x40 }, out type, out consumed));
+        Assert.Equal(0UL, type);
+        Assert.Equal(0, consumed);
+        Assert.False(Http3FrameReader.TryPeekType(ReadOnlySpan<byte>.Empty, out _, out _));
     }
 }

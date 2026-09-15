@@ -72,4 +72,19 @@ public class HttpDatagramTests
         Assert.True(payload.IsEmpty);
         Assert.False(HttpDatagram.TryRead(new byte[] { 0x40 }, out _, out _));
     }
+
+    [Fact]
+    public void Read_Rejects_Quarter_Stream_Id_Above_Varint_Range()
+    {
+        // Quarter Stream ID 2^60 would be stream id 2^62, above the varint maximum 2^62-1 (ADR 0009: every parser is bounded).
+        Assert.False(HttpDatagram.TryRead(TestUtil.Hex("d000000000000000 aa"), out ulong id, out ReadOnlySpan<byte> payload));
+        Assert.Equal(0UL, id);
+        Assert.True(payload.IsEmpty);
+        Assert.False(HttpDatagram.TryRead(TestUtil.Hex("ffffffffffffffff"), out _, out _));
+        // 2^60 - 1 is the largest legal quarter id: stream id 2^62 - 4.
+        Assert.True(HttpDatagram.TryRead(TestUtil.Hex("cfffffffffffffff 01"), out id, out payload));
+        Assert.Equal((1UL << 62) - 4, id);
+        Assert.True(HttpDatagram.IsValidStreamId(id));
+        Assert.Equal(1, payload.Length);
+    }
 }

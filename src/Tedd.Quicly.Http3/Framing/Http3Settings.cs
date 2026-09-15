@@ -11,7 +11,7 @@ public enum Http3SettingsDecodeStatus : byte
     DuplicateSetting,
     /// <summary>A reserved HTTP/2 setting identifier (0x00, 0x02, 0x03, 0x04, 0x05) was present (H3_SETTINGS_ERROR).</summary>
     ReservedSetting,
-    /// <summary>A boolean-valued setting (ENABLE_CONNECT_PROTOCOL, H3_DATAGRAM, ENABLE_WEBTRANSPORT) had a value other than 0 or 1 (H3_SETTINGS_ERROR).</summary>
+    /// <summary>A boolean-valued setting (ENABLE_CONNECT_PROTOCOL, H3_DATAGRAM, ENABLE_WEBTRANSPORT) had a value other than 0 or 1, or a stream-credit setting exceeded 2^60 (H3_SETTINGS_ERROR).</summary>
     InvalidValue,
 }
 
@@ -21,6 +21,12 @@ public enum Http3SettingsDecodeStatus : byte
 /// </summary>
 public struct Http3Settings : IEquatable<Http3Settings>
 {
+    /// <summary>The MAX_FIELD_SECTION_SIZE a QUICLY server advertises (docs/PROTOCOL.md §5): 16 KiB.</summary>
+    public const ulong DefaultMaxFieldSectionSize = 16384;
+
+    /// <summary>Largest legal stream-credit value (2^60, RFC 9000 §19.11 applied to WT_INITIAL_MAX_STREAMS_*).</summary>
+    public const ulong MaxStreamCredit = 1UL << 60;
+
     /// <summary>SETTINGS_QPACK_MAX_TABLE_CAPACITY.</summary>
     public ulong? QpackMaxTableCapacity;
     /// <summary>SETTINGS_MAX_FIELD_SECTION_SIZE.</summary>
@@ -35,15 +41,24 @@ public struct Http3Settings : IEquatable<Http3Settings>
     public ulong? EnableWebTransport;
     /// <summary>SETTINGS_WEBTRANSPORT_MAX_SESSIONS.</summary>
     public ulong? WebTransportMaxSessions;
+    /// <summary>SETTINGS_WT_INITIAL_MAX_DATA (bytes of session-level flow-control credit).</summary>
+    public ulong? WebTransportInitialMaxData;
+    /// <summary>SETTINGS_WT_INITIAL_MAX_STREAMS_UNI (at most 2^60).</summary>
+    public ulong? WebTransportInitialMaxStreamsUni;
+    /// <summary>SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI (at most 2^60).</summary>
+    public ulong? WebTransportInitialMaxStreamsBidi;
 
     /// <summary>
     /// The settings a QUICLY WebTransport server advertises (docs/PROTOCOL.md §5): no dynamic QPACK table,
-    /// Extended CONNECT, HTTP Datagrams and WebTransport enabled with <paramref name="maxSessions"/> sessions.
+    /// MAX_FIELD_SECTION_SIZE=16384, Extended CONNECT, HTTP Datagrams and WebTransport enabled with
+    /// <paramref name="maxSessions"/> sessions. The WT_INITIAL_MAX_* settings are left absent (the draft default:
+    /// zero initial credit until the corresponding capsule raises it).
     /// </summary>
     public static Http3Settings CreateWebTransportServerDefaults(ulong maxSessions) => new()
     {
         QpackMaxTableCapacity = 0,
         QpackBlockedStreams = 0,
+        MaxFieldSectionSize = DefaultMaxFieldSectionSize,
         EnableConnectProtocol = 1,
         H3Datagram = 1,
         EnableWebTransport = 1,
@@ -61,6 +76,9 @@ public struct Http3Settings : IEquatable<Http3Settings>
         n += PairLength(Http3SettingId.H3Datagram, H3Datagram);
         n += PairLength(Http3SettingId.EnableWebTransport, EnableWebTransport);
         n += PairLength(Http3SettingId.WebTransportMaxSessions, WebTransportMaxSessions);
+        n += PairLength(Http3SettingId.WebTransportInitialMaxData, WebTransportInitialMaxData);
+        n += PairLength(Http3SettingId.WebTransportInitialMaxStreamsUni, WebTransportInitialMaxStreamsUni);
+        n += PairLength(Http3SettingId.WebTransportInitialMaxStreamsBidi, WebTransportInitialMaxStreamsBidi);
         return n;
     }
 
@@ -75,6 +93,9 @@ public struct Http3Settings : IEquatable<Http3Settings>
         if (!WritePair(destination, ref pos, Http3SettingId.H3Datagram, H3Datagram)) return -1;
         if (!WritePair(destination, ref pos, Http3SettingId.EnableWebTransport, EnableWebTransport)) return -1;
         if (!WritePair(destination, ref pos, Http3SettingId.WebTransportMaxSessions, WebTransportMaxSessions)) return -1;
+        if (!WritePair(destination, ref pos, Http3SettingId.WebTransportInitialMaxData, WebTransportInitialMaxData)) return -1;
+        if (!WritePair(destination, ref pos, Http3SettingId.WebTransportInitialMaxStreamsUni, WebTransportInitialMaxStreamsUni)) return -1;
+        if (!WritePair(destination, ref pos, Http3SettingId.WebTransportInitialMaxStreamsBidi, WebTransportInitialMaxStreamsBidi)) return -1;
         return pos;
     }
 
@@ -145,6 +166,20 @@ public struct Http3Settings : IEquatable<Http3Settings>
                     if (settings.WebTransportMaxSessions.HasValue) return Http3SettingsDecodeStatus.DuplicateSetting;
                     settings.WebTransportMaxSessions = value;
                     break;
+                case (ulong)Http3SettingId.WebTransportInitialMaxData:
+                    if (settings.WebTransportInitialMaxData.HasValue) return Http3SettingsDecodeStatus.DuplicateSetting;
+                    settings.WebTransportInitialMaxData = value;
+                    break;
+                case (ulong)Http3SettingId.WebTransportInitialMaxStreamsUni:
+                    if (settings.WebTransportInitialMaxStreamsUni.HasValue) return Http3SettingsDecodeStatus.DuplicateSetting;
+                    if (value > MaxStreamCredit) return Http3SettingsDecodeStatus.InvalidValue;
+                    settings.WebTransportInitialMaxStreamsUni = value;
+                    break;
+                case (ulong)Http3SettingId.WebTransportInitialMaxStreamsBidi:
+                    if (settings.WebTransportInitialMaxStreamsBidi.HasValue) return Http3SettingsDecodeStatus.DuplicateSetting;
+                    if (value > MaxStreamCredit) return Http3SettingsDecodeStatus.InvalidValue;
+                    settings.WebTransportInitialMaxStreamsBidi = value;
+                    break;
                 default:
                     // Unknown or reserved-grease identifier: ignore (RFC 9114 §7.2.4.1).
                     break;
@@ -178,13 +213,30 @@ public struct Http3Settings : IEquatable<Http3Settings>
         && EnableConnectProtocol == other.EnableConnectProtocol
         && H3Datagram == other.H3Datagram
         && EnableWebTransport == other.EnableWebTransport
-        && WebTransportMaxSessions == other.WebTransportMaxSessions;
+        && WebTransportMaxSessions == other.WebTransportMaxSessions
+        && WebTransportInitialMaxData == other.WebTransportInitialMaxData
+        && WebTransportInitialMaxStreamsUni == other.WebTransportInitialMaxStreamsUni
+        && WebTransportInitialMaxStreamsBidi == other.WebTransportInitialMaxStreamsBidi;
 
     /// <inheritdoc />
     public override readonly bool Equals(object? obj) => obj is Http3Settings other && Equals(other);
 
     /// <inheritdoc />
-    public override readonly int GetHashCode() => HashCode.Combine(QpackMaxTableCapacity, MaxFieldSectionSize, QpackBlockedStreams, EnableConnectProtocol, H3Datagram, EnableWebTransport, WebTransportMaxSessions);
+    public override readonly int GetHashCode()
+    {
+        var h = new HashCode();
+        h.Add(QpackMaxTableCapacity);
+        h.Add(MaxFieldSectionSize);
+        h.Add(QpackBlockedStreams);
+        h.Add(EnableConnectProtocol);
+        h.Add(H3Datagram);
+        h.Add(EnableWebTransport);
+        h.Add(WebTransportMaxSessions);
+        h.Add(WebTransportInitialMaxData);
+        h.Add(WebTransportInitialMaxStreamsUni);
+        h.Add(WebTransportInitialMaxStreamsBidi);
+        return h.ToHashCode();
+    }
 
     /// <summary>Value equality.</summary>
     public static bool operator ==(Http3Settings left, Http3Settings right) => left.Equals(right);

@@ -213,6 +213,14 @@ public struct Http3FrameReader
     }
 
     /// <summary>
+    /// Reads only the frame-type varint at the start of <paramref name="source"/> without committing to a length
+    /// parse, so a caller can route a fresh client bidirectional stream: 0x41 (WEBTRANSPORT_STREAM) goes to
+    /// <c>WebTransportFraming.TryReadBidirectionalPreamble</c>, anything else to <see cref="Read"/>. Returns false
+    /// when the varint is truncated (nothing is consumed).
+    /// </summary>
+    public static bool TryPeekType(ReadOnlySpan<byte> source, out ulong type, out int consumed) => Http3VarInt.TryRead(source, out type, out consumed);
+
+    /// <summary>
     /// Parses one complete frame from the start of a contiguous buffer. Returns false when the buffer does not
     /// hold a complete frame (header or payload truncated). No max-length guard is applied.
     /// </summary>

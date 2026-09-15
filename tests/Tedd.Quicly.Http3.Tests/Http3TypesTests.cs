@@ -63,6 +63,9 @@ public class Http3TypesTests
         Assert.Equal(0x33UL, (ulong)Http3SettingId.H3Datagram);
         Assert.Equal(0x2b603742UL, (ulong)Http3SettingId.EnableWebTransport);
         Assert.Equal(0xc671706aUL, (ulong)Http3SettingId.WebTransportMaxSessions);
+        Assert.Equal(0xc671706bUL, (ulong)Http3SettingId.WebTransportInitialMaxData);
+        Assert.Equal(0xc671706cUL, (ulong)Http3SettingId.WebTransportInitialMaxStreamsUni);
+        Assert.Equal(0xc671706dUL, (ulong)Http3SettingId.WebTransportInitialMaxStreamsBidi);
     }
 
     [Theory]
@@ -109,7 +112,12 @@ public class Http3TypesTests
     [Fact]
     public void Known_Frame_And_Stream_Types()
     {
-        foreach (Http3FrameType t in Enum.GetValues<Http3FrameType>()) Assert.True(t.IsKnown());
+        foreach (Http3FrameType t in Enum.GetValues<Http3FrameType>())
+        {
+            // WEBTRANSPORT_STREAM (0x41) is a stream signal value, not a length-prefixed frame.
+            Assert.Equal(t != Http3FrameType.WebTransportStream, t.IsKnown());
+        }
+        Assert.False(Http3FrameType.WebTransportStream.IsKnown());
         Assert.False(((Http3FrameType)0x02).IsKnown());
         Assert.False(((Http3FrameType)0x21).IsKnown());
         foreach (Http3StreamType t in Enum.GetValues<Http3StreamType>()) Assert.True(t.IsKnown());

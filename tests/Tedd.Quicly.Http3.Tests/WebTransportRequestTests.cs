@@ -100,32 +100,82 @@ public class WebTransportRequestTests
     [Fact]
     public void Connect_Response()
     {
-        var h = new Http3HeaderCollection(128, 2);
+        // Default: a bare ":status 200" (draft-13 clients need nothing else).
+        var h = new Http3HeaderCollection(128, 3);
         Assert.True(WebTransportRequest.TryBuildConnectResponse(h));
-        Assert.Equal(2, h.Count);
+        Assert.Equal(1, h.Count);
         Assert.Equal("200", TestUtil.AsciiString(h.GetValue(0)));
+        Assert.False(h.Contains("sec-webtransport-http3-draft"u8));
+        Assert.False(h.Contains("capsule-protocol"u8));
+
+        // Legacy draft-02 clients get "sec-webtransport-http3-draft: draft02" on request.
+        h.Clear();
+        Assert.True(WebTransportRequest.TryBuildConnectResponse(h, includeLegacyDraftHeader: true));
+        Assert.Equal(2, h.Count);
         Assert.True(h.TryGet("sec-webtransport-http3-draft"u8, out ReadOnlySpan<byte> draft));
         Assert.Equal("draft02", TestUtil.AsciiString(draft));
         Assert.Equal("draft02", TestUtil.AsciiString(WebTransportRequest.LegacyDraftValue));
 
+        // Optional "capsule-protocol: ?1" (RFC 9297 §3.1).
         h.Clear();
-        Assert.True(WebTransportRequest.TryBuildConnectResponse(h, includeLegacyDraftHeader: false));
-        Assert.Equal(1, h.Count);
+        Assert.True(WebTransportRequest.TryBuildConnectResponse(h, includeCapsuleProtocol: true));
+        Assert.Equal(2, h.Count);
+        Assert.True(h.TryGet("capsule-protocol"u8, out ReadOnlySpan<byte> capsule));
+        Assert.Equal("?1", TestUtil.AsciiString(capsule));
 
-        var one = new Http3HeaderCollection(128, 1);
-        Assert.False(WebTransportRequest.TryBuildConnectResponse(one));
+        h.Clear();
+        Assert.True(WebTransportRequest.TryBuildConnectResponse(h, includeLegacyDraftHeader: true, includeCapsuleProtocol: true));
+        Assert.Equal(3, h.Count);
+        Assert.Equal("capsule-protocol", TestUtil.AsciiString(h.GetName(2)));
+
+        // Collection full at each stage.
+        Assert.False(WebTransportRequest.TryBuildConnectResponse(new Http3HeaderCollection(128, 1), includeLegacyDraftHeader: true));
+        Assert.False(WebTransportRequest.TryBuildConnectResponse(new Http3HeaderCollection(128, 1), includeCapsuleProtocol: true));
+        Assert.False(WebTransportRequest.TryBuildConnectResponse(new Http3HeaderCollection(128, 2), includeLegacyDraftHeader: true, includeCapsuleProtocol: true));
         Assert.False(WebTransportRequest.TryBuildConnectResponse(new Http3HeaderCollection(2, 4)));
 
         byte[] block = new byte[128];
         int n = WebTransportRequest.EncodeConnectResponse(block);
+        Assert.Equal(3, n); // prefix (2 bytes) + indexed ":status 200"
         Assert.Equal(0xD9, block[2]); // :status 200 = index 25
         var dec = new Http3HeaderCollection(128, 4);
         Assert.Equal(QpackDecodeStatus.Ok, QpackDecoder.Decode(block.AsSpan(0, n), dec));
+        Assert.Equal(1, dec.Count);
+
+        n = WebTransportRequest.EncodeConnectResponse(block, includeLegacyDraftHeader: true);
+        dec.Clear();
+        Assert.Equal(QpackDecodeStatus.Ok, QpackDecoder.Decode(block.AsSpan(0, n), dec));
         Assert.Equal(2, dec.Count);
         Assert.Equal("draft02", TestUtil.AsciiString(dec.GetValue(1)));
-        for (int size = 0; size < n; size++) Assert.Equal(-1, WebTransportRequest.EncodeConnectResponse(block.AsSpan(0, size)));
-        Assert.Equal(3, WebTransportRequest.EncodeConnectResponse(block, includeLegacyDraftHeader: false));
-        Assert.True(WebTransportRequest.EncodeConnectResponse(block, useHuffman: false) > n);
+        for (int size = 0; size < n; size++) Assert.Equal(-1, WebTransportRequest.EncodeConnectResponse(block.AsSpan(0, size), includeLegacyDraftHeader: true));
+        Assert.True(WebTransportRequest.EncodeConnectResponse(block, includeLegacyDraftHeader: true, useHuffman: false) > n);
+
+        n = WebTransportRequest.EncodeConnectResponse(block, includeCapsuleProtocol: true);
+        dec.Clear();
+        Assert.Equal(QpackDecodeStatus.Ok, QpackDecoder.Decode(block.AsSpan(0, n), dec));
+        Assert.Equal(2, dec.Count);
+        Assert.Equal("capsule-protocol", TestUtil.AsciiString(dec.GetName(1)));
+        Assert.Equal("?1", TestUtil.AsciiString(dec.GetValue(1)));
+        for (int size = 0; size < n; size++) Assert.Equal(-1, WebTransportRequest.EncodeConnectResponse(block.AsSpan(0, size), includeCapsuleProtocol: true));
+
+        n = WebTransportRequest.EncodeConnectResponse(block, includeLegacyDraftHeader: true, includeCapsuleProtocol: true);
+        dec.Clear();
+        Assert.Equal(QpackDecodeStatus.Ok, QpackDecoder.Decode(block.AsSpan(0, n), dec));
+        Assert.Equal(3, dec.Count);
+    }
+
+    [Fact]
+    public void Validate_Detects_Legacy_Draft02_Request()
+    {
+        Assert.Equal(WebTransportRequestStatus.Ok, WebTransportRequest.Validate(TestUtil.ChromeConnectHeaders(), out WebTransportConnectRequest legacy));
+        Assert.True(legacy.IsLegacyDraft02);
+
+        var modern = new Http3HeaderCollection(256, 8);
+        Assert.True(WebTransportRequest.TryBuildConnectRequest(modern, "example.com"u8, "/quicly"u8, "https://example.com"u8));
+        Assert.Equal(WebTransportRequestStatus.Ok, WebTransportRequest.Validate(modern, out WebTransportConnectRequest current));
+        Assert.False(current.IsLegacyDraft02);
+        Assert.False(default(WebTransportConnectRequest).IsLegacyDraft02);
+        Assert.True(new WebTransportConnectRequest("a"u8, "/"u8, ""u8, isLegacyDraft02: true).IsLegacyDraft02);
     }
 
     [Fact]

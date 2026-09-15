@@ -28,13 +28,19 @@ public readonly ref struct WebTransportConnectRequest
     public readonly ReadOnlySpan<byte> Path;
     /// <summary>The <c>origin</c> value, or empty when absent (non-browser clients).</summary>
     public readonly ReadOnlySpan<byte> Origin;
+    /// <summary>
+    /// True when the request carried the legacy <c>sec-webtransport-http3-draft02</c> field (draft-02 clients),
+    /// i.e. the response should include <c>sec-webtransport-http3-draft: draft02</c>.
+    /// </summary>
+    public readonly bool IsLegacyDraft02;
 
     /// <summary>Creates the view.</summary>
-    public WebTransportConnectRequest(ReadOnlySpan<byte> authority, ReadOnlySpan<byte> path, ReadOnlySpan<byte> origin)
+    public WebTransportConnectRequest(ReadOnlySpan<byte> authority, ReadOnlySpan<byte> path, ReadOnlySpan<byte> origin, bool isLegacyDraft02 = false)
     {
         Authority = authority;
         Path = path;
         Origin = origin;
+        IsLegacyDraft02 = isLegacyDraft02;
     }
 }
 
@@ -58,6 +64,9 @@ public static class WebTransportRequest
     private static ReadOnlySpan<byte> ContentTypeName => "content-type"u8;
     private static ReadOnlySpan<byte> ContentLengthName => "content-length"u8;
     private static ReadOnlySpan<byte> LegacyDraftName => "sec-webtransport-http3-draft"u8;
+    private static ReadOnlySpan<byte> LegacyDraft02RequestName => "sec-webtransport-http3-draft02"u8;
+    private static ReadOnlySpan<byte> CapsuleProtocolName => "capsule-protocol"u8;
+    private static ReadOnlySpan<byte> CapsuleProtocolValue => "?1"u8;
     private static ReadOnlySpan<byte> Connect => "CONNECT"u8;
     private static ReadOnlySpan<byte> WebTransportProtocol => "webtransport"u8;
     private static ReadOnlySpan<byte> Https => "https"u8;
@@ -102,28 +111,35 @@ public static class WebTransportRequest
         if (!headers.TryGet(AuthorityName, out ReadOnlySpan<byte> authority) || authority.IsEmpty) return WebTransportRequestStatus.MissingAuthority;
         if (!headers.TryGet(PathName, out ReadOnlySpan<byte> path) || path.IsEmpty) return WebTransportRequestStatus.MissingPath;
         headers.TryGet(OriginName, out ReadOnlySpan<byte> origin);
-        request = new WebTransportConnectRequest(authority, path, origin);
+        request = new WebTransportConnectRequest(authority, path, origin, headers.Contains(LegacyDraft02RequestName));
         return WebTransportRequestStatus.Ok;
     }
 
     /// <summary>
-    /// Appends the fields of the session-accepting response: <c>:status 200</c> and, when
-    /// <paramref name="includeLegacyDraftHeader"/> is set, <c>sec-webtransport-http3-draft: draft02</c>.
-    /// Returns false when the collection is full.
+    /// Appends the fields of the session-accepting response: <c>:status 200</c>; when
+    /// <paramref name="includeLegacyDraftHeader"/> is set (pass <see cref="WebTransportConnectRequest.IsLegacyDraft02"/>),
+    /// <c>sec-webtransport-http3-draft: draft02</c>; and when <paramref name="includeCapsuleProtocol"/> is set,
+    /// <c>capsule-protocol: ?1</c> (RFC 9297 §3.1 — optional for WebTransport, which draft-ietf-webtrans-http3-13
+    /// says endpoints may ignore; off by default). Returns false when the collection is full.
     /// </summary>
-    public static bool TryBuildConnectResponse(Http3HeaderCollection headers, bool includeLegacyDraftHeader = true)
+    public static bool TryBuildConnectResponse(Http3HeaderCollection headers, bool includeLegacyDraftHeader = false, bool includeCapsuleProtocol = false)
     {
         ArgumentNullException.ThrowIfNull(headers);
         return headers.TryAdd(StatusName, "200"u8)
-            && (!includeLegacyDraftHeader || headers.TryAdd(LegacyDraftName, LegacyDraftValue));
+            && (!includeLegacyDraftHeader || headers.TryAdd(LegacyDraftName, LegacyDraftValue))
+            && (!includeCapsuleProtocol || headers.TryAdd(CapsuleProtocolName, CapsuleProtocolValue));
     }
 
-    /// <summary>Writes the QPACK-encoded session-accepting response. Returns bytes written or -1 when the destination is too small.</summary>
-    public static int EncodeConnectResponse(Span<byte> destination, bool includeLegacyDraftHeader = true, bool useHuffman = true)
+    /// <summary>
+    /// Writes the QPACK-encoded session-accepting response (same fields as <see cref="TryBuildConnectResponse"/>).
+    /// Returns bytes written or -1 when the destination is too small.
+    /// </summary>
+    public static int EncodeConnectResponse(Span<byte> destination, bool includeLegacyDraftHeader = false, bool includeCapsuleProtocol = false, bool useHuffman = true)
     {
         var e = new QpackEncoder(destination, useHuffman);
         bool ok = e.TryWrite(StatusName, "200"u8)
-            && (!includeLegacyDraftHeader || e.TryWrite(LegacyDraftName, LegacyDraftValue));
+            && (!includeLegacyDraftHeader || e.TryWrite(LegacyDraftName, LegacyDraftValue))
+            && (!includeCapsuleProtocol || e.TryWrite(CapsuleProtocolName, CapsuleProtocolValue));
         return ok ? e.BytesWritten : -1;
     }
 

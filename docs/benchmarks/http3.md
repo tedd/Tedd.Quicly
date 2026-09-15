@@ -1,18 +1,19 @@
 # HTTP/3 codec benchmarks (`Tedd.Quicly.Http3`)
 
 Method: ADR 0007. Benchmarks live in `benchmarks/Tedd.Quicly.Benchmarks/Http3`, superseded implementations in
-`benchmarks/Tedd.Quicly.Archive/Http3`. Run with:
+`benchmarks/Tedd.Quicly.Archive/Http3`. All three classes share `Http3BenchConfig`
+(`Job.ShortRun.WithToolchain(InProcessEmitToolchain.Instance)` + `MemoryDiagnoser`). Run with:
 
 ```
-dotnet run -c Release -f net10.0 --project benchmarks/Tedd.Quicly.Benchmarks -- --filter '*Http3*' --job short
+dotnet run -c Release -f net10.0 --project benchmarks/Tedd.Quicly.Benchmarks -- --filter '*Http3*'
+dotnet run -c Release -f net11.0 --project benchmarks/Tedd.Quicly.Benchmarks -- --filter '*Http3*'
 ```
 
-Hardware / runtime of the numbers below: X64 RyuJIT x86-64-v3, .NET 10.0.12 (10.0.1226.42308),
-BenchmarkDotNet 0.15.8, `[ShortRunJob]` (3 iterations, hence the wide error bars), `[MemoryDiagnoser]`.
-
-> BenchmarkDotNet 0.15.8 does not recognise the `net11.0` runtime moniker
-> (`GetRuntimeVersion not implemented for NotRecognized`), so the runs use the `net10.0` target. Re-run on
-> `net11.0` (e.g. `--inProcess`) once BenchmarkDotNet supports it; the code is identical for both TFMs.
+Hardware / runtime of the numbers below: X64 RyuJIT x86-64-v3, Windows 11, BenchmarkDotNet 0.15.8, in-process
+short run (3 iterations, hence the wide error bars), `[MemoryDiagnoser]`. Two runtimes were measured:
+.NET 10.0.12 (10.0.1226.42308) and .NET 11.0.0-preview.7.26381.103. The in-process toolchain is what makes the
+`net11.0` run possible (BenchmarkDotNet 0.15.8 cannot spawn a `net11.0` child process); the code is identical
+for both TFMs and, as expected, so are the numbers within noise.
 
 ## 1. Huffman decode of a 40-byte header value (`HuffmanDecodeBench`)
 
@@ -38,10 +39,21 @@ the EOS leaf sets the fail flag.
 
 ### Measurement
 
-| Method         | Mean     | Error     | StdDev   | Ratio | RatioSD | Allocated | Alloc Ratio |
-|--------------- |---------:|----------:|---------:|------:|--------:|----------:|------------:|
-| V0_TreeWalk    | 592.0 ns | 965.85 ns | 52.94 ns |  1.01 |    0.11 |         - |          NA |
-| V1_NibbleTable | 163.5 ns |  16.33 ns |  0.90 ns |  0.28 |    0.02 |         - |          NA |
+.NET 10.0.12:
+
+| Method         | Mean     | Error       | StdDev   | Ratio | RatioSD | Allocated | Alloc Ratio |
+|--------------- |---------:|------------:|---------:|------:|--------:|----------:|------------:|
+| V0_TreeWalk    | 566.3 ns | 1,147.14 ns | 62.88 ns |  1.01 |    0.14 |         - |          NA |
+| V1_NibbleTable | 168.4 ns |    54.98 ns |  3.01 ns |  0.30 |    0.03 |         - |          NA |
+
+.NET 11.0.0-preview.7:
+
+| Method         | Mean     | Error       | StdDev   | Ratio | RatioSD | Allocated | Alloc Ratio |
+|--------------- |---------:|------------:|---------:|------:|--------:|----------:|------------:|
+| V0_TreeWalk    | 645.4 ns | 1,095.14 ns | 60.03 ns |  1.01 |    0.12 |         - |          NA |
+| V1_NibbleTable | 169.2 ns |    53.04 ns |  2.91 ns |  0.26 |    0.02 |         - |          NA |
+
+(An earlier out-of-process `[ShortRunJob]` run on .NET 10 gave 592.0 ns / 163.5 ns — the same picture.)
 
 Both variants produce byte-identical output for every RFC 7541 Appendix C vector, every single symbol and
 2000 random strings; `ZeroAllocationTests.Huffman_Encode_And_Decode` asserts 0 bytes allocated in steady state.
@@ -57,10 +69,19 @@ Eight fields (`:method CONNECT`, `:authority`, `:scheme https`, `:path`, `:proto
 `sec-webtransport-http3-draft02`, a 111-byte `user-agent`), static table + literals, Huffman where shorter
 (encoded block ≈ 200 bytes). Decoded into a pre-allocated `Http3HeaderCollection`.
 
+.NET 10.0.12:
+
 | Method | Mean     | Error     | StdDev    | Allocated |
 |------- |---------:|----------:|----------:|----------:|
-| Decode | 1.085 us | 0.4173 us | 0.0229 us |         - |
-| Encode | 1.873 us | 3.1825 us | 0.1744 us |         - |
+| Decode | 1.025 us | 0.1480 us | 0.0081 us |         - |
+| Encode | 1.671 us | 3.9288 us | 0.2153 us |         - |
+
+.NET 11.0.0-preview.7:
+
+| Method | Mean     | Error     | StdDev    | Allocated |
+|------- |---------:|----------:|----------:|----------:|
+| Decode | 1.082 us | 0.3663 us | 0.0201 us |         - |
+| Encode | 1.718 us | 0.8835 us | 0.0484 us |         - |
 
 Baseline (V0) only; ~1 µs per request header block is far below anything on the connection path. The encoder's
 extra cost is the linear 99-entry static-table scan per field plus Huffman length computation — a candidate for
@@ -71,10 +92,19 @@ a later hypothesis (name-length bucketed lookup) if profiling ever shows it.
 A 1 MiB stream of 1200-byte DATA frames interleaved with 40-byte HEADERS frames, consumed as one contiguous
 buffer and in 1200-byte receive chunks (payload fragments delivered without copying).
 
-| Method      | Mean     | Error    | StdDev   | Ratio | RatioSD | Allocated | Alloc Ratio |
-|------------ |---------:|---------:|---------:|------:|--------:|----------:|------------:|
-| Contiguous  | 19.56 us | 5.041 us | 0.276 us |  1.00 |    0.02 |         - |          NA |
-| Chunked1200 | 27.64 us | 4.979 us | 0.273 us |  1.41 |    0.02 |         - |          NA |
+.NET 10.0.12:
+
+| Method      | Mean     | Error     | StdDev   | Ratio | RatioSD | Allocated | Alloc Ratio |
+|------------ |---------:|----------:|---------:|------:|--------:|----------:|------------:|
+| Contiguous  | 21.05 us | 20.654 us | 1.132 us |  1.00 |    0.07 |         - |          NA |
+| Chunked1200 | 29.23 us |  7.904 us | 0.433 us |  1.39 |    0.07 |         - |          NA |
+
+.NET 11.0.0-preview.7:
+
+| Method      | Mean     | Error     | StdDev   | Ratio | RatioSD | Allocated | Alloc Ratio |
+|------------ |---------:|----------:|---------:|------:|--------:|----------:|------------:|
+| Contiguous  | 22.48 us |  2.554 us | 0.140 us |  1.00 |    0.01 |         - |          NA |
+| Chunked1200 | 26.71 us | 88.896 us | 4.873 us |  1.19 |    0.19 |         - |          NA |
 
 ≈ 50 GB/s (contiguous) / 38 GB/s (packet-sized chunks) of framed stream: the reader touches only the headers,
 so the cost is ~20–30 ns per frame. Baseline only; no optimisation attempted.

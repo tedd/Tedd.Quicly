@@ -14,6 +14,7 @@ namespace Tedd.Quicly.Transport.MsQuic.Tests.Transport;
 internal sealed class MsQuicTransportHarness : ITransportTestHarness
 {
     private readonly TestRegistration _registration = new("quicly-transport-tests");
+    private readonly Lock _gate = new();
     private readonly List<MsQuicTransport> _transports = [];
     private readonly List<MsQuicTransportListener> _listeners = [];
     private readonly List<MsQuicTransportConnector> _connectors = [];
@@ -32,26 +33,27 @@ internal sealed class MsQuicTransportHarness : ITransportTestHarness
 
     public MsQuicRegistration Registration => _registration.Registration;
 
-    /// <summary>Set by <see cref="Dispose"/> when cleanup did not finish (a transport kept its handles or the registration hung).</summary>
+    /// <summary>Set by <see cref="Dispose"/> when cleanup did not finish (a transport kept its handles, dropped late events, or the registration hung).</summary>
     public string? CleanupError { get; private set; }
 
-    public IReadOnlyList<MsQuicTransport> Transports => _transports;
-
-    public IReadOnlyList<MsQuicTransportListener> Listeners => _listeners;
+    /// <summary>Exceptions thrown by sinks, summed over every transport (computed by <see cref="Dispose"/>).</summary>
+    public long SinkExceptionTotal { get; private set; }
 
     public string Name => "MsQuicTransport (loopback)";
 
     public TimeSpan DefaultTimeout => TestTimeouts.Default;
 
-    public MsQuicTransportOptions ServerOptions(ConformancePairOptions options)
+    public MsQuicTransportOptions ServerOptions(ConformancePairOptions? options = null)
     {
+        options ??= new ConformancePairOptions();
         var server = new MsQuicTransportOptions { ServerPeerBidiStreamCount = options.ServerPeerBidiStreams, ServerPeerUnidiStreamCount = options.ServerPeerUnidiStreams };
         _configure?.Invoke(server);
         return server;
     }
 
-    public MsQuicTransportOptions ClientOptions(ConformancePairOptions options)
+    public MsQuicTransportOptions ClientOptions(ConformancePairOptions? options = null)
     {
+        options ??= new ConformancePairOptions();
         var client = new MsQuicTransportOptions
         {
             ClientPeerBidiStreamCount = options.ClientPeerBidiStreams,
@@ -63,10 +65,10 @@ internal sealed class MsQuicTransportHarness : ITransportTestHarness
         return client;
     }
 
-    public MsQuicTransportListener StartListener(MsQuicTransportOptions options, PreHandshakeCallback preHandshake, AcceptCallback accept, X509Certificate2? certificate = null)
+    public MsQuicTransportListener StartListener(MsQuicTransportOptions options, PreHandshakeCallback preHandshake, AcceptCallback accept, X509Certificate2? certificate = null, IPEndPoint? endPoint = null)
     {
-        var listener = new MsQuicTransportListener(new IPEndPoint(IPAddress.Loopback, 0), certificate ?? Certificate, options, Registration);
-        _listeners.Add(listener);
+        var listener = new MsQuicTransportListener(endPoint ?? new IPEndPoint(IPAddress.Loopback, 0), certificate ?? Certificate, options, Registration);
+        lock (_gate) _listeners.Add(listener);
         listener.Start(preHandshake, accept);
         return listener;
     }
@@ -74,11 +76,16 @@ internal sealed class MsQuicTransportHarness : ITransportTestHarness
     public MsQuicTransportConnector CreateConnector(MsQuicTransportOptions options)
     {
         var connector = new MsQuicTransportConnector(options, Registration);
-        _connectors.Add(connector);
+        lock (_gate) _connectors.Add(connector);
         return connector;
     }
 
-    public void Track(MsQuicTransport transport) => _transports.Add(transport);
+    /// <summary>Registers a transport for disposal (thread-safe: accept callbacks call it on MsQuic worker threads).</summary>
+    public MsQuicTransport Track(MsQuicTransport transport)
+    {
+        lock (_gate) _transports.Add(transport);
+        return transport;
+    }
 
     public ConformancePair CreatePair(ITransportSink clientSink, ITransportSink serverSink, ConformancePairOptions? options = null)
     {
@@ -87,15 +94,13 @@ internal sealed class MsQuicTransportHarness : ITransportTestHarness
         var accepted = new ManualResetEventSlim();
         MsQuicTransportListener listener = StartListener(ServerOptions(options), static (in NewConnectionInfo _) => PreHandshakeDecision.Accept, (ITransport transport, in NewConnectionInfo _) =>
         {
-            server = (MsQuicTransport)transport;
+            server = Track((MsQuicTransport)transport);
             accepted.Set();
             return serverSink;
         });
         MsQuicTransportConnector connector = CreateConnector(ClientOptions(options));
-        MsQuicTransport client = connector.Connect(listener.LocalEndPoint, "localhost", clientSink);
-        Track(client);
+        MsQuicTransport client = Track(connector.Connect(listener.LocalEndPoint, "localhost", clientSink));
         if (!accepted.Wait(DefaultTimeout)) throw new ConformanceException($"[{Name}] the listener never accepted the connection.");
-        Track(server!);
         listener.Stop();
         return new ConformancePair(client, server!);
     }
@@ -115,15 +120,20 @@ internal sealed class MsQuicTransportHarness : ITransportTestHarness
     public void Dispose()
     {
         var problems = new List<string>();
-        foreach (MsQuicTransport transport in _transports) transport.Dispose();
-        foreach (MsQuicTransport transport in _transports)
+        MsQuicTransport[] transports;
+        lock (_gate) transports = [.. _transports];
+        foreach (MsQuicTransport transport in transports) transport.Dispose();
+        foreach (MsQuicTransport transport in transports)
         {
             if (!transport.WaitForHandlesClosed(TimeSpan.FromSeconds(10))) problems.Add("a transport did not release its handles");
             if (transport.LateEventCount != 0) problems.Add($"a transport dropped {transport.LateEventCount} events after OnClosed");
-            if (transport.SinkExceptionCount != 0) problems.Add($"a sink threw: {transport.LastSinkException}");
+            SinkExceptionTotal += transport.SinkExceptionCount;
         }
-        foreach (MsQuicTransportListener listener in _listeners) listener.Dispose();
-        foreach (MsQuicTransportConnector connector in _connectors) connector.Dispose();
+        lock (_gate)
+        {
+            foreach (MsQuicTransportListener listener in _listeners) listener.Dispose();
+            foreach (MsQuicTransportConnector connector in _connectors) connector.Dispose();
+        }
         try
         {
             _registration.Dispose();

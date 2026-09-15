@@ -384,9 +384,17 @@ public sealed unsafe partial class MsQuicTransport : ITransport, IMsQuicConnecti
     void IThreadPoolWorkItem.Execute()
     {
         Volatile.Write(ref _workScheduled, 0);
-        if (Volatile.Read(ref _handleClosed) != 0) return;
-        DrainDeferredCloses();
-        if (Volatile.Read(ref _disposed) != 0 && _shutdownComplete) ReleaseHandlesNow();
+        try
+        {
+            if (Volatile.Read(ref _handleClosed) != 0) return;
+            DrainDeferredCloses();
+            if (Volatile.Read(ref _disposed) != 0 && _shutdownComplete) ReleaseHandlesNow();
+        }
+        catch (Exception ex)
+        {
+            // An exception escaping a thread-pool work item would terminate the process.
+            Diagnose(TransportDiagnosticLevel.Error, "Deferred handle cleanup failed.", ex);
+        }
     }
 
     // ------------------------------------------------------------------ connection events (MsQuic worker thread)

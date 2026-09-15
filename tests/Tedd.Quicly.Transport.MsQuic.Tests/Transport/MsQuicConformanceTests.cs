@@ -27,5 +27,6 @@ public class MsQuicConformanceTests
             harness.Dispose();
         }
         Assert.Null(harness.CleanupError);
+        Assert.Equal(0, harness.SinkExceptionTotal);
     }
 }

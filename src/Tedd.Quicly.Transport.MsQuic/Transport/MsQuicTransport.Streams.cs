@@ -372,8 +372,8 @@ public sealed unsafe partial class MsQuicTransport
         slot.PendingTotal = 0;
         slot.EarlyResumeBytes = 0;
         Volatile.Write(ref slot.ReceiveState, ReceiveIdle);
-        Volatile.Write(ref slot.CloseQueued, 0);
         Volatile.Write(ref slot.CloseFlags, 0);
+        Volatile.Write(ref slot.CloseQueued, 0);
         slot.Generation = slot.Generation == uint.MaxValue ? 1 : slot.Generation + 1;
         Interlocked.And(ref slot.Guard, ~GuardClosing);
         lock (_tableLock)
@@ -485,17 +485,19 @@ public sealed unsafe partial class MsQuicTransport
         for (int i = 0; i < high; i++)
         {
             StreamSlot? slot = slots[i];
-            if (slot is null || Volatile.Read(ref slot.Stream) is null) continue;
-            Interlocked.Exchange(ref slot.ReceiveState, ReceiveIdle);
-            int old = Interlocked.Or(ref slot.CloseFlags, NativeShutdownFlag);
-            if ((old & NativeShutdownFlag) != 0) continue;
-            if ((old & AppClosedFlag) != 0)
-            {
-                EnqueueDeferredClose(slot);
-                continue;
-            }
+            // Pin the slot: a thread-pool drain may be closing and freeing it right now (then it is skipped), and it must
+            // not free it while this loop reads its flags or the sink runs.
+            if (slot is null || !TryPin(slot)) continue;
             try
             {
+                Interlocked.Exchange(ref slot.ReceiveState, ReceiveIdle);
+                int old = Interlocked.Or(ref slot.CloseFlags, NativeShutdownFlag);
+                if ((old & NativeShutdownFlag) != 0) continue;
+                if ((old & AppClosedFlag) != 0)
+                {
+                    EnqueueDeferredClose(slot);
+                    continue;
+                }
                 sink.OnStreamShutdownComplete(slot.Id);
             }
             catch (Exception ex)
@@ -505,7 +507,23 @@ public sealed unsafe partial class MsQuicTransport
                 MsQuicCallbackScope.OnEscapedException(ex);
                 Diagnose(TransportDiagnosticLevel.Error, "ITransportSink.OnStreamShutdownComplete threw during connection shutdown.", ex);
             }
+            finally
+            {
+                Exit(slot);
+            }
         }
+    }
+
+    /// <summary>True while <see cref="CloseSlotNative"/> closes the slot's stream (MsQuic may indicate events inline from <c>StreamClose</c>).</summary>
+    private static bool IsNativeCloseInProgress(StreamSlot slot) => (Volatile.Read(ref slot.Guard) & GuardClosing) != 0;
+
+    /// <summary>Pins a slot that holds a stream and is not being closed (see <see cref="StreamSlot.Guard"/>); false otherwise.</summary>
+    private static bool TryPin(StreamSlot slot)
+    {
+        int guard = Interlocked.Increment(ref slot.Guard);
+        if ((guard & GuardClosing) == 0 && Volatile.Read(ref slot.Stream) is not null) return true;
+        Interlocked.Decrement(ref slot.Guard);
+        return false;
     }
 
     // ------------------------------------------------------------------ connection / stream events (MsQuic worker thread)
@@ -680,6 +698,9 @@ public sealed unsafe partial class MsQuicTransport
     void IMsQuicStreamEvents.ShutdownComplete(MsQuicStream stream, in MsQuicStreamShutdownInfo info)
     {
         var slot = (StreamSlot)stream.Tag!;
+        // StreamClose of a stream MsQuic never started indicates SHUTDOWN_COMPLETE inline, on the closing thread: the slot
+        // is being closed and freed by that very call, so the event must not queue another close.
+        if (IsNativeCloseInProgress(slot)) return;
         Interlocked.Exchange(ref slot.ReceiveState, ReceiveIdle);
         int old = Interlocked.Or(ref slot.CloseFlags, NativeShutdownFlag);
         if ((old & NativeShutdownFlag) != 0) return;

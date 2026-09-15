@@ -50,16 +50,34 @@ public class StreamTests
     }
 
     [Fact]
-    public void PeerStreamLimits_AreEnforced_AndUpdateRaisesStreamsAvailable()
+    public void PeerStreamLimits_AreEnforced_RefusedStreamsNeverStart_AndUpdateRaisesStreamsAvailable()
     {
         using SimHarness h = new(new LinkOptions { DelayMicros = 5_000 });
         Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Bidirectional, 1, 0, out TransportStreamId s1));
         Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Bidirectional, 2, 0, out TransportStreamId s2));
         Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Unidirectional, 3, 0, out TransportStreamId u1));
+        Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Bidirectional, 4, 0, out TransportStreamId s3));
         Assert.Equal(TransportStatus.Success, h.A.StartStream(s1));
-        Assert.Equal(TransportStatus.StreamLimitReached, h.A.StartStream(s2));
-        Assert.Equal(TransportStatus.StreamLimitReached, Sim.SendStream(h.A, s2, "x"u8, 1, TransportSendFlags.Start));
-        Assert.Equal(TransportStatus.StreamLimitReached, h.A.StartStream(u1));
+        // Beyond the peer's limit a start is refused as MsQuic refuses it: accepted now, reported at the next step.
+        Assert.Equal(TransportStatus.Success, h.A.StartStream(s2));
+        Assert.Equal(TransportStatus.Success, h.A.StartStream(u1));
+        Assert.Equal(TransportStatus.Success, Sim.SendStream(h.A, s3, "x"u8, 9, TransportSendFlags.Start));
+        h.Network.Advance(0);
+        Assert.Equal(TransportStatus.Success, Assert.Single(h.SinkA.OfKind(RecordedEventKind.StreamStarted), e => e.StreamId == s1).Status);
+        foreach ((TransportStreamId id, ulong context) in new[] { (s2, 2UL), (u1, 3UL), (s3, 4UL) })
+        {
+            RecordedEvent refused = Assert.Single(h.SinkA.OfKind(RecordedEventKind.StreamStarted), e => e.StreamId == id);
+            Assert.Equal(TransportStatus.StreamLimitReached, refused.Status);
+            Assert.Equal(context, refused.Context);
+            Assert.Single(h.SinkA.OfKind(RecordedEventKind.StreamShutdownComplete), e => e.StreamId == id);
+            Assert.Equal(TransportStatus.InvalidState, h.A.StartStream(id));
+            Assert.Equal(-1, h.A.GetQuicStreamId(id));
+        }
+        RecordedEvent canceled = Assert.Single(h.SinkA.OfKind(RecordedEventKind.StreamSendCompleted));
+        Assert.Equal(s3, canceled.StreamId);
+        Assert.Equal(9UL, canceled.Context);
+        Assert.True(canceled.Canceled);
+        Assert.Equal(TransportStatus.InvalidState, Sim.SendStream(h.A, s2, "x"u8, 1, TransportSendFlags.Start));
 
         h.B.UpdatePeerStreamLimits(3, 1);
         h.Network.Advance(4_999);
@@ -68,8 +86,36 @@ public class StreamTests
         RecordedEvent available = Assert.Single(h.SinkA.OfKind(RecordedEventKind.StreamsAvailable));
         Assert.Equal(2, available.Bidirectional);
         Assert.Equal(1, available.Unidirectional);
-        Assert.Equal(TransportStatus.Success, Sim.SendStream(h.A, s2, "x"u8, 1, TransportSendFlags.Start));
-        Assert.Equal(TransportStatus.Success, h.A.StartStream(u1));
+        // A refused stream stays refused; new streams start.
+        Assert.Equal(TransportStatus.InvalidState, h.A.StartStream(s2));
+        Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Bidirectional, 5, 0, out TransportStreamId s4));
+        Assert.Equal(TransportStatus.Success, Sim.SendStream(h.A, s4, "x"u8, 1, TransportSendFlags.Start));
+        Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Unidirectional, 6, 0, out TransportStreamId u2));
+        Assert.Equal(TransportStatus.Success, h.A.StartStream(u2));
+        h.Network.RunUntilIdle(1_000_000);
+        Assert.Equal(TransportStatus.Success, Assert.Single(h.SinkA.OfKind(RecordedEventKind.StreamStarted), e => e.StreamId == s4).Status);
+        Assert.Equal(TransportStatus.Success, Assert.Single(h.SinkA.OfKind(RecordedEventKind.StreamStarted), e => e.StreamId == u2).Status);
+        Assert.Equal(3, h.SinkB.CountOf(RecordedEventKind.PeerStreamStarted)); // s1, s4 and u2: refused streams never reach the peer
+    }
+
+    [Fact]
+    public void UpdatePeerStreamLimits_LoweringIsIgnoredOnceAdvertised_ButRaisingStillApplies()
+    {
+        using SimHarness h = new(new LinkOptions { DelayMicros = 1_000 });
+        h.B.UpdatePeerStreamLimits(3, 2);
+        h.Network.RunUntilIdle(1_000_000);
+        h.B.UpdatePeerStreamLimits(1, 5); // bidi lowered (ignored: QUIC never takes credit back), uni raised
+        h.Network.RunUntilIdle(1_000_000);
+        RecordedEvent available = h.SinkA.OfKind(RecordedEventKind.StreamsAvailable)[^1];
+        Assert.Equal(3, available.Bidirectional);
+        Assert.Equal(5, available.Unidirectional);
+        for (int i = 0; i < 3; i++)
+        {
+            Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Bidirectional, (ulong)i, 0, out TransportStreamId id));
+            Assert.Equal(TransportStatus.Success, h.A.StartStream(id));
+        }
+        h.Network.RunUntilIdle(1_000_000);
+        Assert.All(h.SinkA.OfKind(RecordedEventKind.StreamStarted), e => Assert.Equal(TransportStatus.Success, e.Status));
     }
 
     [Fact]
@@ -83,14 +129,22 @@ public class StreamTests
         Assert.Equal(1, h.SinkB.CountOf(RecordedEventKind.StreamPeerSendShutdown));
         Assert.Equal(TransportStatus.Success, Sim.SendStream(h.B, peer, [], 2, TransportSendFlags.Fin));
         Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Bidirectional, 9, 0, out TransportStreamId s2));
-        Assert.Equal(TransportStatus.StreamLimitReached, h.A.StartStream(s2));
+        Assert.Equal(TransportStatus.Success, h.A.StartStream(s2)); // no credit yet: refused at the next step
 
         h.Network.RunUntilIdle(1_000_000);
-        Assert.Equal(s1, Assert.Single(h.SinkA.OfKind(RecordedEventKind.StreamShutdownComplete)).StreamId);
+        Assert.Equal(TransportStatus.StreamLimitReached, Assert.Single(h.SinkA.OfKind(RecordedEventKind.StreamStarted), e => e.StreamId == s2).Status);
+        IReadOnlyList<RecordedEvent> shutdowns = h.SinkA.OfKind(RecordedEventKind.StreamShutdownComplete);
+        Assert.Equal(2, shutdowns.Count);
+        Assert.Equal(s2, shutdowns[0].StreamId);
+        Assert.Equal(s1, shutdowns[1].StreamId);
         Assert.Equal(peer, Assert.Single(h.SinkB.OfKind(RecordedEventKind.StreamShutdownComplete)).StreamId);
         RecordedEvent available = Assert.Single(h.SinkA.OfKind(RecordedEventKind.StreamsAvailable));
         Assert.Equal(1, available.Bidirectional);
-        Assert.Equal(TransportStatus.Success, h.A.StartStream(s2));
+        Assert.Equal(TransportStatus.InvalidState, h.A.StartStream(s2)); // a refused stream never starts
+        Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Bidirectional, 10, 0, out TransportStreamId s3));
+        Assert.Equal(TransportStatus.Success, h.A.StartStream(s3));
+        h.Network.RunUntilIdle(1_000_000);
+        Assert.Equal(TransportStatus.Success, Assert.Single(h.SinkA.OfKind(RecordedEventKind.StreamStarted), e => e.StreamId == s3).Status);
     }
 
     [Fact]
@@ -330,14 +384,19 @@ public class StreamTests
         RecordedEvent available = h.SinkA.OfKind(RecordedEventKind.StreamsAvailable)[^1];
         Assert.Equal(1, available.Unidirectional);
 
-        // A local unidirectional stream that never started: aborting receive is meaningless, aborting send shuts it down.
+        // A local stream that never started is released by any abort, like CloseStream (ITransport.AbortStream contract):
+        // no callback follows and the id is stale afterwards.
         Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Unidirectional, 5, 0, out TransportStreamId idle));
         h.A.AbortStream(idle, 1, StreamAbortDirection.Receive);
         h.Network.RunUntilIdle(1_000_000);
         Assert.Equal(1, h.SinkA.CountOf(RecordedEventKind.StreamShutdownComplete));
+        Assert.Equal(TransportStatus.InvalidState, h.A.StartStream(idle));
         h.A.AbortStream(idle, 1, StreamAbortDirection.Send);
         h.Network.RunUntilIdle(1_000_000);
-        Assert.Equal(2, h.SinkA.CountOf(RecordedEventKind.StreamShutdownComplete));
+        Assert.Equal(1, h.SinkA.CountOf(RecordedEventKind.StreamShutdownComplete));
+        Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Unidirectional, 6, 0, out TransportStreamId reused));
+        Assert.Equal(idle.Slot, reused.Slot);
+        Assert.NotEqual(idle.Generation, reused.Generation);
     }
 
     [Fact]

@@ -15,6 +15,10 @@ namespace Tedd.Quicly.Testing.Simulation;
 /// trip after accept. Rejected (no listener, pre-handshake reject, accept returned <c>null</c>): the client raises
 /// <see cref="ITransportSink.OnClosed"/> with <see cref="TransportCloseReason.Transport"/> and
 /// <see cref="SimulatedTransport.StatusUnreachable"/> or <see cref="SimulatedTransport.StatusConnectionRefused"/> one round trip after <c>Connect</c>.
+/// Accepted but failing its handshake (<see cref="LinkOptions.FailHandshake"/>): neither end connects; the client closes one
+/// round trip after <c>Connect</c> and the server half a round trip later, both with
+/// <see cref="SimulatedTransport.StatusHandshakeFailed"/>. <see cref="Connect"/> never throws for a network failure: every
+/// failure is reported through <see cref="ITransportSink.OnClosed"/>.
 /// </remarks>
 public sealed class SimulatedConnector : ITransportConnector
 {
@@ -114,6 +118,14 @@ public sealed class SimulatedConnector : ITransportConnector
                 return;
             }
             server.Sink = sink;
+            if (link.Options.FailHandshake)
+            {
+                // The handshake fails after the accept (for example the client rejects the server's certificate): neither end
+                // connects, the client learns it one round trip after Connect, the server when the client's close arrives.
+                client.ScheduleConnectFailed(now + delay, SimulatedTransport.StatusHandshakeFailed);
+                server.ScheduleConnectFailed(now + 2 * delay, SimulatedTransport.StatusHandshakeFailed);
+                return;
+            }
             server.ScheduleConnect(now, now + 2 * delay);
             client.ScheduleConnect(now + delay, now + delay);
         }

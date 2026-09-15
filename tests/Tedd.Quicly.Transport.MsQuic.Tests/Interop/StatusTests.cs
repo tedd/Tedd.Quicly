@@ -72,6 +72,34 @@ public class StatusTests
     }
 
     [Fact]
+    public void Get_name_spells_out_tls_alert_statuses()
+    {
+        // A SystemRoots client facing a private CA fails with alert 48 (0x80410130 from the Schannel msquic.dll).
+        Assert.Equal("TLS_ALERT(48 unknown_ca)", MsQuicStatus.GetName(MsQuicStatus.TlsAlert(48)));
+        Assert.Equal("TLS_ALERT(120 no_application_protocol)", MsQuicStatus.GetName(MsQuicStatus.TlsAlert(120)));
+        Assert.Equal("TLS_ALERT(40 handshake_failure)", MsQuicStatus.GetName(MsQuicStatus.TlsAlert(40)));
+        Assert.Equal("TLS_ALERT(255)", MsQuicStatus.GetName(MsQuicStatus.TlsAlert(255)));
+        if (OperatingSystem.IsWindows()) Assert.Equal("TLS_ALERT(48 unknown_ca)", MsQuicStatus.GetName(unchecked((int)0x80410130)));
+        // Alerts msquic.h names keep their constant names.
+        Assert.Equal("QUIC_STATUS_BAD_CERTIFICATE", MsQuicStatus.GetName(MsQuicStatus.TlsAlert(42)));
+        Assert.Equal("QUIC_STATUS_CLOSE_NOTIFY", MsQuicStatus.GetName(MsQuicStatus.TlsAlert(0)));
+        for (int alert = 0; alert <= 255; alert++)
+        {
+            Assert.True(MsQuicStatus.TryGetTlsAlert(MsQuicStatus.TlsAlert(alert), out int decoded));
+            Assert.Equal(alert, decoded);
+        }
+        Assert.False(MsQuicStatus.TryGetTlsAlert(MsQuicStatus.TlsAlert(0) - 1, out _));
+        Assert.False(MsQuicStatus.TryGetTlsAlert(MsQuicStatus.TlsAlert(255) + 1, out _));
+        Assert.False(MsQuicStatus.TryGetTlsAlert(MsQuicStatus.QUIC_STATUS_SUCCESS, out _));
+        Assert.False(MsQuicStatus.TryGetTlsAlert(MsQuicStatus.QUIC_STATUS_CERT_UNTRUSTED_ROOT, out _));
+        Assert.False(MsQuicStatus.TryGetTlsAlert(int.MaxValue, out _));
+        Assert.False(MsQuicStatus.TryGetTlsAlert(int.MinValue, out _));
+        Assert.Equal("unknown_ca", MsQuicStatus.TlsAlertDescription(48));
+        Assert.Equal("certificate_required", MsQuicStatus.TlsAlertDescription(116));
+        Assert.Null(MsQuicStatus.TlsAlertDescription(7));
+    }
+
+    [Fact]
     public void Param_helpers()
     {
         Assert.True(MsQuicParam.IsGlobal(MsQuicParam.QUIC_PARAM_GLOBAL_LIBRARY_VERSION));

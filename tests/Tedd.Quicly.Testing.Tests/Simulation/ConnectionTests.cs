@@ -341,7 +341,7 @@ public class ConnectionTests
         Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Unidirectional, 3, 0, out TransportStreamId u3));
         Assert.Equal(TransportStatus.Success, client.StartStream(u1));
         Assert.Equal(TransportStatus.Success, client.StartStream(u2));
-        Assert.Equal(TransportStatus.StreamLimitReached, client.StartStream(u3));
+        Assert.Equal(TransportStatus.Success, client.StartStream(u3)); // beyond the limit: refused asynchronously, as MsQuic does
 
         Assert.Equal(TransportStatus.Success, Sim.SendDatagram(client, "ping"u8, 1));
         Assert.Equal(TransportStatus.Success, Sim.SendDatagram(server, "pong"u8, 2));
@@ -352,6 +352,7 @@ public class ConnectionTests
         Assert.Equal(2, client.GetQuicStreamId(u1));
         Assert.Equal(6, client.GetQuicStreamId(u2));
         Assert.Equal(-1, client.GetQuicStreamId(u3));
+        Assert.Equal(TransportStatus.StreamLimitReached, Assert.Single(clientSink.OfKind(RecordedEventKind.StreamStarted), e => e.StreamId == u3).Status);
         TransportStreamId serverUni = Assert.Single(serverSink.OfKind(RecordedEventKind.PeerStreamStarted), e => e.StreamKind == StreamKind.Unidirectional && server.GetQuicStreamId(e.StreamId) == 2).StreamId;
         Assert.True(serverUni.IsValid);
     }

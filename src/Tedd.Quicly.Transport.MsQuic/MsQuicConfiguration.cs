@@ -44,7 +44,11 @@ public enum MsQuicServerCredentialMode
 /// connections (MsQuic reference-counts it). A credential can be loaded exactly once per configuration;
 /// certificate renewal follows ADR 0009: open a new configuration, swap the configuration the listener callback
 /// returns, then close the old one. Closing it while its connections live on is safe: MsQuic keeps its own
-/// reference, and a key container this configuration persisted stays until those connections are closed too.
+/// reference, and a key container this configuration persisted stays until those connections are closed too. The one
+/// window where it is not safe: between returning it from <see cref="IMsQuicListenerEvents.NewConnection"/> and the
+/// listener applying it (right after that handler returns) MsQuic holds no reference yet, so a concurrent close refuses
+/// the connection or frees the configuration under the listener; hold a reference of your own across that window (see
+/// <see cref="IMsQuicListenerEvents.NewConnection"/>).
 /// </summary>
 public sealed unsafe class MsQuicConfiguration : IDisposable
 {

@@ -117,6 +117,70 @@ public static class MsQuicStatus
         if (status == QUIC_STATUS_CERT_EXPIRED) return nameof(QUIC_STATUS_CERT_EXPIRED);
         if (status == QUIC_STATUS_CERT_UNTRUSTED_ROOT) return nameof(QUIC_STATUS_CERT_UNTRUSTED_ROOT);
         if (status == QUIC_STATUS_CERT_NO_CERT) return nameof(QUIC_STATUS_CERT_NO_CERT);
+        if (TryGetTlsAlert(status, out int alert))
+        {
+            string number = alert.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            string? description = TlsAlertDescription(alert);
+            return description is null ? "TLS_ALERT(" + number + ")" : "TLS_ALERT(" + number + " " + description + ")";
+        }
         return "0x" + status.ToString("X8", System.Globalization.CultureInfo.InvariantCulture);
     }
+
+    /// <summary>
+    /// True when <paramref name="status"/> is a TLS alert status (<c>QUIC_STATUS_TLS_ALERT(alert)</c>, see <see cref="TlsAlert"/>:
+    /// <c>0x80410100 | alert</c> on Windows, <c>TLS_ERROR_BASE + alert</c> on posix); <paramref name="alert"/> is then the TLS
+    /// alert number (0 to 255, RFC 8446 section 6). A client that rejects the server certificate reports such a status, for
+    /// example <c>TLS_ALERT(48 unknown_ca)</c> when a SystemRoots client faces a private CA on Windows.
+    /// </summary>
+    public static bool TryGetTlsAlert(int status, out int alert)
+    {
+        int first = TlsAlert(0);
+        if (status >= first && status <= first + 0xFF)
+        {
+            alert = status - first;
+            return true;
+        }
+        alert = 0;
+        return false;
+    }
+
+    /// <summary>The IANA name of a TLS alert (<c>unknown_ca</c> for 48), or null for a number that has none.</summary>
+    public static string? TlsAlertDescription(int alert) => alert switch
+    {
+        0 => "close_notify",
+        10 => "unexpected_message",
+        20 => "bad_record_mac",
+        21 => "decryption_failed",
+        22 => "record_overflow",
+        30 => "decompression_failure",
+        40 => "handshake_failure",
+        41 => "no_certificate",
+        42 => "bad_certificate",
+        43 => "unsupported_certificate",
+        44 => "certificate_revoked",
+        45 => "certificate_expired",
+        46 => "certificate_unknown",
+        47 => "illegal_parameter",
+        48 => "unknown_ca",
+        49 => "access_denied",
+        50 => "decode_error",
+        51 => "decrypt_error",
+        60 => "export_restriction",
+        70 => "protocol_version",
+        71 => "insufficient_security",
+        80 => "internal_error",
+        86 => "inappropriate_fallback",
+        90 => "user_canceled",
+        100 => "no_renegotiation",
+        109 => "missing_extension",
+        110 => "unsupported_extension",
+        111 => "certificate_unobtainable",
+        112 => "unrecognized_name",
+        113 => "bad_certificate_status_response",
+        114 => "bad_certificate_hash_value",
+        115 => "unknown_psk_identity",
+        116 => "certificate_required",
+        120 => "no_application_protocol",
+        _ => null,
+    };
 }

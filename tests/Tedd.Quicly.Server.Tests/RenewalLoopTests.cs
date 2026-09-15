@@ -140,6 +140,53 @@ public sealed class RenewalLoopTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task ScheduledRenewalFailure_IsReported_AndTheCurrentCertificateKeepsBeingServed()
+    {
+        _env.Ca.CertificateLifetime = TimeSpan.FromSeconds(3);
+        _env.Ca.CertificateBackdate = TimeSpan.Zero;
+        AcmeProvisioningOptions options = _env.Options();
+        options.Renewal = new RenewalSchedulerOptions { UseRenewalInfo = false, CheckInterval = TimeSpan.FromMilliseconds(100), RetryDelay = TimeSpan.FromHours(1) };
+        CertificateProvisioner provisioner = _env.Create(options);
+        Recorder recorder = new(provisioner);
+        await provisioner.StartAsync();
+        X509Certificate2 first = provisioner.Current!;
+        _env.Ca.FailValidation = true;
+
+        await Wait.ForAsync(() => recorder.HasStatus(CertificateState.Failed, "Renewal failed; retrying after 01:00:00"), LongWait, "the scheduled renewal to fail");
+
+        Assert.Same(first, provisioner.Current);
+        Assert.Contains(recorder.Statuses, s => s.State == CertificateState.Renewing);
+        Assert.IsType<AcmeException>(provisioner.Status.Error);
+    }
+
+    [Fact]
+    public async Task DisposeAsync_WhileANewCertificateIsBeingApplied_DiscardsIt()
+    {
+        CertificateProvisioner provisioner = _env.Create(_env.Options());
+        await provisioner.StartAsync();
+        using SemaphoreSlim loading = new(0);
+        using SemaphoreSlim release = new(0);
+        X509Certificate2? late = null;
+        provisioner.CertificateLoader = (pfx, password, flags) =>
+        {
+            loading.Release();
+            release.Wait(LongWait);
+            return late = CertificateProvisioner.LoadServedCertificate(pfx, password, flags);
+        };
+
+        Task renew = provisioner.RenewNowAsync();
+        Assert.True(await loading.WaitAsync(LongWait));
+        ValueTask dispose = provisioner.DisposeAsync(); // stops, then waits for the loop, which is inside the loader
+        release.Release();
+        await dispose;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => renew);
+        Assert.True(Certs.IsDisposed(late!));
+        Assert.Null(provisioner.Current);
+        Assert.Equal(CertificateState.Stopped, provisioner.Status.State);
+    }
+
+    [Fact]
     public async Task TlsAlpn01ValidatedAgainstTheWrongServer_FailsWithTheCasReason()
     {
         CertificateProvisioner provisioner = _env.Create(_env.Options(AcmeChallengeKind.TlsAlpn01), wireValidationPorts: false);

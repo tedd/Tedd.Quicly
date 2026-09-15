@@ -105,6 +105,21 @@ public sealed class ProvisionerSourceTests : IDisposable
     }
 
     [Fact]
+    public async Task ThrowingHandlers_WithoutAnErrorSubscriber_AreIgnored()
+    {
+        using X509Certificate2 certificate = Certs.Create();
+        ServerCertificateOptions options = ServerCertificateOptions.Static(certificate);
+        await using CertificateProvisioner provisioner = new(options);
+        provisioner.Changed += _ => throw new InvalidOperationException("boom");
+
+        await provisioner.StartAsync();
+
+        Assert.Same(options, provisioner.Options);
+        Assert.Same(certificate, provisioner.Current);
+        Assert.Equal(CertificateState.Valid, provisioner.Status.State);
+    }
+
+    [Fact]
     public void Constructor_ValidatesArguments()
     {
         Assert.Throws<ArgumentNullException>(() => new CertificateProvisioner(null!));

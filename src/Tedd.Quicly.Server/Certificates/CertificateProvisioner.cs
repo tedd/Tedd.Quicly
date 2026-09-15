@@ -265,7 +265,6 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
 
         TaskCompletionSource completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        CancellationTokenSource? interrupt;
         lock (_lock)
         {
             // Checked under the lock: the loop cancels the queued requests under this lock when it exits.
@@ -278,10 +277,9 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
             request.NotBefore = DateTimeOffset.MinValue; // a retry waiting for its delay starts at once
             request.Requested = true;
             request.Waiters.Add(completion);
-            interrupt = _interrupt;
+            Interrupt();
         }
 
-        CancelQuietly(interrupt);
         return completion.Task.WaitAsync(cancellationToken);
     }
 
@@ -427,9 +425,10 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     {
         // Always the source's latest certificate, so a reload racing with start-up cannot leave a stale one current.
         X509Certificate2 certificate = source.Current!;
+        string description = CertificateIdentity.Describe(certificate);
         if (Publish(certificate, owned: true))
         {
-            SetStatus(new CertificateStatus(CertificateState.Valid, verb + source.FilePath + ": " + CertificateIdentity.Describe(certificate) + "."));
+            SetStatus(new CertificateStatus(CertificateState.Valid, verb + source.FilePath + ": " + description + "."));
         }
     }
 
@@ -521,8 +520,8 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         try
         {
             IssuedCertificate issued = await manager.OrderCertificateAsync(cancellationToken).ConfigureAwait(false);
-            X509Certificate2 served = ApplyIssued(issued);
-            SetStatus(new CertificateStatus(CertificateState.Valid, "Obtained " + CertificateIdentity.Describe(served) + " from " + o.DirectoryUrl + "."));
+            string served = ApplyIssued(issued);
+            SetStatus(new CertificateStatus(CertificateState.Valid, "Obtained " + served + " from " + o.DirectoryUrl + "."));
         }
         catch (Exception e) when (!(e is OperationCanceledException && cancellationToken.IsCancellationRequested))
         {
@@ -574,12 +573,14 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
             return false;
         }
 
+        // Everything is read from the certificate before it is published: a concurrent DisposeAsync disposes it there.
+        due = _scheduler!.IsRenewalDue(certificate);
+        string description = CertificateIdentity.Describe(certificate);
         Volatile.Write(ref _currentPfx, pfx);
         Publish(certificate, owned: true);
-        due = _scheduler!.IsRenewalDue(certificate);
         SetStatus(due
-            ? new CertificateStatus(CertificateState.Starting, "The persisted certificate " + CertificateIdentity.Describe(certificate) + " is due for renewal; it is served while a replacement is ordered.")
-            : new CertificateStatus(CertificateState.Valid, "Loaded the persisted certificate " + CertificateIdentity.Describe(certificate) + "."));
+            ? new CertificateStatus(CertificateState.Starting, "The persisted certificate " + description + " is due for renewal; it is served while a replacement is ordered.")
+            : new CertificateStatus(CertificateState.Valid, "Loaded the persisted certificate " + description + "."));
         return true;
     }
 
@@ -726,12 +727,12 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
 
     private Task OnRenewedAsync(IssuedCertificate issued, CancellationToken cancellationToken)
     {
-        X509Certificate2 served;
+        string served;
         try
         {
             served = ApplyIssued(issued);
         }
-        catch (Exception e)
+        catch (Exception e) when (e is not OperationCanceledException)
         {
             // The scheduler now tracks a certificate that is not being served: interrupt it and order again after the
             // retry delay, so the served certificate cannot silently run out.
@@ -740,7 +741,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
             return Task.CompletedTask;
         }
 
-        SetStatus(new CertificateStatus(CertificateState.Valid, "Renewed: " + CertificateIdentity.Describe(served) + "."));
+        SetStatus(new CertificateStatus(CertificateState.Valid, "Renewed: " + served + "."));
         return Task.CompletedTask;
     }
 
@@ -758,9 +759,9 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         {
             SetStatus(new CertificateStatus(CertificateState.Renewing, request.Reason));
             IssuedCertificate issued = await _manager!.OrderCertificateAsync(stop).ConfigureAwait(false);
-            X509Certificate2 served = ApplyIssued(issued);
-            string message = !hadCertificate ? "Obtained " + CertificateIdentity.Describe(served) + " from " + o.DirectoryUrl + "."
-                : (request.Requested ? "Renewed on request: " : "Renewed: ") + CertificateIdentity.Describe(served) + ".";
+            string served = ApplyIssued(issued);
+            string message = !hadCertificate ? "Obtained " + served + " from " + o.DirectoryUrl + "."
+                : (request.Requested ? "Renewed on request: " : "Renewed: ") + served + ".";
             SetStatus(new CertificateStatus(CertificateState.Valid, message));
             Complete(request, error: null, cancelled: false);
         }
@@ -786,16 +787,13 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     {
         RenewalSchedulerOptions renewal = _options.AcmeOptions!.Renewal;
         DateTimeOffset notBefore = renewal.TimeProvider.GetUtcNow() + renewal.RetryDelay;
-        CancellationTokenSource? interrupt;
         lock (_lock)
         {
             // A request queued already keeps its own (earlier) start, and is retried until it succeeds as well.
             RenewalRequest queued = _pendingRenewal ??= new RenewalRequest(reason, notBefore, retryUntilSuccess: true);
             queued.RetryUntilSuccess = true;
-            interrupt = _interrupt;
+            Interrupt();
         }
-
-        CancelQuietly(interrupt);
     }
 
     /// <summary>Takes the queued order when it is due; otherwise <paramref name="untilDue"/> is the time left (zero when nothing is queued).</summary>
@@ -904,13 +902,9 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         DateTimeOffset now = _options.AcmeOptions!.Renewal.TimeProvider.GetUtcNow();
         lock (_lock)
         {
-            if (_pendingRenewal is { } queued && (refuseWhenAnyQueued || queued.NotBefore <= now))
-            {
-                return false;
-            }
-
-            _interrupt = interrupt;
-            return true;
+            bool queuedFirst = _pendingRenewal is { } queued && (refuseWhenAnyQueued || queued.NotBefore <= now);
+            _interrupt = queuedFirst ? null : interrupt;
+            return !queuedFirst;
         }
     }
 
@@ -934,16 +928,14 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         return Task.Delay(rounded, _options.AcmeOptions!.Renewal.TimeProvider, cancellationToken);
     }
 
-    private static void CancelQuietly(CancellationTokenSource? source)
+    /// <summary>
+    /// Cuts the loop's registered wait or scheduler run short. Called under <c>_lock</c>, which keeps the source from being
+    /// disposed meanwhile (the loop unregisters it under the lock before disposing it). The cancellation callbacks run
+    /// asynchronously, so no loop code runs under the lock.
+    /// </summary>
+    private void Interrupt()
     {
-        try
-        {
-            source?.Cancel();
-        }
-        catch (ObjectDisposedException)
-        {
-            // The wait or run ended between reading and cancelling it; the loop looks at the queue next anyway.
-        }
+        _ = _interrupt?.CancelAsync();
     }
 
     private void OnManagerProgress(AcmeProgress progress)
@@ -960,8 +952,12 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
     }
 
-    /// <summary>Loads the served certificate from the issued PKCS#12, makes it current and disposes <paramref name="issued"/>.</summary>
-    private X509Certificate2 ApplyIssued(IssuedCertificate issued)
+    /// <summary>
+    /// Loads the served certificate from the issued PKCS#12, makes it current and disposes <paramref name="issued"/>.
+    /// Returns the certificate's description, for the status.
+    /// </summary>
+    /// <exception cref="OperationCanceledException">The provisioner was disposed meanwhile; the certificate was discarded.</exception>
+    private string ApplyIssued(IssuedCertificate issued)
     {
         AcmeProvisioningOptions o = _options.AcmeOptions!;
         byte[] pfx = issued.Pfx;
@@ -975,9 +971,14 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
             issued.Dispose();
         }
 
+        string description = CertificateIdentity.Describe(served);
         Volatile.Write(ref _currentPfx, pfx);
-        Publish(served, owned: true);
-        return served;
+        if (!Publish(served, owned: true))
+        {
+            throw new OperationCanceledException("The certificate provisioner was disposed while a new certificate was being applied; the certificate was discarded.");
+        }
+
+        return description;
     }
 
     /// <summary>
@@ -1005,24 +1006,24 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
 
     // ---- publishing and events --------------------------------------------------------------------------------------
 
-    /// <summary>Makes <paramref name="certificate"/> current and raises <see cref="Changed"/>; false when it already is current or the provisioner is disposed.</summary>
+    /// <summary>
+    /// Makes <paramref name="certificate"/> current and raises <see cref="Changed"/>. Returns false when it already is
+    /// current, or when the provisioner is disposed (an owned certificate is then disposed).
+    /// </summary>
     private bool Publish(X509Certificate2 certificate, bool owned)
     {
         lock (_publishLock)
         {
-            if (Volatile.Read(ref _disposed) != 0)
+            bool disposed = Volatile.Read(ref _disposed) != 0;
+            if (disposed || ReferenceEquals(Current, certificate))
             {
-                // Arrived during disposal (a file reload, an order finishing): nobody will serve it.
-                if (owned)
+                // Arrived during disposal (an order finishing, a file reload): nobody will serve it. Or it is current
+                // already (a file reload racing with start-up).
+                if (disposed && owned)
                 {
                     certificate.Dispose();
                 }
 
-                return false;
-            }
-
-            if (ReferenceEquals(Current, certificate))
-            {
                 return false;
             }
 
@@ -1044,15 +1045,13 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     {
         lock (_statusLock)
         {
-            // After stopping, late reports from winding-down work must not overwrite Stopped.
-            if (_statusSealed)
+            // After stopping, late reports from winding-down work (a file poll already under way) must not overwrite Stopped.
+            if (!_statusSealed)
             {
-                return;
+                _statusSealed = seal;
+                Volatile.Write(ref _status, status);
+                Raise(StatusChanged, status, "StatusChanged");
             }
-
-            _statusSealed = seal;
-            Volatile.Write(ref _status, status);
-            Raise(StatusChanged, status, "StatusChanged");
         }
     }
 

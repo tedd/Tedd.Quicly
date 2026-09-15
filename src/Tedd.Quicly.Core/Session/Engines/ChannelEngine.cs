@@ -88,6 +88,21 @@ internal abstract class ChannelEngine : IDisposable
     public virtual bool TryCancel(int entrySlot) => false;
 
     /// <summary>
+    /// The admission stamp (<see cref="PeerCore.StampAdmission"/>) of the oldest message this engine holds queued and not yet
+    /// handed to the transport, or <see cref="long.MaxValue"/> when it holds none (game thread; the watermark of
+    /// <see cref="QuiclyPeer.FlushAsync"/>). Default: <see cref="long.MaxValue"/>.
+    /// </summary>
+    /// <returns>The oldest queued stamp.</returns>
+    public virtual long OldestQueuedStamp() => long.MaxValue;
+
+    /// <summary>Adds what the engine holds for a channel (queued and in-flight messages and bytes) to its statistics (game thread). Default: nothing.</summary>
+    /// <param name="channelIndex">Dense index of a channel of this engine.</param>
+    /// <param name="statistics">The snapshot being filled.</param>
+    public virtual void AddStatistics(int channelIndex, ref ChannelStatistics statistics)
+    {
+    }
+
+    /// <summary>
     /// The connection is closed (game thread, from <see cref="QuiclyPeer.Poll"/>, after every transport completion was
     /// drained): complete queued entries <see cref="Threading.DeliveryStatus.Disconnected"/> and release their payloads.
     /// </summary>
@@ -160,6 +175,21 @@ internal abstract class ChannelEngine : IDisposable
     /// <param name="aborted">True when the stream was reset or stopped rather than finished.</param>
     /// <param name="errorCode">The reset code.</param>
     public abstract void OnStreamClosed(TransportStreamId id, bool aborted, ulong errorCode);
+
+    /// <summary>
+    /// A stream this engine opened with a context from <see cref="PeerCore.MakeEngineStreamContext"/> finished starting
+    /// (transport thread, routed by the context's mode). <paramref name="status"/> is <see cref="TransportStatus.Success"/>, or
+    /// why the stream never started: with <see cref="TransportStatus.StreamLimitReached"/> the peer's stream limit refused it,
+    /// the send that carried <see cref="TransportSendFlags.Start"/> completes canceled and
+    /// <see cref="ITransportSink.OnStreamShutdownComplete"/> follows (nothing reached the peer). A start refused synchronously
+    /// (the send call itself returned the status) raises nothing. Default: nothing.
+    /// </summary>
+    /// <param name="id">The stream.</param>
+    /// <param name="context">The context given to <see cref="ITransport.OpenStream"/>.</param>
+    /// <param name="status">The outcome.</param>
+    public virtual void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status)
+    {
+    }
 
     /// <summary>
     /// A control message addressed to this mode (LatestAck/LatestReject → ReliableLatest; BulkProgress/BulkRequest/

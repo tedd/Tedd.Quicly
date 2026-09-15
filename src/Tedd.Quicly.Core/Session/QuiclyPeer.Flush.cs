@@ -9,6 +9,9 @@ public sealed unsafe partial class QuiclyPeer
     /// <summary>Send caps at or above this many bytes per second count as unlimited (keeps the token arithmetic in range).</summary>
     internal const long MaxSendRateBytesPerSecond = 2_000_000_000;
 
+    private readonly List<FlushWaiter> _flushWaiters = [];
+    private readonly List<FlushWaiter> _readyFlushWaiters = [];
+    private bool _completingFlushWaiters;
     private bool _inFlush;
     private bool _inScheduler;
     private uint _lastTick;
@@ -37,10 +40,13 @@ public sealed unsafe partial class QuiclyPeer
         _inFlush = true;
         _lastTick = tick;
         EnterCall();
+        NoteGameThread();
         try
         {
             long now = _clock.NowMicros;
             DrainCompletions();
+            DrainForeignSends();
+            RetrySendWaiters();
             long next = RunTimers(now);
             long engineDeadline = long.MaxValue;
             if (_state == PeerState.Connected)
@@ -58,6 +64,7 @@ public sealed unsafe partial class QuiclyPeer
 
             _engineDeadline = engineDeadline;
             UpdateNextDeadline(next);
+            CompleteFlushWaiters(all: false);
         }
         finally
         {
@@ -67,11 +74,18 @@ public sealed unsafe partial class QuiclyPeer
     }
 
     /// <summary>
-    /// Flushes and completes (game thread). Everything admitted before the call has been handed to the transport when the
-    /// returned task completes; with the engines of this wave that happens synchronously.
+    /// Flushes, then completes when everything admitted before the call has been handed to the transport (game thread): a
+    /// watermark over the admission stamps of the messages the engines still hold queued
+    /// (<see cref="ChannelEngine.OldestQueuedStamp"/>). Messages dropped instead (expired, canceled, failed) count as done.
+    /// When nothing is held back (no send cap in the way, streams open) the returned task is already complete and nothing is
+    /// allocated; otherwise it completes inside the later <see cref="Flush"/> (or Immediate send) whose pass hands the last
+    /// of them over, or when the session closes. Continuations run there with <see cref="CompletionMode.PollOnly"/> and on
+    /// the thread pool with <see cref="CompletionMode.ThreadPool"/>. Sends queued from other threads
+    /// (<see cref="PeerOptions.ThreadSafeSend"/>) count once the game thread admitted them.
     /// </summary>
     /// <param name="cancellationToken">Cancels the wait (not the flush).</param>
-    /// <returns>A task that completes when the flush is done.</returns>
+    /// <returns>A task that completes when everything admitted before the call was handed to the transport.</returns>
+    /// <exception cref="ObjectDisposedException">The peer is disposed (also fails a waiting call).</exception>
     public ValueTask FlushAsync(CancellationToken cancellationToken = default)
     {
         if (cancellationToken.IsCancellationRequested)
@@ -80,7 +94,105 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         Flush();
-        return ValueTask.CompletedTask;
+        long mark = _core.LastAdmissionStamp;
+        if (_closedRaised || OldestQueuedStamp() > mark)
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        FlushWaiter waiter = new(mark, _core.CompletionMode == CompletionMode.ThreadPool);
+        if (cancellationToken.CanBeCanceled)
+        {
+            waiter.Registration = cancellationToken.UnsafeRegister(static (state, token) => ((FlushWaiter)state!).Source.TrySetCanceled(token), waiter);
+        }
+
+        _flushWaiters.Add(waiter);
+        return new ValueTask(waiter.Source.Task);
+    }
+
+    /// <summary>The admission stamp of the oldest message any engine still holds queued (<see cref="long.MaxValue"/> when none).</summary>
+    private long OldestQueuedStamp()
+    {
+        long oldest = long.MaxValue;
+        ReadOnlySpan<ChannelEngine> engines = _core.ActiveEngines;
+        for (int i = 0; i < engines.Length; i++)
+        {
+            long stamp = engines[i].OldestQueuedStamp();
+            if (stamp < oldest)
+            {
+                oldest = stamp;
+            }
+        }
+
+        return oldest;
+    }
+
+    /// <summary>
+    /// Completes the <see cref="FlushAsync"/> calls whose messages have all been handed over (after every scheduler pass), or
+    /// every one (<paramref name="all"/>: the session closed and the engines finished their queues). Canceled waits are
+    /// dropped. The list is settled before any continuation runs.
+    /// </summary>
+    private void CompleteFlushWaiters(bool all)
+    {
+        List<FlushWaiter> waiters = _flushWaiters;
+        if (waiters.Count == 0 || _completingFlushWaiters)
+        {
+            return;
+        }
+
+        _completingFlushWaiters = true;
+        try
+        {
+            long oldest = all ? long.MaxValue : OldestQueuedStamp();
+            List<FlushWaiter> ready = _readyFlushWaiters;
+            int kept = 0;
+            for (int i = 0; i < waiters.Count; i++)
+            {
+                FlushWaiter waiter = waiters[i];
+                if (waiter.Mark < oldest || waiter.Source.Task.IsCompleted)
+                {
+                    ready.Add(waiter);
+                }
+                else
+                {
+                    waiters[kept++] = waiter;
+                }
+            }
+
+            waiters.RemoveRange(kept, waiters.Count - kept);
+            for (int i = 0; i < ready.Count; i++)
+            {
+                FlushWaiter waiter = ready[i];
+                waiter.Registration.Dispose();
+                waiter.Source.TrySetResult();
+            }
+
+            ready.Clear();
+        }
+        finally
+        {
+            _completingFlushWaiters = false;
+        }
+    }
+
+    private void FailFlushWaiters(Exception exception)
+    {
+        List<FlushWaiter> waiters = _flushWaiters;
+        for (int i = 0; i < waiters.Count; i++)
+        {
+            waiters[i].Registration.Dispose();
+            waiters[i].Source.TrySetException(exception);
+        }
+
+        waiters.Clear();
+    }
+
+    /// <summary>A <see cref="FlushAsync"/> waiting for its watermark (allocated only when the flush could not hand everything over).</summary>
+    private sealed class FlushWaiter(long mark, bool asynchronous)
+    {
+        public readonly long Mark = mark;
+        public readonly TaskCompletionSource Source = new(asynchronous ? TaskCreationOptions.RunContinuationsAsynchronously : TaskCreationOptions.None);
+        public CancellationTokenRegistration Registration;
     }
 
     private FlushContext NewFlushContext(long now, uint tick) => new()
@@ -184,6 +296,8 @@ public sealed unsafe partial class QuiclyPeer
                     _nextDeadlineMicros = flush.NextDeadline;
                 }
             }
+
+            CompleteFlushWaiters(all: false);
         }
         finally
         {

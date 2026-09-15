@@ -57,8 +57,16 @@ internal sealed class PeerCounters
     /// <summary>Pong samples dropped because the hand-off ring to the game thread was full.</summary>
     public long PongSamplesDropped;
 
+    /// <summary>Stream receives held back (<see cref="Engines.StreamConsume.Pend"/>): ring full or receive budget used up.</summary>
+    public long StreamReceivePends;
+
     /// <summary>Highest receive ring occupancy seen (including reservations).</summary>
     public int ReceiveRingHighWater;
+
+    // ---- any thread (Interlocked)
+
+    /// <summary>Sends queued from other threads (<see cref="PeerOptions.ThreadSafeSend"/>).</summary>
+    public long ThreadSafeSends;
 
     // ---- game thread
 
@@ -88,4 +96,13 @@ internal sealed class PeerCounters
 
     /// <summary>Messages that travelled inside packed containers.</summary>
     public long MessagesPacked;
+
+    /// <summary>Stream sends handed to the transport by the engines (one per gathered submission).</summary>
+    public long StreamSends;
+
+    /// <summary>Bytes of <see cref="StreamSends"/> (preambles, frame headers and payloads).</summary>
+    public long StreamBytesSent;
+
+    /// <summary>Sends from other threads refused when the game thread admitted them (their leases went back to the pool).</summary>
+    public long ThreadSafeSendDrops;
 }

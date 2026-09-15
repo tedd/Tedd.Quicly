@@ -1,9 +1,7 @@
-using System.Runtime.InteropServices;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Framing;
 using Tedd.Quicly.Core.Memory;
-using Tedd.Quicly.Core.Primitives;
 using Tedd.Quicly.Core.State;
 using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Core.Transport;
@@ -126,6 +124,34 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
     /// <param name="channelIndex">Dense index of a channel of this engine.</param>
     internal long KeyEvictions(int channelIndex) => _keys[_localOf[channelIndex]]?.Evictions ?? 0;
 
+    /// <inheritdoc/>
+    public override long OldestQueuedStamp()
+    {
+        long oldest = long.MaxValue;
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            int head = _send[local].QueueHead;
+            if (head >= 0)
+            {
+                long stamp = _core.GetAdmissionStamp(head);
+                if (stamp < oldest)
+                {
+                    oldest = stamp;
+                }
+            }
+        }
+
+        return oldest;
+    }
+
+    /// <inheritdoc/>
+    public override void AddStatistics(int channelIndex, ref ChannelStatistics statistics)
+    {
+        ref ChannelSendState send = ref _send[_localOf[channelIndex]];
+        statistics.QueuedMessages = send.QueueCount;
+        statistics.QueuedBytes = send.QueueBytes;
+    }
+
     // ------------------------------------------------------------------ send (game thread)
 
     /// <inheritdoc/>
@@ -135,7 +161,7 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
         int dense = request.ChannelIndex;
         int local = _localOf[dense];
         ref ChannelSendCounters counters = ref _core.SendCounters(dense);
-        int length = request.Kind == SendPayloadKind.Gather ? GatherLength(request.Gather) : request.Length;
+        int length = request.Kind == SendPayloadKind.Gather ? EnginePayload.GatherLength(request.Gather) : request.Length;
         if (length > _core.EffectiveMaxMessageSize(channel))
         {
             counters.TooLarge++;
@@ -162,7 +188,7 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
         }
 
         PreparedPayload payload = default;
-        if (!TryPreparePayload(ref request, channel, length, ref payload))
+        if (!EnginePayload.TryPrepare(_core, ref request, channel, length, takeSinglePage: false, ref payload))
         {
             _core.DiscardEntry(slot);
             return SendStatus.OutOfBuffers;
@@ -175,7 +201,7 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
         int headerLength = DatagramFraming.GetHeaderLength(channel, in header);
         if (_core.DatagramsEnabled && headerLength + payload.Length > _core.MaxDatagramPayload)
         {
-            ReleasePrepared(in payload);
+            EnginePayload.Release(_core, in payload);
             _core.DiscardEntry(slot);
             if (channel.Fragmentation)
             {
@@ -188,7 +214,7 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
 
         if (request.Options.Track && !_core.TryTrack(slot, request.Options.Context, out request.Token))
         {
-            ReleasePrepared(in payload);
+            EnginePayload.Release(_core, in payload);
             _core.DiscardEntry(slot);
             counters.QueueFull++;
             return SendStatus.QueueFull;
@@ -203,7 +229,8 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
 
         SendEntryTable entries = _core.Entries;
         entries.SetHeaderLength(slot, DatagramFraming.WriteHeader(entries.GetHeaderBlock(slot), channel, in header));
-        CommitPayload(slot, ref request, in payload);
+        EnginePayload.Commit(_core, slot, ref request, in payload);
+        _core.StampAdmission(slot);
         entries.Sequences[slot] = header.Sequence;
         entries.Keys[slot] = header.Key;
         long expiry = request.Options.ExpiryMicros > 0 ? request.Options.ExpiryMicros : _expiryMicros[local];
@@ -551,243 +578,6 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
         {
             _recv[local] = default;
             _keys[local]?.Clear();
-        }
-    }
-
-    // ------------------------------------------------------------------ payload paths (game thread)
-
-    /// <summary>The payload of an admission in progress: what the entry will take when admission commits.</summary>
-    private struct PreparedPayload
-    {
-        /// <summary>The lease the entry takes (rented here, or the caller's owned lease), or empty.</summary>
-        public BufferLease Lease;
-
-        /// <summary><see cref="Lease"/> was rented here (give it back if admission fails).</summary>
-        public bool Rented;
-
-        /// <summary>First payload byte.</summary>
-        public byte* Pointer;
-
-        /// <summary>Payload bytes on the wire (the compressed size when <see cref="RawLength"/> &gt; 0).</summary>
-        public int Length;
-
-        /// <summary>Decoded size of a compressed payload, else 0.</summary>
-        public int RawLength;
-
-        /// <summary>The GC handle pinning a borrowed array, or 0.</summary>
-        public nint Pin;
-    }
-
-    private static int GatherLength(ReadOnlySpan<BufferLease> pages)
-    {
-        int length = 0;
-        foreach (BufferLease page in pages)
-        {
-            length += page.Length;
-        }
-
-        return length;
-    }
-
-    private static bool ShouldCompress(ChannelDefinition channel, int length) =>
-        channel.Compression == ChannelCompression.Lz4 && length >= 2 && length >= channel.MinCompressSize;
-
-    private bool TryPreparePayload(ref SendRequest request, ChannelDefinition channel, int length, ref PreparedPayload payload)
-    {
-        switch (request.Kind)
-        {
-            case SendPayloadKind.Copy:
-                return TryCopyIn(request.Source, channel, compress: true, ref payload);
-            case SendPayloadKind.Owned:
-            {
-                byte* data = length == 0 ? null : _core.GetPointer(in request.Lease);
-                if (!TryCompressFrom(new ReadOnlySpan<byte>(data, length), channel, ref payload))
-                {
-                    // Zero copy: the entry takes the caller's lease on commit (the caller keeps it if admission fails).
-                    payload.Lease = request.Lease;
-                    payload.Pointer = data;
-                    payload.Length = length;
-                }
-
-                return true;
-            }
-
-            case SendPayloadKind.Pinned:
-                if (!TryCompressFrom(new ReadOnlySpan<byte>(request.Pointer, length), channel, ref payload))
-                {
-                    payload.Pointer = request.Pointer;
-                    payload.Length = length;
-                }
-
-                return true;
-            case SendPayloadKind.Borrowed:
-            {
-                ReadOnlyMemory<byte> memory = request.Borrowed;
-                if (length == 0 || TryCompressFrom(memory.Span, channel, ref payload))
-                {
-                    return true;
-                }
-
-                if (MemoryMarshal.TryGetArray(memory, out ArraySegment<byte> segment) && segment.Array is not null)
-                {
-                    GCHandle handle = GCHandle.Alloc(segment.Array, GCHandleType.Pinned);
-                    payload.Pin = GCHandle.ToIntPtr(handle);
-                    payload.Pointer = (byte*)handle.AddrOfPinnedObject() + segment.Offset;
-                    payload.Length = length;
-                    return true;
-                }
-
-                // Not array-backed: a copy is the safe convenience (compression was already tried).
-                return TryCopyIn(memory.Span, channel, compress: false, ref payload);
-            }
-
-            default:
-                return TryGatherIn(request.Gather, length, channel, ref payload);
-        }
-    }
-
-    private bool TryCopyIn(ReadOnlySpan<byte> source, ChannelDefinition channel, bool compress, ref PreparedPayload payload)
-    {
-        int length = source.Length;
-        if (length == 0)
-        {
-            return true;
-        }
-
-        if (!_core.TryRentSend(length, out BufferLease lease))
-        {
-            return false;
-        }
-
-        Span<byte> target = _core.GetSpan(in lease);
-        payload.Lease = lease;
-        payload.Rented = true;
-        payload.Pointer = _core.GetPointer(in lease);
-        if (compress && ShouldCompress(channel, length))
-        {
-            // Compression must shrink the payload (PROTOCOL.md §2.1): a destination one byte short makes it fail otherwise.
-            int compressed = Lz4Block.Compress(source, target.Slice(0, length - 1));
-            if (compressed > 0)
-            {
-                payload.Length = compressed;
-                payload.RawLength = length;
-                return true;
-            }
-        }
-
-        source.CopyTo(target);
-        payload.Length = length;
-        return true;
-    }
-
-    private bool TryCompressFrom(ReadOnlySpan<byte> source, ChannelDefinition channel, ref PreparedPayload payload)
-    {
-        int length = source.Length;
-        if (!ShouldCompress(channel, length) || !_core.TryRentSend(length - 1, out BufferLease lease))
-        {
-            return false;
-        }
-
-        int compressed = Lz4Block.Compress(source, _core.GetSpan(in lease).Slice(0, length - 1));
-        if (compressed <= 0)
-        {
-            _core.ReturnSend(in lease);
-            return false;
-        }
-
-        payload.Lease = lease;
-        payload.Rented = true;
-        payload.Pointer = _core.GetPointer(in lease);
-        payload.Length = compressed;
-        payload.RawLength = length;
-        return true;
-    }
-
-    private bool TryGatherIn(ReadOnlySpan<BufferLease> pages, int length, ChannelDefinition channel, ref PreparedPayload payload)
-    {
-        if (length == 0)
-        {
-            return true;
-        }
-
-        if (!_core.TryRentSend(length, out BufferLease lease))
-        {
-            return false;
-        }
-
-        Span<byte> target = _core.GetSpan(in lease);
-        int offset = 0;
-        foreach (BufferLease page in pages)
-        {
-            if (!page.IsEmpty)
-            {
-                _core.GetSpan(in page).Slice(0, page.Length).CopyTo(target.Slice(offset));
-                offset += page.Length;
-            }
-        }
-
-        payload.Length = length;
-        if (ShouldCompress(channel, length) && _core.TryRentSend(length - 1, out BufferLease packed))
-        {
-            int compressed = Lz4Block.Compress(target.Slice(0, length), _core.GetSpan(in packed).Slice(0, length - 1));
-            if (compressed > 0)
-            {
-                _core.ReturnSend(in lease);
-                lease = packed;
-                payload.Length = compressed;
-                payload.RawLength = length;
-            }
-            else
-            {
-                _core.ReturnSend(in packed);
-            }
-        }
-
-        payload.Lease = lease;
-        payload.Rented = true;
-        payload.Pointer = _core.GetPointer(in lease);
-        return true;
-    }
-
-    private void ReleasePrepared(in PreparedPayload payload)
-    {
-        if (payload.Rented)
-        {
-            _core.ReturnSend(in payload.Lease);
-        }
-
-        if (payload.Pin != 0)
-        {
-            GCHandle.FromIntPtr(payload.Pin).Free();
-        }
-    }
-
-    private void CommitPayload(int slot, ref SendRequest request, in PreparedPayload payload)
-    {
-        SendEntryTable entries = _core.Entries;
-        if (!payload.Lease.IsEmpty)
-        {
-            entries.Leases[slot] = payload.Lease;
-        }
-
-        _core.SetPayload(slot, payload.Pointer, payload.Length);
-        if (payload.Pin != 0)
-        {
-            entries.PinHandles[slot] = payload.Pin;
-            entries[slot].Flags |= SendEntryFlags.Pinned;
-        }
-
-        // Ownership of an owned lease or of gathered pages moved to the peer; their bytes were copied or compressed away.
-        if (request.Kind == SendPayloadKind.Owned && payload.Rented)
-        {
-            _core.ReturnSend(in request.Lease);
-        }
-        else if (request.Kind == SendPayloadKind.Gather)
-        {
-            foreach (BufferLease page in request.Gather)
-            {
-                _core.ReturnSend(in page);
-            }
         }
     }
 }

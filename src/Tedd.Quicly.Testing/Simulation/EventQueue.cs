@@ -19,6 +19,7 @@ internal enum SimEventKind : byte
     StreamStopSending,
     StreamsAvailable,
     StreamCreditReturn,
+    StreamWindowUpdate,
     MtuChange,
     Disconnect,
     CloseLocal,

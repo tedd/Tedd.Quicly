@@ -47,11 +47,20 @@ public sealed unsafe partial class QuiclyPeer
 
         _inPoll = true;
         EnterCall();
+        NoteGameThread();
         int dispatched = 0;
         try
         {
             long now = _clock.NowMicros;
             DrainCompletions();
+            bool immediate = DrainForeignSends();
+            RetrySendWaiters();
+            if (immediate && _state == PeerState.Connected)
+            {
+                // An Immediate send from another thread: its scheduler pass runs here, on the game thread.
+                FlushImmediate();
+            }
+
             ProcessSignals(now);
             long next = RunTimers(now);
             RaiseTransitions(holdClosed: true);
@@ -513,8 +522,11 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         DrainCompletions();
+        ReleaseForeignSends();
         ReleaseAllReceived();
         _closedRaised = true;
+        CompleteSendWaiters(exception: null);
+        CompleteFlushWaiters(all: true);
         RaiseTransitions(holdClosed: false);
     }
 

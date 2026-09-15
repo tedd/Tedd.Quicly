@@ -157,7 +157,8 @@ public class SessionEdgeTests
     {
         using ServerHarness h = new(link: new LinkOptions { DelayMicros = 10_000 });
         Assert.True(h.Admit());
-        h.Raw.OpenUni([0x04, 0x01, 0x07], out TransportStreamId id);
+        // Channel 5 (Bulk) is still a placeholder: its stream is reset at the preamble.
+        h.Raw.OpenUni([0x05, 0x01, 0x07], out TransportStreamId id);
         h.Run(5_000);
         Assert.Equal(TransportStatus.Success, RawClient.SendStream(h.Raw.Transport, id, [0x01, 0x08], TransportSendFlags.None));
         h.Run(30_000);

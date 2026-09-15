@@ -108,6 +108,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         _sink = new Sink(this);
         _core = new PeerCore(this, role, table, options);
         _handlers = new MessageHandler?[_core.ChannelCount];
+        InitializeSendSide(options);
         long now = _clock.NowMicros;
         _controlBucket.Initialize(options.ControlMessagesPerSecond, options.ControlMessagesPerSecond, now);
         _pongBucket.Initialize(options.PongsPerSecond, options.PongBurst, now);
@@ -307,6 +308,11 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.DatagramBytesSent = c.DatagramBytesSent;
         statistics.ContainersSent = c.ContainersSent;
         statistics.MessagesPacked = c.MessagesPacked;
+        statistics.StreamSends = c.StreamSends;
+        statistics.StreamBytesSent = c.StreamBytesSent;
+        statistics.StreamReceivePends = Volatile.Read(ref c.StreamReceivePends);
+        statistics.ThreadSafeSends = Volatile.Read(ref c.ThreadSafeSends);
+        statistics.ThreadSafeSendDrops = c.ThreadSafeSendDrops;
         statistics.SendBytesOutstanding = _core.SendBytesOutstanding;
         statistics.ReceiveBytesOutstanding = _core.ReceiveBytesOutstanding;
     }
@@ -343,6 +349,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.ReceiveKeyTableFull = Volatile.Read(ref recv.KeyTableFull);
         statistics.ReceiveTooLarge = Volatile.Read(ref recv.TooLarge);
         statistics.OutOfBuffers = Volatile.Read(ref recv.OutOfBuffers);
+        _core.GetEngine(index).AddStatistics(index, ref statistics);
         return true;
     }
 
@@ -390,6 +397,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         }
 
         _disposed = true;
+        FailWaitersOnDispose();
         ITransport? transport = _transport;
         if (transport is not null)
         {
@@ -460,6 +468,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
             _core.ReturnReceive(in _held.Lease);
         }
 
+        ReleaseForeignSends();
         _core.Dispose();
         _controlPool.Dispose();
     }

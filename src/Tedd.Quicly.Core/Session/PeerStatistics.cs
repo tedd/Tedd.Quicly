@@ -121,6 +121,21 @@ public struct PeerStatistics
     /// <summary>Messages that travelled inside packed containers.</summary>
     public long MessagesPacked;
 
+    /// <summary>Stream sends handed to the transport (one per gathered submission of an ordered channel, PROTOCOL.md §3.1).</summary>
+    public long StreamSends;
+
+    /// <summary>Bytes of <see cref="StreamSends"/> (preambles, frame headers and payloads).</summary>
+    public long StreamBytesSent;
+
+    /// <summary>Stream receives held back by back-pressure (receive ring full or receive budget used up) and resumed from Poll.</summary>
+    public long StreamReceivePends;
+
+    /// <summary>Sends queued from other threads (<see cref="PeerOptions.ThreadSafeSend"/>).</summary>
+    public long ThreadSafeSends;
+
+    /// <summary>Sends from other threads the game thread refused when it admitted them (counted in the channel's statistics too).</summary>
+    public long ThreadSafeSendDrops;
+
     /// <summary>Send lease bytes held now.</summary>
     public long SendBytesOutstanding;
 
@@ -182,4 +197,16 @@ public struct ChannelStatistics
 
     /// <summary>Messages dropped because no receive buffer was available.</summary>
     public long OutOfBuffers;
+
+    /// <summary>Messages admitted and not yet handed to the transport (now).</summary>
+    public long QueuedMessages;
+
+    /// <summary>Payload bytes of <see cref="QueuedMessages"/>.</summary>
+    public long QueuedBytes;
+
+    /// <summary>Messages handed to the transport and not yet completed (reliable channels; now).</summary>
+    public long InFlightMessages;
+
+    /// <summary>Payload bytes of <see cref="InFlightMessages"/>.</summary>
+    public long InFlightBytes;
 }

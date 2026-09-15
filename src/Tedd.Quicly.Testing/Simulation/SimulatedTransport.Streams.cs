@@ -135,26 +135,18 @@ public sealed unsafe partial class SimulatedTransport
             {
                 int offset = i * chunkSize;
                 int length = (int)Math.Min(chunkSize, total - offset);
-                bool chunkFin = fin && i == chunks - 1;
-                if (unlimited)
+                TxPacket packet = new()
                 {
-                    DepartChunk(record, generation, offset, length, streamOffset + offset, chunkFin, now);
-                }
+                    Priority = priority, Bytes = length, Record = record, RecordGeneration = generation,
+                    BufferOffset = offset, StreamOffset = streamOffset + offset, Fin = fin && i == chunks - 1,
+                };
+                if (s.BlockedCount > 0 || packet.StreamOffset + length > s.SendLimit)
+                    s.Block(in packet); // flow control: held until the peer raises the stream's limit
                 else
-                {
-                    _tx.Push(new TxPacket
-                    {
-                        Priority = priority, Bytes = length, Record = record, RecordGeneration = generation,
-                        BufferOffset = offset, StreamOffset = streamOffset + offset, Fin = chunkFin,
-                    });
-                }
+                    EmitChunk(in packet, unlimited, now);
             }
             if (!unlimited)
-            {
-                NoteQueueDepth();
-                if (!_txBusy)
-                    StartNextTx();
-            }
+                KickTx();
             return TransportStatus.Success;
         }
     }
@@ -201,6 +193,8 @@ public sealed unsafe partial class SimulatedTransport
             ArgumentOutOfRangeException.ThrowIfGreaterThan(bytesConsumed, s.Frontier - s.Head);
             s.Head += bytesConsumed;
             s.Pending = false;
+            if (bytesConsumed > 0)
+                AdvertiseWindow(s);
             Post(SimEventKind.StreamDeliver, _network.NowMicros, this, id.Slot, id.Generation);
         }
     }
@@ -356,6 +350,18 @@ public sealed unsafe partial class SimulatedTransport
         ps.CanReceive = true;
         s.PeerSlot = peerSlot;
         s.PeerGeneration = ps.Generation;
+        int window = Link.Options.StreamReceiveWindowBytes;
+        if (window > 0)
+        {
+            // Flow control: each receiving side starts with one window of credit for the sending side.
+            s.SendLimit = window;
+            ps.AdvertisedLimit = window;
+            if (bidi)
+            {
+                ps.SendLimit = window;
+                s.AdvertisedLimit = window;
+            }
+        }
 
         long now = _network.NowMicros;
         Post(SimEventKind.StreamStarted, now, this, slot, s.Generation);
@@ -510,6 +516,8 @@ public sealed unsafe partial class SimulatedTransport
         if (result.BytesConsumed < 0 || result.BytesConsumed > available)
             throw new InvalidOperationException($"OnStreamReceived consumed {result.BytesConsumed} bytes of {available} delivered.");
         s.Head += result.BytesConsumed;
+        if (result.BytesConsumed > 0)
+            AdvertiseWindow(s);
         if (result.Pending)
         {
             s.Pending = true;
@@ -571,6 +579,63 @@ public sealed unsafe partial class SimulatedTransport
     private void RaiseStreamsAvailable() =>
         Sink!.OnStreamsAvailable((ushort)Math.Max(0, _peerAllowsBidi - _localOpenBidi), (ushort)Math.Max(0, _peerAllowsUni - _localOpenUni));
 
+    // ------------------------------------------------------------------ flow control (LinkOptions.StreamReceiveWindowBytes)
+
+    private void EmitChunk(in TxPacket packet, bool unlimited, long now)
+    {
+        if (unlimited)
+            DepartChunk(packet.Record, packet.RecordGeneration, packet.BufferOffset, packet.Bytes, packet.StreamOffset, packet.Fin, now);
+        else
+            _tx.Push(packet);
+    }
+
+    private void KickTx()
+    {
+        NoteQueueDepth();
+        if (!_txBusy && _tx.Count > 0)
+            StartNextTx();
+    }
+
+    /// <summary>
+    /// Receiver side: once the application consumed a quarter of the window beyond the last advertised limit, the sender's
+    /// limit becomes the consumed offset plus the window, one one-way delay later (a MAX_STREAM_DATA frame).
+    /// </summary>
+    private void AdvertiseWindow(SimStream s)
+    {
+        int window = Link.Options.StreamReceiveWindowBytes;
+        SimulatedTransport? peer = Peer;
+        if (window <= 0 || s.RecvDone || peer is null)
+            return;
+        long limit = s.Head + window;
+        if (limit - s.AdvertisedLimit < Math.Max(1, window / 4))
+            return;
+        s.AdvertisedLimit = limit;
+        Post(SimEventKind.StreamWindowUpdate, _network.NowMicros + Link.Options.DelayMicros, peer, s.PeerSlot, s.PeerGeneration, l0: limit);
+    }
+
+    /// <summary>Sender side: the peer raised the stream's limit; packets now within it leave in order.</summary>
+    private void OnStreamWindowUpdateEvent(ref SimEvent e)
+    {
+        if (!TryGetStream(new TransportStreamId(e.I0, e.G0), out SimStream s, allowAppClosed: true) || e.L0 <= s.SendLimit)
+            return;
+        s.SendLimit = e.L0;
+        bool unlimited = Link.Options.BandwidthBitsPerSecond == 0;
+        long now = _network.NowMicros;
+        bool released = false;
+        while (s.BlockedCount > 0)
+        {
+            ref TxPacket head = ref s.PeekBlocked();
+            if (head.StreamOffset + head.Bytes > s.SendLimit)
+                break;
+            TxPacket packet = head;
+            s.DropBlocked();
+            EmitChunk(in packet, unlimited, now);
+            released = true;
+        }
+        if (released && !unlimited)
+            KickTx();
+    }
+
     // ------------------------------------------------------------------ close helpers
 
     private void CancelAllStreamSends(bool keepForPeer)
@@ -626,6 +691,9 @@ public sealed unsafe partial class SimulatedTransport
                 return;
             case SimEventKind.StreamSendComplete:
                 OnStreamSendCompleteEvent(ref e);
+                return;
+            case SimEventKind.StreamWindowUpdate:
+                OnStreamWindowUpdateEvent(ref e);
                 return;
             case SimEventKind.StreamsAvailable:
                 if (_state == TransportState.Connected)

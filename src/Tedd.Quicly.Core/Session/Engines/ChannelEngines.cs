@@ -18,8 +18,7 @@ internal static class ChannelEngines
     {
         ChannelMode.UnreliableUnordered => new UnreliableUnorderedEngine(),
         ChannelMode.UnreliableSequenced => new UnreliableSequencedEngine(),
-        // Wave C1 step 3: ReliableOrderedEngine.
-        ChannelMode.ReliableOrdered => new PlaceholderEngine(mode),
+        ChannelMode.ReliableOrdered => new ReliableOrderedEngine(),
         // Wave C2: GroupStreamEngine, ReliableLatestEngine, BulkEngine.
         ChannelMode.ReliableUnordered => new PlaceholderEngine(mode),
         ChannelMode.ReliableLatest => new PlaceholderEngine(mode),

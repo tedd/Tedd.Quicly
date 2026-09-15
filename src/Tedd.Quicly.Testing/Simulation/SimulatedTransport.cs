@@ -23,8 +23,10 @@ namespace Tedd.Quicly.Testing.Simulation;
 /// <para>
 /// Streams: data is cut into packets of the current maximum datagram payload, reassembled in order at the receiver
 /// and delivered as one segment per packet; a send completes one one-way delay after all of its bytes (and every
-/// byte before them) reached the peer's transport. Flow control is not modelled; receive back-pressure is
-/// <see cref="ReceiveResult.PendingAfter"/>. Consuming fewer bytes than delivered without <c>Pending</c> keeps the
+/// byte before them) reached the peer's transport. Flow control is modelled only with
+/// <see cref="LinkOptions.StreamReceiveWindowBytes"/> (per stream: the sender holds back packets beyond the receiver's consumed
+/// offset plus the window, and the receiver raises the limit as its application consumes); otherwise the only receive
+/// back-pressure is <see cref="ReceiveResult.PendingAfter"/>. Consuming fewer bytes than delivered without <c>Pending</c> keeps the
 /// remainder, which is delivered again together with the next data to arrive; once the FIN has been indicated no more
 /// data can arrive, so the remainder is indicated again at the next advance step if the call consumed at least one
 /// byte (consuming nothing after the FIN without <c>Pending</c> stalls the stream: use <c>PendingAfter</c>).

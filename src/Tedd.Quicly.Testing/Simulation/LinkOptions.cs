@@ -61,6 +61,14 @@ public sealed class LinkOptions
     /// </summary>
     public bool DatagramSendStateReporting { get; set; } = true;
 
+    /// <summary>
+    /// Stream flow control (QUIC's MAX_STREAM_DATA), per stream: how many bytes beyond what its application consumed a
+    /// receiver lets the sender have. The sender holds back packets beyond the limit (a send completes only when all of its
+    /// bytes were delivered, so back-pressure reaches the sender); the receiver raises the limit to its consumed offset plus
+    /// the window once it consumed a quarter of the window, one one-way delay later. 0 (the default) means unlimited.
+    /// </summary>
+    public int StreamReceiveWindowBytes { get; set; }
+
     /// <summary>Unidirectional streams each endpoint initially lets its peer have open. Default 0 (MsQuic before admission).</summary>
     public ushort PeerUnidiStreams { get; set; }
 
@@ -102,6 +110,7 @@ public sealed class LinkOptions
         ValidatePercent(ReorderPercent, nameof(ReorderPercent));
         ArgumentOutOfRangeException.ThrowIfNegative(BandwidthBitsPerSecond);
         ArgumentOutOfRangeException.ThrowIfNegative(MaxQueueBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(StreamReceiveWindowBytes);
         ValidatePayload(MaxDatagramPayload);
         if (DisconnectAtMicros is < 0)
             throw new ArgumentOutOfRangeException(nameof(DisconnectAtMicros), DisconnectAtMicros, "Must be non-negative.");

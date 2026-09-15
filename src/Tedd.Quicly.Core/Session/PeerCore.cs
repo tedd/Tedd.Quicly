@@ -47,6 +47,16 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary><see cref="ITransport.OpenStream"/> context of the control stream; engines must use other values.</summary>
     public const ulong ControlStreamContext = 1UL << 63;
 
+    /// <summary>
+    /// Tag bit of the <see cref="ITransport.OpenStream"/> context of a stream an engine opened
+    /// (<see cref="MakeEngineStreamContext"/>): the peer routes its <see cref="ITransportSink.OnStreamStarted"/> to the
+    /// engine of the encoded mode (<see cref="ChannelEngine.OnStreamStarted"/>).
+    /// </summary>
+    public const ulong EngineStreamContextTag = 1UL << 62;
+
+    /// <summary>Mask of the stream serial carried in an engine stream context (24 bits; it wraps).</summary>
+    public const uint EngineStreamSerialMask = 0xFF_FFFF;
+
     private readonly SlabAllocator _allocator;
     private readonly bool _ownsAllocator;
     private readonly int[] _indexById;
@@ -79,6 +89,9 @@ internal sealed unsafe class PeerCore : IDisposable
     private bool _disposed;
     private readonly int[] _scheduleOrder;
     private readonly CompletionEntry[] _localCompletions;
+    private readonly NativeArray<long> _stamps;
+    private readonly bool _atomicSendBudget;
+    private long _stamp;
     private int _localHead;
     private int _localTail;
     private int _localCount;
@@ -122,6 +135,8 @@ internal sealed unsafe class PeerCore : IDisposable
         int capacity = Entries.Capacity;
         Segments = new SegmentArena(options.SegmentArenaCapacity);
         _tokens = new NativeArray<SendToken>(capacity);
+        _stamps = new NativeArray<long>(capacity);
+        _atomicSendBudget = options.ThreadSafeSend;
         _userContexts = new NativeArray<ulong>(capacity);
         _entryOfToken = new int[capacity];
         Array.Fill(_entryOfToken, -1);
@@ -151,6 +166,56 @@ internal sealed unsafe class PeerCore : IDisposable
     /// ascending id among channels of equal priority. Precomputed at construction.
     /// </summary>
     public ReadOnlySpan<int> ScheduleOrder => _scheduleOrder;
+
+    /// <summary>The admission stamp of the most recently admitted message (0 before the first; game thread).</summary>
+    public long LastAdmissionStamp => _stamp;
+
+    /// <summary>
+    /// Gives an admitted entry the next peer-wide admission number (game thread, at commit). Engines keep every channel
+    /// queue in admission order, so the stamp of a queue's head is the oldest of the queue; <see cref="QuiclyPeer.FlushAsync"/>
+    /// waits until no queue holds a stamp at or below its mark (<see cref="ChannelEngine.OldestQueuedStamp"/>).
+    /// </summary>
+    /// <param name="slot">The entry.</param>
+    public void StampAdmission(int slot) => _stamps[slot] = ++_stamp;
+
+    /// <summary>The admission stamp of an entry (<see cref="StampAdmission"/>; game thread).</summary>
+    /// <param name="slot">The entry.</param>
+    /// <returns>The stamp.</returns>
+    public long GetAdmissionStamp(int slot) => _stamps[slot];
+
+    /// <summary>
+    /// The <see cref="ITransport.OpenStream"/> context of a stream an engine opens: <see cref="EngineStreamContextTag"/>, the
+    /// mode (bits 56-61), the stream serial (bits 32-55) and the dense channel index (bits 0-31). Never equal to
+    /// <see cref="ControlStreamContext"/>.
+    /// </summary>
+    /// <param name="mode">The engine's mode.</param>
+    /// <param name="channelIndex">Dense channel index.</param>
+    /// <param name="serial">The engine's serial of the stream (masked to <see cref="EngineStreamSerialMask"/>).</param>
+    /// <returns>The context.</returns>
+    public static ulong MakeEngineStreamContext(ChannelMode mode, int channelIndex, uint serial) =>
+        EngineStreamContextTag | ((ulong)((byte)mode & 0x3F) << 56) | ((ulong)(serial & EngineStreamSerialMask) << 32) | (uint)channelIndex;
+
+    /// <summary>Decodes a context made by <see cref="MakeEngineStreamContext"/> (any thread).</summary>
+    /// <param name="context">A stream context.</param>
+    /// <param name="mode">The engine's mode.</param>
+    /// <param name="channelIndex">Dense channel index.</param>
+    /// <param name="serial">The stream serial.</param>
+    /// <returns><see langword="false"/> for any other context (the control stream, a test engine's own values).</returns>
+    public static bool TryDecodeEngineStreamContext(ulong context, out ChannelMode mode, out int channelIndex, out uint serial)
+    {
+        if ((context & (ControlStreamContext | EngineStreamContextTag)) != EngineStreamContextTag)
+        {
+            mode = default;
+            channelIndex = -1;
+            serial = 0;
+            return false;
+        }
+
+        mode = (ChannelMode)(byte)((context >> 56) & 0x3F);
+        channelIndex = (int)(uint)context;
+        serial = (uint)(context >> 32) & EngineStreamSerialMask;
+        return true;
+    }
 
     /// <summary>Completions queued with <see cref="QueueLocalCompletion"/> and not yet routed.</summary>
     public int LocalCompletionsQueued => _localCount;
@@ -339,11 +404,14 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>The transport reported <c>OnClosed</c>; no further callback arrives.</summary>
     public bool IsTransportClosed => _transportClosed;
 
-    /// <summary>Send lease bytes held now (game thread).</summary>
-    public long SendBytesOutstanding => _sendBytes;
+    /// <summary>Send lease bytes held now (game thread; any thread with <see cref="PeerOptions.ThreadSafeSend"/>).</summary>
+    public long SendBytesOutstanding => Volatile.Read(ref _sendBytes);
 
     /// <summary>Receive lease bytes held now (any thread).</summary>
     public long ReceiveBytesOutstanding => Volatile.Read(ref _receiveBytes);
+
+    /// <summary>The receive budget (<see cref="PeerOptions.ReceiveBudgetBytes"/>).</summary>
+    public long ReceiveBudgetBytes => _receiveBudget;
 
     // ------------------------------------------------------------------ construction
 
@@ -557,7 +625,10 @@ internal sealed unsafe class PeerCore : IDisposable
 
     // ------------------------------------------------------------------ leases
 
-    /// <summary>Rents a send lease of at least <paramref name="length"/> bytes within the send budget (game thread).</summary>
+    /// <summary>
+    /// Rents a send lease of at least <paramref name="length"/> bytes within the send budget (game thread; any thread when
+    /// <see cref="PeerOptions.ThreadSafeSend"/> is on, which makes the budget accounting atomic).
+    /// </summary>
     /// <param name="length">Bytes needed.</param>
     /// <param name="lease">The lease, or empty.</param>
     /// <returns><see langword="false"/> when the budget or the pool is exhausted.</returns>
@@ -566,6 +637,19 @@ internal sealed unsafe class PeerCore : IDisposable
         if (!_allocator.TryRent(length, out lease))
         {
             return false;
+        }
+
+        if (_atomicSendBudget)
+        {
+            if (Interlocked.Add(ref _sendBytes, lease.Length) > _sendBudget)
+            {
+                Interlocked.Add(ref _sendBytes, -lease.Length);
+                _allocator.Return(in lease);
+                lease = BufferLease.Empty;
+                return false;
+            }
+
+            return true;
         }
 
         if (_sendBytes + lease.Length > _sendBudget)
@@ -579,7 +663,7 @@ internal sealed unsafe class PeerCore : IDisposable
         return true;
     }
 
-    /// <summary>Returns a send lease (game thread). Empty leases are ignored.</summary>
+    /// <summary>Returns a send lease (the threads of <see cref="TryRentSend"/>). Empty leases are ignored.</summary>
     /// <param name="lease">The lease.</param>
     public void ReturnSend(in BufferLease lease)
     {
@@ -588,7 +672,15 @@ internal sealed unsafe class PeerCore : IDisposable
             return;
         }
 
-        _sendBytes -= lease.Length;
+        if (_atomicSendBudget)
+        {
+            Interlocked.Add(ref _sendBytes, -lease.Length);
+        }
+        else
+        {
+            _sendBytes -= lease.Length;
+        }
+
         _allocator.Return(in lease);
     }
 
@@ -732,6 +824,7 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <param name="id">The stream.</param>
     public void NotePendedStream(TransportStreamId id)
     {
+        Counters.StreamReceivePends++;
         if (!PendedStreams.TryEnqueue(in id))
         {
             // Sized to the peer's stream allowance + 2: a stream can pend only once until resumed.
@@ -1199,6 +1292,7 @@ internal sealed unsafe class PeerCore : IDisposable
         Entries.Dispose();
         Segments.Dispose();
         _tokens.Dispose();
+        _stamps.Dispose();
         _userContexts.Dispose();
         _sendCounters.Dispose();
         _recvCounters.Dispose();

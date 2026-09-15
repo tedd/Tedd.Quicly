@@ -909,9 +909,20 @@ public sealed unsafe partial class QuiclyPeer
 
     private void HandleStreamStarted(TransportStreamId id, ulong context, TransportStatus status)
     {
-        if (context == PeerCore.ControlStreamContext && status != TransportStatus.Success && !_ignoreIncoming)
+        if (context == PeerCore.ControlStreamContext)
         {
-            RequestLocalClose(QuiclyErrorCode.InternalError);
+            if (status != TransportStatus.Success && !_ignoreIncoming)
+            {
+                RequestLocalClose(QuiclyErrorCode.InternalError);
+            }
+
+            return;
+        }
+
+        // A stream an engine opened: its start (or refusal by the peer's stream limit) goes to the engine of the context's mode.
+        if (PeerCore.TryDecodeEngineStreamContext(context, out ChannelMode mode, out _, out _) && (int)mode < ChannelEngines.ModeCount)
+        {
+            _core.GetEngine(mode)?.OnStreamStarted(id, context, status);
         }
     }
 

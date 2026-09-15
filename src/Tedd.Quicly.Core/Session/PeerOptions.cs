@@ -47,8 +47,16 @@ public sealed class PeerOptions
     public CompletionMode CompletionMode { get; set; } = CompletionMode.PollOnly;
 
     /// <summary>
-    /// Allow <c>Send*</c> from threads other than the game thread (a multi-producer front drained at Flush/Poll).
-    /// Reserved: the multi-producer front arrives with the delivery engines; until then sends must come from the game thread.
+    /// Allow <c>SendCopy</c>/<c>SendOwned</c>/<c>SendPinned</c>/<c>SendBorrowed</c>/<c>SendGather</c>/<c>SendAsync</c> and
+    /// <c>RentBuffer</c>/<c>ReturnBuffer</c> from threads other than the game thread (ARCHITECTURE.md §3). The game thread is
+    /// the thread that last entered <c>Poll</c> or <c>Flush</c> (before the first call: the thread that created the peer);
+    /// its sends are admitted directly. A send from any other thread copies the payload into a send lease (an owned lease
+    /// moves as it is), queues a 64-byte request in a lock-free multi-producer ring of <see cref="SendTableCapacity"/> slots
+    /// and answers <c>Admitted</c> without a token (<c>QueueFull</c> when the ring is full; tracked sends answer
+    /// <c>NotSupported</c> because tokens belong to the game thread). The game thread admits the requests, oldest first, at
+    /// the start of its next <c>Poll</c> or <c>Flush</c>; <c>Immediate</c> from another thread means "at the next Poll or
+    /// Flush". Requests of one thread keep their order; there is no order between threads. The send budget is then kept with
+    /// atomic operations. Off by default: all other members stay game-thread only.
     /// </summary>
     public bool ThreadSafeSend { get; set; }
 

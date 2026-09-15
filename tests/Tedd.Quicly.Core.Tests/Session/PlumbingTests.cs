@@ -502,10 +502,12 @@ public class SendPlumbingTests
         using SessionHarness h = new(table: TestTables.AllModes);
         byte[] data = [1];
 
-        // Channels 2 and 3 (the unreliable modes) have their engines; 4 … 7 are placeholders until step 3 and wave C2.
+        // Channels 2 … 4 (the unreliable modes and ReliableOrdered) have their engines; 5 … 7 are placeholders until wave C2.
         Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2, 1), data).Status);
         Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(3, 1), data).Status);
-        for (ushort channel = 4; channel <= 7; channel++)
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(4, 1), data).Status);
+        Assert.Equal(SendStatus.Admitted, (await h.Client.SendAsync(new SendHeader(4, 1), data)).Status);
+        for (ushort channel = 5; channel <= 7; channel++)
         {
             Assert.Equal(SendStatus.NotSupported, h.Client.SendCopy(new SendHeader(channel, 1), data).Status);
             Assert.Equal(SendStatus.NotSupported, h.Client.SendBorrowed(new SendHeader(channel, 1), data).Status);
@@ -775,7 +777,6 @@ public class StreamPlumbingTests
     }
 
     [Theory]
-    [InlineData((byte)4)]
     [InlineData((byte)5)]
     public void Streams_Of_Modes_Without_An_Engine_Are_Reset(byte channel)
     {

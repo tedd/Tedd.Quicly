@@ -1,20 +1,38 @@
 using System.Formats.Asn1;
 using System.Globalization;
 using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Tedd.Quicly.Acme;
 using Tedd.Quicly.Acme.Models;
 
-namespace Tedd.Quicly.Acme.Tests.Fake;
+namespace Tedd.Quicly.Testing.Acme;
 
 /// <summary>
 /// An in-process RFC 8555 server on a loopback HttpListener: directory, nonces, accounts (JWS verification for ES256 and
-/// RS256, single-use nonces, EAB), orders, authorizations, challenges (validated through hooks), finalization (CSR parsed
-/// and signed by <see cref="TestCa"/>), certificate download with an alternate chain, revocation, and controllable failures.
+/// RS256, single-use nonces, EAB), orders, authorizations, challenges, finalization (CSR parsed and signed by
+/// <see cref="TestCa"/>), certificate download with an alternate chain, revocation, ARI, and controllable failures.
 /// </summary>
+/// <remarks>
+/// <para>For tests only: nothing here is hardened, and no production project may reference <c>Tedd.Quicly.Testing</c>.</para>
+/// <para>Challenge validation has two modes per type. The callback mode (<see cref="Http01Lookup"/>,
+/// <see cref="TlsAlpnLookup"/>) asks a delegate what the responder would serve. The real mode validates over the network
+/// like a public CA: <c>http-01</c> performs <c>GET http://{<see cref="Http01ValidationHost"/>}:{<see cref="Http01ValidationPort"/>}/.well-known/acme-challenge/{token}</c>
+/// with <c>Host</c> set to the identifier, follows no redirects, and compares the body with the key authorization;
+/// <c>tls-alpn-01</c> connects to <see cref="TlsAlpnValidationHost"/>:<see cref="TlsAlpnValidationPort"/>, handshakes
+/// TLS with SNI set to the identifier (the <c>in-addr.arpa</c> / <c>ip6.arpa</c> name for IP identifiers, RFC 8738)
+/// and ALPN <c>acme-tls/1</c>, and checks the presented certificate: a single subjectAltName equal to the identifier
+/// and a critical <c>acmeIdentifier</c> extension (<c>1.3.6.1.5.5.7.1.31</c>) holding SHA-256(keyAuthorization).
+/// When a callback is set it takes precedence; a certificate returned by <see cref="TlsAlpnLookup"/> is checked by the
+/// same rules, and a malformed one fails the validation with a problem document. <c>dns-01</c> always queries the injected <see cref="DnsTxtLookup"/>
+/// (for example <see cref="InMemoryDns01Provider.Lookup"/>); real DNS is out of scope. Every validation is recorded in
+/// <see cref="ValidationLog"/>.</para>
+/// </remarks>
 public sealed class FakeAcmeServer : IAsyncDisposable
 {
     private readonly HttpListener _listener = new();
@@ -27,10 +45,12 @@ public sealed class FakeAcmeServer : IAsyncDisposable
     private readonly Dictionary<string, ChallengeRecord> _challenges = new(StringComparer.Ordinal);
     private readonly Dictionary<string, CertRecord> _certs = new(StringComparer.Ordinal);
     private readonly HashSet<string> _revoked = new(StringComparer.Ordinal);
-    private readonly HttpClient _validationHttp = new();
+    // Like a CA's validation client: no proxy, no redirects (a redirect away from the challenge path is a failure here).
+    private readonly HttpClient _validationHttp = new(new SocketsHttpHandler { AllowAutoRedirect = false, UseProxy = false });
     private int _nextId;
     private Task? _loop;
 
+    /// <summary>Creates the CA and binds its loopback listener to a free port; call <see cref="Start"/> to begin answering.</summary>
     public FakeAcmeServer()
     {
         // The listener is started here (not in Start) so a port race with a parallel test class is resolved before the URLs are handed out.
@@ -41,22 +61,30 @@ public sealed class FakeAcmeServer : IAsyncDisposable
         AlternateCa = new TestCa("Fake Alternate Root CA");
     }
 
+    /// <summary>Base URL of the CA (<c>http://127.0.0.1:{port}/</c>).</summary>
     public Uri BaseUri { get; }
 
+    /// <summary>The ACME directory URL to hand to clients.</summary>
     public Uri DirectoryUrl { get; }
 
+    /// <summary>The root that signs the default chain.</summary>
     public TestCa Ca { get; }
 
+    /// <summary>The root of the alternate chain (<c>Link: rel="alternate"</c>).</summary>
     public TestCa AlternateCa { get; }
 
     // ---- configuration -------------------------------------------------------------------------------------------
 
+    /// <summary>Require External Account Binding on newAccount, verified against <see cref="EabKid"/> and <see cref="EabHmacKey"/>.</summary>
     public bool RequireEab { get; set; }
 
+    /// <summary>The EAB key id the CA accepts.</summary>
     public string EabKid { get; set; } = "eab-kid-1";
 
+    /// <summary>The EAB HMAC key the CA verifies with (random per instance).</summary>
     public byte[] EabHmacKey { get; set; }
 
+    /// <summary><see cref="EabHmacKey"/> in base64url, the way a CA dashboard hands it out.</summary>
     public string EabHmacKeyBase64Url => System.Buffers.Text.Base64Url.EncodeToString(EabHmacKey);
 
     /// <summary>Respond with badNonce to this many POSTs (each still consumes the nonce and issues a fresh one).</summary>
@@ -80,23 +108,31 @@ public sealed class FakeAcmeServer : IAsyncDisposable
     /// <summary>Force every challenge validation to fail.</summary>
     public bool FailValidation { get; set; }
 
+    /// <summary>Answer newNonce without a <c>Replay-Nonce</c> header.</summary>
     public bool OmitNonceOnNewNonce { get; set; }
 
+    /// <summary>Answer newAccount without a <c>Location</c> header.</summary>
     public bool OmitLocationOnNewAccount { get; set; }
 
+    /// <summary>Answer newOrder without a <c>Location</c> header.</summary>
     public bool OmitLocationOnNewOrder { get; set; }
 
     /// <summary>Finalize responses carry no Location header (RFC 8555 does not require one).</summary>
     public bool OmitLocationOnFinalize { get; set; }
 
+    /// <summary>Leave <c>revokeCert</c> out of the directory.</summary>
     public bool OmitRevokeCertFromDirectory { get; set; }
 
+    /// <summary>Leave the <c>certificate</c> URL out of valid orders.</summary>
     public bool OmitCertificateUrlOnValidOrder { get; set; }
 
+    /// <summary>Serve an empty certificate chain.</summary>
     public bool ReturnEmptyPemChain { get; set; }
 
+    /// <summary>Serve a certificate chain whose PEM does not decode to a certificate.</summary>
     public bool ReturnInvalidPem { get; set; }
 
+    /// <summary>Do not advertise the alternate chain.</summary>
     public bool OmitAlternateChainLink { get; set; }
 
     /// <summary>Additional raw Link header value appended to certificate responses (to exercise the client's parser).</summary>
@@ -172,34 +208,84 @@ public sealed class FakeAcmeServer : IAsyncDisposable
     /// <summary>Alternative direct http-01 lookup: (domain, token) → key authorization.</summary>
     public Func<string, string, string?>? Http01Lookup { get; set; }
 
+    /// <summary><c>dns-01</c> validation: returns the TXT values of a record name, for example <see cref="InMemoryDns01Provider.Lookup"/>. Real DNS is never queried.</summary>
     public Func<string, IReadOnlyList<string>>? DnsTxtLookup { get; set; }
 
+    /// <summary>Callback <c>tls-alpn-01</c> validation: the certificate the responder would present for a domain. Takes precedence over <see cref="TlsAlpnValidationHost"/>.</summary>
     public Func<string, X509Certificate2?>? TlsAlpnLookup { get; set; }
+
+    /// <summary>
+    /// Real <c>http-01</c> validation: the host (name or IP literal) the CA connects to, standing in for the identifier's
+    /// address record. <see langword="null"/> (default) disables the real mode. Ignored while <see cref="Http01Lookup"/> is set.
+    /// </summary>
+    public string? Http01ValidationHost { get; set; }
+
+    /// <summary>Port for real <c>http-01</c> validation. Default 80 (tests pass the port the responder actually bound).</summary>
+    public int Http01ValidationPort { get; set; } = 80;
+
+    /// <summary>
+    /// Real <c>tls-alpn-01</c> validation: the host (name or IP literal) the CA connects to. <see langword="null"/> (default)
+    /// disables the real mode. Ignored while <see cref="TlsAlpnLookup"/> is set.
+    /// </summary>
+    public string? TlsAlpnValidationHost { get; set; }
+
+    /// <summary>Port for real <c>tls-alpn-01</c> validation. Default 443 (tests pass the port the responder actually bound).</summary>
+    public int TlsAlpnValidationPort { get; set; } = 443;
+
+    /// <summary>Bound on one real validation (connect, handshake, request and body). Default 10 s.</summary>
+    public TimeSpan ValidationTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>Every challenge validation performed, in order (not those short-circuited by <see cref="FailValidation"/>).</summary>
+    public List<FakeAcmeValidation> ValidationLog { get; } = [];
+
+    /// <summary>Validity of issued certificates when the order requests no <c>notAfter</c>. Default 90 days.</summary>
+    public TimeSpan CertificateLifetime { get; set; } = TimeSpan.FromDays(90);
+
+    /// <summary>How far <c>notBefore</c> is backdated when the order requests none. Default 5 minutes.</summary>
+    public TimeSpan CertificateBackdate { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>Answer this many requests with a bare <c>503 Service Unavailable</c> (no problem document), as during a CA outage.</summary>
+    public int UnavailableRequestsRemaining { get; set; }
+
+    /// <summary>Number of certificates issued (finalized orders).</summary>
+    public int IssuedCount
+    {
+        get { lock (_lock) { return _certs.Count; } }
+    }
 
     // ---- observability -------------------------------------------------------------------------------------------
 
+    /// <summary>Every request as <c>METHOD /path</c>, in arrival order.</summary>
     public List<string> RequestLog { get; } = [];
 
+    /// <summary><c>User-Agent</c> of the last request.</summary>
     public string? LastUserAgent { get; private set; }
 
+    /// <summary><c>Accept</c> header of the last request.</summary>
     public string? LastAccept { get; private set; }
 
+    /// <summary><c>Content-Type</c> of the last request.</summary>
     public string? LastContentType { get; private set; }
 
+    /// <summary>Number of newNonce requests.</summary>
     public int NewNonceRequests { get; private set; }
 
+    /// <summary>The key authorization of every successful validation.</summary>
     public List<string> ValidatedKeyAuthorizations { get; } = [];
 
+    /// <summary>Number of accounts created.</summary>
     public int AccountCount
     {
         get { lock (_lock) { return _accounts.Count; } }
     }
 
+    /// <summary>Number of certificates revoked.</summary>
     public int RevokedCount
     {
         get { lock (_lock) { return _revoked.Count; } }
     }
 
+    /// <summary>The status of the account at <paramref name="accountUrl"/>, or <see langword="null"/> when there is none.</summary>
     public string? GetAccountStatus(Uri accountUrl)
     {
         lock (_lock)
@@ -216,6 +302,7 @@ public sealed class FakeAcmeServer : IAsyncDisposable
         }
     }
 
+    /// <summary>The contacts of the account at <paramref name="accountUrl"/>, or <see langword="null"/> when there is none.</summary>
     public IReadOnlyList<string>? GetAccountContacts(Uri accountUrl)
     {
         lock (_lock)
@@ -232,11 +319,13 @@ public sealed class FakeAcmeServer : IAsyncDisposable
         }
     }
 
+    /// <summary>Starts answering requests.</summary>
     public void Start()
     {
         _loop = Task.Run(LoopAsync);
     }
 
+    /// <summary>Stops the listener and releases the CA keys.</summary>
     public async ValueTask DisposeAsync()
     {
         _cts.Cancel();
@@ -313,6 +402,7 @@ public sealed class FakeAcmeServer : IAsyncDisposable
 
         (int Status, string? ContentType, string Body)? overrideResponse = null;
         bool rateLimited = false;
+        bool unavailable = false;
         lock (_lock)
         {
             RequestLog.Add(req.HttpMethod + " " + path);
@@ -325,11 +415,22 @@ public sealed class FakeAcmeServer : IAsyncDisposable
                 overrideResponse = _overrides[overrideIndex].Response;
                 _overrides.RemoveAt(overrideIndex);
             }
+            else if (UnavailableRequestsRemaining > 0)
+            {
+                UnavailableRequestsRemaining--;
+                unavailable = true;
+            }
             else if (RateLimitRemaining > 0)
             {
                 RateLimitRemaining--;
                 rateLimited = true;
             }
+        }
+
+        if (unavailable)
+        {
+            await WriteRawAsync(res, 503, "text/html", Encoding.ASCII.GetBytes("<html><body>503 Service Unavailable</body></html>"), addNonce: false);
+            return;
         }
 
         if (overrideResponse is { } ov)
@@ -521,10 +622,10 @@ public sealed class FakeAcmeServer : IAsyncDisposable
                 return new Problem(400, AcmeErrorTypes.Malformed, "jwk is only allowed for newAccount and revokeCert.");
             }
 
-            Jwk? parsed = JsonSerializer.Deserialize(jwk.ToJsonString(), AcmeJsonContext.Default.Jwk);
+            Jwk? parsed = ParseJwk(jwk);
             try
             {
-                result.Key = AcmeAccountKey.FromJwk(parsed!);
+                result.Key = AcmeAccountKey.FromJwk(parsed ?? throw new ArgumentException("jwk has no kty."));
             }
             catch (ArgumentException e)
             {
@@ -705,7 +806,7 @@ public sealed class FakeAcmeServer : IAsyncDisposable
             return new Problem(401, AcmeErrorTypes.Unauthorized, "EAB HMAC verification failed.");
         }
 
-        Jwk? innerJwk = JsonSerializer.Deserialize(System.Buffers.Text.Base64Url.DecodeFromChars(payloadB64), AcmeJsonContext.Default.Jwk);
+        Jwk? innerJwk = ParseJwk(JsonNode.Parse(System.Buffers.Text.Base64Url.DecodeFromChars(payloadB64)) as JsonObject);
         using AcmeAccountKey innerKey = AcmeAccountKey.FromJwk(innerJwk!);
         return innerKey.Thumbprint == outer.Thumbprint ? null : new Problem(400, AcmeErrorTypes.Malformed, "EAB payload JWK does not match the account key.");
     }
@@ -755,11 +856,11 @@ public sealed class FakeAcmeServer : IAsyncDisposable
                 string value = n["value"]!.GetValue<string>();
                 if (type is not ("dns" or "ip"))
                 {
-                    subproblems.Add(ProblemNode(AcmeErrorTypes.UnsupportedIdentifier, "Unsupported type " + type, new AcmeIdentifier(type, value)));
+                    subproblems.Add((JsonNode)ProblemNode(AcmeErrorTypes.UnsupportedIdentifier, "Unsupported type " + type, new AcmeIdentifier(type, value)));
                 }
                 else if (RejectedIdentifiers.Contains(value))
                 {
-                    subproblems.Add(ProblemNode(AcmeErrorTypes.RejectedIdentifier, "Policy forbids " + value, new AcmeIdentifier(type, value)));
+                    subproblems.Add((JsonNode)ProblemNode(AcmeErrorTypes.RejectedIdentifier, "Policy forbids " + value, new AcmeIdentifier(type, value)));
                 }
 
                 identifiers.Add(new AcmeIdentifier(type, value));
@@ -989,66 +1090,256 @@ public sealed class FakeAcmeServer : IAsyncDisposable
         }
     }
 
+    private const string AcmeTls1 = "acme-tls/1";
+
+    private const string AcmeIdentifierOid = "1.3.6.1.5.5.7.1.31";
+
+    private const int MaxHttp01BodyBytes = 64 * 1024;
+
     private async Task<string?> ValidateAsync(ChallengeRecord chall, string keyAuth)
     {
-        string domain = chall.Authz.Identifier.Value;
-        switch (chall.Type)
+        AcmeIdentifier identifier = chall.Authz.Identifier;
+        string? failure = chall.Type switch
         {
-            case AcmeChallengeTypes.Http01:
+            AcmeChallengeTypes.Http01 => await ValidateHttp01Async(identifier, chall.Token, keyAuth),
+            AcmeChallengeTypes.Dns01 => ValidateDns01(identifier.Value, keyAuth),
+            _ => await ValidateTlsAlpn01Async(identifier, keyAuth),
+        };
+
+        lock (_lock)
+        {
+            ValidationLog.Add(new FakeAcmeValidation(chall.Type, identifier, failure));
+        }
+
+        return failure;
+    }
+
+    private async Task<string?> ValidateHttp01Async(AcmeIdentifier identifier, string token, string keyAuth)
+    {
+        string domain = identifier.Value;
+        string? served = null;
+        if (Http01Lookup is not null)
+        {
+            served = Http01Lookup(domain, token);
+        }
+        else if (Http01ValidationHost is { } host)
+        {
+            return await FetchHttp01Async(identifier, host, Http01ValidationPort, token, keyAuth);
+        }
+        else if (Http01BaseUri is not null)
+        {
+            using HttpRequestMessage req = new(HttpMethod.Get, new Uri(Http01BaseUri, "/.well-known/acme-challenge/" + token));
+            req.Headers.Host = domain;
+            using HttpResponseMessage resp = await _validationHttp.SendAsync(req);
+            if (resp.IsSuccessStatusCode)
             {
-                string? served = null;
-                if (Http01Lookup is not null)
-                {
-                    served = Http01Lookup(domain, chall.Token);
-                }
-                else if (Http01BaseUri is not null)
-                {
-                    using HttpRequestMessage req = new(HttpMethod.Get, new Uri(Http01BaseUri, "/.well-known/acme-challenge/" + chall.Token));
-                    req.Headers.Host = domain;
-                    using HttpResponseMessage resp = await _validationHttp.SendAsync(req);
-                    if (resp.IsSuccessStatusCode)
-                    {
-                        served = (await resp.Content.ReadAsStringAsync()).Trim();
-                    }
-                }
-
-                return served is null ? "Fetching http://" + domain + "/.well-known/acme-challenge/" + chall.Token + " failed."
-                    : served != keyAuth ? "Key authorization mismatch."
-                    : null;
-            }
-
-            case AcmeChallengeTypes.Dns01:
-            {
-                string name = "_acme-challenge." + domain;
-                string expected = System.Buffers.Text.Base64Url.EncodeToString(SHA256.HashData(Encoding.ASCII.GetBytes(keyAuth)));
-                IReadOnlyList<string> records = DnsTxtLookup?.Invoke(name) ?? [];
-                return records.Contains(expected) ? null : "No TXT record " + name + " with the expected value.";
-            }
-
-            default:
-            {
-                X509Certificate2? cert = TlsAlpnLookup?.Invoke(domain);
-                if (cert is null)
-                {
-                    return "No acme-tls/1 certificate presented for " + domain + ".";
-                }
-
-                if (!cert.MatchesHostname(domain))
-                {
-                    return "Certificate SAN does not cover " + domain + ".";
-                }
-
-                X509Extension? ext = cert.Extensions["1.3.6.1.5.5.7.1.31"];
-                if (ext is null || !ext.Critical)
-                {
-                    return "acmeIdentifier extension missing or not critical.";
-                }
-
-                byte[] value = new AsnReader(ext.RawData, AsnEncodingRules.DER).ReadOctetString();
-                byte[] expected = SHA256.HashData(Encoding.ASCII.GetBytes(keyAuth));
-                return value.AsSpan().SequenceEqual(expected) ? null : "acmeIdentifier hash mismatch.";
+                served = (await resp.Content.ReadAsStringAsync()).Trim();
             }
         }
+
+        return served is null ? "Fetching http://" + domain + "/.well-known/acme-challenge/" + token + " failed."
+            : served != keyAuth ? "Key authorization mismatch."
+            : null;
+    }
+
+    /// <summary>The real http-01 check: GET the challenge path from host:port with the identifier as Host, no redirects.</summary>
+    private async Task<string?> FetchHttp01Async(AcmeIdentifier identifier, string host, int port, string token, string keyAuth)
+    {
+        Uri uri = new UriBuilder(Uri.UriSchemeHttp, host, port, "/.well-known/acme-challenge/" + token).Uri;
+        string hostHeader = identifier.IsIp && IPAddress.Parse(identifier.Value).AddressFamily == AddressFamily.InterNetworkV6
+            ? "[" + identifier.Value + "]"
+            : identifier.Value;
+        using CancellationTokenSource timeout = new(ValidationTimeout);
+        try
+        {
+            using HttpRequestMessage request = new(HttpMethod.Get, uri);
+            request.Headers.Host = hostHeader;
+            using HttpResponseMessage response = await _validationHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+            if (response.StatusCode != HttpStatusCode.OK)
+            {
+                return "GET " + uri + " (Host: " + hostHeader + ") answered HTTP " + ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture) + ".";
+            }
+
+            byte[] body = await ReadBoundedAsync(response.Content, MaxHttp01BodyBytes, timeout.Token);
+
+            // RFC 8555 §8.3: the body must be the key authorization; like Boulder, trailing whitespace is tolerated.
+            string text = Encoding.ASCII.GetString(body).TrimEnd();
+            return text == keyAuth ? null : "Key authorization mismatch at " + uri + ".";
+        }
+        catch (Exception e)
+        {
+            return "Fetching " + uri + " (Host: " + hostHeader + ") failed: " + e.Message;
+        }
+    }
+
+    private static async Task<byte[]> ReadBoundedAsync(HttpContent content, int limit, CancellationToken cancellationToken)
+    {
+        using Stream stream = await content.ReadAsStreamAsync(cancellationToken);
+        using MemoryStream buffer = new();
+        byte[] chunk = new byte[4096];
+        int read;
+        while ((read = await stream.ReadAsync(chunk, cancellationToken)) > 0)
+        {
+            if (buffer.Length + read > limit)
+            {
+                throw new InvalidDataException("The response body exceeds " + limit.ToString(CultureInfo.InvariantCulture) + " bytes.");
+            }
+
+            buffer.Write(chunk, 0, read);
+        }
+
+        return buffer.ToArray();
+    }
+
+    private string? ValidateDns01(string domain, string keyAuth)
+    {
+        string name = "_acme-challenge." + domain;
+        string expected = System.Buffers.Text.Base64Url.EncodeToString(SHA256.HashData(Encoding.ASCII.GetBytes(keyAuth)));
+        IReadOnlyList<string> records = DnsTxtLookup?.Invoke(name) ?? [];
+        return records.Contains(expected) ? null : "No TXT record " + name + " with the expected value.";
+    }
+
+    private async Task<string?> ValidateTlsAlpn01Async(AcmeIdentifier identifier, string keyAuth)
+    {
+        string domain = identifier.Value;
+        if (TlsAlpnLookup is null && TlsAlpnValidationHost is { } host)
+        {
+            return await HandshakeTlsAlpn01Async(identifier, host, TlsAlpnValidationPort, keyAuth);
+        }
+
+        // The certificate the responder would present is held to the same RFC 8737 rules as one presented over the network:
+        // exactly one subjectAltName, and a malformed acmeIdentifier is a failed validation (a problem document), not a 500.
+        X509Certificate2? cert = TlsAlpnLookup?.Invoke(domain);
+        return cert is null
+            ? "No acme-tls/1 certificate presented for " + domain + "."
+            : CheckTlsAlpnCertificate(cert, identifier, keyAuth);
+    }
+
+    /// <summary>
+    /// The real tls-alpn-01 check (RFC 8737 §3): TLS to host:port with SNI = identifier (reverse-DNS name for IPs, RFC 8738
+    /// §6) offering only ALPN acme-tls/1, then inspect the presented certificate.
+    /// </summary>
+    private async Task<string?> HandshakeTlsAlpn01Async(AcmeIdentifier identifier, string host, int port, string keyAuth)
+    {
+        string serverName = identifier.IsIp ? ReverseDnsName(IPAddress.Parse(identifier.Value)) : identifier.Value;
+        string target = host + ":" + port.ToString(CultureInfo.InvariantCulture);
+        using CancellationTokenSource timeout = new(ValidationTimeout);
+        try
+        {
+            using Socket socket = new(SocketType.Stream, ProtocolType.Tcp);
+            await socket.ConnectAsync(host, port, timeout.Token);
+            using SslStream ssl = new(new NetworkStream(socket, ownsSocket: false), leaveInnerStreamOpen: false);
+            SslClientAuthenticationOptions options = new()
+            {
+                TargetHost = serverName,
+                ApplicationProtocols = [new SslApplicationProtocol(AcmeTls1)],
+
+                // The validation certificate is self-signed by design: RFC 8737 checks its content, not its chain.
+                RemoteCertificateValidationCallback = static (_, _, _, _) => true,
+                CertificateRevocationCheckMode = System.Security.Cryptography.X509Certificates.X509RevocationMode.NoCheck,
+            };
+            await ssl.AuthenticateAsClientAsync(options, timeout.Token);
+            if (ssl.NegotiatedApplicationProtocol != new SslApplicationProtocol(AcmeTls1))
+            {
+                return "TLS server " + target + " did not negotiate acme-tls/1 for SNI " + serverName + ".";
+            }
+
+            if (ssl.RemoteCertificate is not { } remote)
+            {
+                return "TLS server " + target + " presented no certificate for SNI " + serverName + ".";
+            }
+
+            using X509Certificate2 presented = X509CertificateLoader.LoadCertificate(remote.GetRawCertData());
+            return CheckTlsAlpnCertificate(presented, identifier, keyAuth);
+        }
+        catch (Exception e)
+        {
+            return "TLS handshake with " + target + " (SNI " + serverName + ", ALPN acme-tls/1) failed: " + e.Message;
+        }
+    }
+
+    /// <summary>RFC 8737 §3: exactly one subjectAltName (the identifier) and a critical acmeIdentifier = SHA-256(keyAuthorization).</summary>
+    private static string? CheckTlsAlpnCertificate(X509Certificate2 certificate, AcmeIdentifier identifier, string keyAuth)
+    {
+        X509Extension? sanExtension = certificate.Extensions["2.5.29.17"];
+        if (sanExtension is null)
+        {
+            return "The acme-tls/1 certificate has no subjectAltName.";
+        }
+
+        X509SubjectAlternativeNameExtension san = new(sanExtension.RawData, sanExtension.Critical);
+        List<string> dnsNames = [.. san.EnumerateDnsNames()];
+        List<IPAddress> addresses = [.. san.EnumerateIPAddresses()];
+        bool matches = identifier.IsIp
+            ? dnsNames.Count == 0 && addresses.Count == 1 && addresses[0].Equals(IPAddress.Parse(identifier.Value))
+            : addresses.Count == 0 && dnsNames.Count == 1 && string.Equals(dnsNames[0], identifier.Value, StringComparison.OrdinalIgnoreCase);
+        if (!matches)
+        {
+            return "The acme-tls/1 certificate's subjectAltName [" + string.Join(", ", dnsNames.Concat(addresses.Select(a => a.ToString()))) + "] is not exactly " + identifier.Value + ".";
+        }
+
+        X509Extension? ext = certificate.Extensions[AcmeIdentifierOid];
+        if (ext is null || !ext.Critical)
+        {
+            return "acmeIdentifier extension missing or not critical.";
+        }
+
+        byte[] value;
+        try
+        {
+            AsnReader reader = new(ext.RawData, AsnEncodingRules.DER);
+            value = reader.ReadOctetString();
+            reader.ThrowIfNotEmpty();
+        }
+        catch (AsnContentException)
+        {
+            return "acmeIdentifier extension is not a DER OCTET STRING.";
+        }
+
+        byte[] expected = SHA256.HashData(Encoding.ASCII.GetBytes(keyAuth));
+        return value.AsSpan().SequenceEqual(expected) ? null : "acmeIdentifier hash mismatch.";
+    }
+
+    /// <summary>The reverse-DNS name of an address (<c>4.3.2.1.in-addr.arpa</c>, nibble-format <c>ip6.arpa</c>), the SNI a CA sends for IP identifiers (RFC 8738 §6).</summary>
+    public static string ReverseDnsName(IPAddress address)
+    {
+        ArgumentNullException.ThrowIfNull(address);
+        byte[] bytes = address.GetAddressBytes();
+        StringBuilder sb = new();
+        if (address.AddressFamily == AddressFamily.InterNetwork)
+        {
+            for (int i = bytes.Length - 1; i >= 0; i--)
+            {
+                sb.Append(bytes[i].ToString(CultureInfo.InvariantCulture)).Append('.');
+            }
+
+            return sb.Append("in-addr.arpa").ToString();
+        }
+
+        const string hex = "0123456789abcdef";
+        for (int i = bytes.Length - 1; i >= 0; i--)
+        {
+            sb.Append(hex[bytes[i] & 0xF]).Append('.').Append(hex[bytes[i] >> 4]).Append('.');
+        }
+
+        return sb.Append("ip6.arpa").ToString();
+    }
+
+    /// <summary>Reads a public JWK from a JSON object with the public <see cref="Jwk"/> model (the library's JSON context is internal).</summary>
+    private static Jwk? ParseJwk(JsonObject? node)
+    {
+        string? kty = Text(node, "kty");
+        return kty is null ? null : new Jwk
+        {
+            Kty = kty,
+            Crv = Text(node, "crv"),
+            X = Text(node, "x"),
+            Y = Text(node, "y"),
+            E = Text(node, "e"),
+            N = Text(node, "n"),
+        };
+
+        static string? Text(JsonObject? o, string name) => o?[name] is JsonValue v && v.TryGetValue(out string? s) ? s : null;
     }
 
     private (int, JsonNode?, string?, string?, byte[]?, List<string>?, string?) Finalize(JwsResult jws, string id)
@@ -1111,8 +1402,8 @@ public sealed class FakeAcmeServer : IAsyncDisposable
 
             // X.509 validity has second precision: truncate so the stored values match what the certificate carries.
             DateTimeOffset now = Clock();
-            DateTimeOffset notBefore = Truncate(order.NotBefore ?? now.AddMinutes(-5));
-            DateTimeOffset notAfter = Truncate(order.NotAfter ?? now.AddDays(90));
+            DateTimeOffset notBefore = Truncate(order.NotBefore ?? now - CertificateBackdate);
+            DateTimeOffset notAfter = Truncate(order.NotAfter ?? now + CertificateLifetime);
             using X509Certificate2 leaf = Ca.IssueFromCsr(csr, order.Identifiers, notBefore, notAfter);
             string certId = NextId("cert");
             string? ariId = Ca.IncludeAuthorityKeyIdentifier ? AcmeClient.GetAriCertificateId(leaf) : null;
@@ -1516,4 +1807,14 @@ public sealed class FakeAcmeServer : IAsyncDisposable
         public DateTimeOffset NotAfter;
         public bool Replaced;
     }
+}
+
+/// <summary>One challenge validation performed by <see cref="FakeAcmeServer"/>.</summary>
+/// <param name="ChallengeType">The challenge type (<c>http-01</c>, <c>dns-01</c>, <c>tls-alpn-01</c>).</param>
+/// <param name="Identifier">The identifier validated (a wildcard's base domain).</param>
+/// <param name="Error">Why validation failed, or <see langword="null"/> on success.</param>
+public sealed record FakeAcmeValidation(string ChallengeType, AcmeIdentifier Identifier, string? Error)
+{
+    /// <summary>True when the validation succeeded.</summary>
+    public bool Succeeded => Error is null;
 }

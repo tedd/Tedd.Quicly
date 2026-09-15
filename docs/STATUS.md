@@ -17,8 +17,9 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 | **Core total** | | **2 492** | | |
 | Http3 | HTTP/3 frames, QPACK (static + Huffman), HTTP datagrams, WebTransport framing and capsules | 504 | 100 % | [http3](benchmarks/http3.md) |
 | Transport.MsQuic (bindings) | layout-validated MsQuic interop, registration/configuration/listener/connection/stream wrappers | 524 (4 skipped off-Windows) | 98.4 % | — |
-| Testing | deterministic simulated network and transport, recording sink, test certificates | 260 | 99.9 % | [simulation](benchmarks/simulation.md) |
-| Acme | RFC 8555 client for any CA, EAB, http-01 / dns-01 / tls-alpn-01, renewal (ARI aware) | 424 | ~98 % (Unix-only branches) | [acme](benchmarks/acme.md) |
+| Testing | deterministic simulated network and transport, recording sink, test certificates, in-process fake ACME CA | 260 | 99.9 % | [simulation](benchmarks/simulation.md) |
+| Acme | RFC 8555 client for any CA, EAB, http-01 / dns-01 / tls-alpn-01, renewal (ARI aware) | 430 | ~98 % (Unix-only branches) | [acme](benchmarks/acme.md) |
+| Server · Certificates | provisioning from a static certificate, a file or ACME; consumer binding with grace-period disposal; reverse-DNS tls-alpn-01 responder | 308 | 99.5 % | — |
 | Http | hardened HTTP/1.1 server, ACME responders, ClientHello peek for tls-alpn-01, static files | 772 (2 skipped) | 99.9 % | [http](benchmarks/http.md) |
 | Replication | entity ids, bit packing, quantisation, SIMD delta codec, snapshot history, inputs, prediction, interpolation, dedup, tick clock | 474 | 100 % | [replication](benchmarks/replication.md) |
 
@@ -27,8 +28,7 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 | Module | Content |
 |---|---|
 | Core · Session (wave C1) | `QuiclyPeer`, handshake and admission, control stream, ping/clock sync, scheduler and packer, unreliable and ordered engines, Poll/Drain, completions |
-| Transport.MsQuic (transport) | MsQuic-backed `ITransport`, connector, listener with certificate hot swap, transport conformance suite shared with the simulator |
-| Server · Certificates | certificate provisioning (static, file, ACME), consumer binding, reusable fake ACME CA for end-to-end tests |
+| Transport.MsQuic (transport) | MsQuic-backed `ITransport`, connector, listener with certificate hot swap, transport conformance suite shared with the simulator — implemented, in review |
 
 ## Remaining
 

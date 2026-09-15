@@ -166,6 +166,13 @@ public sealed unsafe partial class SimulatedTransport
         {
             if (_state is TransportState.Closing or TransportState.Closed || !TryGetStream(id, out SimStream s))
                 return;
+            if (s.Local && !s.Started)
+            {
+                // Never started: nothing to abort on the wire, so it is released like CloseStream (ITransport.AbortStream contract).
+                s.AppClosed = true;
+                AbortCore(id.Slot, s, 0, StreamAbortDirection.Both);
+                return;
+            }
             AbortCore(id.Slot, s, errorCode, direction);
         }
     }
@@ -510,18 +517,21 @@ public sealed unsafe partial class SimulatedTransport
         if (result.BytesConsumed < 0 || result.BytesConsumed > available)
             throw new InvalidOperationException($"OnStreamReceived consumed {result.BytesConsumed} bytes of {available} delivered.");
         s.Head += result.BytesConsumed;
-        if (result.Pending)
+        if (result.Pending || (result.BytesConsumed == 0 && available > 0))
         {
+            // Back-pressure. Consuming nothing of a non-empty indication counts as PendingAfter(0) (ReceiveResult contract).
             s.Pending = true;
             s.FinIndicated = fin;
             return;
         }
-        if (!fin)
+        if (s.Head < s.Frontier)
+        {
+            // Partial consumption: indicate the rest again at the next step, with whatever arrives meanwhile (ReceiveResult contract).
+            Post(SimEventKind.StreamDeliver, _network.NowMicros, this, slot, generation);
             return;
-        if (s.Head == s.Frontier)
+        }
+        if (fin)
             CompleteReceive(slot, s);
-        else if (result.BytesConsumed > 0)
-            Post(SimEventKind.StreamDeliver, _network.NowMicros, this, slot, generation); // no more data will come: indicate the rest again
     }
 
     private void CompleteReceive(int slot, SimStream s)

@@ -36,6 +36,11 @@ public unsafe interface ITransport : IDisposable
     TransportStatus SendStream(TransportStreamId id, TransportSegment* segments, int count, ulong context, TransportSendFlags flags);
 
     /// <summary>Aborts one or both directions of a stream with an application error code.</summary>
+    /// <remarks>
+    /// Directions the stream does not have are ignored. Aborting a local stream that was never started (no
+    /// <see cref="StartStream"/>, no send with <see cref="TransportSendFlags.Start"/>) releases it like <see cref="CloseStream"/>:
+    /// no callback follows for it and its id is stale afterwards.
+    /// </remarks>
     void AbortStream(TransportStreamId id, ulong errorCode, StreamAbortDirection direction);
 
     /// <summary>Sets the scheduling priority of a stream (0 lowest, 65535 highest, 32767 default).</summary>
@@ -51,6 +56,11 @@ public unsafe interface ITransport : IDisposable
     void ResumeStreamReceive(TransportStreamId id, int bytesConsumed);
 
     /// <summary>Releases the local stream slot once the sink has seen <see cref="ITransportSink.OnStreamShutdownComplete"/>.</summary>
+    /// <remarks>
+    /// May be called from inside a callback (typically from <see cref="ITransportSink.OnStreamShutdownComplete"/>). Called
+    /// earlier, it aborts both directions with error code 0: completions of pending sends are still reported (canceled),
+    /// <see cref="ITransportSink.OnStreamShutdownComplete"/> is not. The id is stale afterwards; stale ids are ignored.
+    /// </remarks>
     void CloseStream(TransportStreamId id);
 
     /// <summary>Raises the number of streams the peer may open (called after admission).</summary>
@@ -109,12 +119,19 @@ public interface ITransportSink
     /// <summary>The transport recommends keeping about <paramref name="bytes"/> outstanding on the stream.</summary>
     void OnIdealSendBufferSize(TransportStreamId id, ulong bytes);
 
-    /// <summary>The peer raised our stream limits.</summary>
+    /// <summary>The peer raised our stream limits (or returned stream credit). Only raised after <see cref="OnConnected"/>.</summary>
     void OnStreamsAvailable(ushort bidirectional, ushort unidirectional);
 
     /// <summary>The peer's address changed (migration / NAT rebind).</summary>
     void OnPeerAddressChanged(in TransportConnectedInfo info);
 
     /// <summary>The connection is closed. No further callbacks follow.</summary>
+    /// <remarks>
+    /// Before it, every accepted send has completed (in-flight stream sends canceled, datagrams in a final state) and every
+    /// stream not yet shut down has reported <see cref="OnStreamShutdownComplete"/>. <paramref name="reason"/> is
+    /// <see cref="TransportCloseReason.Local"/> after <see cref="ITransport.Close"/> (with its error code),
+    /// <see cref="TransportCloseReason.Peer"/> with the peer's application error code, or
+    /// <see cref="TransportCloseReason.Transport"/> with a transport-specific <paramref name="transportStatus"/>.
+    /// </remarks>
     void OnClosed(TransportCloseReason reason, ulong errorCode, int transportStatus);
 }

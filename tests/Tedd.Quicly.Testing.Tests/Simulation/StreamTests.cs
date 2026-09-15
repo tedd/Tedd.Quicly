@@ -330,14 +330,19 @@ public class StreamTests
         RecordedEvent available = h.SinkA.OfKind(RecordedEventKind.StreamsAvailable)[^1];
         Assert.Equal(1, available.Unidirectional);
 
-        // A local unidirectional stream that never started: aborting receive is meaningless, aborting send shuts it down.
+        // A local stream that never started is released by any abort, like CloseStream (ITransport.AbortStream contract):
+        // no callback follows and the id is stale afterwards.
         Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Unidirectional, 5, 0, out TransportStreamId idle));
         h.A.AbortStream(idle, 1, StreamAbortDirection.Receive);
         h.Network.RunUntilIdle(1_000_000);
         Assert.Equal(1, h.SinkA.CountOf(RecordedEventKind.StreamShutdownComplete));
+        Assert.Equal(TransportStatus.InvalidState, h.A.StartStream(idle));
         h.A.AbortStream(idle, 1, StreamAbortDirection.Send);
         h.Network.RunUntilIdle(1_000_000);
-        Assert.Equal(2, h.SinkA.CountOf(RecordedEventKind.StreamShutdownComplete));
+        Assert.Equal(1, h.SinkA.CountOf(RecordedEventKind.StreamShutdownComplete));
+        Assert.Equal(TransportStatus.Success, h.A.OpenStream(StreamKind.Unidirectional, 6, 0, out TransportStreamId reused));
+        Assert.Equal(idle.Slot, reused.Slot);
+        Assert.NotEqual(idle.Generation, reused.Generation);
     }
 
     [Fact]

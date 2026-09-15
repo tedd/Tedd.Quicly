@@ -70,6 +70,15 @@ public interface IMsQuicListenerEvents
     void DosModeChanged(MsQuicListener listener, bool enabled)
     {
     }
+
+    /// <summary>
+    /// <see cref="NewConnection"/> returned a configuration but applying it to <paramref name="connection"/> failed with
+    /// <paramref name="status"/>: MsQuic refuses the connection and no event will ever reach it. Release whatever the
+    /// handler set up for it. Called on the worker thread, inside the NEW_CONNECTION callback. Default: nothing.
+    /// </summary>
+    void ConnectionConfigurationFailed(MsQuicListener listener, MsQuicConnection connection, int status)
+    {
+    }
 }
 
 /// <summary>A QUIC listener bound to a local UDP end point and a set of ALPNs.</summary>
@@ -272,6 +281,15 @@ public sealed unsafe class MsQuicListener : IDisposable
         if (MsQuicStatus.Failed(status))
         {
             connection.Abandon();
+            try
+            {
+                _events.ConnectionConfigurationFailed(this, connection, status);
+            }
+            catch (Exception ex)
+            {
+                LastCallbackException = ex;
+                MsQuicCallbackScope.OnEscapedException(ex);
+            }
             return status;
         }
         // From here on the application owns the connection and must Close it after SHUTDOWN_COMPLETE.

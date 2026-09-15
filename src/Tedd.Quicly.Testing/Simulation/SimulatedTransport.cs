@@ -24,10 +24,11 @@ namespace Tedd.Quicly.Testing.Simulation;
 /// Streams: data is cut into packets of the current maximum datagram payload, reassembled in order at the receiver
 /// and delivered as one segment per packet; a send completes one one-way delay after all of its bytes (and every
 /// byte before them) reached the peer's transport. Flow control is not modelled; receive back-pressure is
-/// <see cref="ReceiveResult.PendingAfter"/>. Consuming fewer bytes than delivered without <c>Pending</c> keeps the
-/// remainder, which is delivered again together with the next data to arrive; once the FIN has been indicated no more
-/// data can arrive, so the remainder is indicated again at the next advance step if the call consumed at least one
-/// byte (consuming nothing after the FIN without <c>Pending</c> stalls the stream: use <c>PendingAfter</c>).
+/// <see cref="ReceiveResult.PendingAfter"/>. Consuming at least one byte but fewer than delivered, without <c>Pending</c>,
+/// keeps the remainder and indicates it again at the next advance step, together with any data that arrived meanwhile;
+/// consuming nothing of a non-empty indication counts as <c>PendingAfter(0)</c> (both as the <see cref="ReceiveResult"/>
+/// contract states, and as MsQuicTransport behaves). Aborting a local stream that was never started releases it like
+/// <see cref="ITransport.CloseStream"/>.
 /// <see cref="ITransportSink.OnStreamAborted"/> reports the direction the peer aborted:
 /// <see cref="StreamAbortDirection.Send"/> (reset: our receive side is dead) or <see cref="StreamAbortDirection.Receive"/>
 /// (stop-sending: our pending sends are canceled). Aborts are causal: the peer keeps delivering data it already holds
@@ -362,6 +363,7 @@ public sealed unsafe partial class SimulatedTransport : ITransport
             DatagramSendState = o.DatagramsEnabled && o.DatagramSendStateReporting,
             MaxDatagramPayload = Link.MaxPayload,
             StreamPriority = true,
+            CancelOnBlocked = true,
         };
     }
 

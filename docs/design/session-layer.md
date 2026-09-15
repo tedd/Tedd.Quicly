@@ -228,8 +228,10 @@ Notes for session-layer tests over the simulator:
 3. Stream flow control is not modelled. Sends complete while the receiver stays Pending, and the receive buffer is unbounded, so
    sender-side back-pressure cannot be exercised here yet.
 4. Stream limits count concurrently open streams. The defaults are 1 bidi and 0 uni until `UpdatePeerStreamLimits`.
-5. A partial consume without `Pending` keeps the remainder. It is indicated again with the next data, or at the next step after the FIN
-   when the call consumed at least one byte. Consuming nothing after the FIN without `Pending` stalls the stream.
+5. A partial consume without `Pending` (at least one byte) keeps the remainder and indicates it again at the next step, together with
+   any data that arrived meanwhile, without waiting for new data (MsQuic re-indicates it right after the callback). Consuming nothing of
+   a non-empty indication without `Pending` counts as `PendingAfter(0)`: the stream waits for `ResumeStreamReceive` (`ReceiveResult`
+   contract, identical on both transports).
 6. Zero-allocation tests need a warm-up that reaches the run's peak of concurrent events, streams and sends; the tables grow to that peak
    and then stay. A stream-per-message workload under jitter needs about 15,000 messages.
 7. `OnIdealSendBufferSize` and `OnPeerAddressChanged` are never raised. `IdealSendBufferSize` and `AppOwnedReceiveBuffers` are false.

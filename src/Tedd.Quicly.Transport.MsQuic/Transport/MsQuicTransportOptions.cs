@@ -137,6 +137,15 @@ public sealed class MsQuicTransportOptions
     /// <summary>Stream scheduling (ROUND_ROBIN: bulk must not starve ordered channels).</summary>
     public QUIC_STREAM_SCHEDULING_SCHEME StreamSchedulingScheme { get; set; } = QUIC_STREAM_SCHEDULING_SCHEME.ROUND_ROBIN;
 
+    /// <summary>
+    /// How a listener hands its certificate to MsQuic (server only). Default <see cref="MsQuicServerCredentialMode.Auto"/>:
+    /// PKCS#12 where MsQuic accepts it, <c>CERTIFICATE_CONTEXT</c> on Windows (the bundled msquic 2.5.10 rejects PKCS#12).
+    /// </summary>
+    public MsQuicServerCredentialMode ServerCredentialMode { get; set; } = MsQuicServerCredentialMode.Auto;
+
+    /// <summary>Where a key persisted for the <c>CERTIFICATE_CONTEXT</c> path lives (server only, ADR 0009). Default <see cref="MsQuicKeyStorage.User"/>.</summary>
+    public MsQuicKeyStorage ServerKeyStorage { get; set; } = MsQuicKeyStorage.User;
+
     /// <summary>How the client validates the server certificate. Default <see cref="ServerCertificateValidationMode.SystemRoots"/>.</summary>
     public ServerCertificateValidationMode ServerCertificateValidation { get; set; } = ServerCertificateValidationMode.SystemRoots;
 

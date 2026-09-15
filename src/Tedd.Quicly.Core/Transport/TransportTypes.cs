@@ -141,6 +141,11 @@ public struct TransportCapabilities
     public bool AppOwnedReceiveBuffers;
     /// <summary>The transport reports the ideal number of bytes to keep outstanding per stream.</summary>
     public bool IdealSendBufferSize;
+    /// <summary>
+    /// Datagram sends honour <see cref="TransportSendFlags.CancelOnBlocked"/>; when false the flag is ignored (for example
+    /// with an MsQuic library older than 2.4).
+    /// </summary>
+    public bool CancelOnBlocked;
 }
 
 /// <summary>Snapshot of transport-level statistics. Fixed layout, no references.</summary>
@@ -177,6 +182,21 @@ public struct TransportStatistics
 }
 
 /// <summary>Outcome of <see cref="ITransportSink.OnStreamReceived"/>.</summary>
+/// <remarks>
+/// <para><see cref="Consumed"/> with every indicated byte completes the indication; the next indication starts where it ended.</para>
+/// <para><b>Partial consumption without <c>Pending</c></b> (at least one byte, fewer than indicated): the transport keeps the
+/// rest and indicates it again at the offset where consumption stopped, without waiting for new data, together with whatever
+/// has arrived since (MsQuic: right after the callback returns; the simulator: at the next advance step). A sink that consumes
+/// only whole frames therefore sees an incomplete frame again, possibly before more of it has arrived: it should take such a
+/// tail into its own parser state or return <see cref="PendingAfter"/>.</para>
+/// <para><b>Consuming nothing</b> of a non-empty indication without <c>Pending</c> counts as <c>PendingAfter(0)</c>: nothing
+/// more is delivered on the stream until <see cref="ITransport.ResumeStreamReceive"/>. An empty indication (it carries only
+/// the FIN) is fully consumed by <c>Consumed(0)</c>.</para>
+/// <para><b><see cref="PendingAfter"/></b>: the given bytes are consumed now and the rest is held back; nothing more is
+/// delivered on the stream until <see cref="ITransport.ResumeStreamReceive"/> credits further bytes and has the remainder
+/// indicated again. A resume issued on another thread while the receive callback is still returning takes effect once it
+/// has returned. Do not call <see cref="ITransport.ResumeStreamReceive"/> for a stream from inside its own receive callback.</para>
+/// </remarks>
 public readonly record struct ReceiveResult(int BytesConsumed, bool Pending)
 {
     /// <summary>All given bytes consumed synchronously.</summary>

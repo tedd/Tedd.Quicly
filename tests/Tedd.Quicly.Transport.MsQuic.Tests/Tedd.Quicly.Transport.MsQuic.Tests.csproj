@@ -7,4 +7,8 @@
     <ProjectReference Include="..\..\src\Tedd.Quicly.Transport.MsQuic\Tedd.Quicly.Transport.MsQuic.csproj" />
     <ProjectReference Include="..\..\src\Tedd.Quicly.Testing\Tedd.Quicly.Testing.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- The layout dump is the source of truth for the bindings; LayoutTests parses it at run time. -->
+    <None Include="..\..\docs\reference\msquic\msquic_layout_dotnet11_preview7.txt" Link="msquic_layout_dotnet11_preview7.txt" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

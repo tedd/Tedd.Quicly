@@ -82,10 +82,10 @@ internal sealed class HttpConnection
     public bool IsStopping => _server.IsStopping;
 
     /// <summary>
-    /// A response sent while an <c>Expect: 100-continue</c> body is still unread must advertise <c>Connection: close</c>:
-    /// the client may never send that body, so the connection cannot be reused.
+    /// A response must advertise <c>Connection: close</c> when the request body state makes reuse impossible: an
+    /// <c>Expect: 100-continue</c> body the client may never send, or a body read that failed or was cancelled.
     /// </summary>
-    public bool MustCloseAfterResponse => _expectContinue && !_continueSent && _bodyRemaining > 0;
+    public bool MustCloseAfterResponse => _bodyRemaining < 0 || (_expectContinue && !_continueSent && _bodyRemaining > 0);
 
     public ReadOnlySpan<byte> ServerHeaderLine => _server.ServerHeaderLine;
 
@@ -700,7 +700,15 @@ internal sealed class HttpConnection
         {
             var cts = IoCts();
             using var registration = RegisterExternal(cancellationToken, cts);
-            n = await ReadWithTimeoutAsync(_stream, destination[..toRead], _limits.RequestBodyReadTimeout, cts).ConfigureAwait(false);
+            try
+            {
+                n = await ReadWithTimeoutAsync(_stream, destination[..toRead], _limits.RequestBodyReadTimeout, cts).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                _bodyRemaining = -1; // how much of the body is still on the wire is unknown: the connection cannot be reused
+                throw;
+            }
             if (n == 0)
             {
                 _bodyRemaining = -1;

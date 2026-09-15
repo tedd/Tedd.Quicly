@@ -129,6 +129,14 @@ public class TlsFragmentationTests
             await raw.SendAsync([0x17, 0x03, 0x03, 0x00, 0x01, 0x00]);
             Assert.True(await raw.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
         }
+        // a partial ClientHello followed by the client hanging up
+        using (var raw = await RawClient.ConnectAsync(host.EndPoint))
+        {
+            await raw.SendAsync([0x16, 0x03, 0x01, 0x00, 0x40, 0x01, 0x00, 0x00, 0x3C]);
+            raw.Socket.Shutdown(SocketShutdown.Send);
+            Assert.True(await raw.WaitForCloseAsync(TimeSpan.FromSeconds(5)));
+        }
+        await HttpServerTests.WaitUntilAsync(() => host.Server.HandshakeFailures == 2);
         // a ClientHello announcing a 16 MiB body
         using (var raw = await RawClient.ConnectAsync(host.EndPoint))
         {
@@ -154,6 +162,6 @@ public class TlsFragmentationTests
             Assert.True(await raw.WaitForCloseAsync(TimeSpan.FromSeconds(10)));
         }
         await HttpServerTests.WaitUntilAsync(() => host.Server.ActiveConnections == 0);
-        Assert.Equal(3, host.Server.HandshakeFailures);
+        Assert.Equal(4, host.Server.HandshakeFailures);
     }
 }

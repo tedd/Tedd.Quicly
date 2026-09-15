@@ -412,6 +412,58 @@ public class HttpServerTests
     }
 
     [Fact]
+    public async Task Handler_that_claims_without_writing_gets_empty_200()
+    {
+        await using var host = TestHost.Start(o => o.Use(new ClaimingHandler()));
+        using var client = host.CreateClient();
+        using var response = await client.GetAsync("/");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(0, response.Content.Headers.ContentLength);
+        Assert.Empty(await response.Content.ReadAsByteArrayAsync());
+    }
+
+    private sealed class ClaimingHandler : IHttpHandler
+    {
+        public ValueTask<bool> TryHandleAsync(HttpRequestContext context, CancellationToken cancellationToken) => new(true);
+    }
+
+    [Fact]
+    public async Task Handlers_may_pass_their_own_cancellation_tokens()
+    {
+        var routes = new RouteTable()
+            .MapPost("/own", async (ctx, ct) =>
+            {
+                using var own = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                var body = await ctx.ReadBodyAsync(own.Token);
+                await ctx.Response.SendAsync(body, own.Token);
+            })
+            .MapPost("/cancelled", async (ctx, ct) =>
+            {
+                using var own = new CancellationTokenSource();
+                own.Cancel();
+                var buffer = new byte[16];
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await ctx.Body.ReadAsync(buffer, own.Token));
+                // the connection's own timeout source was replaced, so the response can still be written
+                await ctx.Response.SendTextAsync("recovered", cancellationToken: ct);
+            })
+            .MapDelete("/gone", (ctx, ct) => ctx.Response.SendStatusAsync(204, ct));
+        routes.MaxRequestBodyBytes = 1024;
+        await using var host = TestHost.Start(o => o.Use(routes));
+        using var client = host.CreateClient();
+        using var own = await client.PostAsync("/own", new StringContent("payload"));
+        Assert.Equal("payload", await own.Content.ReadAsStringAsync());
+
+        using var raw = await RawClient.ConnectAsync(host.EndPoint);
+        await raw.SendAsync("POST /cancelled HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\n\r\n");
+        await Task.Delay(50);
+        var response = await raw.ReadResponseAsync();
+        Assert.Equal("recovered", response.Body);
+        Assert.Equal("close", response["Connection"]); // the unread body cannot be trusted after a cancelled read
+        using var del = await client.DeleteAsync("/gone");
+        Assert.Equal(HttpStatusCode.NoContent, del.StatusCode);
+    }
+
+    [Fact]
     public async Task Truncated_declared_body_closes_connection()
     {
         var routes = new RouteTable().MapGet("/short", async (ctx, ct) =>

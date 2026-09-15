@@ -114,6 +114,24 @@ public class StaticFilePolicyTests : IDisposable
     }
 
     [Fact]
+    public async Task Locked_file_is_not_served_instead_of_failing()
+    {
+        var handler = new StaticFileHandler(_root);
+        await using var host = TestHost.Start(o => o.Use(handler));
+        using var client = host.CreateClient();
+        var path = Path.Combine(_root, "small.txt");
+        using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            using var locked = await client.GetAsync("/small.txt");
+            if (OperatingSystem.IsWindows())
+                Assert.Equal(HttpStatusCode.NotFound, locked.StatusCode); // sharing violation at open time
+            else
+                Assert.Equal(HttpStatusCode.OK, locked.StatusCode); // no mandatory locking
+        }
+        Assert.Equal("small", await client.GetStringAsync("/small.txt"));
+    }
+
+    [Fact]
     public async Task Symbolic_links_are_refused()
     {
         var outside = Path.Combine(Path.GetTempPath(), "quicly-outside-" + Path.GetFileName(_root));

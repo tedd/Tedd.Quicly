@@ -161,9 +161,7 @@ internal static class HttpParser
 
         while (true)
         {
-            int windowEnd = Math.Min(input.Length, headersEndLimit);
-            if (windowEnd < pos)
-                return HttpParseStatus.HeadersTooLarge;
+            int windowEnd = Math.Min(input.Length, headersEndLimit); // never below pos: every consumed line ended inside the previous window
             var hwindow = input[pos..windowEnd];
             int hlf = hwindow.IndexOf((byte)'\n');
             if (hlf < 0)

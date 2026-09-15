@@ -26,6 +26,7 @@ public class RawProtocolTests
     [InlineData("GET nopath HTTP/1.1\r\nHost: a\r\n\r\n", 400)]
     [InlineData("GET /%zz HTTP/1.1\r\nHost: a\r\n\r\n", 400)]
     [InlineData("GET http:// HTTP/1.1\r\n\r\n", 400)]
+    [InlineData("GET http:///path HTTP/1.1\r\n\r\n", 400)]                     // empty authority
     [InlineData("GET http://h?x=1 HTTP/1.1\r\n\r\n", 400)]
     [InlineData("GET * HTTP/1.1\r\nHost: a\r\n\r\n", 400)]                       // '*' only for OPTIONS
     [InlineData("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", 411)]
@@ -373,6 +374,51 @@ public class RawProtocolTests
         raw.Socket.Shutdown(System.Net.Sockets.SocketShutdown.Send);
         var text = await raw.ReadToEndAsync();
         Assert.Equal(string.Empty, text);
+        await HttpServerTests.WaitUntilAsync(() => host.Server.ActiveConnections == 0);
+        Assert.Empty(errors);
+    }
+
+    [Fact]
+    public async Task Handler_swallowing_body_eof_still_closes_connection()
+    {
+        var routes = new RouteTable().MapPost("/swallow", async (ctx, ct) =>
+        {
+            try
+            {
+                await ctx.ReadBodyAsync(ct);
+            }
+            catch (IOException)
+            {
+                // the client hung up mid-body; answer anyway
+            }
+            await ctx.Response.SendTextAsync("partial", cancellationToken: ct);
+        });
+        await using var host = TestHost.Start(o => o.Use(routes));
+        using var raw = await RawClient.ConnectAsync(host.EndPoint);
+        await raw.SendAsync("POST /swallow HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc");
+        raw.Socket.Shutdown(System.Net.Sockets.SocketShutdown.Send);
+        var text = await raw.ReadToEndAsync();
+        Assert.StartsWith("HTTP/1.1 200", text, StringComparison.Ordinal);
+        Assert.EndsWith("partial", text, StringComparison.Ordinal);
+        await HttpServerTests.WaitUntilAsync(() => host.Server.ActiveConnections == 0);
+    }
+
+    [Fact]
+    public async Task Client_closing_while_unread_body_is_drained_is_silent()
+    {
+        var errors = new List<Exception>();
+        var routes = new RouteTable().MapPost("/ignore", (ctx, ct) => ctx.Response.SendTextAsync("ignored", cancellationToken: ct));
+        await using var host = TestHost.Start(o =>
+        {
+            o.OnError = e => { lock (errors) errors.Add(e); };
+            o.Use(routes);
+        });
+        using var raw = await RawClient.ConnectAsync(host.EndPoint);
+        await raw.SendAsync("POST /ignore HTTP/1.1\r\nHost: a\r\nContent-Length: 70000\r\n\r\n");
+        Assert.Equal("ignored", (await raw.ReadResponseAsync()).Body);
+        await raw.SendAsync(new byte[100]);
+        raw.Socket.Shutdown(System.Net.Sockets.SocketShutdown.Send);
+        Assert.Equal(string.Empty, await raw.ReadToEndAsync());
         await HttpServerTests.WaitUntilAsync(() => host.Server.ActiveConnections == 0);
         Assert.Empty(errors);
     }

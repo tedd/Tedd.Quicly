@@ -140,6 +140,19 @@ public class ClientHelloAssemblyTests
         }
         Assert.Equal(ClientHelloAssembleStatus.TooLarge, Assemble([.. big], out _, out _));
 
+        // a declared length that fits exactly (64 KiB) but records that overshoot the assembly buffer before completing it
+        var overshoot = new List<byte>();
+        overshoot.AddRange([0x16, 0x03, 0x01, 0x3E, 0x80]); // 16000-byte record
+        var first = new byte[16000];
+        first[0] = 0x01; first[1] = 0x00; first[2] = 0xFF; first[3] = 0xFC; // body 65532 -> message 65536
+        overshoot.AddRange(first);
+        for (int i = 0; i < 4; i++)
+        {
+            overshoot.AddRange([0x16, 0x03, 0x01, 0x40, 0x00]);
+            overshoot.AddRange(new byte[16384]);
+        }
+        Assert.Equal(ClientHelloAssembleStatus.TooLarge, Assemble([.. overshoot], out _, out _));
+
         // the record-length helper is unchanged
         Assert.Equal(0, ClientHelloParser.GetRecordLength([0x16]));
         Assert.Equal(5 + 1, ClientHelloParser.GetRecordLength([0x16, 0x03, 0x03, 0x00, 0x01]));

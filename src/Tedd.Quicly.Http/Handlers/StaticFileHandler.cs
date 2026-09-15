@@ -246,8 +246,9 @@ public sealed class StaticFileHandler : IHttpHandler
         {
             await response.SendFileAsync(file.FullName, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (!response.HasStarted && ex is FileNotFoundException or DirectoryNotFoundException or UnauthorizedAccessException)
+        catch (Exception ex) when (!response.HasStarted && ex is IOException or UnauthorizedAccessException)
         {
+            // Vanished, locked or unreadable between stat and open: not served (404), never a 500.
             response.Headers.Remove("ETag");
             response.Headers.Remove("Last-Modified");
             response.ContentType = null;

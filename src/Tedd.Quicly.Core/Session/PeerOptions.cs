@@ -88,7 +88,12 @@ public sealed class PeerOptions
     /// <summary>The host's expected flush period, used to resolve <see cref="ChannelDefinition.ExpiryTwiceFlushInterval"/>. Default 1/60 s.</summary>
     public TimeSpan FlushInterval { get; set; } = TimeSpan.FromTicks(166_667);
 
-    /// <summary>Send bandwidth cap in bytes per second (token bucket, PROTOCOL.md §4.5); 0 = unlimited.</summary>
+    /// <summary>
+    /// Send cap in bytes per second (a token bucket, PROTOCOL.md §4.5): the scheduler hands application datagrams (and, with the
+    /// ordered-stream engine, stream data) to the transport only while the bucket is positive; its burst is two flush intervals'
+    /// worth, and a pass held back by it lowers <see cref="QuiclyPeer.NextDeadline"/> to the refill time. Control traffic (pings,
+    /// the handshake, close) is not capped. 0, or 2 000 000 000 and more, means no cap.
+    /// </summary>
     public long MaxSendBytesPerSecond { get; set; }
 
     /// <summary>Bulk traffic's share of the estimated bandwidth (PROTOCOL.md §4.5). Reserved for the bulk engine. Default 0.5.</summary>

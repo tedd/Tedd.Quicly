@@ -3,6 +3,9 @@
     <Description>Tedd.Quicly.Testing</Description>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="Tedd.Quicly.Testing.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />
   </ItemGroup>
 </Project>

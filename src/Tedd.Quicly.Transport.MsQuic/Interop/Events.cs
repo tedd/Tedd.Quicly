@@ -107,13 +107,13 @@ public unsafe struct QUIC_CONNECTION_EVENT
         [StructLayout(LayoutKind.Sequential)]
         public struct _LOCAL_ADDRESS_CHANGED_e__Struct
         {
-            public QuicAddr* Address;
+            public QUIC_ADDR* Address;
         }
 
         [StructLayout(LayoutKind.Sequential)]
         public struct _PEER_ADDRESS_CHANGED_e__Struct
         {
-            public QuicAddr* Address;
+            public QUIC_ADDR* Address;
         }
 
         [StructLayout(LayoutKind.Sequential)]

@@ -9,12 +9,16 @@ namespace Tedd.Quicly.Transport.MsQuic;
 /// <see cref="IMsQuicConnectionEvents.PeerStreamStarted"/> (peer).
 /// </summary>
 /// <remarks>
-/// <para>Lifetime: the owner must call <see cref="Close"/> exactly once, normally after
-/// <see cref="IMsQuicStreamEvents.ShutdownComplete"/> (calling it inline from that callback is allowed).
-/// Closing earlier aborts the stream silently. Never call any method after <see cref="Close"/>.</para>
-/// <para>Buffers passed to <see cref="Send"/> must stay valid and unmodified until the matching
-/// <see cref="IMsQuicStreamEvents.SendComplete"/> (send buffering is disabled by default).</para>
-/// <para>Threading: callbacks are serialised with the owning connection's callbacks on MsQuic worker threads.</para>
+/// <para><b>Lifetime.</b> The owner must call <see cref="Close"/> exactly once, normally after
+/// <see cref="IMsQuicStreamEvents.ShutdownComplete"/>, and never from an MsQuic callback thread (enforced; defer
+/// it to the owner's thread). Closing earlier aborts the stream silently. Never call any method after <see cref="Close"/>.</para>
+/// <para><b>Buffers.</b> Buffers and the buffer array passed to <see cref="Send"/> must stay valid and unmodified
+/// until the matching <see cref="IMsQuicStreamEvents.SendComplete"/> (send buffering is disabled by default); on
+/// a failure status no completion follows. A completion may arrive before <see cref="Send"/> returns.</para>
+/// <para><b>Threading.</b> Callbacks are serialised with the owning connection's callbacks on MsQuic worker
+/// threads. <see cref="Start"/> may deliver <c>StartComplete</c> inline before it returns.</para>
+/// <para><b>Failure.</b> An exception escaping <see cref="Events"/> is recorded in <see cref="LastCallbackException"/>
+/// and poisons the owning connection (see <see cref="MsQuicConnection.Poison"/>).</para>
 /// </remarks>
 public sealed unsafe class MsQuicStream : IDisposable
 {
@@ -41,7 +45,10 @@ public sealed unsafe class MsQuicStream : IDisposable
     /// <summary>True when the peer opened the stream.</summary>
     public bool IsPeerStarted { get; }
 
-    /// <summary>The QUIC stream id; <see cref="ulong.MaxValue"/> until known (assigned at START_COMPLETE for local streams).</summary>
+    /// <summary>
+    /// The QUIC stream id; <see cref="ulong.MaxValue"/> until known. Peer streams know it immediately; local
+    /// streams learn it at <c>StartComplete</c> (or earlier through <see cref="QueryId"/> once started).
+    /// </summary>
     public ulong Id { get; private set; } = ulong.MaxValue;
 
     /// <summary>Event sink. Set before <see cref="Start"/> / before returning from PeerStreamStarted.</summary>
@@ -54,7 +61,7 @@ public sealed unsafe class MsQuicStream : IDisposable
     /// <summary>Free slot for the owner's state; never touched by the wrapper.</summary>
     public object? Tag { get; set; }
 
-    /// <summary>The last exception thrown by <see cref="Events"/> (callbacks must not throw; the wrapper records and swallows).</summary>
+    /// <summary>The last exception thrown by <see cref="Events"/> (callbacks never propagate; the wrapper records and poisons the connection).</summary>
     public Exception? LastCallbackException { get; private set; }
 
     internal MsQuicStream(MsQuicConnection connection, QUIC_HANDLE* handle, QUIC_STREAM_OPEN_FLAGS flags, bool peerStarted)
@@ -104,7 +111,12 @@ public sealed unsafe class MsQuicStream : IDisposable
         _gcHandle.Free();
     }
 
-    /// <summary>Starts a locally-opened stream. Completion is reported by <see cref="IMsQuicStreamEvents.StartComplete"/>.</summary>
+    /// <summary>
+    /// Starts a locally-opened stream. Completion is reported by <see cref="IMsQuicStreamEvents.StartComplete"/>,
+    /// possibly inline. With <see cref="QUIC_STREAM_START_FLAGS.FAIL_BLOCKED"/> a stream-limit failure is returned
+    /// as <c>QUIC_STATUS_STREAM_LIMIT_REACHED</c> (and reported in StartComplete); add
+    /// <see cref="QUIC_STREAM_START_FLAGS.SHUTDOWN_ON_FAIL"/> to have MsQuic shut the stream down on failure.
+    /// </summary>
     public int Start(QUIC_STREAM_START_FLAGS flags)
     {
         ObjectDisposedException.ThrowIf(_handle == null, this);
@@ -113,17 +125,24 @@ public sealed unsafe class MsQuicStream : IDisposable
 
     /// <summary>
     /// Queues <paramref name="bufferCount"/> gathered buffers for sending. Returns the status; no allocation.
-    /// <see cref="QUIC_SEND_FLAGS.FIN"/> closes the send direction after this data;
-    /// <see cref="QUIC_SEND_FLAGS.START"/> starts the stream implicitly.
+    /// <see cref="QUIC_SEND_FLAGS.FIN"/> closes the send direction after this data; <see cref="QUIC_SEND_FLAGS.START"/>
+    /// starts the stream implicitly; <see cref="QUIC_SEND_FLAGS.DELAY_SEND"/> hints that more data follows.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int Send(QUIC_BUFFER* buffers, uint bufferCount, QUIC_SEND_FLAGS flags, void* clientContext)
-        => _api.Table->StreamSend(_handle, buffers, bufferCount, flags, clientContext);
+    {
+        if (_handle == null) ThrowDisposed();
+        return _api.Table->StreamSend(_handle, buffers, bufferCount, flags, clientContext);
+    }
 
-    /// <summary>Shuts down the stream: GRACEFUL sends FIN; ABORT_SEND / ABORT_RECEIVE / ABORT reset with <paramref name="errorCode"/>.</summary>
+    /// <summary>
+    /// Shuts down the stream: GRACEFUL sends FIN; ABORT_SEND / ABORT_RECEIVE / ABORT reset with <paramref name="errorCode"/>.
+    /// <see cref="QUIC_STREAM_SHUTDOWN_FLAGS.INLINE"/> is refused (ADR 0008 §7).
+    /// </summary>
     public int Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS flags, ulong errorCode)
     {
         ObjectDisposedException.ThrowIf(_handle == null, this);
+        if ((flags & QUIC_STREAM_SHUTDOWN_FLAGS.INLINE) != 0) throw new ArgumentException("INLINE shutdown is never used (ADR 0008 §7).", nameof(flags));
         return _api.Table->StreamShutdown(_handle, flags, errorCode);
     }
 
@@ -148,6 +167,15 @@ public sealed unsafe class MsQuicStream : IDisposable
         return _api.SetParam(_handle, MsQuicParam.QUIC_PARAM_STREAM_PRIORITY, in priority);
     }
 
+    /// <summary>Reads the stream id through <c>QUIC_PARAM_STREAM_ID</c> (fails until the stream is started) and caches it in <see cref="Id"/>.</summary>
+    public int QueryId(out ulong id)
+    {
+        ObjectDisposedException.ThrowIf(_handle == null, this);
+        int status = _api.GetParam(_handle, MsQuicParam.QUIC_PARAM_STREAM_ID, out id);
+        if (MsQuicStatus.Succeeded(status)) Id = id;
+        return status;
+    }
+
     /// <summary>Typed <c>SetParam</c>.</summary>
     public int SetParam<T>(uint param, in T value) where T : unmanaged
     {
@@ -162,11 +190,12 @@ public sealed unsafe class MsQuicStream : IDisposable
         return _api.GetParam(_handle, param, out value);
     }
 
-    /// <summary>Closes the handle (<c>StreamClose</c>) and frees the context. Idempotent. Allowed inline from this stream's callbacks.</summary>
+    /// <summary>Closes the handle (<c>StreamClose</c>) and frees the context. Idempotent. Throws when called from an MsQuic callback thread (ADR 0008 §7).</summary>
     public void Close()
     {
         QUIC_HANDLE* handle = _handle;
         if (handle == null) return;
+        MsQuicCallbackScope.ThrowIfInsideCallback("StreamClose");
         _handle = null;
         _api.Table->StreamClose(handle);
         if (_gcHandle.IsAllocated) _gcHandle.Free();
@@ -175,10 +204,13 @@ public sealed unsafe class MsQuicStream : IDisposable
     /// <inheritdoc cref="Close"/>
     public void Dispose() => Close();
 
+    private void ThrowDisposed() => throw new ObjectDisposedException(nameof(MsQuicStream));
+
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static int NativeCallback(QUIC_HANDLE* handle, void* context, QUIC_STREAM_EVENT* evt)
     {
         var stream = (MsQuicStream)GCHandle.FromIntPtr((nint)context).Target!;
+        MsQuicCallbackScope.Enter();
         try
         {
             return stream.HandleEvent(evt);
@@ -186,7 +218,12 @@ public sealed unsafe class MsQuicStream : IDisposable
         catch (Exception ex)
         {
             stream.LastCallbackException = ex;
+            stream.Connection.Poison(ex);
             return MsQuicStatus.QUIC_STATUS_INTERNAL_ERROR;
+        }
+        finally
+        {
+            MsQuicCallbackScope.Exit();
         }
     }
 
@@ -230,8 +267,10 @@ public sealed unsafe class MsQuicStream : IDisposable
             case QUIC_STREAM_EVENT_TYPE.PEER_ACCEPTED:
                 events.PeerAccepted(this);
                 return MsQuicStatus.QUIC_STATUS_SUCCESS;
+            case QUIC_STREAM_EVENT_TYPE.CANCEL_ON_LOSS:
+                events.CancelOnLoss(this, evt->CANCEL_ON_LOSS.ErrorCode);
+                return MsQuicStatus.QUIC_STATUS_SUCCESS;
             default:
-                // CANCEL_ON_LOSS and preview events are not surfaced.
                 return MsQuicStatus.QUIC_STATUS_SUCCESS;
         }
     }

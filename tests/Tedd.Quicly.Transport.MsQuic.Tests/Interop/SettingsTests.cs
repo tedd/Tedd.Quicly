@@ -2,6 +2,7 @@ using Tedd.Quicly.Transport.MsQuic.Interop;
 
 namespace Tedd.Quicly.Transport.MsQuic.Tests.Interop;
 
+[Collection(MsQuicCollection.Name)]
 public class SettingsTests
 {
     private delegate void Setter(ref QUIC_SETTINGS s);
@@ -170,23 +171,49 @@ public class SettingsTests
     }
 
     [Fact]
-    public void Builder_defaults_are_game_friendly()
+    public void Builder_defaults_follow_architecture_section_7()
     {
         QUIC_SETTINGS s = MsQuicSettings.Default.ToNative();
         Assert.True(s.IsSet.IdleTimeoutMs);
         Assert.Equal(30_000UL, s.IdleTimeoutMs);
+        Assert.True(s.IsSet.HandshakeIdleTimeoutMs);
+        Assert.Equal(5_000UL, s.HandshakeIdleTimeoutMs);
+        Assert.True(s.IsSet.DisconnectTimeoutMs);
+        Assert.Equal(6_000u, s.DisconnectTimeoutMs);
         Assert.True(s.IsSet.KeepAliveIntervalMs);
-        Assert.Equal(15_000u, s.KeepAliveIntervalMs);
+        Assert.Equal(0u, s.KeepAliveIntervalMs);
         Assert.True(s.IsSet.PeerBidiStreamCount);
-        Assert.Equal(128, s.PeerBidiStreamCount);
+        Assert.Equal(1, s.PeerBidiStreamCount);
         Assert.True(s.IsSet.PeerUnidiStreamCount);
-        Assert.Equal(128, s.PeerUnidiStreamCount);
-        Assert.True(s.IsSet.DatagramReceiveEnabled);
-        Assert.True(s.DatagramReceiveEnabled);
+        Assert.Equal(0, s.PeerUnidiStreamCount);
+        Assert.True(s.IsSet.StreamRecvWindowUnidiDefault);
+        Assert.Equal(2u * 1024 * 1024, s.StreamRecvWindowUnidiDefault);
+        Assert.True(s.IsSet.ConnFlowControlWindow);
+        Assert.Equal(16u * 1024 * 1024, s.ConnFlowControlWindow);
+        Assert.True(s.IsSet.MinimumMtu && s.IsSet.MaximumMtu);
+        Assert.Equal(1248, s.MinimumMtu);
+        Assert.Equal(1500, s.MaximumMtu);
+        Assert.True(s.IsSet.MaxAckDelayMs);
+        Assert.Equal(5u, s.MaxAckDelayMs);
+        Assert.True(s.IsSet.PacingEnabled && s.PacingEnabled);
+        Assert.True(s.IsSet.MigrationEnabled && s.MigrationEnabled);
+        Assert.True(s.IsSet.DatagramReceiveEnabled && s.DatagramReceiveEnabled);
         Assert.True(s.IsSet.SendBufferingEnabled);
         Assert.False(s.SendBufferingEnabled);
-        Assert.False(s.IsSet.HandshakeIdleTimeoutMs);
-        Assert.False(s.IsSet.PacingEnabled);
+        Assert.True(s.IsSet.ServerResumptionLevel);
+        Assert.Equal(QUIC_SERVER_RESUMPTION_LEVEL.NO_RESUME, s.ServerResumptionLevel);
+        Assert.True(s.IsSet.CongestionControlAlgorithm);
+        Assert.Equal((ushort)QUIC_CONGESTION_CONTROL_ALGORITHM.CUBIC, s.CongestionControlAlgorithm);
+        // Stream multi-receive (preview) is never enabled.
+        Assert.False(s.IsSet.StreamMultiReceiveEnabled);
+        Assert.Equal(0UL, s.Flags);
+        Assert.False(s.IsSet.StreamRecvWindowBidiLocalDefault || s.IsSet.StreamRecvWindowBidiRemoteDefault || s.IsSet.GreaseQuicBitEnabled);
+
+        QUIC_SETTINGS client = MsQuicSettings.Client().ToNative();
+        Assert.Equal(10_000u, client.KeepAliveIntervalMs);
+        client.IsSet.KeepAliveIntervalMs = false;
+        client.KeepAliveIntervalMs = 0;
+        Assert.Equal(s.IsSetFlags & ~(1UL << 16), client.IsSetFlags);
     }
 
     [Fact]
@@ -228,8 +255,16 @@ public class SettingsTests
             ServerResumptionLevel = QUIC_SERVER_RESUMPTION_LEVEL.RESUME_AND_ZERORTT,
             CongestionControlAlgorithm = QUIC_CONGESTION_CONTROL_ALGORITHM.CUBIC,
             MaxOperationsPerDrain = 14,
+            StreamRecvWindowUnidiDefault = 1 << 20,
+            StreamRecvWindowBidiLocalDefault = 1 << 21,
+            StreamRecvWindowBidiRemoteDefault = 1 << 22,
+            InitialWindowPackets = 15,
         };
         QUIC_SETTINGS s = b.ToNative();
+        Assert.Equal(1u << 20, s.StreamRecvWindowUnidiDefault);
+        Assert.Equal(1u << 21, s.StreamRecvWindowBidiLocalDefault);
+        Assert.Equal(1u << 22, s.StreamRecvWindowBidiRemoteDefault);
+        Assert.Equal(15u, s.InitialWindowPackets);
         Assert.Equal(1000UL, s.IdleTimeoutMs);
         Assert.Equal(2000UL, s.HandshakeIdleTimeoutMs);
         Assert.Equal(3000u, s.KeepAliveIntervalMs);
@@ -258,7 +293,7 @@ public class SettingsTests
         Assert.Equal(14, s.MaxOperationsPerDrain);
         const ulong all = (1UL << 0) | (1UL << 1) | (1UL << 2) | (1UL << 8) | (1UL << 6) | (1UL << 7) | (1UL << 12) | (1UL << 13) | (1UL << 14) | (1UL << 15) | (1UL << 16)
             | (1UL << 17) | (1UL << 18) | (1UL << 19) | (1UL << 22) | (1UL << 23) | (1UL << 24) | (1UL << 25) | (1UL << 26) | (1UL << 27) | (1UL << 28) | (1UL << 29)
-            | (1UL << 32) | (1UL << 33) | (1UL << 34);
+            | (1UL << 32) | (1UL << 33) | (1UL << 34) | (1UL << 11) | (1UL << 35) | (1UL << 36) | (1UL << 37);
         Assert.Equal(all, s.IsSetFlags);
     }
 

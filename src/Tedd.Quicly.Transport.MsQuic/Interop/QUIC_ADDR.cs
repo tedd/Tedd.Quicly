@@ -28,7 +28,7 @@ public struct QuicAddrFamilyAndLen
     [FieldOffset(1)] public byte sin_family_bsd;
 }
 
-/// <summary><c>sockaddr_in</c>.</summary>
+/// <summary><c>sockaddr_in</c> (the IPv4 view of <see cref="QUIC_ADDR"/>).</summary>
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct QuicAddrIn
 {
@@ -38,7 +38,7 @@ public unsafe struct QuicAddrIn
     public fixed byte sin_addr[4];
 }
 
-/// <summary><c>sockaddr_in6</c>.</summary>
+/// <summary><c>sockaddr_in6</c> (the IPv6 view of <see cref="QUIC_ADDR"/>).</summary>
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct QuicAddrIn6
 {
@@ -50,9 +50,9 @@ public unsafe struct QuicAddrIn6
     public uint sin6_scope_id;
 }
 
-/// <summary><c>QUIC_ADDR</c>: a 28-byte union of <c>sockaddr_in</c> / <c>sockaddr_in6</c>.</summary>
+/// <summary><c>QUIC_ADDR</c>: a 28-byte union of <c>sockaddr_in</c> / <c>sockaddr_in6</c> (the runtime's bindings call it <c>QuicAddr</c>).</summary>
 [StructLayout(LayoutKind.Explicit)]
-public unsafe struct QuicAddr
+public unsafe struct QUIC_ADDR
 {
     [FieldOffset(0)] public QuicAddrIn Ipv4;
     [FieldOffset(0)] public QuicAddrIn6 Ipv6;
@@ -89,23 +89,22 @@ public unsafe struct QuicAddr
     /// <summary>True for <c>AF_INET6</c>.</summary>
     public readonly bool IsIPv6 => Family == QuicAddressFamily.INET6;
 
-    /// <summary>Builds a <see cref="QuicAddr"/> from an <see cref="IPEndPoint"/>.</summary>
-    public static QuicAddr FromIPEndPoint(IPEndPoint endPoint)
+    /// <summary>Builds a <see cref="QUIC_ADDR"/> from an <see cref="IPEndPoint"/> without allocating.</summary>
+    public static QUIC_ADDR FromIPEndPoint(IPEndPoint endPoint)
     {
         ArgumentNullException.ThrowIfNull(endPoint);
-        QuicAddr addr = default;
-        // V0: the obvious implementation; GetAddressBytes allocates a byte[] per call.
-        byte[] bytes = endPoint.Address.GetAddressBytes();
-        if (endPoint.Address.AddressFamily == AddressFamily.InterNetwork)
+        QUIC_ADDR addr = default;
+        IPAddress address = endPoint.Address;
+        if (address.AddressFamily == AddressFamily.InterNetwork)
         {
             addr.Family = QuicAddressFamily.INET;
-            for (int i = 0; i < 4; i++) addr.Ipv4.sin_addr[i] = bytes[i];
+            address.TryWriteBytes(new Span<byte>(addr.Ipv4.sin_addr, 4), out _);
         }
-        else if (endPoint.Address.AddressFamily == AddressFamily.InterNetworkV6)
+        else if (address.AddressFamily == AddressFamily.InterNetworkV6)
         {
             addr.Family = QuicAddressFamily.INET6;
-            for (int i = 0; i < 16; i++) addr.Ipv6.sin6_addr[i] = bytes[i];
-            addr.Ipv6.sin6_scope_id = (uint)endPoint.Address.ScopeId;
+            address.TryWriteBytes(new Span<byte>(addr.Ipv6.sin6_addr, 16), out _);
+            addr.Ipv6.sin6_scope_id = (uint)address.ScopeId;
         }
         else
         {

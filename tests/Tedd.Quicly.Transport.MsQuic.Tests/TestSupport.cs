@@ -5,10 +5,17 @@ using System.Text;
 using Tedd.Quicly.Testing.Certificates;
 using Tedd.Quicly.Transport.MsQuic.Interop;
 
-// Loopback tests share MsQuic worker threads; run them serially so per-thread allocation probes and timing stay deterministic.
-[assembly: CollectionBehavior(DisableTestParallelization = true)]
-
 namespace Tedd.Quicly.Transport.MsQuic.Tests;
+
+/// <summary>
+/// Every test class joins this collection so the loopback tests run one at a time: they share MsQuic worker
+/// threads and the per-thread allocation probes and timing assertions need a quiet machine.
+/// </summary>
+[CollectionDefinition(Name)]
+public class MsQuicCollection
+{
+    public const string Name = "MsQuic";
+}
 
 internal static class TestTimeouts
 {
@@ -32,61 +39,79 @@ internal static class TestTimeouts
     }
 }
 
-internal unsafe delegate MsQuicReceiveResult ReceiveHandler(MsQuicStream stream, QUIC_BUFFER* buffers, uint bufferCount, ulong absoluteOffset, ulong totalLength, QUIC_RECEIVE_FLAGS flags);
 
 internal delegate void SpanHandler(ReadOnlySpan<byte> data);
 
 /// <summary>Records every connection event into awaitable slots.</summary>
 internal sealed unsafe class ConnectionRecorder : IMsQuicConnectionEvents
 {
-    public readonly TaskCompletionSource<(string Alpn, bool Resumed)> Connected = TestTimeouts.NewTcs<(string, bool)>();
-    public readonly TaskCompletionSource<(int Status, ulong ErrorCode)> TransportShutdown = TestTimeouts.NewTcs<(int, ulong)>();
-    public readonly TaskCompletionSource<ulong> PeerShutdown = TestTimeouts.NewTcs<ulong>();
-    public readonly TaskCompletionSource<(bool HandshakeCompleted, bool PeerAcknowledged, bool AppCloseInProgress)> ShutdownComplete = TestTimeouts.NewTcs<(bool, bool, bool)>();
-    public readonly TaskCompletionSource<(bool Enabled, ushort MaxLength)> DatagramSendEnabled = TestTimeouts.NewTcs<(bool, ushort)>();
-    public readonly TaskCompletionSource<MsQuicStream> FirstPeerStream = TestTimeouts.NewTcs<MsQuicStream>();
-    public readonly TaskCompletionSource<(ushort Bidi, ushort Unidi)> StreamsAvailable = TestTimeouts.NewTcs<(ushort, ushort)>();
+    public readonly TaskCompletionSource<(string Alpn, bool Resumed)> ConnectedTcs = TestTimeouts.NewTcs<(string, bool)>();
+    public readonly TaskCompletionSource<(int Status, ulong ErrorCode)> TransportShutdownTcs = TestTimeouts.NewTcs<(int, ulong)>();
+    public readonly TaskCompletionSource<ulong> PeerShutdownTcs = TestTimeouts.NewTcs<ulong>();
+    public readonly TaskCompletionSource<(bool HandshakeCompleted, bool PeerAcknowledged, bool AppCloseInProgress)> ShutdownCompleteTcs = TestTimeouts.NewTcs<(bool, bool, bool)>();
+    public readonly TaskCompletionSource<(bool Enabled, ushort MaxLength)> DatagramSendEnabledTcs = TestTimeouts.NewTcs<(bool, ushort)>();
+    public readonly TaskCompletionSource<MsQuicStream> FirstPeerStreamTcs = TestTimeouts.NewTcs<MsQuicStream>();
+    public readonly TaskCompletionSource<(ushort Bidi, ushort Unidi)> StreamsAvailableTcs = TestTimeouts.NewTcs<(ushort, ushort)>();
+    public readonly TaskCompletionSource<bool> PeerNeedsStreamsTcs = TestTimeouts.NewTcs<bool>();
+    public readonly TaskCompletionSource<bool> CertificateReceivedTcs = TestTimeouts.NewTcs<bool>();
     public readonly ConcurrentBag<MsQuicStream> PeerStreams = [];
     public readonly ConcurrentQueue<byte[]> Datagrams = [];
+    public readonly ConcurrentQueue<(ushort Bidi, ushort Unidi)> StreamsAvailableHistory = [];
 
     public int DatagramsReceived;
     public int FinalSendStates;
     public QUIC_DATAGRAM_SEND_STATE[]? SendStates;
-    public X509Certificate2? ReceivedCertificate;
+    public byte[]? CertificateDer;
+    public byte[]? ChainPkcs7;
+    public int CertificateDeferredStatus;
+    public bool CertificateCanDefer;
+    public bool CertificateIsPortable;
+    public MsQuicCertificateDecision CertificateDecision = MsQuicCertificateDecision.Accept;
     public bool AcceptPeerStreams = true;
-    public bool AcceptCertificate = true;
     public bool KeepDatagrams = true;
+    public bool InsideCallbackSeen;
     public Func<MsQuicStream, IMsQuicStreamEvents>? PeerStreamEventsFactory;
     public SpanHandler? OnDatagram;
+    public Action<MsQuicConnection>? OnShutdownComplete;
     public MsQuicConnection? Connection;
 
     public void Connected(MsQuicConnection connection, ReadOnlySpan<byte> negotiatedAlpn, bool sessionResumed)
     {
         Connection = connection;
-        this.Connected.TrySetResult((Encoding.ASCII.GetString(negotiatedAlpn), sessionResumed));
+        InsideCallbackSeen = MsQuicCallbackScope.IsInsideCallback;
+        ConnectedTcs.TrySetResult((Encoding.ASCII.GetString(negotiatedAlpn), sessionResumed));
     }
 
-    public void ShutdownInitiatedByTransport(MsQuicConnection connection, int status, ulong errorCode) => TransportShutdown.TrySetResult((status, errorCode));
+    public void ShutdownInitiatedByTransport(MsQuicConnection connection, int status, ulong errorCode) => TransportShutdownTcs.TrySetResult((status, errorCode));
 
-    public void ShutdownInitiatedByPeer(MsQuicConnection connection, ulong errorCode) => PeerShutdown.TrySetResult(errorCode);
+    public void ShutdownInitiatedByPeer(MsQuicConnection connection, ulong errorCode) => PeerShutdownTcs.TrySetResult(errorCode);
 
     public void ShutdownComplete(MsQuicConnection connection, bool handshakeCompleted, bool peerAcknowledgedShutdown, bool appCloseInProgress)
-        => this.ShutdownComplete.TrySetResult((handshakeCompleted, peerAcknowledgedShutdown, appCloseInProgress));
+    {
+        ShutdownCompleteTcs.TrySetResult((handshakeCompleted, peerAcknowledgedShutdown, appCloseInProgress));
+        OnShutdownComplete?.Invoke(connection);
+    }
 
     public bool PeerStreamStarted(MsQuicConnection connection, MsQuicStream stream, QUIC_STREAM_OPEN_FLAGS flags)
     {
         if (!AcceptPeerStreams) return false;
         stream.Events = PeerStreamEventsFactory?.Invoke(stream) ?? new StreamRecorder();
         PeerStreams.Add(stream);
-        FirstPeerStream.TrySetResult(stream);
+        FirstPeerStreamTcs.TrySetResult(stream);
         return true;
     }
 
-    public void StreamsAvailable(MsQuicConnection connection, ushort bidirectionalCount, ushort unidirectionalCount) => this.StreamsAvailable.TrySetResult((bidirectionalCount, unidirectionalCount));
+    public void StreamsAvailable(MsQuicConnection connection, ushort bidirectionalCount, ushort unidirectionalCount)
+    {
+        StreamsAvailableHistory.Enqueue((bidirectionalCount, unidirectionalCount));
+        StreamsAvailableTcs.TrySetResult((bidirectionalCount, unidirectionalCount));
+    }
+
+    public void PeerNeedsStreams(MsQuicConnection connection, bool bidirectional) => PeerNeedsStreamsTcs.TrySetResult(bidirectional);
 
     public void DatagramStateChanged(MsQuicConnection connection, bool sendEnabled, ushort maxSendLength)
     {
-        if (sendEnabled) DatagramSendEnabled.TrySetResult((sendEnabled, maxSendLength));
+        if (sendEnabled) DatagramSendEnabledTcs.TrySetResult((sendEnabled, maxSendLength));
     }
 
     public void DatagramReceived(MsQuicConnection connection, ReadOnlySpan<byte> data, QUIC_RECEIVE_FLAGS flags)
@@ -107,63 +132,71 @@ internal sealed unsafe class ConnectionRecorder : IMsQuicConnectionEvents
         }
     }
 
-    public bool PeerCertificateReceived(MsQuicConnection connection, X509Certificate2? certificate, uint deferredErrorFlags, int deferredStatus)
+    public MsQuicCertificateDecision PeerCertificateReceived(MsQuicConnection connection, in MsQuicPeerCertificateInfo info)
     {
-        ReceivedCertificate = certificate;
-        return AcceptCertificate;
+        CertificateDer = info.CertificateDer.ToArray();
+        ChainPkcs7 = info.ChainPkcs7.ToArray();
+        CertificateDeferredStatus = info.DeferredStatus;
+        CertificateCanDefer = info.CanDefer;
+        CertificateIsPortable = info.IsPortable;
+        CertificateReceivedTcs.TrySetResult(true);
+        return CertificateDecision;
     }
 }
 
 /// <summary>Records stream events; by default accumulates received bytes and consumes everything.</summary>
 internal sealed unsafe class StreamRecorder : IMsQuicStreamEvents
 {
-    public readonly TaskCompletionSource<(int Status, ulong Id, bool PeerAccepted)> StartComplete = TestTimeouts.NewTcs<(int, ulong, bool)>();
-    public readonly TaskCompletionSource<bool> Fin = TestTimeouts.NewTcs<bool>();
-    public readonly TaskCompletionSource<bool> PeerSendShutdown = TestTimeouts.NewTcs<bool>();
-    public readonly TaskCompletionSource<ulong> PeerSendAborted = TestTimeouts.NewTcs<ulong>();
-    public readonly TaskCompletionSource<ulong> PeerReceiveAborted = TestTimeouts.NewTcs<ulong>();
-    public readonly TaskCompletionSource<bool> SendShutdownComplete = TestTimeouts.NewTcs<bool>();
-    public readonly TaskCompletionSource<MsQuicStreamShutdownInfo> ShutdownComplete = TestTimeouts.NewTcs<MsQuicStreamShutdownInfo>();
-    public readonly TaskCompletionSource<ulong> IdealSendBufferSize = TestTimeouts.NewTcs<ulong>();
-    public readonly TaskCompletionSource<bool> PeerAccepted = TestTimeouts.NewTcs<bool>();
+    public readonly TaskCompletionSource<(int Status, ulong Id, bool PeerAccepted)> StartCompleteTcs = TestTimeouts.NewTcs<(int, ulong, bool)>();
+    public readonly TaskCompletionSource<bool> FinTcs = TestTimeouts.NewTcs<bool>();
+    public readonly TaskCompletionSource<bool> PeerSendShutdownTcs = TestTimeouts.NewTcs<bool>();
+    public readonly TaskCompletionSource<ulong> PeerSendAbortedTcs = TestTimeouts.NewTcs<ulong>();
+    public readonly TaskCompletionSource<ulong> PeerReceiveAbortedTcs = TestTimeouts.NewTcs<ulong>();
+    public readonly TaskCompletionSource<bool> SendShutdownCompleteTcs = TestTimeouts.NewTcs<bool>();
+    public readonly TaskCompletionSource<MsQuicStreamShutdownInfo> ShutdownCompleteTcs = TestTimeouts.NewTcs<MsQuicStreamShutdownInfo>();
+    public readonly TaskCompletionSource<ulong> IdealSendBufferSizeTcs = TestTimeouts.NewTcs<ulong>();
+    public readonly TaskCompletionSource<bool> PeerAcceptedTcs = TestTimeouts.NewTcs<bool>();
     public readonly MemoryStream Received = new();
     public readonly ConcurrentQueue<(nint Context, bool Canceled)> SendCompletes = [];
-    public readonly TaskCompletionSource<bool> AllSendsComplete = TestTimeouts.NewTcs<bool>();
+    public readonly TaskCompletionSource<bool> AllSendsCompleteTcs = TestTimeouts.NewTcs<bool>();
     public int ExpectedSends = 1;
     public int ReceiveCount;
     public long ReceivedBytes;
-    public ReceiveHandler? OnReceive;
-    public Action<MsQuicStream, nint, bool>? OnSendComplete;
+    public Action<MsQuicStream>? OnShutdownComplete;
 
-    public void StartComplete(MsQuicStream stream, int status, ulong id, bool peerAccepted) => this.StartComplete.TrySetResult((status, id, peerAccepted));
+    public void StartComplete(MsQuicStream stream, int status, ulong id, bool peerAccepted) => StartCompleteTcs.TrySetResult((status, id, peerAccepted));
 
     public MsQuicReceiveResult Receive(MsQuicStream stream, QUIC_BUFFER* buffers, uint bufferCount, ulong absoluteOffset, ulong totalLength, QUIC_RECEIVE_FLAGS flags)
     {
         Interlocked.Increment(ref ReceiveCount);
-        if (OnReceive is not null) return OnReceive(stream, buffers, bufferCount, absoluteOffset, totalLength, flags);
         lock (Received)
         {
             for (uint i = 0; i < bufferCount; i++) Received.Write(buffers[i].Span);
         }
         Interlocked.Add(ref ReceivedBytes, (long)totalLength);
-        if ((flags & QUIC_RECEIVE_FLAGS.FIN) != 0) Fin.TrySetResult(true);
+        if ((flags & QUIC_RECEIVE_FLAGS.FIN) != 0) FinTcs.TrySetResult(true);
         return MsQuicReceiveResult.Consumed(totalLength);
     }
 
     public void SendComplete(MsQuicStream stream, void* clientContext, bool canceled)
     {
         SendCompletes.Enqueue(((nint)clientContext, canceled));
-        OnSendComplete?.Invoke(stream, (nint)clientContext, canceled);
-        if (SendCompletes.Count >= ExpectedSends) AllSendsComplete.TrySetResult(true);
+        if (SendCompletes.Count >= ExpectedSends) AllSendsCompleteTcs.TrySetResult(true);
     }
 
-    public void PeerSendShutdown(MsQuicStream stream) => this.PeerSendShutdown.TrySetResult(true);
-    public void PeerSendAborted(MsQuicStream stream, ulong errorCode) => this.PeerSendAborted.TrySetResult(errorCode);
-    public void PeerReceiveAborted(MsQuicStream stream, ulong errorCode) => this.PeerReceiveAborted.TrySetResult(errorCode);
-    public void SendShutdownComplete(MsQuicStream stream, bool graceful) => this.SendShutdownComplete.TrySetResult(graceful);
-    public void ShutdownComplete(MsQuicStream stream, in MsQuicStreamShutdownInfo info) => this.ShutdownComplete.TrySetResult(info);
-    public void IdealSendBufferSize(MsQuicStream stream, ulong byteCount) => this.IdealSendBufferSize.TrySetResult(byteCount);
-    public void PeerAccepted(MsQuicStream stream) => this.PeerAccepted.TrySetResult(true);
+    public void PeerSendShutdown(MsQuicStream stream) => PeerSendShutdownTcs.TrySetResult(true);
+    public void PeerSendAborted(MsQuicStream stream, ulong errorCode) => PeerSendAbortedTcs.TrySetResult(errorCode);
+    public void PeerReceiveAborted(MsQuicStream stream, ulong errorCode) => PeerReceiveAbortedTcs.TrySetResult(errorCode);
+    public void SendShutdownComplete(MsQuicStream stream, bool graceful) => SendShutdownCompleteTcs.TrySetResult(graceful);
+
+    public void ShutdownComplete(MsQuicStream stream, in MsQuicStreamShutdownInfo info)
+    {
+        ShutdownCompleteTcs.TrySetResult(info);
+        OnShutdownComplete?.Invoke(stream);
+    }
+
+    public void IdealSendBufferSize(MsQuicStream stream, ulong byteCount) => IdealSendBufferSizeTcs.TrySetResult(byteCount);
+    public void PeerAccepted(MsQuicStream stream) => PeerAcceptedTcs.TrySetResult(true);
 }
 
 /// <summary>A registration + server configuration + listener on 127.0.0.1:ephemeral, with tracking so Dispose never hangs.</summary>
@@ -177,32 +210,48 @@ internal sealed class Loopback : IMsQuicListenerEvents, IDisposable
     public readonly MsQuicListener Listener;
     public readonly IPEndPoint EndPoint;
     public readonly ConcurrentBag<MsQuicConnection> Accepted = [];
-    public readonly TaskCompletionSource<MsQuicConnection> FirstAccepted = TestTimeouts.NewTcs<MsQuicConnection>();
-    public readonly TaskCompletionSource<bool> StopComplete = TestTimeouts.NewTcs<bool>();
+    public readonly TaskCompletionSource<MsQuicConnection> FirstAcceptedTcs = TestTimeouts.NewTcs<MsQuicConnection>();
+    public readonly TaskCompletionSource<bool> StopCompleteTcs = TestTimeouts.NewTcs<bool>();
     public readonly List<string> LastClientAlpns = [];
     public string? LastServerName;
+    public string? LastNegotiatedAlpn;
+    public IPEndPoint? LastRemoteEndPoint;
+    public uint LastQuicVersion;
     public bool RejectConnections;
     public Func<MsQuicConnection, IMsQuicConnectionEvents> ServerEventsFactory = static _ => new ConnectionRecorder();
+    /// <summary>Picks the configuration for a negotiated ALPN; null falls back to <see cref="ServerConfiguration"/>.</summary>
+    public Func<string, MsQuicConfiguration?>? SelectConfiguration;
 
-    private readonly List<MsQuicConfiguration> _clientConfigurations = [];
+    private readonly List<MsQuicConfiguration> _configurations = [];
     private readonly List<MsQuicConnection> _clientConnections = [];
     private readonly ConcurrentBag<MsQuicStream> _streams = [];
-    private readonly ConcurrentBag<ConnectionRecorder> _recorders = [];
 
-    public Loopback(MsQuicSettings? serverSettings = null, MsQuicServerCredentialMode credentialMode = MsQuicServerCredentialMode.Auto)
+    /// <summary>Test posture: generous stream limits on both sides so the tests can open streams freely.</summary>
+    public static MsQuicSettings TestServerSettings() => new() { PeerBidiStreamCount = 16, PeerUnidiStreamCount = 16 };
+
+    public static MsQuicSettings TestClientSettings() => new() { PeerBidiStreamCount = 16, PeerUnidiStreamCount = 16, KeepAliveInterval = TimeSpan.FromSeconds(10) };
+
+    public Loopback(MsQuicSettings? serverSettings = null, MsQuicServerCredentialMode credentialMode = MsQuicServerCredentialMode.Auto, string[]? listenerAlpns = null)
     {
         Registration = new MsQuicRegistration("quicly-tests");
         Certificate = TestCertificates.CreateSelfSigned("CN=localhost", TimeSpan.FromDays(1), ecdsa: true, "localhost");
-        ServerConfiguration = MsQuicConfiguration.CreateServer(Registration, [Alpn], Certificate, serverSettings, credentialMode);
+        ServerConfiguration = MsQuicConfiguration.CreateServer(Registration, [Alpn], Certificate, serverSettings ?? TestServerSettings(), credentialMode);
         Listener = new MsQuicListener(Registration, this);
-        Listener.Start(new IPEndPoint(IPAddress.Loopback, 0), [Alpn]);
+        Listener.Start(new IPEndPoint(IPAddress.Loopback, 0), listenerAlpns ?? [Alpn]);
         EndPoint = Listener.LocalEndPoint;
+    }
+
+    public MsQuicConfiguration CreateServerConfiguration(string alpn, MsQuicSettings? settings = null)
+    {
+        var config = MsQuicConfiguration.CreateServer(Registration, [alpn], Certificate, settings ?? TestServerSettings());
+        _configurations.Add(config);
+        return config;
     }
 
     public MsQuicConfiguration CreateClientConfiguration(MsQuicCertificateValidation validation = MsQuicCertificateValidation.InsecureSkipValidation, string alpn = Alpn, MsQuicSettings? settings = null)
     {
-        var config = MsQuicConfiguration.CreateClient(Registration, [alpn], validation, settings);
-        _clientConfigurations.Add(config);
+        var config = MsQuicConfiguration.CreateClient(Registration, [alpn], validation, settings ?? TestClientSettings());
+        _configurations.Add(config);
         return config;
     }
 
@@ -211,21 +260,20 @@ internal sealed class Loopback : IMsQuicListenerEvents, IDisposable
         configuration ??= CreateClientConfiguration();
         var connection = new MsQuicConnection(Registration, events);
         _clientConnections.Add(connection);
-        if (events is ConnectionRecorder recorder) _recorders.Add(recorder);
         MsQuicException.ThrowIfFailed(connection.Start(configuration, EndPoint.Address.ToString(), (ushort)EndPoint.Port, QuicAddressFamily.INET), "ConnectionStart");
         return connection;
     }
 
-    public async Task<(MsQuicConnection Client, ConnectionRecorder ClientEvents, MsQuicConnection Server, ConnectionRecorder ServerEvents)> ConnectPairAsync(MsQuicConfiguration? clientConfiguration = null)
+    public async Task<(MsQuicConnection Client, ConnectionRecorder ClientEvents, MsQuicConnection Server, ConnectionRecorder ServerEvents)> ConnectPairAsync(MsQuicConfiguration? clientConfiguration = null, string expectedAlpn = Alpn)
     {
         var clientEvents = new ConnectionRecorder();
         MsQuicConnection client = Connect(clientEvents, clientConfiguration);
-        (string alpn, _) = await clientEvents.Connected.Within();
-        Assert.Equal(Alpn, alpn);
-        MsQuicConnection server = await FirstAccepted.Within();
+        (string alpn, _) = await clientEvents.ConnectedTcs.Within();
+        Assert.Equal(expectedAlpn, alpn);
+        MsQuicConnection server = await FirstAcceptedTcs.Within();
         var serverEvents = (ConnectionRecorder)server.Events;
-        (alpn, _) = await serverEvents.Connected.Within();
-        Assert.Equal(Alpn, alpn);
+        (alpn, _) = await serverEvents.ConnectedTcs.Within();
+        Assert.Equal(expectedAlpn, alpn);
         return (client, clientEvents, server, serverEvents);
     }
 
@@ -235,13 +283,16 @@ internal sealed class Loopback : IMsQuicListenerEvents, IDisposable
         return stream;
     }
 
-    public unsafe MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, ref QUIC_NEW_CONNECTION_INFO info)
+    public MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, in MsQuicNewConnectionInfo info)
     {
-        LastServerName = Encoding.UTF8.GetString(info.ServerNameSpan);
+        LastServerName = Encoding.UTF8.GetString(info.ServerName);
+        LastNegotiatedAlpn = Encoding.ASCII.GetString(info.NegotiatedAlpn);
+        LastRemoteEndPoint = info.RemoteAddress.ToIPEndPoint();
+        LastQuicVersion = info.QuicVersion;
         lock (LastClientAlpns)
         {
             LastClientAlpns.Clear();
-            ReadOnlySpan<byte> list = new(info.ClientAlpnList, info.ClientAlpnListLength);
+            ReadOnlySpan<byte> list = info.ClientAlpnList;
             while (!list.IsEmpty)
             {
                 int len = list[0];
@@ -250,27 +301,37 @@ internal sealed class Loopback : IMsQuicListenerEvents, IDisposable
             }
         }
         if (RejectConnections) return null;
+        MsQuicConfiguration? configuration = SelectConfiguration?.Invoke(LastNegotiatedAlpn) ?? ServerConfiguration;
         IMsQuicConnectionEvents events = ServerEventsFactory(connection);
         connection.Events = events;
-        if (events is ConnectionRecorder recorder) _recorders.Add(recorder);
         Accepted.Add(connection);
-        FirstAccepted.TrySetResult(connection);
-        return ServerConfiguration;
+        FirstAcceptedTcs.TrySetResult(connection);
+        return configuration;
     }
 
-    public void StopComplete(MsQuicListener listener, bool appCloseInProgress) => this.StopComplete.TrySetResult(true);
+    public void StopComplete(MsQuicListener listener, bool appCloseInProgress) => StopCompleteTcs.TrySetResult(true);
 
     public void Dispose()
     {
-        foreach (ConnectionRecorder r in _recorders)
+        foreach (MsQuicConnection c in Accepted)
         {
-            foreach (MsQuicStream s in r.PeerStreams) s.Close();
+            if (c.Events is ConnectionRecorder r)
+            {
+                foreach (MsQuicStream s in r.PeerStreams) s.Close();
+            }
+        }
+        foreach (MsQuicConnection c in _clientConnections)
+        {
+            if (c.Events is ConnectionRecorder r)
+            {
+                foreach (MsQuicStream s in r.PeerStreams) s.Close();
+            }
         }
         foreach (MsQuicStream s in _streams) s.Close();
         foreach (MsQuicConnection c in _clientConnections) c.Close();
         foreach (MsQuicConnection c in Accepted) c.Close();
         Listener.Close();
-        foreach (MsQuicConfiguration c in _clientConfigurations) c.Close();
+        foreach (MsQuicConfiguration c in _configurations) c.Close();
         ServerConfiguration.Close();
         Registration.Close();
         Certificate.Dispose();
@@ -298,6 +359,12 @@ internal sealed unsafe class NativeBlock : IDisposable
         for (int i = 0; i < Length; i++) Pointer[i] = PatternAt(baseOffset + i);
     }
 
+    public void CopyFrom(ReadOnlySpan<byte> data) => data.CopyTo(Span);
+
+    public string AsciiString() => Encoding.ASCII.GetString(Span);
+
+    public void WriteInt32(int offset, int value) => System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(Span[offset..], value);
+
     public void Dispose()
     {
         if (Pointer != null)
@@ -305,5 +372,99 @@ internal sealed unsafe class NativeBlock : IDisposable
             System.Runtime.InteropServices.NativeMemory.Free(Pointer);
             Pointer = null;
         }
+    }
+}
+
+/// <summary>
+/// A native <c>QUIC_BUFFER[]</c> so that async tests never hold pointers across awaits; the array stays valid
+/// until the matching completion, as MsQuic requires.
+/// </summary>
+internal sealed unsafe class NativeBuffers : IDisposable
+{
+    public QUIC_BUFFER* Buffers { get; private set; }
+    public uint Count { get; }
+
+    public NativeBuffers(int count)
+    {
+        Count = (uint)count;
+        Buffers = (QUIC_BUFFER*)System.Runtime.InteropServices.NativeMemory.AllocZeroed((nuint)(count * sizeof(QUIC_BUFFER)));
+    }
+
+    /// <summary>One buffer covering the whole block.</summary>
+    public static NativeBuffers Single(NativeBlock block)
+    {
+        var buffers = new NativeBuffers(1);
+        buffers.Set(0, block, 0, block.Length);
+        return buffers;
+    }
+
+    public void Set(int index, NativeBlock block, int offset, int length) => Buffers[index] = new QUIC_BUFFER(block.Pointer + offset, (uint)length);
+
+    public int SendOn(MsQuicStream stream, QUIC_SEND_FLAGS flags, nint context) => stream.Send(Buffers, Count, flags, (void*)context);
+
+    public int SendDatagramOn(MsQuicConnection connection, QUIC_SEND_FLAGS flags, nint context) => connection.SendDatagram(Buffers, Count, flags, (void*)context);
+
+    /// <summary>Sends entry <paramref name="index"/> as its own datagram.</summary>
+    public int SendDatagramOn(MsQuicConnection connection, int index, QUIC_SEND_FLAGS flags, nint context) => connection.SendDatagram(Buffers + index, 1, flags, (void*)context);
+
+    public void Dispose()
+    {
+        if (Buffers != null)
+        {
+            System.Runtime.InteropServices.NativeMemory.Free(Buffers);
+            Buffers = null;
+        }
+    }
+}
+
+internal static unsafe class RawCredentials
+{
+    /// <summary>Loads a raw client credential with exactly <paramref name="flags"/>.</summary>
+    public static int LoadClient(MsQuicConfiguration configuration, QUIC_CREDENTIAL_FLAGS flags)
+    {
+        QUIC_CREDENTIAL_CONFIG cred = default;
+        cred.Type = QUIC_CREDENTIAL_TYPE.NONE;
+        cred.Flags = flags;
+        return configuration.LoadCredential(&cred);
+    }
+
+    /// <summary>Loads a credential of an invalid type (MsQuic must refuse it).</summary>
+    public static int LoadInvalid(MsQuicConfiguration configuration)
+    {
+        QUIC_CREDENTIAL_CONFIG cred = default;
+        cred.Type = (QUIC_CREDENTIAL_TYPE)999;
+        return configuration.LoadCredential(&cred);
+    }
+}
+
+/// <summary>
+/// Measures managed allocations attributed to the MsQuic worker thread between two consecutive samples taken on
+/// that same thread. Any allocation in the wrapper's callback path (or the handler) shows up as a positive delta.
+/// </summary>
+internal sealed class CallbackAllocationProbe
+{
+    private int _lastThread;
+    private long _lastAllocated;
+    private bool _armed;
+    public long Allocated;
+    public int Samples;
+
+    public void Arm()
+    {
+        _armed = true;
+        _lastThread = 0;
+    }
+
+    public void Sample()
+    {
+        long now = GC.GetAllocatedBytesForCurrentThread();
+        int thread = Environment.CurrentManagedThreadId;
+        if (_armed && thread == _lastThread)
+        {
+            Allocated += now - _lastAllocated;
+            Samples++;
+        }
+        _lastThread = thread;
+        _lastAllocated = now;
     }
 }

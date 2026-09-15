@@ -9,31 +9,36 @@ namespace Tedd.Quicly.Transport.MsQuic;
 /// <summary>How a client validates the server certificate.</summary>
 public enum MsQuicCertificateValidation
 {
-    /// <summary>Platform validation (system trust store). Self-signed certificates are rejected.</summary>
-    System = 0,
+    /// <summary>Platform validation against the system trust store (default). Self-signed certificates are rejected.</summary>
+    SystemRoots = 0,
     /// <summary>No validation at all (<c>QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION</c>). Development only.</summary>
     InsecureSkipValidation = 1,
     /// <summary>
-    /// The certificate is delivered as DER to <see cref="IMsQuicConnectionEvents.PeerCertificateReceived"/> and the
-    /// handler decides (<c>INDICATE_CERTIFICATE_RECEIVED | NO_CERTIFICATE_VALIDATION | USE_PORTABLE_CERTIFICATES</c>).
+    /// Platform validation runs but its verdict is deferred to the application
+    /// (<c>INDICATE_CERTIFICATE_RECEIVED | DEFER_CERTIFICATE_VALIDATION | USE_PORTABLE_CERTIFICATES</c>): the
+    /// certificate and chain arrive as DER / PKCS#7 bytes in <see cref="IMsQuicConnectionEvents.PeerCertificateReceived"/>
+    /// together with the platform result, and the handler accepts, rejects or defers the decision to a later
+    /// <see cref="MsQuicConnection.CompleteCertificateValidation"/> call.
     /// </summary>
-    Custom = 2,
+    Callback = 2,
 }
 
 /// <summary>How a server certificate is handed to MsQuic.</summary>
 public enum MsQuicServerCredentialMode
 {
-    /// <summary><see cref="CertificateContext"/> on Windows, <see cref="Pkcs12"/> elsewhere.</summary>
+    /// <summary><see cref="Pkcs12"/> when the private key is exportable, otherwise <see cref="CertificateContext"/> (Windows).</summary>
     Auto = 0,
-    /// <summary><c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT</c> (Windows/Schannel; the key is persisted first, see <see cref="MsQuicCertificateHelper"/>).</summary>
-    CertificateContext = 1,
-    /// <summary><c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c> (all platforms).</summary>
-    Pkcs12 = 2,
+    /// <summary><c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c>: the certificate and key are exported to an in-memory PKCS#12 blob (all TLS providers).</summary>
+    Pkcs12 = 1,
+    /// <summary><c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT</c> (Windows/Schannel only; the key is persisted first, see <see cref="MsQuicCertificateHelper"/>).</summary>
+    CertificateContext = 2,
 }
 
 /// <summary>
 /// An MsQuic configuration: ALPN list + <see cref="QUIC_SETTINGS"/> + credential. Shared by any number of
-/// connections. Close it after the connections that use it.
+/// connections (MsQuic reference-counts it). Close it after the connections that use it. A credential can be
+/// loaded exactly once per configuration; certificate renewal means opening a new configuration and letting the
+/// listener callback pick it (ADR 0009).
 /// </summary>
 public sealed unsafe class MsQuicConfiguration : IDisposable
 {
@@ -55,14 +60,22 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
     /// <summary>True when a credential has been loaded.</summary>
     public bool HasCredential { get; private set; }
 
-    /// <summary>
-    /// True when the loaded credential asks MsQuic to indicate the peer certificate as portable DER bytes
-    /// (<c>INDICATE_CERTIFICATE_RECEIVED | USE_PORTABLE_CERTIFICATES</c>). Connections use it to decode
-    /// <c>PEER_CERTIFICATE_RECEIVED</c>.
-    /// </summary>
-    public bool IndicatesPortableCertificate { get; private set; }
+    /// <summary>The credential type that was loaded (<see cref="QUIC_CREDENTIAL_TYPE.NONE"/> for clients and before loading).</summary>
+    public QUIC_CREDENTIAL_TYPE CredentialType { get; private set; }
 
-    /// <summary>Opens a configuration with the given ALPNs and settings builder (defaults when null).</summary>
+    /// <summary>The flags the credential was loaded with.</summary>
+    public QUIC_CREDENTIAL_FLAGS CredentialFlags { get; private set; }
+
+    /// <summary>
+    /// True when the credential asks MsQuic to indicate the peer certificate as portable DER bytes
+    /// (<c>INDICATE_CERTIFICATE_RECEIVED | USE_PORTABLE_CERTIFICATES</c>).
+    /// </summary>
+    public bool IndicatesPortableCertificate => (CredentialFlags & (QUIC_CREDENTIAL_FLAGS.INDICATE_CERTIFICATE_RECEIVED | QUIC_CREDENTIAL_FLAGS.USE_PORTABLE_CERTIFICATES)) == (QUIC_CREDENTIAL_FLAGS.INDICATE_CERTIFICATE_RECEIVED | QUIC_CREDENTIAL_FLAGS.USE_PORTABLE_CERTIFICATES);
+
+    /// <summary>True when the credential defers certificate validation, so a handler may answer with <see cref="MsQuicCertificateDecision.Defer"/>.</summary>
+    public bool DefersCertificateValidation => (CredentialFlags & QUIC_CREDENTIAL_FLAGS.DEFER_CERTIFICATE_VALIDATION) != 0;
+
+    /// <summary>Opens a configuration with the given ALPNs and settings builder (<see cref="MsQuicSettings.Default"/> when null).</summary>
     public MsQuicConfiguration(MsQuicRegistration registration, ReadOnlySpan<string> alpns, MsQuicSettings? settings = null)
         : this(registration, alpns, (settings ?? MsQuicSettings.Default).ToNative())
     {
@@ -109,10 +122,10 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
         }
     }
 
-    /// <summary>Creates a client configuration with the requested validation policy.</summary>
-    public static MsQuicConfiguration CreateClient(MsQuicRegistration registration, ReadOnlySpan<string> alpns, MsQuicCertificateValidation validation = MsQuicCertificateValidation.System, MsQuicSettings? settings = null)
+    /// <summary>Creates a client configuration with the requested validation policy (<see cref="MsQuicSettings.Client"/> defaults when <paramref name="settings"/> is null).</summary>
+    public static MsQuicConfiguration CreateClient(MsQuicRegistration registration, ReadOnlySpan<string> alpns, MsQuicCertificateValidation validation = MsQuicCertificateValidation.SystemRoots, MsQuicSettings? settings = null)
     {
-        var config = new MsQuicConfiguration(registration, alpns, settings);
+        var config = new MsQuicConfiguration(registration, alpns, settings ?? MsQuicSettings.Client());
         try
         {
             config.LoadClientCredential(validation);
@@ -133,71 +146,94 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
         if (MsQuicStatus.Succeeded(status))
         {
             HasCredential = true;
-            const QUIC_CREDENTIAL_FLAGS portable = QUIC_CREDENTIAL_FLAGS.INDICATE_CERTIFICATE_RECEIVED | QUIC_CREDENTIAL_FLAGS.USE_PORTABLE_CERTIFICATES;
-            IndicatesPortableCertificate = (credential->Flags & portable) == portable;
+            CredentialType = credential->Type;
+            CredentialFlags = credential->Flags;
         }
         return status;
     }
 
-    /// <summary>Loads a server certificate (must carry a private key). Throws <see cref="MsQuicException"/> on failure.</summary>
+    /// <summary>
+    /// Loads a server certificate (must carry a private key). Throws <see cref="MsQuicException"/> on failure.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="MsQuicServerCredentialMode.Auto"/> prefers PKCS#12: the certificate is exported with its key
+    /// to an in-memory blob and MsQuic imports it (no store, no persisted key container). The Schannel build
+    /// bundled with .NET accepts this path (covered by the loopback tests). When the key is not exportable the
+    /// Windows fallback is a certificate context whose key has been persisted with <c>PersistKeySet | UserKeySet</c>;
+    /// on other platforms a non-exportable key is an error. <see cref="CredentialType"/> records which path was used.
+    /// </remarks>
     public void LoadServerCredential(X509Certificate2 certificate, MsQuicServerCredentialMode mode = MsQuicServerCredentialMode.Auto)
     {
         ArgumentNullException.ThrowIfNull(certificate);
         ObjectDisposedException.ThrowIf(_handle == null, this);
         if (!certificate.HasPrivateKey) throw new ArgumentException("The server certificate must have a private key.", nameof(certificate));
-        if (mode == MsQuicServerCredentialMode.Auto)
-        {
-            mode = OperatingSystem.IsWindows() ? MsQuicServerCredentialMode.CertificateContext : MsQuicServerCredentialMode.Pkcs12;
-        }
 
-        QUIC_CREDENTIAL_CONFIG cred = default;
-        cred.Flags = QUIC_CREDENTIAL_FLAGS.NONE;
-        if (mode == MsQuicServerCredentialMode.CertificateContext)
+        byte[]? pfx = null;
+        if (mode != MsQuicServerCredentialMode.CertificateContext && MsQuicCertificateHelper.TryExportPkcs12(certificate, out pfx))
         {
-            if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("CERTIFICATE_CONTEXT credentials are Windows only.");
-            X509Certificate2 usable = MsQuicCertificateHelper.EnsurePersistedPrivateKey(certificate);
-            if (!ReferenceEquals(usable, certificate))
+            try
             {
-                _ownedCertificate?.Dispose();
-                _ownedCertificate = usable;
+                LoadPkcs12Credential(pfx);
+                return;
             }
-            cred.Type = QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT;
-            cred.CertificateContext = (void*)usable.Handle;
+            finally
+            {
+                CryptographicOperations.ZeroMemory(pfx);
+            }
+        }
+        if (mode == MsQuicServerCredentialMode.Pkcs12)
+        {
+            throw new ArgumentException("The private key is not exportable, so it cannot be handed to MsQuic as PKCS#12.", nameof(certificate));
+        }
+        if (!OperatingSystem.IsWindows())
+        {
+            throw new PlatformNotSupportedException("CERTIFICATE_CONTEXT credentials are Windows only; provide a certificate with an exportable private key.");
+        }
+        LoadCertificateContextCredential(certificate);
+    }
+
+    private void LoadPkcs12Credential(byte[] pfx)
+    {
+        fixed (byte* p = pfx)
+        {
+            QUIC_CERTIFICATE_PKCS12 pkcs12 = new() { Asn1Blob = p, Asn1BlobLength = (uint)pfx.Length, PrivateKeyPassword = null };
+            QUIC_CREDENTIAL_CONFIG cred = default;
+            cred.Type = QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12;
+            cred.Flags = QUIC_CREDENTIAL_FLAGS.NONE;
+            cred.CertificatePkcs12 = &pkcs12;
             int status = LoadCredential(&cred);
-            GC.KeepAlive(usable);
-            MsQuicException.ThrowIfFailed(status, "ConfigurationLoadCredential(CERTIFICATE_CONTEXT)");
-            return;
-        }
-
-        byte[] pfx = certificate.Export(X509ContentType.Pkcs12);
-        try
-        {
-            fixed (byte* p = pfx)
-            {
-                QUIC_CERTIFICATE_PKCS12 pkcs12 = new() { Asn1Blob = p, Asn1BlobLength = (uint)pfx.Length, PrivateKeyPassword = null };
-                cred.Type = QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12;
-                cred.CertificatePkcs12 = &pkcs12;
-                int status = LoadCredential(&cred);
-                MsQuicException.ThrowIfFailed(status, "ConfigurationLoadCredential(CERTIFICATE_PKCS12)");
-            }
-        }
-        finally
-        {
-            CryptographicOperations.ZeroMemory(pfx);
+            MsQuicException.ThrowIfFailed(status, "ConfigurationLoadCredential(CERTIFICATE_PKCS12)");
         }
     }
 
+    private void LoadCertificateContextCredential(X509Certificate2 certificate)
+    {
+        X509Certificate2 usable = MsQuicCertificateHelper.EnsurePersistedPrivateKey(certificate);
+        if (!ReferenceEquals(usable, certificate))
+        {
+            _ownedCertificate?.Dispose();
+            _ownedCertificate = usable;
+        }
+        QUIC_CREDENTIAL_CONFIG cred = default;
+        cred.Type = QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT;
+        cred.Flags = QUIC_CREDENTIAL_FLAGS.NONE;
+        cred.CertificateContext = (void*)usable.Handle;
+        int status = LoadCredential(&cred);
+        GC.KeepAlive(usable);
+        MsQuicException.ThrowIfFailed(status, "ConfigurationLoadCredential(CERTIFICATE_CONTEXT)");
+    }
+
     /// <summary>Loads a client credential (no client certificate) with the requested validation policy.</summary>
-    public void LoadClientCredential(MsQuicCertificateValidation validation = MsQuicCertificateValidation.System)
+    public void LoadClientCredential(MsQuicCertificateValidation validation = MsQuicCertificateValidation.SystemRoots)
     {
         ObjectDisposedException.ThrowIf(_handle == null, this);
         QUIC_CREDENTIAL_CONFIG cred = default;
         cred.Type = QUIC_CREDENTIAL_TYPE.NONE;
         cred.Flags = validation switch
         {
+            MsQuicCertificateValidation.SystemRoots => QUIC_CREDENTIAL_FLAGS.CLIENT,
             MsQuicCertificateValidation.InsecureSkipValidation => QUIC_CREDENTIAL_FLAGS.CLIENT | QUIC_CREDENTIAL_FLAGS.NO_CERTIFICATE_VALIDATION,
-            MsQuicCertificateValidation.Custom => QUIC_CREDENTIAL_FLAGS.CLIENT | QUIC_CREDENTIAL_FLAGS.INDICATE_CERTIFICATE_RECEIVED | QUIC_CREDENTIAL_FLAGS.NO_CERTIFICATE_VALIDATION | QUIC_CREDENTIAL_FLAGS.USE_PORTABLE_CERTIFICATES,
-            MsQuicCertificateValidation.System => QUIC_CREDENTIAL_FLAGS.CLIENT,
+            MsQuicCertificateValidation.Callback => QUIC_CREDENTIAL_FLAGS.CLIENT | QUIC_CREDENTIAL_FLAGS.INDICATE_CERTIFICATE_RECEIVED | QUIC_CREDENTIAL_FLAGS.DEFER_CERTIFICATE_VALIDATION | QUIC_CREDENTIAL_FLAGS.USE_PORTABLE_CERTIFICATES,
             _ => throw new ArgumentOutOfRangeException(nameof(validation)),
         };
         int status = LoadCredential(&cred);

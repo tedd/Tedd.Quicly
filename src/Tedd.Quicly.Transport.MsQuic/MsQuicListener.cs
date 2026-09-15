@@ -5,20 +5,63 @@ using Tedd.Quicly.Transport.MsQuic.Interop;
 
 namespace Tedd.Quicly.Transport.MsQuic;
 
+/// <summary>
+/// Read-only view over <see cref="QUIC_NEW_CONNECTION_INFO"/> for the new-connection callback. Every span and
+/// reference is valid only during the callback.
+/// </summary>
+public readonly unsafe ref struct MsQuicNewConnectionInfo
+{
+    private readonly QUIC_NEW_CONNECTION_INFO* _info;
+
+    internal MsQuicNewConnectionInfo(QUIC_NEW_CONNECTION_INFO* info) => _info = info;
+
+    /// <summary>The raw structure.</summary>
+    public QUIC_NEW_CONNECTION_INFO* Raw => _info;
+
+    /// <summary>Negotiated QUIC version (1 for RFC 9000).</summary>
+    public uint QuicVersion => _info->QuicVersion;
+
+    /// <summary>The peer's address.</summary>
+    public ref readonly QUIC_ADDR RemoteAddress => ref *_info->RemoteAddress;
+
+    /// <summary>The local address the connection arrived on.</summary>
+    public ref readonly QUIC_ADDR LocalAddress => ref *_info->LocalAddress;
+
+    /// <summary>The SNI the client sent (UTF-8, not null-terminated; empty when absent).</summary>
+    public ReadOnlySpan<byte> ServerName => new(_info->ServerName, _info->ServerNameLength);
+
+    /// <summary>The ALPN MsQuic negotiated (the first entry of the client's list that the listener offers).</summary>
+    public ReadOnlySpan<byte> NegotiatedAlpn => new(_info->NegotiatedAlpn, _info->NegotiatedAlpnLength);
+
+    /// <summary>The full ALPN list the client offered, wire format (one-byte length prefix per entry).</summary>
+    public ReadOnlySpan<byte> ClientAlpnList => new(_info->ClientAlpnList, _info->ClientAlpnListLength);
+
+    /// <summary>The raw ClientHello bytes.</summary>
+    public ReadOnlySpan<byte> CryptoBuffer => new(_info->CryptoBuffer, (int)_info->CryptoBufferLength);
+
+    /// <summary>True when <see cref="NegotiatedAlpn"/> equals <paramref name="alpn"/> (ASCII, ordinal).</summary>
+    public bool NegotiatedAlpnIs(ReadOnlySpan<byte> alpn) => NegotiatedAlpn.SequenceEqual(alpn);
+}
+
 /// <summary>Listener event sink.</summary>
-/// <remarks>Threading: invoked on MsQuic worker threads; <see cref="NewConnection"/> may run concurrently for different connections.</remarks>
-public unsafe interface IMsQuicListenerEvents
+/// <remarks>Threading: invoked on MsQuic worker threads; <see cref="NewConnection"/> may run concurrently for different connections. Exceptions are recorded in <see cref="MsQuicListener.LastCallbackException"/> and reject the connection.</remarks>
+public interface IMsQuicListenerEvents
 {
     /// <summary>
-    /// A client is connecting. Inspect <paramref name="info"/> (ALPN list, SNI, addresses; valid only during the
-    /// call), set <see cref="MsQuicConnection.Events"/> on <paramref name="connection"/> and return the
-    /// configuration to accept with, or null to reject. On rejection the wrapper is released and MsQuic drops
-    /// the connection; the app must not close it.
+    /// A client is connecting. Inspect <paramref name="info"/> (remote address, SNI, negotiated ALPN; valid only
+    /// during the call), set <see cref="MsQuicConnection.Events"/> on <paramref name="connection"/> and return the
+    /// configuration to accept with (one per ALPN when several are hosted), or null to reject. On rejection MsQuic
+    /// drops the connection and the wrapper is released; the app must not use it afterwards.
     /// </summary>
-    MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, ref QUIC_NEW_CONNECTION_INFO info);
+    MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, in MsQuicNewConnectionInfo info);
 
     /// <summary>The listener has fully stopped (after <see cref="MsQuicListener.Stop"/> or <see cref="MsQuicListener.Close"/>).</summary>
     void StopComplete(MsQuicListener listener, bool appCloseInProgress)
+    {
+    }
+
+    /// <summary>Denial-of-service mitigation mode toggled (only when <c>QUIC_PARAM_DOS_MODE_EVENTS</c> is enabled).</summary>
+    void DosModeChanged(MsQuicListener listener, bool enabled)
     {
     }
 }
@@ -51,7 +94,7 @@ public sealed unsafe class MsQuicListener : IDisposable
     /// <summary>Free slot for the owner's state; never touched by the wrapper.</summary>
     public object? Tag { get; set; }
 
-    /// <summary>The last exception thrown by the event sink (callbacks must not throw; the wrapper records and swallows).</summary>
+    /// <summary>The last exception thrown by the event sink (callbacks never propagate; the wrapper records and rejects).</summary>
     public Exception? LastCallbackException { get; private set; }
 
     /// <summary>Opens a listener (not yet started).</summary>
@@ -80,7 +123,7 @@ public sealed unsafe class MsQuicListener : IDisposable
         ArgumentNullException.ThrowIfNull(localEndPoint);
         ObjectDisposedException.ThrowIf(_handle == null, this);
         if (alpns.Length == 0) throw new ArgumentException("At least one ALPN is required.", nameof(alpns));
-        QuicAddr addr = QuicAddr.FromIPEndPoint(localEndPoint);
+        QUIC_ADDR addr = QUIC_ADDR.FromIPEndPoint(localEndPoint);
         AlpnList list = AlpnList.Create(alpns);
         try
         {
@@ -95,7 +138,7 @@ public sealed unsafe class MsQuicListener : IDisposable
     }
 
     /// <summary>The bound local address (valid after <see cref="Start"/>).</summary>
-    public int GetLocalAddress(out QuicAddr address)
+    public int GetLocalAddress(out QUIC_ADDR address)
     {
         ObjectDisposedException.ThrowIf(_handle == null, this);
         return _api.GetParam(_handle, MsQuicParam.QUIC_PARAM_LISTENER_LOCAL_ADDRESS, out address);
@@ -106,7 +149,7 @@ public sealed unsafe class MsQuicListener : IDisposable
     {
         get
         {
-            int status = GetLocalAddress(out QuicAddr addr);
+            int status = GetLocalAddress(out QUIC_ADDR addr);
             MsQuicException.ThrowIfFailed(status, "GetParam(LISTENER_LOCAL_ADDRESS)");
             return addr.ToIPEndPoint() ?? throw new InvalidOperationException("Listener is not bound.");
         }
@@ -121,11 +164,12 @@ public sealed unsafe class MsQuicListener : IDisposable
         _api.Table->ListenerStop(_handle);
     }
 
-    /// <summary>Stops (if needed), closes the handle and frees the context. Idempotent. Blocks until stopped.</summary>
+    /// <summary>Stops (if needed), closes the handle and frees the context. Idempotent. Blocks until stopped. Never call it from a callback thread.</summary>
     public void Close()
     {
         QUIC_HANDLE* handle = _handle;
         if (handle == null) return;
+        MsQuicCallbackScope.ThrowIfInsideCallback("ListenerClose");
         _handle = null;
         IsStarted = false;
         _api.Table->ListenerClose(handle);
@@ -139,6 +183,7 @@ public sealed unsafe class MsQuicListener : IDisposable
     private static int NativeCallback(QUIC_HANDLE* handle, void* context, QUIC_LISTENER_EVENT* evt)
     {
         var listener = (MsQuicListener)GCHandle.FromIntPtr((nint)context).Target!;
+        MsQuicCallbackScope.Enter();
         try
         {
             return listener.HandleEvent(evt);
@@ -146,7 +191,12 @@ public sealed unsafe class MsQuicListener : IDisposable
         catch (Exception ex)
         {
             listener.LastCallbackException = ex;
+            MsQuicCallbackScope.OnEscapedException(ex);
             return MsQuicStatus.QUIC_STATUS_INTERNAL_ERROR;
+        }
+        finally
+        {
+            MsQuicCallbackScope.Exit();
         }
     }
 
@@ -159,6 +209,9 @@ public sealed unsafe class MsQuicListener : IDisposable
             case QUIC_LISTENER_EVENT_TYPE.STOP_COMPLETE:
                 _events.StopComplete(this, evt->STOP_COMPLETE.AppCloseInProgress);
                 return MsQuicStatus.QUIC_STATUS_SUCCESS;
+            case QUIC_LISTENER_EVENT_TYPE.DOS_MODE_CHANGED:
+                _events.DosModeChanged(this, evt->DOS_MODE_CHANGED.DosModeEnabled);
+                return MsQuicStatus.QUIC_STATUS_SUCCESS;
             default:
                 return MsQuicStatus.QUIC_STATUS_SUCCESS;
         }
@@ -170,15 +223,17 @@ public sealed unsafe class MsQuicListener : IDisposable
         MsQuicConfiguration? configuration;
         try
         {
-            configuration = _events.NewConnection(this, connection, ref *info);
+            configuration = _events.NewConnection(this, connection, new MsQuicNewConnectionInfo(info));
         }
         catch (Exception ex)
         {
             LastCallbackException = ex;
+            MsQuicCallbackScope.OnEscapedException(ex);
             configuration = null;
         }
         if (configuration is null || configuration.IsClosed)
         {
+            // MsQuic drops a connection whose NEW_CONNECTION callback fails and never indicates events for it.
             connection.Abandon();
             return MsQuicStatus.QUIC_STATUS_CONNECTION_REFUSED;
         }
@@ -188,7 +243,6 @@ public sealed unsafe class MsQuicListener : IDisposable
         int status = connection.SetConfiguration(configuration);
         if (MsQuicStatus.Failed(status))
         {
-            // MsQuic drops a connection whose NEW_CONNECTION callback fails and never indicates events for it.
             connection.Abandon();
             return status;
         }

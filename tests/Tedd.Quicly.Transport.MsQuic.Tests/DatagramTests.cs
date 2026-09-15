@@ -3,9 +3,42 @@ using Tedd.Quicly.Transport.MsQuic.Interop;
 
 namespace Tedd.Quicly.Transport.MsQuic.Tests;
 
-public unsafe class DatagramTests
+[Collection(MsQuicCollection.Name)]
+public class DatagramTests
 {
     private const int Count = 100;
+
+    private sealed class Burst : IDisposable
+    {
+        public readonly NativeBlock Block;
+        public readonly NativeBuffers Buffers;
+
+        public Burst(int payloadLength)
+        {
+            Block = new NativeBlock(payloadLength * Count);
+            Block.FillPattern(0);
+            Buffers = new NativeBuffers(Count);
+            for (int i = 0; i < Count; i++)
+            {
+                Block.WriteInt32(i * payloadLength, i);
+                Buffers.Set(i, Block, i * payloadLength, payloadLength);
+            }
+        }
+
+        public void SendAll(MsQuicConnection sender)
+        {
+            for (int i = 0; i < Count; i++)
+            {
+                Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, Buffers.SendDatagramOn(sender, i, QUIC_SEND_FLAGS.NONE, i + 1));
+            }
+        }
+
+        public void Dispose()
+        {
+            Buffers.Dispose();
+            Block.Dispose();
+        }
+    }
 
     private static async Task SendBurstAndVerifyAsync(MsQuicConnection sender, ConnectionRecorder senderEvents, ConnectionRecorder receiverEvents, int payloadLength)
     {
@@ -29,20 +62,8 @@ public unsafe class DatagramTests
         };
         senderEvents.SendStates = new QUIC_DATAGRAM_SEND_STATE[Count];
 
-        using var block = new NativeBlock(payloadLength * Count);
-        block.FillPattern(0);
-        QUIC_BUFFER* buffers = stackalloc QUIC_BUFFER[Count];
-        for (int i = 0; i < Count; i++)
-        {
-            byte* p = block.Pointer + i * payloadLength;
-            BinaryPrimitives.WriteInt32LittleEndian(new Span<byte>(p, 4), i);
-            buffers[i] = new QUIC_BUFFER(p, (uint)payloadLength);
-        }
-        for (int i = 0; i < Count; i++)
-        {
-            int status = sender.SendDatagram(&buffers[i], 1, QUIC_SEND_FLAGS.NONE, (void*)(i + 1));
-            Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, status);
-        }
+        using var burst = new Burst(payloadLength);
+        burst.SendAll(sender);
 
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref receivedCount) >= Count * 9 / 10, TimeSpan.FromSeconds(2)), $"received {receivedCount}/{Count} in 2 s");
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref senderEvents.FinalSendStates) == Count, TimeSpan.FromSeconds(5)), $"final states {senderEvents.FinalSendStates}/{Count}");
@@ -60,8 +81,8 @@ public unsafe class DatagramTests
         using var loopback = new Loopback();
         (MsQuicConnection client, ConnectionRecorder clientEvents, MsQuicConnection server, ConnectionRecorder serverEvents) = await loopback.ConnectPairAsync();
 
-        (bool clientEnabled, ushort clientMax) = await clientEvents.DatagramSendEnabled.Within();
-        (bool serverEnabled, ushort serverMax) = await serverEvents.DatagramSendEnabled.Within();
+        (bool clientEnabled, ushort clientMax) = await clientEvents.DatagramSendEnabledTcs.Within();
+        (bool serverEnabled, ushort serverMax) = await serverEvents.DatagramSendEnabledTcs.Within();
         Assert.True(clientEnabled);
         Assert.True(serverEnabled);
         Assert.True(clientMax > 100, $"client max {clientMax}");
@@ -71,8 +92,28 @@ public unsafe class DatagramTests
         await SendBurstAndVerifyAsync(server, serverEvents, clientEvents, serverMax - 16);
 
         client.Shutdown(QUIC_CONNECTION_SHUTDOWN_FLAGS.NONE, 0);
-        await clientEvents.ShutdownComplete.Within();
-        await serverEvents.ShutdownComplete.Within();
+        await clientEvents.ShutdownCompleteTcs.Within();
+        await serverEvents.ShutdownCompleteTcs.Within();
+    }
+
+    [Fact]
+    public async Task Newer_send_flags_are_accepted_by_the_library()
+    {
+        using var loopback = new Loopback();
+        (MsQuicConnection client, ConnectionRecorder clientEvents, _, ConnectionRecorder serverEvents) = await loopback.ConnectPairAsync();
+        (_, ushort max) = await clientEvents.DatagramSendEnabledTcs.Within();
+        Assert.True(64 < max);
+        using var block = new NativeBlock(64);
+        block.FillPattern(0);
+        using NativeBuffers buffers = NativeBuffers.Single(block);
+        QUIC_SEND_FLAGS flags = QUIC_SEND_FLAGS.DGRAM_PRIORITY | QUIC_SEND_FLAGS.CANCEL_ON_BLOCKED | QUIC_SEND_FLAGS.PRIORITY_WORK;
+        Assert.True(MsQuicFeatureGate.AreSendFlagsSupported(client.Api.Version, flags));
+        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, buffers.SendDatagramOn(client, flags, 0));
+        Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref serverEvents.DatagramsReceived) >= 1, TestTimeouts.Default));
+        Assert.True(serverEvents.Datagrams.TryDequeue(out byte[]? payload));
+        Assert.Equal(block.Span.ToArray(), payload);
+        client.Shutdown(QUIC_CONNECTION_SHUTDOWN_FLAGS.NONE, 0);
+        await clientEvents.ShutdownCompleteTcs.Within();
     }
 
     [Fact]
@@ -80,31 +121,31 @@ public unsafe class DatagramTests
     {
         using var loopback = new Loopback();
         (MsQuicConnection client, ConnectionRecorder clientEvents, _, _) = await loopback.ConnectPairAsync();
-        (_, ushort max) = await clientEvents.DatagramSendEnabled.Within();
+        (_, ushort max) = await clientEvents.DatagramSendEnabledTcs.Within();
         using var block = new NativeBlock(max + 100);
-        QUIC_BUFFER buffer = new(block.Pointer, (uint)(max + 100));
-        int status = client.SendDatagram(&buffer, 1, QUIC_SEND_FLAGS.NONE, null);
+        using NativeBuffers buffers = NativeBuffers.Single(block);
+        int status = buffers.SendDatagramOn(client, QUIC_SEND_FLAGS.NONE, 0);
         Assert.True(MsQuicStatus.Failed(status), MsQuicStatus.GetName(status));
     }
 
     [Fact]
     public async Task Datagram_receive_disabled_by_settings_means_peer_cannot_send()
     {
-        using var loopback = new Loopback(new MsQuicSettings { DatagramReceiveEnabled = false });
+        MsQuicSettings serverSettings = Loopback.TestServerSettings();
+        serverSettings.DatagramReceiveEnabled = false;
+        using var loopback = new Loopback(serverSettings);
         (MsQuicConnection client, ConnectionRecorder clientEvents, _, ConnectionRecorder serverEvents) = await loopback.ConnectPairAsync();
-        // The server does not advertise datagram support, so the client never gets send-enabled...
         await Task.Delay(200);
-        Assert.False(clientEvents.DatagramSendEnabled.Task.IsCompleted);
-        // ...while the client (receive enabled by default) lets the server send.
-        (bool enabled, _) = await serverEvents.DatagramSendEnabled.Within();
+        Assert.False(clientEvents.DatagramSendEnabledTcs.Task.IsCompleted);
+        (bool enabled, _) = await serverEvents.DatagramSendEnabledTcs.Within();
         Assert.True(enabled);
         using var block = new NativeBlock(16);
-        QUIC_BUFFER buffer = new(block.Pointer, 16);
-        Assert.True(MsQuicStatus.Failed(client.SendDatagram(&buffer, 1, QUIC_SEND_FLAGS.NONE, null)));
+        using NativeBuffers buffers = NativeBuffers.Single(block);
+        Assert.True(MsQuicStatus.Failed(buffers.SendDatagramOn(client, QUIC_SEND_FLAGS.NONE, 0)));
     }
 
     /// <summary>Receiver that only counts and samples allocations (never allocates itself).</summary>
-    private sealed class ProbeConnectionEvents : IMsQuicConnectionEvents
+    private sealed unsafe class ProbeConnectionEvents : IMsQuicConnectionEvents
     {
         public readonly CallbackAllocationProbe Probe = new();
         public int Received;
@@ -134,6 +175,17 @@ public unsafe class DatagramTests
         }
     }
 
+    private static long SendMeasured(MsQuicConnection client, NativeBuffers buffers, int first, int count)
+    {
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < count; i++)
+        {
+            int status = buffers.SendDatagramOn(client, QUIC_SEND_FLAGS.NONE, first + i + 1);
+            if (status != MsQuicStatus.QUIC_STATUS_SUCCESS) throw new MsQuicException(status, "DatagramSend");
+        }
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
     [Fact]
     public async Task Datagram_send_and_receive_paths_do_not_allocate_in_steady_state()
     {
@@ -147,25 +199,16 @@ public unsafe class DatagramTests
         int payload = Math.Min(clientProbe.MaxSendLength - 16, 1000);
         using var block = new NativeBlock(payload);
         block.FillPattern(0);
-        QUIC_BUFFER buffer = new(block.Pointer, (uint)payload);
+        using NativeBuffers buffers = NativeBuffers.Single(block);
 
         const int warmup = 200;
         const int measured = 2000;
-        for (int i = 0; i < warmup; i++)
-        {
-            Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, client.SendDatagram(&buffer, 1, QUIC_SEND_FLAGS.NONE, (void*)(i + 1)));
-        }
+        SendMeasured(client, buffers, 0, warmup);
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref clientProbe.FinalStates) == warmup, TestTimeouts.Default));
 
         clientProbe.Probe.Arm();
         serverProbe.Probe.Arm();
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < measured; i++)
-        {
-            int status = client.SendDatagram(&buffer, 1, QUIC_SEND_FLAGS.NONE, (void*)(warmup + i + 1));
-            if (status != MsQuicStatus.QUIC_STATUS_SUCCESS) throw new MsQuicException(status, "DatagramSend");
-        }
-        long senderAllocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        long senderAllocated = SendMeasured(client, buffers, warmup, measured);
 
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref clientProbe.FinalStates) == warmup + measured, TestTimeouts.Default), $"final {clientProbe.FinalStates}");
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref serverProbe.Received) >= (warmup + measured) * 9 / 10, TestTimeouts.Default), $"received {serverProbe.Received}");

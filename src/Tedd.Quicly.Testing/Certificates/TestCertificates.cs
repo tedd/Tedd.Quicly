@@ -4,17 +4,24 @@ using System.Security.Cryptography.X509Certificates;
 namespace Tedd.Quicly.Testing.Certificates;
 
 /// <summary>
-/// Self-signed certificates for tests and development. Every certificate returned here is exported to PKCS#12
-/// and re-imported with <see cref="X509KeyStorageFlags.Exportable"/> (never <c>EphemeralKeySet</c>) so that
-/// Windows/Schannel - and therefore MsQuic - can use its private key (ADR 0006).
+/// Self-signed certificates for tests and development.
 /// </summary>
+/// <remarks>
+/// Every certificate returned here goes through a PKCS#12 round trip and is re-imported with
+/// <see cref="X509KeyStorageFlags.Exportable"/> (never <c>EphemeralKeySet</c>): the key ends up in a real key
+/// container that lives as long as the certificate object, which is what both MsQuic credential paths need on
+/// Windows. The preferred <c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c> path re-exports the key (hence
+/// <c>Exportable</c>), and the <c>CERTIFICATE_CONTEXT</c> fallback needs a non-ephemeral container for Schannel.
+/// Certificates created directly with <c>CertificateRequest.CreateSelfSigned</c> carry an ephemeral CNG key that
+/// Schannel cannot use through a certificate context.
+/// </remarks>
 public static class TestCertificates
 {
     private static readonly Oid s_serverAuth = new("1.3.6.1.5.5.7.3.1");
     private static readonly Oid s_clientAuth = new("1.3.6.1.5.5.7.3.2");
 
     /// <summary>
-    /// Creates a self-signed server certificate. The returned instance owns a persisted key; dispose it when done.
+    /// Creates a self-signed server certificate. Dispose the returned instance when done.
     /// </summary>
     /// <param name="subject">Distinguished name, e.g. <c>CN=localhost</c>.</param>
     /// <param name="validity">Total validity period (not-before is backdated by five minutes to absorb clock skew).</param>
@@ -23,6 +30,7 @@ public static class TestCertificates
     public static X509Certificate2 CreateSelfSigned(string subject, TimeSpan validity, bool ecdsa = true, params string[] dnsNames)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(subject);
+        ArgumentNullException.ThrowIfNull(dnsNames);
         if (validity <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(validity), "Validity must be positive.");
 
         DateTimeOffset notBefore = DateTimeOffset.UtcNow.AddMinutes(-5);
@@ -34,7 +42,7 @@ public static class TestCertificates
             var request = new CertificateRequest(subject, key, HashAlgorithmName.SHA256);
             AddExtensions(request, X509KeyUsageFlags.DigitalSignature, dnsNames);
             using X509Certificate2 ephemeral = request.CreateSelfSigned(notBefore, notAfter);
-            return Persist(ephemeral);
+            return RoundTripThroughPfx(ephemeral);
         }
         else
         {
@@ -42,7 +50,7 @@ public static class TestCertificates
             var request = new CertificateRequest(subject, key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
             AddExtensions(request, X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, dnsNames);
             using X509Certificate2 ephemeral = request.CreateSelfSigned(notBefore, notAfter);
-            return Persist(ephemeral);
+            return RoundTripThroughPfx(ephemeral);
         }
     }
 
@@ -51,7 +59,10 @@ public static class TestCertificates
     /// period of at most 14 days (13 days here). Pin it with <see cref="Sha256Fingerprint"/>.
     /// </summary>
     public static X509Certificate2 CreateWebTransportDevCertificate(string subject = "CN=localhost", params string[] dnsNames)
-        => CreateSelfSigned(subject, TimeSpan.FromDays(13), ecdsa: true, dnsNames.Length == 0 ? ["localhost"] : dnsNames);
+    {
+        ArgumentNullException.ThrowIfNull(dnsNames);
+        return CreateSelfSigned(subject, TimeSpan.FromDays(13), ecdsa: true, dnsNames.Length == 0 ? ["localhost"] : dnsNames);
+    }
 
     /// <summary>SHA-256 fingerprint of the DER certificate (what WebTransport's <c>serverCertificateHashes</c> expects).</summary>
     public static byte[] Sha256Fingerprint(X509Certificate2 certificate)
@@ -85,7 +96,7 @@ public static class TestCertificates
         }
     }
 
-    private static X509Certificate2 Persist(X509Certificate2 ephemeral)
+    private static X509Certificate2 RoundTripThroughPfx(X509Certificate2 ephemeral)
     {
         byte[] pfx = ephemeral.Export(X509ContentType.Pkcs12);
         try

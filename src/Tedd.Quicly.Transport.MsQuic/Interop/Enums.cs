@@ -249,6 +249,21 @@ public enum QUIC_KEY_EXCHANGE_ALGORITHM
     NONE = 0,
 }
 
+/// <summary>TLS key-exchange group negotiated (<see cref="QUIC_HANDSHAKE_INFO_2_5.TlsGroup"/>, MsQuic 2.5+).</summary>
+public enum QUIC_TLS_GROUP
+{
+    UNKNOWN = 0,
+    SECP256R1 = 23,
+    SECP384R1 = 24,
+    X25519 = 29,
+    MLKEM512 = 512,
+    MLKEM768 = 513,
+    MLKEM1024 = 514,
+    SECP256R1MLKEM768 = 4587,
+    X25519MLKEM768 = 4588,
+    SECP384R1MLKEM1024 = 4589,
+}
+
 /// <summary>TLS 1.3 cipher suite negotiated.</summary>
 public enum QUIC_CIPHER_SUITE
 {

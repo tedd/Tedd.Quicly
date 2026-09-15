@@ -2,6 +2,7 @@ using Tedd.Quicly.Transport.MsQuic.Interop;
 
 namespace Tedd.Quicly.Transport.MsQuic.Tests.Interop;
 
+[Collection(MsQuicCollection.Name)]
 public class StatusTests
 {
     [Fact]

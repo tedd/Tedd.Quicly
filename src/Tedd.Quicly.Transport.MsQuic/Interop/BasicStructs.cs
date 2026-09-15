@@ -52,13 +52,33 @@ public struct QUIC_HANDSHAKE_INFO
     public QUIC_CIPHER_SUITE CipherSuite;
 }
 
+/// <summary>
+/// <c>QUIC_HANDSHAKE_INFO</c> as extended by MsQuic 2.5 (<c>TlsGroup</c> appended, 36 bytes). The runtime's
+/// bindings still use the 32-byte form, which every library accepts; use this one only when
+/// <c>MsQuicApi.Version</c> is 2.5 or later and the key-exchange group is wanted.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct QUIC_HANDSHAKE_INFO_2_5
+{
+    public QUIC_TLS_PROTOCOL_VERSION TlsProtocolVersion;
+    public QUIC_CIPHER_ALGORITHM CipherAlgorithm;
+    public int CipherStrength;
+    public QUIC_HASH_ALGORITHM Hash;
+    public int HashStrength;
+    public QUIC_KEY_EXCHANGE_ALGORITHM KeyExchangeAlgorithm;
+    public int KeyExchangeStrength;
+    public QUIC_CIPHER_SUITE CipherSuite;
+    /// <summary>Added in v2.5.</summary>
+    public QUIC_TLS_GROUP TlsGroup;
+}
+
 /// <summary>Information about an incoming connection (<c>QUIC_LISTENER_EVENT.NEW_CONNECTION.Info</c>).</summary>
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct QUIC_NEW_CONNECTION_INFO
 {
     public uint QuicVersion;
-    public QuicAddr* LocalAddress;
-    public QuicAddr* RemoteAddress;
+    public QUIC_ADDR* LocalAddress;
+    public QUIC_ADDR* RemoteAddress;
     public uint CryptoBufferLength;
     public ushort ClientAlpnListLength;
     public ushort ServerNameLength;
@@ -108,10 +128,21 @@ public unsafe struct QUIC_TLS_SECRETS
 /// <summary>
 /// Connection statistics (<c>QUIC_PARAM_CONN_STATISTICS_V2</c>). Only the fields up to MsQuic 2.5
 /// (<c>QUIC_STATISTICS_V2_SIZE_4</c>) are included; the preview-feature block is deliberately omitted.
+/// MsQuic fills <c>min(bufferLength, librarySize)</c> bytes, so a query with <c>sizeof(QUIC_STATISTICS_V2)</c>
+/// works against every 2.x library; the <c>SIZE_*</c> constants say which fields a given byte count covers.
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct QUIC_STATISTICS_V2
 {
+    /// <summary><c>QUIC_STATISTICS_V2_SIZE_1</c>: through <see cref="KeyUpdateCount"/> (MsQuic 2.0).</summary>
+    public const uint SIZE_1 = 188;
+    /// <summary><c>QUIC_STATISTICS_V2_SIZE_2</c>: through <see cref="DestCidUpdateCount"/> (MsQuic 2.1).</summary>
+    public const uint SIZE_2 = 196;
+    /// <summary><c>QUIC_STATISTICS_V2_SIZE_3</c>: through <see cref="SendEcnCongestionCount"/> (MsQuic 2.2).</summary>
+    public const uint SIZE_3 = 200;
+    /// <summary><c>QUIC_STATISTICS_V2_SIZE_4</c>: through <see cref="RttVariance"/> (MsQuic 2.5) = the size of this struct.</summary>
+    public const uint SIZE_4 = 208;
+
     public ulong CorrelationId;
     /// <summary>Bitfield: see the bool properties.</summary>
     public uint _bitfield;

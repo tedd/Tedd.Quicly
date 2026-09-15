@@ -113,6 +113,11 @@ public unsafe interface IMsQuicStreamEvents
     void PeerAccepted(MsQuicStream stream)
     {
     }
+
+    /// <summary>A send flagged <see cref="QUIC_SEND_FLAGS.CANCEL_ON_LOSS"/> hit packet loss; the stream is being aborted with <paramref name="errorCode"/> (MsQuic 2.2+).</summary>
+    void CancelOnLoss(MsQuicStream stream, ulong errorCode)
+    {
+    }
 }
 
 /// <summary>Sink that ignores every event and consumes all received data; used when no handler is attached.</summary>

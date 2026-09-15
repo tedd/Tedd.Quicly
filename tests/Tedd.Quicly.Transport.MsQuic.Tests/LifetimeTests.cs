@@ -6,15 +6,16 @@ using Tedd.Quicly.Transport.MsQuic.Interop;
 namespace Tedd.Quicly.Transport.MsQuic.Tests;
 
 /// <summary>Registration / configuration / listener handle rules: explicit lifetimes, idempotent Close, no use after Close.</summary>
-public unsafe class LifetimeTests
+[Collection(MsQuicCollection.Name)]
+public class LifetimeTests
 {
     private sealed class NoListenerEvents : IMsQuicListenerEvents
     {
-        public MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, ref QUIC_NEW_CONNECTION_INFO info) => null;
+        public MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, in MsQuicNewConnectionInfo info) => null;
     }
 
     [Fact]
-    public void Registration_close_is_idempotent_and_blocks_use_after_close()
+    public unsafe void Registration_close_is_idempotent_and_blocks_use_after_close()
     {
         var registration = new MsQuicRegistration("lifetime", QUIC_EXECUTION_PROFILE.MAX_THROUGHPUT);
         Assert.False(registration.IsClosed);
@@ -40,7 +41,7 @@ public unsafe class LifetimeTests
     }
 
     [Fact]
-    public void Configuration_validates_arguments_and_closes_idempotently()
+    public unsafe void Configuration_validates_arguments_and_closes_idempotently()
     {
         using var registration = new MsQuicRegistration();
         Assert.Throws<ArgumentNullException>(() => new MsQuicConfiguration(null!, ["a"]));
@@ -52,19 +53,35 @@ public unsafe class LifetimeTests
         Assert.Equal(["one", "two"], config.Alpns);
         Assert.Same(registration, config.Registration);
         Assert.False(config.HasCredential);
+        Assert.Equal(QUIC_CREDENTIAL_TYPE.NONE, config.CredentialType);
         Assert.False(config.IsClosed);
         Assert.True(config.Handle != null);
         config.LoadClientCredential(MsQuicCertificateValidation.InsecureSkipValidation);
         Assert.True(config.HasCredential);
+        Assert.Equal(QUIC_CREDENTIAL_FLAGS.CLIENT | QUIC_CREDENTIAL_FLAGS.NO_CERTIFICATE_VALIDATION, config.CredentialFlags);
         Assert.False(config.IndicatesPortableCertificate);
+        Assert.False(config.DefersCertificateValidation);
         config.Close();
         config.Close();
         config.Dispose();
         Assert.True(config.IsClosed);
         Assert.Throws<ObjectDisposedException>(() => config.LoadClientCredential());
-        Assert.Throws<ObjectDisposedException>(() => config.LoadCredential(null));
+        Assert.Throws<ObjectDisposedException>(() => RawCredentials.LoadInvalid(config));
         using X509Certificate2 cert = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
         Assert.Throws<ObjectDisposedException>(() => config.LoadServerCredential(cert));
+    }
+
+    [Fact]
+    public void Client_credential_modes_map_to_the_documented_flags()
+    {
+        using var registration = new MsQuicRegistration();
+        using var systemRoots = MsQuicConfiguration.CreateClient(registration, ["a"]);
+        Assert.Equal(QUIC_CREDENTIAL_FLAGS.CLIENT, systemRoots.CredentialFlags);
+        using var callback = MsQuicConfiguration.CreateClient(registration, ["a"], MsQuicCertificateValidation.Callback);
+        Assert.Equal(QUIC_CREDENTIAL_FLAGS.CLIENT | QUIC_CREDENTIAL_FLAGS.INDICATE_CERTIFICATE_RECEIVED | QUIC_CREDENTIAL_FLAGS.DEFER_CERTIFICATE_VALIDATION | QUIC_CREDENTIAL_FLAGS.USE_PORTABLE_CERTIFICATES, callback.CredentialFlags);
+        Assert.True(callback.IndicatesPortableCertificate);
+        Assert.True(callback.DefersCertificateValidation);
+        Assert.Equal(QUIC_CREDENTIAL_TYPE.NONE, callback.CredentialType);
     }
 
     [Fact]
@@ -79,24 +96,55 @@ public unsafe class LifetimeTests
     }
 
     [Fact]
-    public void Server_credential_requires_private_key_and_validates_mode()
+    public void Server_credential_prefers_pkcs12_and_records_the_path()
     {
         using var registration = new MsQuicRegistration();
-        using var config = new MsQuicConfiguration(registration, ["a"]);
         using X509Certificate2 withKey = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
         using X509Certificate2 publicOnly = X509CertificateLoader.LoadCertificate(withKey.Export(X509ContentType.Cert));
+
+        using var config = new MsQuicConfiguration(registration, ["a"]);
         Assert.Throws<ArgumentNullException>(() => config.LoadServerCredential(null!));
         Assert.Throws<ArgumentException>(() => config.LoadServerCredential(publicOnly));
-        if (!OperatingSystem.IsWindows())
-        {
-            Assert.Throws<PlatformNotSupportedException>(() => config.LoadServerCredential(withKey, MsQuicServerCredentialMode.CertificateContext));
-        }
-        config.LoadServerCredential(withKey, MsQuicServerCredentialMode.Pkcs12);
+        config.LoadServerCredential(withKey);
         Assert.True(config.HasCredential);
+        Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12, config.CredentialType);
+        Assert.Equal(QUIC_CREDENTIAL_FLAGS.NONE, config.CredentialFlags);
+
+        using var explicitPkcs12 = MsQuicConfiguration.CreateServer(registration, ["a"], withKey, mode: MsQuicServerCredentialMode.Pkcs12);
+        Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12, explicitPkcs12.CredentialType);
     }
 
     [Fact]
-    public void Create_server_closes_configuration_when_credential_load_fails()
+    public void Non_exportable_key_falls_back_to_certificate_context_on_windows()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "key containers are a Windows concept");
+        using var registration = new MsQuicRegistration();
+        using X509Certificate2 exportable = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
+        byte[] pfx = exportable.Export(X509ContentType.Pkcs12);
+        using X509Certificate2 nonExportable = X509CertificateLoader.LoadPkcs12(pfx, null, X509KeyStorageFlags.UserKeySet);
+        Assert.False(MsQuicCertificateHelper.TryExportPkcs12(nonExportable, out _));
+
+        using var auto = MsQuicConfiguration.CreateServer(registration, ["a"], nonExportable);
+        Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT, auto.CredentialType);
+
+        using var forcedContext = MsQuicConfiguration.CreateServer(registration, ["a"], exportable, mode: MsQuicServerCredentialMode.CertificateContext);
+        Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT, forcedContext.CredentialType);
+
+        Assert.Throws<ArgumentException>(() => MsQuicConfiguration.CreateServer(registration, ["a"], nonExportable, mode: MsQuicServerCredentialMode.Pkcs12));
+    }
+
+    [Fact]
+    public void Non_exportable_key_is_an_error_off_windows()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "the CERTIFICATE_CONTEXT fallback exists on Windows");
+        using var registration = new MsQuicRegistration();
+        using X509Certificate2 withKey = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
+        using var config = new MsQuicConfiguration(registration, ["a"]);
+        Assert.Throws<PlatformNotSupportedException>(() => config.LoadServerCredential(withKey, MsQuicServerCredentialMode.CertificateContext));
+    }
+
+    [Fact]
+    public void Create_helpers_close_the_configuration_when_loading_fails()
     {
         using var registration = new MsQuicRegistration();
         using X509Certificate2 withKey = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
@@ -111,9 +159,7 @@ public unsafe class LifetimeTests
     {
         using var registration = new MsQuicRegistration();
         using var config = new MsQuicConfiguration(registration, ["a"]);
-        QUIC_CREDENTIAL_CONFIG cred = default;
-        cred.Type = (QUIC_CREDENTIAL_TYPE)999;
-        int status = config.LoadCredential(&cred);
+        int status = RawCredentials.LoadInvalid(config);
         Assert.True(MsQuicStatus.Failed(status), MsQuicStatus.GetName(status));
         Assert.False(config.HasCredential);
     }
@@ -137,13 +183,11 @@ public unsafe class LifetimeTests
         IPEndPoint ep = listener.LocalEndPoint;
         Assert.NotEqual(0, ep.Port);
         Assert.Equal(IPAddress.Loopback, ep.Address);
-        Assert.True(MsQuicStatus.Succeeded(listener.GetLocalAddress(out QuicAddr addr)));
+        Assert.True(MsQuicStatus.Succeeded(listener.GetLocalAddress(out QUIC_ADDR addr)));
         Assert.Equal(ep.Port, addr.Port);
 
-        // Starting twice is an MsQuic error surfaced as an exception.
         Assert.Throws<MsQuicException>(() => listener.Start(new IPEndPoint(IPAddress.Loopback, 0), ["a"]));
 
-        // A second listener on the same port with the same ALPN is refused.
         var second = new MsQuicListener(registration, events);
         MsQuicException ex = Assert.Throws<MsQuicException>(() => second.Start(ep, ["a"]));
         Assert.True(ex.Status == MsQuicStatus.QUIC_STATUS_ALPN_IN_USE || ex.Status == MsQuicStatus.QUIC_STATUS_ADDRESS_IN_USE, MsQuicStatus.GetName(ex.Status));
@@ -151,8 +195,8 @@ public unsafe class LifetimeTests
 
         listener.Stop();
         Assert.False(listener.IsStarted);
-        Assert.True(await events.StopComplete.Within());
-        listener.Stop(); // no-op when not started
+        Assert.True(await events.StopCompleteTcs.Within());
+        listener.Stop();
         listener.Close();
         listener.Close();
         Assert.True(listener.IsClosed);
@@ -174,8 +218,7 @@ public unsafe class LifetimeTests
         Assert.Equal(IPAddress.IPv6Loopback, listener.LocalEndPoint.Address);
         listener.Dispose();
         Assert.True(listener.IsClosed);
-        // ListenerClose is synchronous: STOP_COMPLETE (with AppCloseInProgress) has been delivered by now.
-        Assert.True(events.StopComplete.Task.IsCompleted);
+        Assert.True(events.StopCompleteTcs.Task.IsCompleted);
         Assert.True(events.AppCloseInProgress);
     }
 
@@ -191,30 +234,83 @@ public unsafe class LifetimeTests
         var client = new MsQuicConnection(loopback.Registration, clientEvents);
         IPEndPoint ep = listener.LocalEndPoint;
         MsQuicException.ThrowIfFailed(client.Start(clientConfig, "127.0.0.1", (ushort)ep.Port, QuicAddressFamily.INET), "start");
-        (int status, _) = await clientEvents.TransportShutdown.Within();
+        (int status, _) = await clientEvents.TransportShutdownTcs.Within();
         Assert.True(MsQuicStatus.Failed(status));
-        await clientEvents.ShutdownComplete.Within();
+        await clientEvents.ShutdownCompleteTcs.Within();
         Assert.IsType<InvalidOperationException>(listener.LastCallbackException);
         client.Close();
         listener.Close();
     }
 
+    [Fact]
+    public async Task Listener_close_from_its_own_callback_is_refused()
+    {
+        using var registration = new MsQuicRegistration();
+        var events = new ClosingListenerEvents();
+        var listener = new MsQuicListener(registration, events);
+        events.Listener = listener;
+        listener.Start(new IPEndPoint(IPAddress.Loopback, 0), ["a"]);
+        listener.Stop();
+        Assert.True(await events.StopCompleteTcs.Within());
+        Assert.IsType<InvalidOperationException>(events.Caught);
+        Assert.False(listener.IsClosed);
+        listener.Close();
+    }
+
+    [Fact]
+    public async Task Closed_configuration_is_rejected_by_the_listener()
+    {
+        using var loopback = new Loopback();
+        MsQuicConfiguration closed = loopback.CreateServerConfiguration(Loopback.Alpn);
+        closed.Close();
+        loopback.SelectConfiguration = _ => closed;
+        var clientEvents = new ConnectionRecorder();
+        loopback.Connect(clientEvents);
+        (int status, _) = await clientEvents.TransportShutdownTcs.Within();
+        Assert.True(MsQuicStatus.Failed(status));
+        await clientEvents.ShutdownCompleteTcs.Within();
+        Assert.False(clientEvents.ConnectedTcs.Task.IsCompleted);
+    }
+
     private sealed class RecordingListenerEvents : IMsQuicListenerEvents
     {
-        public readonly TaskCompletionSource<bool> StopComplete = TestTimeouts.NewTcs<bool>();
+        public readonly TaskCompletionSource<bool> StopCompleteTcs = TestTimeouts.NewTcs<bool>();
         public bool AppCloseInProgress;
 
-        public MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, ref QUIC_NEW_CONNECTION_INFO info) => null;
+        public MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, in MsQuicNewConnectionInfo info) => null;
 
         public void StopComplete(MsQuicListener listener, bool appCloseInProgress)
         {
             AppCloseInProgress = appCloseInProgress;
-            this.StopComplete.TrySetResult(true);
+            StopCompleteTcs.TrySetResult(true);
         }
     }
 
     private sealed class ThrowingListenerEvents : IMsQuicListenerEvents
     {
-        public MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, ref QUIC_NEW_CONNECTION_INFO info) => throw new InvalidOperationException("boom");
+        public MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, in MsQuicNewConnectionInfo info) => throw new InvalidOperationException("boom");
+    }
+
+    private sealed class ClosingListenerEvents : IMsQuicListenerEvents
+    {
+        public readonly TaskCompletionSource<bool> StopCompleteTcs = TestTimeouts.NewTcs<bool>();
+        public MsQuicListener? Listener;
+        public Exception? Caught;
+
+        public MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, in MsQuicNewConnectionInfo info) => null;
+
+        public void StopComplete(MsQuicListener listener, bool appCloseInProgress)
+        {
+            try
+            {
+                Assert.True(MsQuicCallbackScope.IsInsideCallback);
+                Listener!.Close();
+            }
+            catch (Exception ex)
+            {
+                Caught = ex;
+            }
+            StopCompleteTcs.TrySetResult(true);
+        }
     }
 }

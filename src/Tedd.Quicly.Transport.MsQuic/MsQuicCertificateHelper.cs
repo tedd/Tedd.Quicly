@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -5,11 +6,22 @@ using System.Security.Cryptography.X509Certificates;
 namespace Tedd.Quicly.Transport.MsQuic;
 
 /// <summary>
-/// Certificate plumbing for Schannel (ADR 0006): Windows' TLS stack can only use a private key that lives in a
-/// key container, so certificates whose key is ephemeral (e.g. from <c>CertificateRequest.CreateSelfSigned</c>
-/// or imported with <see cref="X509KeyStorageFlags.EphemeralKeySet"/>) are re-imported through PKCS#12 into a
-/// persisted, exportable key before being handed to MsQuic.
+/// Certificate plumbing for the two server credential paths (ADR 0009).
 /// </summary>
+/// <remarks>
+/// <para><b>Preferred: PKCS#12 in memory.</b> <see cref="TryExportPkcs12"/> serialises the certificate with its
+/// private key and MsQuic imports the blob itself (<c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c>): no store
+/// import, no persisted key container. Verified against the Schannel build bundled with .NET (see
+/// <c>MsQuicConfiguration.LoadServerCredential</c>). It needs an exportable private key; certificates whose key
+/// container forbids export make <see cref="TryExportPkcs12"/> return false.</para>
+/// <para><b>Fallback: CERTIFICATE_CONTEXT.</b> Schannel can only sign with a key that lives in a persisted, non-
+/// ephemeral container. Ephemeral CNG keys (from <c>CertificateRequest.CreateSelfSigned</c> or an
+/// <see cref="X509KeyStorageFlags.EphemeralKeySet"/> import) are re-imported through PKCS#12 with
+/// <see cref="X509KeyStorageFlags.PersistKeySet"/> | <see cref="X509KeyStorageFlags.UserKeySet"/> — never
+/// <c>Exportable</c> (irrelevant to Schannel, needlessly weakens the key) and never <c>EphemeralKeySet</c>. A
+/// persisted container outlives the certificate object; delete it with <see cref="DeletePersistedPrivateKey"/>
+/// once no configuration uses it any more.</para>
+/// </remarks>
 public static class MsQuicCertificateHelper
 {
     /// <summary>
@@ -51,9 +63,10 @@ public static class MsQuicCertificateHelper
     }
 
     /// <summary>
-    /// Returns a certificate whose private key Schannel can use. When the key is already persisted (or the OS
-    /// is not Windows) the same instance is returned; otherwise a new instance backed by a persisted, exportable
-    /// key container is returned and the caller owns (must dispose) it.
+    /// Returns a certificate whose private key Schannel can use through a certificate context. When the key is
+    /// already persisted (or the OS is not Windows) the same instance is returned; otherwise a new instance backed
+    /// by a persisted user key container is returned and the caller owns it (dispose it and, when the key is no
+    /// longer needed, <see cref="DeletePersistedPrivateKey"/> it).
     /// </summary>
     public static X509Certificate2 EnsurePersistedPrivateKey(X509Certificate2 certificate)
     {
@@ -69,18 +82,91 @@ public static class MsQuicCertificateHelper
         return ReimportWithPersistedKey(certificate);
     }
 
-    /// <summary>Exports to PKCS#12 and re-imports with <see cref="X509KeyStorageFlags.Exportable"/> (no <c>EphemeralKeySet</c>).</summary>
+    /// <summary>
+    /// Exports to PKCS#12 and re-imports with <see cref="X509KeyStorageFlags.PersistKeySet"/> |
+    /// <see cref="X509KeyStorageFlags.UserKeySet"/> (no <c>Exportable</c>, no <c>EphemeralKeySet</c>).
+    /// </summary>
     public static X509Certificate2 ReimportWithPersistedKey(X509Certificate2 certificate)
     {
         ArgumentNullException.ThrowIfNull(certificate);
         byte[] pfx = certificate.Export(X509ContentType.Pkcs12);
         try
         {
-            return X509CertificateLoader.LoadPkcs12(pfx, null, X509KeyStorageFlags.Exportable);
+            return X509CertificateLoader.LoadPkcs12(pfx, null, X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.UserKeySet);
         }
         finally
         {
             CryptographicOperations.ZeroMemory(pfx);
         }
+    }
+
+    /// <summary>
+    /// Exports the certificate and its private key as an unencrypted PKCS#12 blob for
+    /// <c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c>. Returns false when the certificate has no private key or the
+    /// key is not exportable. Zero the blob after use.
+    /// </summary>
+    public static bool TryExportPkcs12(X509Certificate2 certificate, [NotNullWhen(true)] out byte[]? pkcs12)
+    {
+        ArgumentNullException.ThrowIfNull(certificate);
+        pkcs12 = null;
+        if (!certificate.HasPrivateKey)
+        {
+            return false;
+        }
+        try
+        {
+            pkcs12 = certificate.Export(X509ContentType.Pkcs12);
+            return true;
+        }
+        catch (CryptographicException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Deletes the persisted CNG key container behind <paramref name="certificate"/> (Windows only). Returns true
+    /// when a container was deleted; false when there is nothing to delete (no private key, ephemeral key, non-CNG
+    /// key, or not Windows). Only call it after every MsQuic configuration that loaded the certificate is closed.
+    /// </summary>
+    public static bool DeletePersistedPrivateKey(X509Certificate2 certificate)
+    {
+        ArgumentNullException.ThrowIfNull(certificate);
+        if (!OperatingSystem.IsWindows() || !certificate.HasPrivateKey)
+        {
+            return false;
+        }
+        return DeletePersistedPrivateKeyWindows(certificate);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool DeletePersistedPrivateKeyWindows(X509Certificate2 certificate)
+    {
+        using (ECDsa? ecdsa = certificate.GetECDsaPrivateKey())
+        {
+            if (ecdsa is ECDsaCng ecdsaCng)
+            {
+                return DeleteCngKey(ecdsaCng.Key);
+            }
+            if (ecdsa is not null)
+            {
+                return false;
+            }
+        }
+        using (RSA? rsa = certificate.GetRSAPrivateKey())
+        {
+            return rsa is RSACng rsaCng && DeleteCngKey(rsaCng.Key);
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool DeleteCngKey(CngKey key)
+    {
+        if (key.IsEphemeral)
+        {
+            return false;
+        }
+        key.Delete();
+        return true;
     }
 }

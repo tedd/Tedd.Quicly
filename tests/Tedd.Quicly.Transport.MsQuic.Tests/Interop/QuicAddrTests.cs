@@ -4,12 +4,13 @@ using Tedd.Quicly.Transport.MsQuic.Interop;
 
 namespace Tedd.Quicly.Transport.MsQuic.Tests.Interop;
 
+[Collection(MsQuicCollection.Name)]
 public unsafe class QuicAddrTests
 {
     [Fact]
     public void Size_is_28_bytes()
     {
-        Assert.Equal(28, sizeof(QuicAddr));
+        Assert.Equal(28, sizeof(QUIC_ADDR));
         Assert.Equal(28, Unsafe.SizeOf<QuicAddrIn6>());
         Assert.Equal(8, Unsafe.SizeOf<QuicAddrIn>());
         Assert.Equal(2, Unsafe.SizeOf<QuicAddrFamilyAndLen>());
@@ -29,7 +30,7 @@ public unsafe class QuicAddrTests
     public void Ipv4_round_trips()
     {
         var ep = new IPEndPoint(IPAddress.Parse("192.168.10.20"), 4433);
-        QuicAddr addr = QuicAddr.FromIPEndPoint(ep);
+        QUIC_ADDR addr = QUIC_ADDR.FromIPEndPoint(ep);
         Assert.True(addr.IsIPv4);
         Assert.False(addr.IsIPv6);
         Assert.Equal(QuicAddressFamily.INET, addr.Family);
@@ -50,7 +51,7 @@ public unsafe class QuicAddrTests
     {
         var address = IPAddress.Parse("fe80::1234:5678%7");
         var ep = new IPEndPoint(address, 65000);
-        QuicAddr addr = QuicAddr.FromIPEndPoint(ep);
+        QUIC_ADDR addr = QUIC_ADDR.FromIPEndPoint(ep);
         Assert.True(addr.IsIPv6);
         Assert.Equal(QuicAddressFamily.INET6, addr.Family);
         Assert.Equal(65000, addr.Port);
@@ -68,7 +69,7 @@ public unsafe class QuicAddrTests
     [Fact]
     public void Unspecified_family_maps_to_null_end_point()
     {
-        QuicAddr addr = default;
+        QUIC_ADDR addr = default;
         Assert.Equal(QuicAddressFamily.UNSPEC, addr.Family);
         Assert.Null(addr.ToIPEndPoint());
         addr.Family = 99;
@@ -79,7 +80,7 @@ public unsafe class QuicAddrTests
     [Fact]
     public void Port_setter_writes_network_order()
     {
-        QuicAddr addr = default;
+        QUIC_ADDR addr = default;
         addr.Port = 0x1234;
         Assert.Equal(0x1234, addr.Port);
         byte* raw = (byte*)&addr;
@@ -91,7 +92,7 @@ public unsafe class QuicAddrTests
     [Fact]
     public void Rejects_null_and_unsupported_families()
     {
-        Assert.Throws<ArgumentNullException>(() => QuicAddr.FromIPEndPoint(null!));
+        Assert.Throws<ArgumentNullException>(() => QUIC_ADDR.FromIPEndPoint(null!));
     }
 
     [Fact]

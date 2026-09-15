@@ -260,18 +260,58 @@ public class SnapshotHistoryTests
         Assert.True(history.TryGetBaseline(0, out baselineTick, out _));
         Assert.Equal(6u, baselineTick);
 
+        // A reset forgets the baseline and fences off acknowledgements of snapshots stored before it (they may still
+        // be in flight); only later snapshots can become the baseline. Other peers are unaffected.
+        Assert.True(history.AckBaseline(1, 6));
         history.ResetPeer(0);
         Assert.False(history.TryGetBaseline(0, out _, out _));
-        Assert.True(history.AckBaseline(0, 5));
+        Assert.False(history.AckBaseline(0, 5));
+        Assert.False(history.AckBaseline(0, 8));
+        Assert.False(history.TryGetBaseline(0, out _, out _));
+        Assert.True(history.AckBaseline(1, 7));
+        Assert.True(history.Store(9, Pattern(9, 20)));
+        Assert.False(history.AckBaseline(0, 8));
+        Assert.True(history.AckBaseline(0, 9));
+        Assert.True(history.TryGetBaseline(0, out baselineTick, out _));
+        Assert.Equal(9u, baselineTick);
 
         Assert.Throws<ArgumentOutOfRangeException>(() => history.AckBaseline(2, 5));
         Assert.Throws<ArgumentOutOfRangeException>(() => history.TryGetBaseline(-1, out _, out _));
         Assert.Throws<ArgumentOutOfRangeException>(() => history.ResetPeer(2));
 
+        // Clear drops snapshots, baselines and fences.
+        history.ResetPeer(1);
         history.Clear();
         Assert.Equal(0, history.Count);
         Assert.False(history.TryGetBaseline(0, out _, out _));
         Assert.True(history.Store(1, Pattern(1, 20)));
+        Assert.True(history.AckBaseline(0, 1));
+        Assert.True(history.AckBaseline(1, 1));
+    }
+
+    [Theory]
+    [InlineData(1, 100)]
+    [InlineData(2, 64)]
+    [InlineData(4, 100)]
+    [InlineData(7, 33)]
+    [InlineData(32, 256)]
+    public void An_Arena_Of_Capacity_Plus_One_Largest_Snapshots_Keeps_Capacity_Snapshots(int capacity, int largest)
+    {
+        // Documented sizing: ArenaBytes >= (Capacity + 1) * S keeps the newest Capacity snapshots whatever their sizes.
+        Random random = new(capacity * 1000 + largest);
+        SnapshotHistory history = new(capacity, (capacity + 1) * largest, 0);
+        int[] lengths = new int[5000];
+        for (uint tick = 0; tick < lengths.Length; tick++)
+        {
+            int length = random.Next(4) == 0 ? largest : random.Next(0, largest + 1);
+            lengths[tick] = length;
+            Assert.True(history.Store(tick, Pattern(tick, length)));
+            Assert.Equal(Math.Min((int)tick + 1, capacity), history.Count);
+            for (uint back = 0; back < (uint)history.Count; back++)
+            {
+                AssertHolds(history, tick - back, lengths[tick - back]);
+            }
+        }
     }
 
     [Fact]
@@ -333,7 +373,8 @@ public class SnapshotHistoryTests
                 Assert.True(decoded.AsSpan(0, m).SequenceEqual(world));
                 Assert.True(client.Store(tick, decoded.AsSpan(0, m)));
 
-                // The tracked send completes Delivered some ticks later, unless that report is lost.
+                // Application-level acknowledgement: the client echoes the tick it decoded; the echo reaches the
+                // server some ticks later, unless it is lost.
                 if (random.NextDouble() < 0.9)
                 {
                     acks.Add((tick, tick + (uint)random.Next(1, 6)));

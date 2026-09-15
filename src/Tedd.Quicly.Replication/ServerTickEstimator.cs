@@ -16,8 +16,10 @@ namespace Tedd.Quicly.Replication;
 /// <b>Slewing:</b> the first <see cref="Update"/> after the first observation locks onto the target directly. Later
 /// changes of the target are applied gradually: at most <see cref="MaxSlewRate"/> × elapsed local time per update
 /// (default 5 %, i.e. the estimated server clock runs between 0.95× and 1.05× real time while converging), so
-/// the estimate never jumps and never runs backwards. An error larger than <see cref="StepThresholdMicros"/>
-/// (a resume, a server hitch) is corrected in one step instead (counted in <see cref="StepCount"/>).
+/// while slewing, with non-decreasing local time, the estimate never jumps and never runs backwards. An error
+/// larger than <see cref="StepThresholdMicros"/> (a resume, a server hitch) is corrected in one step instead
+/// (counted in <see cref="StepCount"/>); a step can move the estimate backwards, and so can an <see cref="Update"/>
+/// whose local time is earlier than the previous one.
 /// </para>
 /// <para>The offset is peer-supplied and advisory; the result is for scheduling and interpolation only. Not thread-safe.</para>
 /// </remarks>

@@ -23,7 +23,8 @@ namespace Tedd.Quicly.Replication;
 /// </para>
 /// <para>
 /// <see langword="default"/>(<see cref="EntityId"/>) (index 0, generation 0) is never issued by an allocator with
-/// at least one generation bit, so it can serve as "no entity".
+/// at least two generation bits, so it can then serve as "no entity" (see <see cref="EntityIdAllocator"/> for 0 and
+/// 1 bits).
 /// </para>
 /// </remarks>
 public readonly struct EntityId : IEquatable<EntityId>

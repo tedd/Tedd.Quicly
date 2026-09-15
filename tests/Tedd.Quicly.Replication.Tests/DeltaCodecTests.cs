@@ -415,8 +415,11 @@ public class DeltaCodecTests
                 }
             }
 
-            ReadOnlySpan<byte> baselineSpan = baselineMemory.CopyToTail(baseline);
-            ReadOnlySpan<byte> deltaSpan = deltaMemory.CopyToTail(delta);
+            // Alternate between spans that end at a guard page and spans that start right after one, so reads past
+            // the end and before the start both fault.
+            bool atHead = (iteration & 1) != 0;
+            ReadOnlySpan<byte> baselineSpan = baselineMemory.CopyGuarded(baseline, atHead);
+            ReadOnlySpan<byte> deltaSpan = deltaMemory.CopyGuarded(delta, atHead);
             int destinationLength = random.Next(0, 260);
             int reference = int.MinValue;
             byte[]? referenceOutput = null;
@@ -455,8 +458,9 @@ public class DeltaCodecTests
             byte[] baseline = TestData.Random(random, random.Next(0, 300));
             byte[] current = TestData.Mutate(random, baseline, random.Next(0, 300), random.NextDouble() * 0.5);
             byte[] expected = ReferenceEncode(baseline, current);
-            ReadOnlySpan<byte> b = baselineMemory.CopyToTail(baseline);
-            ReadOnlySpan<byte> c = currentMemory.CopyToTail(current);
+            bool atHead = (iteration & 1) != 0;
+            ReadOnlySpan<byte> b = baselineMemory.CopyGuarded(baseline, atHead);
+            ReadOnlySpan<byte> c = currentMemory.CopyGuarded(current, atHead);
             byte[] destination = new byte[expected.Length];
             for (int level = 0; level < Levels; level++)
             {

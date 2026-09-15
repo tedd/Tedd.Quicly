@@ -46,9 +46,15 @@ namespace Tedd.Quicly.Replication;
 /// given spans, whatever the input.
 /// </para>
 /// <para>
-/// Pairing: the sender encodes against the newest snapshot the peer acknowledged
-/// (<see cref="SnapshotHistory.TryGetBaseline"/>, or an empty baseline when there is none) and tells the receiver
-/// which tick that was; the receiver keeps its own <see cref="SnapshotHistory"/> of decoded snapshots to find it.
+/// Pairing: the sender encodes against the newest snapshot the receiver has confirmed it <em>decoded</em>
+/// (<see cref="SnapshotHistory.TryGetBaseline"/> fed by application-level acknowledgements — the receiver echoes the
+/// newest tick it decoded — or an empty baseline when there is none) and tells the receiver which tick that was; the
+/// receiver keeps its own <see cref="SnapshotHistory"/> of decoded snapshots to find it. Transport acknowledgements
+/// (<c>Delivered</c> completions) only prove the datagram reached the peer's QUIC stack (PROTOCOL.md §4.3) and must not
+/// select baselines; the <see cref="SnapshotHistory"/> remarks explain the desync they cause and the recovery path
+/// (full-snapshot request answered with <see cref="SnapshotHistory.ResetPeer"/>). The format carries no checksum:
+/// decoding against a different baseline than the encoder used yields wrong bytes, not an error, so always carry the
+/// baseline tick in the message.
 /// </para>
 /// </remarks>
 public static class DeltaCodec
@@ -63,7 +69,7 @@ public static class DeltaCodec
     public const int MaxInputLength = 0x7000_0000;
 
     /// <summary>
-    /// Upper bound on the size of <see cref="Encode"/>'s output for a current snapshot of
+    /// Upper bound on the size of <see cref="Encode(ReadOnlySpan{byte}, ReadOnlySpan{byte}, Span{byte})"/>'s output for a current snapshot of
     /// <paramref name="currentLength"/> bytes: <c>currentLength + currentLength / 32 + 16</c>.
     /// </summary>
     /// <param name="currentLength">Length of the current snapshot.</param>
@@ -109,7 +115,7 @@ public static class DeltaCodec
     public static int Encode(ReadOnlySpan<byte> baseline, ReadOnlySpan<byte> current, Span<byte> destination) =>
         Encode(PreferredWidth, baseline, current, destination);
 
-    /// <summary>Reconstructs a snapshot from <paramref name="baseline"/> and a delta produced by <see cref="Encode"/>.</summary>
+    /// <summary>Reconstructs a snapshot from <paramref name="baseline"/> and a delta produced by <see cref="Encode(ReadOnlySpan{byte}, ReadOnlySpan{byte}, Span{byte})"/>.</summary>
     /// <param name="baseline">The same baseline the delta was encoded against.</param>
     /// <param name="delta">The delta. Malformed input is rejected, never trusted.</param>
     /// <param name="destination">
@@ -145,7 +151,7 @@ public static class DeltaCodec
         _ => Decode<SimdNone>(baseline, delta, destination),
     };
 
-    /// <summary>Encodes a delta (as <see cref="Encode"/>) and then applies the optional LZ4 stage.</summary>
+    /// <summary>Encodes a delta (as <see cref="Encode(ReadOnlySpan{byte}, ReadOnlySpan{byte}, Span{byte})"/>) and then applies the optional LZ4 stage.</summary>
     /// <param name="baseline">The baseline.</param>
     /// <param name="current">The snapshot to encode.</param>
     /// <param name="destination">Receives <c>RawLength varint</c> + body; <see cref="GetMaxCompressedLength"/> bytes always suffice.</param>
@@ -190,7 +196,7 @@ public static class DeltaCodec
     /// <summary>Decodes the output of <see cref="EncodeCompressed"/>.</summary>
     /// <param name="baseline">The baseline.</param>
     /// <param name="packet">The compressed delta.</param>
-    /// <param name="destination">Receives the snapshot (same rules as <see cref="Decode"/>).</param>
+    /// <param name="destination">Receives the snapshot (same rules as <see cref="Decode(ReadOnlySpan{byte}, ReadOnlySpan{byte}, Span{byte})"/>).</param>
     /// <param name="scratch">
     /// Work space for the decompressed delta; a <c>RawLength</c> larger than it is rejected, so size it with
     /// <see cref="GetMaxEncodedLength"/> of the largest snapshot you accept. Must not overlap the other spans.

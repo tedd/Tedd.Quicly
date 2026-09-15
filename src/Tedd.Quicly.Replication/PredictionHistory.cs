@@ -28,6 +28,16 @@ public interface IReplay<TState>
 /// later inputs are re-applied through <see cref="IReplay{TState}"/> starting from the authoritative state, their
 /// recorded states are overwritten with the corrected ones, and the corrected newest state is returned.
 /// </para>
+/// <para>
+/// <b>Capacity:</b> keep <see cref="Capacity"/> at least the number of inputs that can be unacknowledged at once —
+/// the round-trip time in ticks plus jitter and the server's input buffering, with margin. When more are
+/// outstanding, <see cref="Record"/> drops the oldest predicted state (counted in <see cref="OverflowCount"/>).
+/// <see cref="Reconcile"/> still replays <em>every</em> input after the authoritative sequence: for the dropped ones
+/// it calls <see cref="IReplay{TState}"/> by sequence number (consecutive, from the authoritative sequence + 1 up to
+/// the newest dropped one) without keeping a corrected state. The replay must therefore fetch inputs by sequence (an
+/// <see cref="InputBuffer{TInput}"/> at least as large as this history) and apply "no input" for a sequence it does
+/// not have — the correction is then approximate, which a non-zero <see cref="OverflowCount"/> signals.
+/// </para>
 /// <para>Sequences use 32-bit serial arithmetic. Allocation-free after construction; not thread-safe.</para>
 /// </remarks>
 public sealed class PredictionHistory<TState>
@@ -42,6 +52,9 @@ public sealed class PredictionHistory<TState>
     private int _count;
     private uint _lastReconciled;
     private bool _hasReconciled;
+    private uint _droppedNewest;
+    private bool _hasDropped;
+    private long _overflowCount;
 
     /// <summary>Creates a history.</summary>
     /// <param name="capacity">Predicted states remembered (at least 1); the oldest is dropped when full.</param>
@@ -65,6 +78,12 @@ public sealed class PredictionHistory<TState>
     /// <summary>Sequence of the newest authoritative state accepted by <see cref="Reconcile"/> (meaningful when <see cref="HasReconciled"/>).</summary>
     public uint LastReconciledSequence => _lastReconciled;
 
+    /// <summary>
+    /// Number of predicted states dropped because the history was full (since construction or <see cref="Clear"/>).
+    /// Non-zero means <see cref="Capacity"/> is too small for the current latency; see the class remarks.
+    /// </summary>
+    public long OverflowCount => _overflowCount;
+
     /// <summary>Records the predicted state after input <paramref name="sequence"/>.</summary>
     /// <param name="sequence">The input's sequence; must be newer than the previously recorded one and than the last reconciled one.</param>
     /// <param name="predicted">The state after applying the input.</param>
@@ -79,6 +98,10 @@ public sealed class PredictionHistory<TState>
 
         if (_count == _sequences.Length)
         {
+            // Not yet acknowledged (acknowledged entries were dropped by Reconcile): Reconcile must still replay it.
+            _droppedNewest = _sequences[_oldest];
+            _hasDropped = true;
+            _overflowCount++;
             _oldest = Slot(1);
             _count--;
         }
@@ -117,7 +140,10 @@ public sealed class PredictionHistory<TState>
     /// <typeparam name="TReplay">The replay implementation (a struct: no delegate, no allocation).</typeparam>
     /// <param name="sequence">The last input the server applied.</param>
     /// <param name="authoritative">The server's state after that input.</param>
-    /// <param name="replay">Re-applies one input; called once per remaining entry, oldest first.</param>
+    /// <param name="replay">
+    /// Re-applies one input; called once per input after <paramref name="sequence"/>, oldest first — for every
+    /// remaining entry and, after an overflow, also for the dropped sequences (see the class remarks).
+    /// </param>
     /// <returns>
     /// The corrected current state (the authoritative state when no later input is recorded). A stale update — a
     /// sequence not newer than <see cref="LastReconciledSequence"/> — changes nothing and returns the newest recorded
@@ -140,6 +166,24 @@ public sealed class PredictionHistory<TState>
         }
 
         TState state = authoritative;
+        if (_hasDropped)
+        {
+            if (SerialNumber.IsNewer(_droppedNewest, sequence))
+            {
+                // The history overflowed: inputs sequence + 1 .. _droppedNewest are unacknowledged but have no recorded
+                // state any more. Replay them by number so the correction still covers every later input.
+                for (uint s = sequence; s != _droppedNewest;)
+                {
+                    s++;
+                    replay.Replay(s, ref state);
+                }
+            }
+            else
+            {
+                _hasDropped = false;
+            }
+        }
+
         for (int i = 0; i < _count; i++)
         {
             int slot = Slot(i);
@@ -157,6 +201,9 @@ public sealed class PredictionHistory<TState>
         _count = 0;
         _hasReconciled = false;
         _lastReconciled = 0;
+        _hasDropped = false;
+        _droppedNewest = 0;
+        _overflowCount = 0;
     }
 
     private int Slot(int logical)

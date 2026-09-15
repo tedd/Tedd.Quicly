@@ -33,6 +33,11 @@ public static class Quantization
     private const float Sqrt2 = 1.41421356237309505f;
     private const float InvSqrt2 = 0.70710678118654752f;
 
+    // Inputs whose |x| + |y| + |z| (unit vector) or squared length (quaternion) lies in this range are normalised on the
+    // plain float path; anything else (tiny, huge, zero or non-finite) is prescaled by a power of two first.
+    private const float SafeMin = 1e-30f;
+    private const float SafeMax = 1e30f;
+
     /// <summary>
     /// Maps <paramref name="value"/> in [<paramref name="min"/>, <paramref name="max"/>] to an integer in
     /// [0, 2^<paramref name="bits"/> − 1] by rounding to the nearest step.
@@ -83,7 +88,11 @@ public static class Quantization
     /// in [−1, 1] are stored as symmetric fixed point (−1, 0 and +1 are exact) with
     /// <paramref name="bitsPerComponent"/> bits each: x in the low bits, y above it.
     /// </summary>
-    /// <param name="direction">The direction; it need not be normalized. Zero or non-finite vectors encode +Z.</param>
+    /// <param name="direction">
+    /// The direction; it need not be normalized. Every finite non-zero vector keeps its direction, whatever its
+    /// magnitude (a vector outside a safe magnitude range is first scaled by an exact power of two, so no finite
+    /// input overflows or underflows). Zero or non-finite vectors encode +Z.
+    /// </param>
     /// <param name="bitsPerComponent">2..16 (the result uses 2 × bitsPerComponent bits).</param>
     /// <returns>The packed encoding.</returns>
     /// <remarks>
@@ -97,12 +106,23 @@ public static class Quantization
         ValidateRange(bitsPerComponent, MinUnitVectorBits, MaxUnitVectorBits);
         float x = direction.X, y = direction.Y, z = direction.Z;
         float sum = MathF.Abs(x) + MathF.Abs(y) + MathF.Abs(z);
-        if (!(sum > 0f) || !float.IsFinite(sum))
+        if (!(sum >= SafeMin && sum <= SafeMax))
         {
-            x = 0f;
-            y = 0f;
-            z = 1f;
-            sum = 1f;
+            // Rare path — tiny, huge, zero or non-finite input: prescale by an exact power of two so the largest
+            // component lands in [2^-22, 4), where the sum and its reciprocal can neither overflow nor underflow. Zero,
+            // NaN and infinities still give a zero, NaN or infinite sum and are the only degenerate inputs.
+            float s = PowerOfTwoScale(MathF.Max(MathF.Max(MathF.Abs(x), MathF.Abs(y)), MathF.Abs(z)));
+            x *= s;
+            y *= s;
+            z *= s;
+            sum = MathF.Abs(x) + MathF.Abs(y) + MathF.Abs(z);
+            if (!(sum > 0f) || !float.IsFinite(sum))
+            {
+                x = 0f;
+                y = 0f;
+                z = 1f;
+                sum = 1f;
+            }
         }
 
         float inv = 1f / sum;
@@ -151,7 +171,11 @@ public static class Quantization
     /// <paramref name="bitsPerComponent"/> bits. Layout from the least significant bit: index (2 bits), then the
     /// three remaining components in x, y, z, w order.
     /// </summary>
-    /// <param name="rotation">The rotation; it is normalized first. Zero or non-finite quaternions encode identity.</param>
+    /// <param name="rotation">
+    /// The rotation; it is normalized first (a quaternion outside a safe magnitude range is first scaled by an exact
+    /// power of two, so every finite non-zero quaternion keeps its rotation whatever its magnitude). Zero or
+    /// non-finite quaternions encode identity.
+    /// </param>
     /// <param name="bitsPerComponent">2..20 (the result uses 2 + 3 × bitsPerComponent bits).</param>
     /// <returns>The packed encoding.</returns>
     /// <remarks>
@@ -166,13 +190,25 @@ public static class Quantization
         ValidateRange(bitsPerComponent, MinQuaternionBits, MaxQuaternionBits);
         float x = rotation.X, y = rotation.Y, z = rotation.Z, w = rotation.W;
         float lengthSquared = x * x + y * y + z * z + w * w;
-        if (!(lengthSquared > 0f) || !float.IsFinite(lengthSquared))
+        if (!(lengthSquared >= SafeMin && lengthSquared <= SafeMax))
         {
-            x = 0f;
-            y = 0f;
-            z = 0f;
-            w = 1f;
-            lengthSquared = 1f;
+            // Rare path — tiny, huge, zero or non-finite input: prescale by an exact power of two so the largest
+            // component lands in [2^-22, 4), where the squared length can neither overflow nor underflow. Zero, NaN
+            // and infinities still give a zero, NaN or infinite length and are the only degenerate inputs.
+            float s = PowerOfTwoScale(MathF.Max(MathF.Max(MathF.Abs(x), MathF.Abs(y)), MathF.Max(MathF.Abs(z), MathF.Abs(w))));
+            x *= s;
+            y *= s;
+            z *= s;
+            w *= s;
+            lengthSquared = x * x + y * y + z * z + w * w;
+            if (!(lengthSquared > 0f) || !float.IsFinite(lengthSquared))
+            {
+                x = 0f;
+                y = 0f;
+                z = 0f;
+                w = 1f;
+                lengthSquared = 1f;
+            }
         }
 
         float ax = MathF.Abs(x), ay = MathF.Abs(y), az = MathF.Abs(z), aw = MathF.Abs(w);
@@ -228,6 +264,20 @@ public static class Quantization
         float w = index == 3 ? d : c;
         float invLength = 1f / MathF.Sqrt(x * x + y * y + z * z + w * w);
         return new Quaternion(x * invLength, y * invLength, z * invLength, w * invLength);
+    }
+
+    /// <summary>
+    /// Returns an exact power of two 2^k such that <paramref name="largestAbs"/> · 2^k lies in [1, 2) for normal floats
+    /// below 2^127, in [2, 4) for those at or above it, and in [2^-22, 2) for subnormals. Branch-free: the scale's
+    /// biased exponent is <c>254 − e</c> clamped to the normal range. The result for zero, NaN or infinity is
+    /// irrelevant (the caller detects those afterwards).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float PowerOfTwoScale(float largestAbs)
+    {
+        int e = (BitConverter.SingleToInt32Bits(largestAbs) >> 23) & 0xFF;
+        int biased = Math.Clamp(254 - e, 1, 254);
+        return BitConverter.Int32BitsToSingle(biased << 23);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

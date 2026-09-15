@@ -18,6 +18,15 @@ namespace Tedd.Quicly.Replication;
 /// fixed layout, the same definition on both ends, and hosts of the same endianness (every mainstream .NET
 /// target is little-endian). A batch whose length is not exactly <c>5 + Count × sizeof(TInput)</c> is malformed.
 /// </para>
+/// <para>
+/// <b>Warning — field types:</b> the input bytes come straight from the network and are not validated. Declare
+/// <c>TInput</c> with integer fields only (<c>byte</c>, <c>sbyte</c>, <c>short</c>, <c>int</c>, … and fixed buffers of
+/// them). A <see cref="bool"/> read from the wire can hold any byte value (for example 2, which makes
+/// <c>a == b</c> false for two "true" values), a <see cref="char"/> can be an unpaired surrogate and an enum any
+/// underlying value. Carry such values as integers and convert them with explicit checks after reading
+/// (<c>flags != 0</c>, range-checked enums). <see cref="float"/> fields are safe to copy but may arrive as NaN or
+/// infinity; clamp or reject them before simulating.
+/// </para>
 /// </remarks>
 public static class InputBatch
 {

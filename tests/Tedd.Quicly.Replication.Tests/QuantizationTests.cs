@@ -298,4 +298,55 @@ public class QuantizationTests
         Assert.Throws<ArgumentOutOfRangeException>(() => Quantization.DequantizeQuaternion(0, 1));
         Assert.Throws<ArgumentOutOfRangeException>(() => Quantization.DequantizeQuaternion(0, 21));
     }
+
+    [Theory]
+    [InlineData(1e-45f)]          // smallest subnormal: components are 0 or ±1 ulp
+    [InlineData(3e-39f)]          // subnormal: 1 / (|x| + |y| + |z|) overflows float
+    [InlineData(1e-30f)]          // around the safe-range edge
+    [InlineData(1e-20f)]          // the squared length underflows float
+    [InlineData(1e20f)]           // the squared length overflows float
+    [InlineData(1e30f)]
+    [InlineData(3e38f)]           // |x| + |y| + |z| overflows float
+    [InlineData(float.MaxValue)]
+    public void Extreme_Finite_Magnitudes_Keep_Their_Direction_And_Rotation(float scale)
+    {
+        const int Bits = 12;
+        int m = (1 << (Bits - 1)) - 1;
+        double vectorBound = UnitVectorBoundFactor / m + FloatRounding;
+        double quaternionBound = QuaternionBoundFactor / m + FloatRounding;
+        Random random = new(BitConverter.SingleToInt32Bits(scale));
+        int checkedVectors = 0;
+        int checkedRotations = 0;
+        for (int i = 0; i < 4000; i++)
+        {
+            // The float input itself is the reference: its exact direction, normalised in double.
+            Vector3 d = Vector3.Normalize(new((float)random.NextDouble() - 0.5f, (float)random.NextDouble() - 0.5f, (float)random.NextDouble() - 0.5f));
+            Vector3 v = new(d.X * scale, d.Y * scale, d.Z * scale);
+            if (v != Vector3.Zero)
+            {
+                double length = Math.Sqrt(((double)v.X * v.X) + ((double)v.Y * v.Y) + ((double)v.Z * v.Z));
+                Vector3 back = Quantization.DequantizeUnitVector(Quantization.QuantizeUnitVector(v, Bits), Bits);
+                double dx = back.X - (v.X / length), dy = back.Y - (v.Y / length), dz = back.Z - (v.Z / length);
+                double angle = 2 * Math.Asin(Math.Min(1, Math.Sqrt((dx * dx) + (dy * dy) + (dz * dz)) / 2));
+                Assert.True(angle <= vectorBound, $"scale {scale}: {v} → {back}, {angle} rad");
+                checkedVectors++;
+            }
+
+            Quaternion q = Quaternion.Normalize(new(
+                (float)random.NextDouble() - 0.5f, (float)random.NextDouble() - 0.5f, (float)random.NextDouble() - 0.5f, (float)random.NextDouble() - 0.5f));
+            Quaternion r = new(q.X * scale, q.Y * scale, q.Z * scale, q.W * scale);
+            if (r != default)
+            {
+                double length = Math.Sqrt(((double)r.X * r.X) + ((double)r.Y * r.Y) + ((double)r.Z * r.Z) + ((double)r.W * r.W));
+                Quaternion back = Quantization.DequantizeQuaternion(Quantization.QuantizeQuaternion(r, Bits), Bits);
+                double dot = Math.Abs(((back.X * (double)r.X) + (back.Y * (double)r.Y) + (back.Z * (double)r.Z) + (back.W * (double)r.W)) / length);
+                double angle = 2 * Math.Acos(Math.Min(1, dot));
+                Assert.True(angle <= quaternionBound, $"scale {scale}: {r} → {back}, {angle} rad");
+                checkedRotations++;
+            }
+        }
+
+        Assert.True(checkedVectors > 1000);
+        Assert.True(checkedRotations > 1000);
+    }
 }

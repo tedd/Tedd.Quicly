@@ -119,9 +119,54 @@ public class PredictionHistoryTests
         Assert.True(history.Record(7, new PlayerState(7, 0)));
         Assert.True(history.Record(8, new PlayerState(8, 0)));
         Assert.Equal(3, history.Count);
+        Assert.Equal(1, history.OverflowCount);
         Assert.False(history.TryGetPredicted(5, out _));
         Assert.True(history.TryGetPredicted(6, out PlayerState six));
         Assert.Equal(new PlayerState(6, 0), six);
+    }
+
+    [Fact]
+    public void Overflow_Still_Replays_Every_Unacknowledged_Input_By_Sequence()
+    {
+        // Inputs 0..9 (sequence s moves X by s + 1 and Y by 1); only 6..9 still have a recorded state.
+        (InputBuffer<Step> inputs, PredictionHistory<PlayerState> history, _) = Predict(10, capacity: 4);
+        Assert.Equal(6, history.OverflowCount);
+        List<uint> calls = [];
+        Replayer replay = new() { Inputs = inputs, Calls = calls };
+
+        PlayerState corrected = history.Reconcile(2, new PlayerState(1000, 0), ref replay);
+        Assert.Equal(new uint[] { 3, 4, 5, 6, 7, 8, 9 }, calls);
+        Assert.Equal(new PlayerState(1000 + 4 + 5 + 6 + 7 + 8 + 9 + 10, 7), corrected);
+        Assert.True(history.TryGetPredicted(9, out PlayerState newest));
+        Assert.Equal(corrected, newest);
+
+        // Input 5 was dropped and is still unacknowledged after 4.
+        calls.Clear();
+        corrected = history.Reconcile(4, new PlayerState(0, 0), ref replay);
+        Assert.Equal(new uint[] { 5, 6, 7, 8, 9 }, calls);
+        Assert.Equal(new PlayerState(6 + 7 + 8 + 9 + 10, 5), corrected);
+
+        // Past every dropped input only recorded entries are replayed again.
+        calls.Clear();
+        corrected = history.Reconcile(7, new PlayerState(0, 0), ref replay);
+        Assert.Equal(new uint[] { 8, 9 }, calls);
+        Assert.Equal(new PlayerState(9 + 10, 2), corrected);
+        calls.Clear();
+        history.Reconcile(8, new PlayerState(0, 0), ref replay);
+        Assert.Equal(new uint[] { 9 }, calls);
+
+        history.Clear();
+        Assert.Equal(0, history.OverflowCount);
+    }
+
+    [Fact]
+    public void Overflow_Replay_Crosses_The_Sequence_Wrap()
+    {
+        (InputBuffer<Step> inputs, PredictionHistory<PlayerState> history, _) = Predict(6, uint.MaxValue - 3, capacity: 2);
+        List<uint> calls = [];
+        Replayer replay = new() { Inputs = inputs, Calls = calls };
+        history.Reconcile(uint.MaxValue - 3, default, ref replay);
+        Assert.Equal(new uint[] { uint.MaxValue - 2, uint.MaxValue - 1, uint.MaxValue, 0, 1 }, calls);
     }
 
     [Fact]

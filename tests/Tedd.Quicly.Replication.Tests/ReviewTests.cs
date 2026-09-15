@@ -4,94 +4,178 @@ namespace Tedd.Quicly.Replication.Tests;
 
 /// <summary>
 /// Review findings (adversarial review of the replication module). Each test states the documented or specified
-/// behaviour it checks; the tests fail against the implementation under review.
+/// behaviour it checks; they failed against the implementation under review and pass after the follow-up fixes.
 /// </summary>
 public class ReviewTests
 {
     /// <summary>
-    /// SnapshotHistory's remarks recommend <c>AckBaseline</c> on a tracked unreliable send's <c>Delivered</c> and state
-    /// "any acknowledged baseline is guaranteed to be available there too". PROTOCOL.md §4.3 says a transport ack
-    /// only proves delivery to the peer's transport. On an <c>UnreliableSequenced</c> channel the receiver drops a
-    /// datagram that arrives after a newer one (it is still transport-acked). If that Delivered completion is
-    /// processed before the newer one's, the sender encodes against a snapshot the receiver never decoded; that
-    /// undecodable delta is itself transport-acked and becomes the next baseline, and so on: permanent desync with
-    /// every later datagram delivered.
+    /// A server → client delta link following the pairing documented on <see cref="SnapshotHistory"/>: each message
+    /// carries its tick and its baseline tick; the client keeps a history of decoded snapshots and echoes the newest
+    /// tick it decoded (an application-level acknowledgement); the server calls <c>AckBaseline</c> only with echoes.
+    /// The client's channel behaves like <c>UnreliableSequenced</c>: a message older than the newest delivered one is
+    /// dropped by the receiver (although the transport acknowledged it).
     /// </summary>
-    [Fact]
-    public void Review_Documented_Delivered_Ack_Pairing_Recovers_From_A_Dropped_Stale_Datagram()
+    private sealed class DeltaLink
     {
-        SnapshotHistory server = new(32, 64 * 1024, 1);
-        SnapshotHistory client = new(32, 64 * 1024, 0);
-        byte[] world = new byte[256];
-        byte[] packet = new byte[DeltaCodec.GetMaxEncodedLength(world.Length)];
-        byte[] decoded = new byte[world.Length];
-        uint lastSequencedTick = 0;
+        public readonly SnapshotHistory Server = new(32, 64 * 1024, 1);
+        public readonly SnapshotHistory Client = new(32, 64 * 1024, 0);
+        private readonly byte[] _world = new byte[256];
+        private readonly byte[] _packet = new byte[DeltaCodec.GetMaxEncodedLength(256)];
+        private readonly byte[] _decoded = new byte[256];
+        private uint _lastSequencedTick;
 
-        // Returns true when the client could decode (it drops stale datagrams like UnreliableSequenced, and
-        // datagrams whose baseline it does not have).
-        bool Deliver(uint tick, bool hasBaseline, uint baselineTick, ReadOnlySpan<byte> delta)
+        public readonly record struct Message(uint Tick, bool HasBaseline, uint BaselineTick, byte[] Delta);
+
+        /// <summary>The newest tick the client decoded (what it echoes), 0 before the first.</summary>
+        public uint NewestDecoded { get; private set; }
+
+        public Message Send(uint tick)
         {
-            if (tick <= lastSequencedTick)
+            _world[tick % (uint)_world.Length] ^= (byte)tick;
+            Assert.True(Server.Store(tick, _world));
+            bool has = Server.TryGetBaseline(0, out uint baselineTick, out ReadOnlySpan<byte> baseline);
+            int n = DeltaCodec.Encode(has ? baseline : default, _world, _packet);
+            return new Message(tick, has, baselineTick, _packet.AsSpan(0, n).ToArray());
+        }
+
+        /// <summary>Receiver side. Returns <see langword="false"/> when the message was dropped or its baseline is missing.</summary>
+        public bool Receive(Message message, out bool missingBaseline)
+        {
+            missingBaseline = false;
+            if (message.Tick <= _lastSequencedTick)
             {
                 return false;   // sequenced channel: older than the newest delivered message
             }
 
-            lastSequencedTick = tick;
+            _lastSequencedTick = message.Tick;
             ReadOnlySpan<byte> clientBaseline = default;
-            if (hasBaseline && !client.TryGet(baselineTick, out clientBaseline))
+            if (message.HasBaseline && !Client.TryGet(message.BaselineTick, out clientBaseline))
             {
-                return false;   // baseline never decoded here
+                missingBaseline = true;
+                return false;
             }
 
-            int m = DeltaCodec.Decode(clientBaseline, delta, decoded);
-            Assert.True(m >= 0);
-            client.Store(tick, decoded.AsSpan(0, m));
+            int m = DeltaCodec.Decode(clientBaseline, message.Delta, _decoded);
+            Assert.Equal(_world.Length, m);
+            Assert.True(Server.TryGet(message.Tick, out ReadOnlySpan<byte> sent));
+            Assert.True(_decoded.AsSpan(0, m).SequenceEqual(sent));
+            Assert.True(Client.Store(message.Tick, _decoded.AsSpan(0, m)));
+            NewestDecoded = message.Tick;
             return true;
         }
 
-        (bool Has, uint Baseline, byte[] Delta) Send(uint tick)
+        /// <summary>Client lost its history (reconnect); it keeps receiving on the same sequenced channel.</summary>
+        public void ClientLosesHistory()
         {
-            world[tick % (uint)world.Length] ^= (byte)tick;
-            Assert.True(server.Store(tick, world));
-            bool has = server.TryGetBaseline(0, out uint baselineTick, out ReadOnlySpan<byte> baseline);
-            int n = DeltaCodec.Encode(has ? baseline : default, world, packet);
-            return (has, baselineTick, packet.AsSpan(0, n).ToArray());
+            Client.Clear();
+            NewestDecoded = 0;
         }
+    }
 
-        // Tick 1: full snapshot, delivered, acked.
-        var s1 = Send(1);
-        Assert.True(Deliver(1, s1.Has, s1.Baseline, s1.Delta));
-        server.AckBaseline(0, 1);
+    /// <summary>
+    /// SnapshotHistory's remarks used to recommend <c>AckBaseline</c> on a tracked unreliable send's <c>Delivered</c>,
+    /// which PROTOCOL.md §4.3 does not support (a transport ack only proves delivery to the peer's transport): a
+    /// sequenced receiver drops tick 2 after tick 3 overtook it, Delivered(2) makes 2 the baseline, and every later
+    /// delta is undecodable while every datagram arrives. With the documented application-level acknowledgements
+    /// (the client echoes the newest tick it decoded) the dropped datagram never becomes a baseline, and every later
+    /// message decodes — also with delayed, reordered and lost echoes.
+    /// </summary>
+    [Fact]
+    public void Review_Documented_Application_Ack_Pairing_Recovers_From_A_Dropped_Stale_Datagram()
+    {
+        DeltaLink link = new();
 
-        // Ticks 2 and 3 are sent; 3 overtakes 2 in the network, so the sequenced receiver drops 2.
-        var s2 = Send(2);
-        var s3 = Send(3);
-        Assert.True(Deliver(3, s3.Has, s3.Baseline, s3.Delta));
-        Assert.False(Deliver(2, s2.Has, s2.Baseline, s2.Delta));
+        // Tick 1: full snapshot, decoded, echoed.
+        Assert.True(link.Receive(link.Send(1), out _));
+        Assert.True(link.Server.AckBaseline(0, link.NewestDecoded));
 
-        // Both were acknowledged by the peer's QUIC stack; the completion for 2 is processed first.
-        server.AckBaseline(0, 2);
+        // Ticks 2 and 3 are sent; 3 overtakes 2 in the network, so the sequenced receiver drops 2. Both would have
+        // been transport-acknowledged; the client never echoes 2 because it never decoded it.
+        DeltaLink.Message m2 = link.Send(2);
+        DeltaLink.Message m3 = link.Send(3);
+        Assert.True(link.Receive(m3, out _));
+        Assert.False(link.Receive(m2, out bool missing));
+        Assert.False(missing);
+        uint echoAfter3 = link.NewestDecoded;
+        Assert.Equal(3u, echoAfter3);
 
-        // From here on every datagram is delivered in order and acknowledged immediately; the completion for 3
-        // arrives late (after 4's), which AckBaseline ignores as older.
+        // From here on every message is delivered in order; echoes reach the server two ticks late, every fifth one is
+        // lost, and the stale echo of tick 3 arrives after newer ones (AckBaseline ignores it as older).
+        Queue<(uint Due, uint Echo)> echoes = new();
+        echoes.Enqueue((5, echoAfter3));
         int decodedAfter = 0;
         for (uint tick = 4; tick < 100; tick++)
         {
-            var s = Send(tick);
-            if (Deliver(tick, s.Has, s.Baseline, s.Delta))
+            Assert.True(link.Receive(link.Send(tick), out _), $"tick {tick} did not decode");
+            decodedAfter++;
+            if (tick % 5 != 0)
             {
-                decodedAfter++;
+                echoes.Enqueue((tick + 2, link.NewestDecoded));
             }
 
-            server.AckBaseline(0, tick);
-            if (tick == 5)
+            while (echoes.Count > 0 && echoes.Peek().Due <= tick)
             {
-                server.AckBaseline(0, 3);
+                link.Server.AckBaseline(0, echoes.Dequeue().Echo);
+            }
+
+            if (tick == 10)
+            {
+                link.Server.AckBaseline(0, echoAfter3);
             }
         }
 
-        // Documented guarantee: an acknowledged baseline is available at the receiver, so the stream recovers.
-        Assert.True(decodedAfter > 0, "Receiver never decodes again: every later delta is against a baseline it never had.");
+        Assert.Equal(96, decodedAfter);
+        Assert.True(link.Server.TryGetBaseline(0, out uint baselineTick, out _));
+        Assert.True(baselineTick >= 95);
+    }
+
+    /// <summary>
+    /// The documented recovery path: a receiver that lost its history (so it misses the baseline of the next delta)
+    /// requests a full snapshot; the sender answers with <see cref="SnapshotHistory.ResetPeer"/>. An echo sent before
+    /// the loss that arrives after the reset (no cross-channel ordering, PROTOCOL.md §4.7) must not re-establish a
+    /// baseline the receiver no longer has.
+    /// </summary>
+    [Fact]
+    public void Review_Full_Snapshot_Request_And_ResetPeer_Recover_A_Receiver_That_Lost_Its_History()
+    {
+        DeltaLink link = new();
+        uint staleEcho = 0;
+        for (uint tick = 1; tick <= 10; tick++)
+        {
+            Assert.True(link.Receive(link.Send(tick), out _));
+            if (tick == 9)
+            {
+                staleEcho = link.NewestDecoded;   // in flight while the client loses its history
+            }
+            else
+            {
+                link.Server.AckBaseline(0, link.NewestDecoded);
+            }
+        }
+
+        link.ClientLosesHistory();
+        DeltaLink.Message m11 = link.Send(11);
+        Assert.True(m11.HasBaseline);
+        Assert.False(link.Receive(m11, out bool missingBaseline));
+        Assert.True(missingBaseline);
+
+        // The full-snapshot request arrives: the server resets the peer. The stale echo arrives afterwards.
+        link.Server.ResetPeer(0);
+        Assert.False(link.Server.AckBaseline(0, staleEcho));
+        Assert.False(link.Server.AckBaseline(0, 10));
+
+        // Next message is a full snapshot; its echo becomes the new baseline and deltas resume.
+        DeltaLink.Message m12 = link.Send(12);
+        Assert.False(m12.HasBaseline);
+        Assert.True(link.Receive(m12, out _));
+        Assert.True(link.Server.AckBaseline(0, link.NewestDecoded));
+        for (uint tick = 13; tick <= 20; tick++)
+        {
+            DeltaLink.Message message = link.Send(tick);
+            Assert.True(message.HasBaseline);
+            Assert.True(link.Receive(message, out _), $"tick {tick} did not decode");
+            link.Server.AckBaseline(0, link.NewestDecoded);
+        }
     }
 
     /// <summary>

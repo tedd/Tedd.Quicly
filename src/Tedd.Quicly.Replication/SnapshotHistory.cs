@@ -10,21 +10,53 @@ namespace Tedd.Quicly.Replication;
 /// <remarks>
 /// <para>
 /// <b>Storage:</b> snapshots are appended to a circular byte arena in tick order; each slot records tick, offset and
-/// length. A store evicts the oldest snapshots whose bytes it would overwrite (and the oldest one when all
-/// <see cref="Capacity"/> slots are used). Nothing is allocated after construction.
+/// length. A store evicts the oldest snapshot when all <see cref="Capacity"/> slots are used, and then every older
+/// snapshot that is in its way: those whose bytes it would overwrite and, when the new snapshot does not fit
+/// between the write position and the arena end (it then wraps to offset 0), also the older snapshots in that
+/// skipped tail, even though their bytes are not overwritten (eviction is strictly oldest-first, so the retained
+/// snapshots are always the newest ones, contiguous in tick order). An undersized arena therefore keeps fewer
+/// than <see cref="Capacity"/> snapshots. <b>Sizing:</b> with <c>ArenaBytes ≥ (Capacity + 1) × S</c>, where
+/// <c>S</c> is the largest snapshot stored, the arena never evicts anything the slot limit would keep
+/// (<c>2 × Capacity × S</c> leaves generous headroom). Nothing is allocated after construction.
 /// </para>
 /// <para>
 /// <b>Ticks</b> are <see cref="uint"/> serial numbers (RFC 1982, <see cref="SerialNumber"/>) — the same width as
 /// QUICLY's <c>SenderTick</c> — and must strictly increase across <see cref="Store"/> calls.
 /// </para>
 /// <para>
-/// <b>Acknowledged baselines — pairing with QUICLY tracked unreliable sends:</b> send each peer's delta on an
-/// unreliable channel with <c>SendOptions { Track = true, Context = tick }</c>. When the completion for that send
-/// reports <c>Delivered</c> (the transport acknowledged the datagram, PROTOCOL.md §4.3), call
-/// <c>AckBaseline(peer.Index, (uint)context)</c>. <see cref="TryGetBaseline"/> then returns the newest acknowledged
-/// snapshot that is still in the ring; when it returns <see langword="false"/> the next message must be encoded
-/// against an empty baseline (a full snapshot). The receiver keeps its own history of decoded snapshots keyed by
-/// the same ticks, so any acknowledged baseline is guaranteed to be available there too.
+/// <b>Acknowledged baselines — use application-level acknowledgements.</b> A baseline may only be a snapshot the
+/// receiver has actually <em>decoded and stored</em>, and only the receiving application can know that. The receiver
+/// keeps its own <see cref="SnapshotHistory"/> of decoded snapshots and echoes the newest tick it decoded in every
+/// message it sends back (for example next to its <see cref="InputBatch"/> in the same datagram, which it sends every
+/// tick anyway, so a lost echo is repaired by the next one). On receiving an echo the sender calls
+/// <c>AckBaseline(peer, echoedTick)</c>; out-of-order echoes are harmless because the baseline only moves forward.
+/// Each delta message carries its own tick and the baseline tick it was encoded against (or "none"), so the
+/// receiver can look the baseline up with <see cref="TryGet"/>.
+/// </para>
+/// <para>
+/// <b>Do not use transport acknowledgements</b> (a tracked unreliable send completing <c>Delivered</c>) as baseline
+/// acknowledgements. PROTOCOL.md §4.3: a QUIC acknowledgement proves delivery to the peer's transport, not that the
+/// application processed the message. The receiver can drop a transport-acknowledged datagram — an
+/// <c>UnreliableSequenced</c> channel drops one that arrives after a newer one, receive-side queue and budget limits
+/// (ADR 0009, PROTOCOL.md §7) drop under load, and a history that only accepts increasing ticks cannot store one
+/// that arrives out of order on an <c>UnreliableUnordered</c> channel. A sender that then encodes against that tick
+/// produces a delta the receiver cannot decode; that datagram is transport-acknowledged in turn and becomes the next
+/// baseline, and the stream never recovers although every later datagram arrives. <c>Delivered</c> / <c>Lost</c>
+/// completions remain useful for statistics, but they must not call <see cref="AckBaseline"/>.
+/// </para>
+/// <para>
+/// <b>Guarantee and sizing:</b> with application-level acknowledgements, if the receiver's history has at least as
+/// many slots as the sender's and its arena is sized as above, every baseline <see cref="TryGetBaseline"/> returns is
+/// still in the receiver's history when the delta arrives (the receiver cannot have decoded more than
+/// <c>Capacity − 1</c> ticks newer than the baseline while the sender still holds it).
+/// </para>
+/// <para>
+/// <b>Recovery:</b> a receiver that cannot find a baseline (its history was cleared, e.g. after a reconnect or a
+/// load hitch that exceeded its sizing) asks for a full snapshot on a reliable or <c>RequestResponse</c> channel; the
+/// sender answers with <see cref="ResetPeer"/>, which makes the next messages full snapshots and ignores echoes of
+/// ticks stored before the reset (they may still be in flight on another channel, PROTOCOL.md §4.7, and refer to
+/// snapshots the receiver no longer has). The first full snapshot the receiver decodes after that is echoed and
+/// becomes the new baseline.
 /// </para>
 /// <para>
 /// Spans returned by <see cref="TryGet"/>, <see cref="TryGetLatest"/> and <see cref="TryGetBaseline"/> alias the arena
@@ -46,8 +78,11 @@ public sealed class SnapshotHistory
     private readonly uint[] _ticks;
     private readonly int[] _offsets;
     private readonly int[] _lengths;
+    private readonly ulong[] _storeSequence;
     private readonly uint[] _peerTick;
     private readonly bool[] _peerHasTick;
+    private readonly ulong[] _peerFence;
+    private ulong _nextStoreSequence;
     private int _oldest;
     private int _count;
     private int _head;
@@ -66,8 +101,10 @@ public sealed class SnapshotHistory
         _ticks = new uint[capacity];
         _offsets = new int[capacity];
         _lengths = new int[capacity];
+        _storeSequence = new ulong[capacity];
         _peerTick = new uint[maxPeers];
         _peerHasTick = new bool[maxPeers];
+        _peerFence = new ulong[maxPeers];
     }
 
     /// <summary>Number of snapshot slots.</summary>
@@ -142,6 +179,7 @@ public sealed class SnapshotHistory
         _ticks[newSlot] = tick;
         _offsets[newSlot] = offset;
         _lengths[newSlot] = length;
+        _storeSequence[newSlot] = _nextStoreSequence++;
         _count++;
         snapshot.CopyTo(_arena.AsSpan(offset));
         _head = offset + length;
@@ -189,20 +227,23 @@ public sealed class SnapshotHistory
     }
 
     /// <summary>
-    /// Records that <paramref name="peerIndex"/> has received the snapshot of <paramref name="tick"/> (typically from a
-    /// <c>Delivered</c> completion whose send context was the tick). The peer's baseline only moves forward.
+    /// Records that <paramref name="peerIndex"/> has decoded and stored the snapshot of <paramref name="tick"/> — an
+    /// application-level acknowledgement (the tick the receiver echoes back), never a transport <c>Delivered</c>
+    /// completion (see the class remarks). The peer's baseline only moves forward.
     /// </summary>
     /// <param name="peerIndex">The peer index, 0..<see cref="MaxPeers"/>−1.</param>
     /// <param name="tick">The acknowledged tick.</param>
     /// <returns>
     /// <see langword="true"/> when <paramref name="tick"/> became the peer's baseline; <see langword="false"/> when it is
-    /// no longer (or never was) in the ring, or is older than the peer's current baseline.
+    /// no longer (or never was) in the ring, is older than the peer's current baseline, or was stored before the
+    /// peer's last <see cref="ResetPeer"/>.
     /// </returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="peerIndex"/> is out of range.</exception>
     public bool AckBaseline(int peerIndex, uint tick)
     {
         ValidatePeer(peerIndex);
-        if (FindSlot(tick) < 0)
+        int slot = FindSlot(tick);
+        if (slot < 0 || _storeSequence[slot] < _peerFence[peerIndex])
         {
             return false;
         }
@@ -247,7 +288,13 @@ public sealed class SnapshotHistory
         return false;
     }
 
-    /// <summary>Forgets the baseline of <paramref name="peerIndex"/> (new connection, new epoch, or a peer slot reused).</summary>
+    /// <summary>
+    /// Forgets the baseline of <paramref name="peerIndex"/>, so the next messages are full snapshots — on a new
+    /// connection or epoch, when a peer slot is reused, or when the receiver asked for a full snapshot because it is
+    /// missing a baseline. Acknowledgements of snapshots stored before the reset are ignored from now on (they may
+    /// still arrive, and refer to snapshots the receiver no longer has); only snapshots stored afterwards can become
+    /// the peer's baseline again.
+    /// </summary>
     /// <param name="peerIndex">The peer index, 0..<see cref="MaxPeers"/>−1.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="peerIndex"/> is out of range.</exception>
     public void ResetPeer(int peerIndex)
@@ -255,6 +302,7 @@ public sealed class SnapshotHistory
         ValidatePeer(peerIndex);
         _peerHasTick[peerIndex] = false;
         _peerTick[peerIndex] = 0;
+        _peerFence[peerIndex] = _nextStoreSequence;
     }
 
     /// <summary>Removes every snapshot and every peer baseline.</summary>
@@ -265,6 +313,9 @@ public sealed class SnapshotHistory
         _head = 0;
         Array.Clear(_peerHasTick);
         Array.Clear(_peerTick);
+
+        // Every snapshot stored from now on has a store sequence at or above every fence, so fences can go too.
+        Array.Clear(_peerFence);
     }
 
     private int Slot(int logical)

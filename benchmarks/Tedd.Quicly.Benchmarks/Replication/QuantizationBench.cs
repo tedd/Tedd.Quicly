@@ -1,5 +1,6 @@
 using System.Numerics;
 using BenchmarkDotNet.Attributes;
+using Tedd.Quicly.Archive.Replication;
 using Tedd.Quicly.Replication;
 
 namespace Tedd.Quicly.Benchmarks.Replication;
@@ -46,6 +47,42 @@ public class QuantizationBench
     }
 
     [Benchmark]
+    public ulong QuantizeQuaternion_V0()
+    {
+        ulong x = 0;
+        for (int i = 0; i < Count; i++)
+        {
+            x ^= QuantizationV0.QuantizeQuaternion(_rotations[i], 10);
+        }
+
+        return x;
+    }
+
+    [Benchmark]
+    public ulong QuantizeQuaternion_V1()
+    {
+        ulong x = 0;
+        for (int i = 0; i < Count; i++)
+        {
+            x ^= QuantizationV1.QuantizeQuaternion(_rotations[i], 10);
+        }
+
+        return x;
+    }
+
+    [Benchmark]
+    public ulong QuantizeQuaternion_V2()
+    {
+        ulong x = 0;
+        for (int i = 0; i < Count; i++)
+        {
+            x ^= QuantizationV2.QuantizeQuaternion(_rotations[i], 10);
+        }
+
+        return x;
+    }
+
+    [Benchmark]
     public float DequantizeQuaternion()
     {
         float x = 0;
@@ -64,6 +101,42 @@ public class QuantizationBench
         for (int i = 0; i < Count; i++)
         {
             x ^= Quantization.QuantizeUnitVector(_directions[i], 12);
+        }
+
+        return x;
+    }
+
+    [Benchmark]
+    public uint QuantizeUnitVector_V0()
+    {
+        uint x = 0;
+        for (int i = 0; i < Count; i++)
+        {
+            x ^= QuantizationV0.QuantizeUnitVector(_directions[i], 12);
+        }
+
+        return x;
+    }
+
+    [Benchmark]
+    public uint QuantizeUnitVector_V1()
+    {
+        uint x = 0;
+        for (int i = 0; i < Count; i++)
+        {
+            x ^= QuantizationV1.QuantizeUnitVector(_directions[i], 12);
+        }
+
+        return x;
+    }
+
+    [Benchmark]
+    public uint QuantizeUnitVector_V2()
+    {
+        uint x = 0;
+        for (int i = 0; i < Count; i++)
+        {
+            x ^= QuantizationV2.QuantizeUnitVector(_directions[i], 12);
         }
 
         return x;

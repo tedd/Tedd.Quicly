@@ -16,10 +16,14 @@ namespace Tedd.Quicly.Replication;
 /// decreasing ticks the allocator stays correct but may skip a reusable index behind a not-yet-ready one.
 /// </para>
 /// <para>
-/// Generations wrap inside the wire mask (<see cref="EntityId.GetGenerationMask"/>) and skip 0 when at least one
-/// generation bit is configured, so <see langword="default"/>(<see cref="EntityId"/>) is never alive. An index
-/// returns to an old generation after 2^bits − 1 reuses; choose <c>generationBits</c> and the reuse delay so that
-/// cannot happen within the lifetime of a stale packet.
+/// Generations wrap inside the wire mask (<see cref="EntityId.GetGenerationMask"/>). With at least two generation
+/// bits they skip 0, so <see langword="default"/>(<see cref="EntityId"/>) is never alive, and an index returns to an
+/// old generation after 2^bits − 1 reuses. With one bit the generation alternates 1, 0, 1, … (skipping 0 would
+/// leave a single generation and a freed id would come back alive unchanged), so a stale id is detected until the
+/// second reuse, and <see langword="default"/>(<see cref="EntityId"/>) can be alive — do not use it as "no entity".
+/// With 0 bits there is no generation at all and no stale-id detection: a reused index is exactly the old id.
+/// Choose <c>generationBits</c> and the reuse delay so that no generation repeats within the lifetime of a stale
+/// packet.
 /// </para>
 /// <para>Not thread-safe: owned by one thread (the simulation).</para>
 /// </remarks>
@@ -30,6 +34,7 @@ public sealed class EntityIdAllocator
     private readonly uint[] _freeIndex;
     private readonly long[] _freeReadyTick;
     private readonly uint _mask;
+    private readonly uint _skipZero;
     private int _freeHead;
     private int _freeCount;
     private int _highWater;
@@ -45,6 +50,7 @@ public sealed class EntityIdAllocator
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
         ArgumentOutOfRangeException.ThrowIfNegative(reuseDelayTicks);
         _mask = EntityId.GetGenerationMask(generationBits);
+        _skipZero = _mask > 1 ? 1u : 0u;
         GenerationBits = generationBits;
         ReuseDelayTicks = reuseDelayTicks;
         _generations = new uint[capacity];
@@ -100,8 +106,9 @@ public sealed class EntityIdAllocator
     }
 
     /// <summary>
-    /// Frees an alive id: its generation is bumped (so the old id is no longer alive) and its index becomes
-    /// reusable at <paramref name="tick"/> + <see cref="ReuseDelayTicks"/>.
+    /// Frees an alive id: its generation is bumped (so the old id is no longer alive, and stays dead when the index is
+    /// reused — except with 0 generation bits, where there is no generation) and its index becomes reusable at
+    /// <paramref name="tick"/> + <see cref="ReuseDelayTicks"/>.
     /// </summary>
     /// <param name="id">The id to free.</param>
     /// <param name="tick">The current simulation tick.</param>
@@ -117,7 +124,7 @@ public sealed class EntityIdAllocator
         _alive[index] = false;
         _count--;
         uint next = (_generations[index] + 1) & _mask;
-        next |= (next == 0 && _mask != 0) ? 1u : 0u;
+        next |= next == 0 ? _skipZero : 0u;
         _generations[index] = next;
 
         int tail = _freeHead + _freeCount;
@@ -149,7 +156,7 @@ public sealed class EntityIdAllocator
             {
                 _alive[i] = false;
                 uint next = (_generations[i] + 1) & _mask;
-                next |= (next == 0 && _mask != 0) ? 1u : 0u;
+                next |= next == 0 ? _skipZero : 0u;
                 _generations[i] = next;
             }
         }

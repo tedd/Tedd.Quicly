@@ -82,7 +82,7 @@ internal sealed class ServerCertificatePolicy
         }
         catch (Exception ex)
         {
-            _diagnostic?.Invoke(TransportDiagnosticLevel.Error, "Server certificate validation threw; the certificate is rejected.", ex);
+            Diagnose(TransportDiagnosticLevel.Error, "Server certificate validation threw; the certificate is rejected.", ex);
             return MsQuicCertificateDecision.Reject;
         }
     }
@@ -98,7 +98,20 @@ internal sealed class ServerCertificatePolicy
 
     private MsQuicCertificateDecision Reject(string why)
     {
-        _diagnostic?.Invoke(TransportDiagnosticLevel.Warning, "Server certificate rejected: " + why + ".", null);
+        Diagnose(TransportDiagnosticLevel.Warning, "Server certificate rejected: " + why + ".", null);
         return MsQuicCertificateDecision.Reject;
+    }
+
+    /// <summary>Reports to the user's diagnostic callback; an exception it throws is swallowed (the policy never throws).</summary>
+    private void Diagnose(TransportDiagnosticLevel level, string message, Exception? exception)
+    {
+        try
+        {
+            _diagnostic?.Invoke(level, message, exception);
+        }
+        catch
+        {
+            // A diagnostics sink must not break certificate validation.
+        }
     }
 }

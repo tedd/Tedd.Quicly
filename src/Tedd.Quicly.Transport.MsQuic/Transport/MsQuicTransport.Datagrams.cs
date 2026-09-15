@@ -27,10 +27,11 @@ public sealed unsafe partial class MsQuicTransport
     {
         ArgumentOutOfRangeException.ThrowIfNegative(count);
         if (count > 0 && segments == null) throw new ArgumentNullException(nameof(segments));
-        if (Volatile.Read(ref _state) != StateConnected || !_datagramsEnabled) return TransportStatus.InvalidState;
+        int datagrams = _datagramState;
+        if (Volatile.Read(ref _state) != StateConnected || (datagrams & DatagramEnabledBit) == 0) return TransportStatus.InvalidState;
         long total = 0;
         for (int i = 0; i < count; i++) total += segments[i].Length;
-        if (total > _maxDatagramPayload) return TransportStatus.TooLarge;
+        if (total > (datagrams & 0xFFFF)) return TransportStatus.TooLarge;
         QUIC_SEND_FLAGS sendFlags = s_datagramFlagMap[(int)flags & 63] & _supportedSendFlags;
         int status = _connection.SendDatagram((QUIC_BUFFER*)segments, (uint)count, sendFlags, (void*)context);
         return MsQuicStatus.Succeeded(status) ? TransportStatus.Success : MapStatus(status, datagramSend: true);
@@ -90,31 +91,26 @@ public sealed unsafe partial class MsQuicTransport
 
     void IMsQuicConnectionEvents.DatagramStateChanged(MsQuicConnection connection, bool sendEnabled, ushort maxSendLength)
     {
-        _maxDatagramPayload = maxSendLength;
-        _datagramsEnabled = sendEnabled;
-        ITransportSink? sink = LiveSink;
-        if (sink is null) return;
+        _datagramState = (sendEnabled ? DatagramEnabledBit : 0) | maxSendLength;
         try
         {
-            sink.OnDatagramCapabilityChanged(sendEnabled, sendEnabled ? maxSendLength : 0);
+            LiveSink?.OnDatagramCapabilityChanged(sendEnabled, sendEnabled ? maxSendLength : 0);
         }
         catch (Exception ex)
         {
-            OnSinkException(ex);
+            OnHandlerException(ex);
         }
     }
 
     void IMsQuicConnectionEvents.DatagramReceived(MsQuicConnection connection, ReadOnlySpan<byte> data, QUIC_RECEIVE_FLAGS flags)
     {
-        ITransportSink? sink = LiveSink;
-        if (sink is null) return;
         try
         {
-            sink.OnDatagramReceived(data);
+            LiveSink?.OnDatagramReceived(data);
         }
         catch (Exception ex)
         {
-            OnSinkException(ex);
+            OnHandlerException(ex);
         }
     }
 
@@ -122,15 +118,13 @@ public sealed unsafe partial class MsQuicTransport
     {
         DatagramSendState mapped = MapDatagramSendState(state);
         if (mapped == DatagramSendState.Unknown) return;
-        ITransportSink? sink = LiveSink;
-        if (sink is null) return;
         try
         {
-            sink.OnDatagramSendStateChanged((ulong)clientContext, mapped);
+            LiveSink?.OnDatagramSendStateChanged((ulong)clientContext, mapped);
         }
         catch (Exception ex)
         {
-            OnSinkException(ex);
+            OnHandlerException(ex);
         }
     }
 }

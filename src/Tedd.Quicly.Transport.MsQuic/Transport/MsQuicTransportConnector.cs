@@ -40,9 +40,11 @@ public sealed class MsQuicTransportConnector : ITransportConnector, IDisposable
     /// <exception cref="ArgumentException">The options are invalid.</exception>
     /// <exception cref="InvalidOperationException">Insecure validation was requested where it is not allowed.</exception>
     /// <exception cref="MsQuicException">MsQuic refused the registration or the configuration.</exception>
+    /// <exception cref="PlatformNotSupportedException">The process is 32-bit (see <see cref="MsQuicTransport.SegmentLayoutMatchesQuicBuffer"/>).</exception>
     public MsQuicTransportConnector(MsQuicTransportOptions options, MsQuicRegistration? registration = null)
     {
         ArgumentNullException.ThrowIfNull(options);
+        MsQuicTransport.ThrowIfSegmentLayoutUnsupported();
         _options = options.Clone();
         _options.Validate(client: true);
         _policy = new ServerCertificatePolicy(_options);

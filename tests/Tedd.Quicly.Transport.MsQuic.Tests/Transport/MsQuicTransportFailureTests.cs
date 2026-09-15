@@ -178,7 +178,8 @@ public unsafe class MsQuicTransportFailureTests
             var slots = new HashSet<int>();
             foreach (TransportStreamId id in ids) Assert.True(slots.Add(id.Slot));
             foreach (TransportStreamId id in ids) client.CloseStream(id);
-            Assert.Equal(0, client.OpenStreamCount);
+            // The native closes run on the cleanup work item: the slots return to the table once it has run.
+            Assert.True(Spin.Until(() => client.OpenStreamCount == 0, Timeout), $"open streams {client.OpenStreamCount}");
             for (int i = 0; i < 40; i++)
             {
                 Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Bidirectional, (ulong)i, 32767, out TransportStreamId id));

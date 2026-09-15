@@ -17,13 +17,18 @@ namespace Tedd.Quicly.Transport.MsQuic;
 /// refuses the connection there. Otherwise the <see cref="AcceptCallback"/> runs (still inside NEW_CONNECTION) with the new
 /// <see cref="MsQuicTransport"/>; it returns the sink that receives the transport's callbacks, or null to refuse the
 /// connection. Both callbacks run on MsQuic worker threads, possibly concurrently for different connections, and must not
-/// block or call methods of the new transport (its events start after the accept callback returns).</para>
+/// block or call members of the new transport (keep it and use it after the callback returns; its events start then). A
+/// transport the accept callback refuses (returns null or throws) is <see cref="TransportState.Closed"/> at once and never
+/// raises a callback; disposing it is harmless.</para>
 /// <para><b>Certificates.</b> The listener borrows certificates: keep each one alive until
 /// <see cref="CertificateRetired"/> reports it. <see cref="UpdateCertificate"/> opens new configurations (one credential
 /// per configuration) and atomically switches the ones handed to new connections; an old configuration is closed once
 /// no connection created with it is still handshaking (reference counted per configuration: one reference for "current",
-/// one per handshaking connection), so connections established with the old certificate keep working. On Windows the
-/// credential goes through <c>CERTIFICATE_CONTEXT</c> (the bundled msquic 2.5.10 rejects PKCS#12).</para>
+/// one per handshaking connection), so connections established with the old certificate keep working. A connection's
+/// reference is taken inside NEW_CONNECTION before its configuration is returned to the wrapper (which applies it only
+/// after the callback returns) and dropped once the handshake has ended or the connection was refused, so a swap can never
+/// close a configuration inside that window. A certificate is retired once no open configuration uses the instance. On
+/// Windows the credential goes through <c>CERTIFICATE_CONTEXT</c> (the bundled msquic 2.5.10 rejects PKCS#12).</para>
 /// <para><b>Lifetime.</b> <see cref="Stop"/> refuses new connections; existing ones are unaffected. <see cref="Dispose"/>
 /// also closes the listener handle and releases the current configurations; a registration the listener created is
 /// closed once every accepted transport has released its handles and every configuration is closed.</para>
@@ -37,19 +42,18 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
     internal sealed class ConfigurationEntry : IThreadPoolWorkItem
     {
         private readonly MsQuicTransportListener _owner;
-        private readonly CertificateGeneration _generation;
         private int _references = 1;
 
-        public ConfigurationEntry(MsQuicTransportListener owner, MsQuicConfiguration configuration, CertificateGeneration generation)
+        public ConfigurationEntry(MsQuicTransportListener owner, MsQuicConfiguration configuration, X509Certificate2 certificate)
         {
             _owner = owner;
             Configuration = configuration;
-            _generation = generation;
+            Certificate = certificate;
         }
 
         public MsQuicConfiguration Configuration { get; }
 
-        public X509Certificate2 Certificate => _generation.Certificate;
+        public X509Certificate2 Certificate { get; }
 
         public int ReferenceCount => Volatile.Read(ref _references);
 
@@ -79,15 +83,8 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
         private void Close()
         {
             Configuration.Close();
-            _owner.OnConfigurationClosed(_generation);
+            _owner.OnConfigurationClosed(Certificate);
         }
-    }
-
-    /// <summary>The configurations (one per ALPN) created for one certificate.</summary>
-    internal sealed class CertificateGeneration(X509Certificate2 certificate, int configurations)
-    {
-        public readonly X509Certificate2 Certificate = certificate;
-        public int OpenConfigurations = configurations;
     }
 
     private readonly MsQuicTransportOptions _options;
@@ -97,6 +94,9 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
     private readonly byte[][] _alpns;
     private readonly Lock _gate = new();
     private readonly Action<MsQuicTransport> _onHandlesClosed;
+
+    /// <summary>Open configurations per certificate instance (reference equality); guarded by <see cref="_gate"/>.</summary>
+    private readonly Dictionary<X509Certificate2, int> _certificateUses = new(ReferenceEqualityComparer.Instance);
     private ConfigurationEntry[] _current;
     private MsQuicListener? _listener;
     private IPEndPoint? _boundEndPoint;
@@ -117,10 +117,12 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
     /// <param name="options">Server options (copied); null for the defaults.</param>
     /// <param name="registration">A registration to borrow; null to create and own one.</param>
     /// <exception cref="MsQuicException">MsQuic refused the registration, a configuration or the credential.</exception>
+    /// <exception cref="PlatformNotSupportedException">The process is 32-bit (see <see cref="MsQuicTransport.SegmentLayoutMatchesQuicBuffer"/>).</exception>
     public MsQuicTransportListener(IPEndPoint localEndPoint, X509Certificate2 certificate, MsQuicTransportOptions? options = null, MsQuicRegistration? registration = null)
     {
         ArgumentNullException.ThrowIfNull(localEndPoint);
         ArgumentNullException.ThrowIfNull(certificate);
+        MsQuicTransport.ThrowIfSegmentLayoutUnsupported();
         _options = (options ?? new MsQuicTransportOptions()).Clone();
         _options.Validate(client: false);
         _requestedEndPoint = localEndPoint;
@@ -148,8 +150,12 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
     public MsQuicRegistration Registration => _registration;
 
     /// <summary>
-    /// Called (on a thread-pool thread or the disposing thread) when every configuration that used a certificate has been
-    /// closed, after <see cref="UpdateCertificate"/> or <see cref="Dispose"/>: the owner may dispose the certificate then.
+    /// Called when no open configuration uses a certificate instance any more, after <see cref="UpdateCertificate"/> or
+    /// <see cref="Dispose"/>: the owner may dispose the certificate then. Uses are counted per instance (reference
+    /// equality), so re-applying the certificate the listener already serves does not retire it; an instance applied again
+    /// after it was reported is borrowed anew and reported again when that use ends. Called on a thread-pool thread or on
+    /// the thread that called <see cref="UpdateCertificate"/> or <see cref="Dispose"/>, with the listener's gate held (so
+    /// <see cref="UpdateCertificate"/> cannot hand the instance out again meanwhile): do not block in it.
     /// </summary>
     public Action<X509Certificate2>? CertificateRetired { get; set; }
 
@@ -310,6 +316,8 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
         }
         if (sink is null)
         {
+            // MsQuic keeps the refused native connection and never raises an event for it: the transport is Closed for good.
+            transport.MarkRefused();
             entry.Release();
             Interlocked.Increment(ref _acceptRefused);
             return null;
@@ -331,7 +339,6 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
 
     private ConfigurationEntry[] CreateEntries(X509Certificate2 certificate)
     {
-        var generation = new CertificateGeneration(certificate, _alpns.Length);
         var entries = new ConfigurationEntry[_alpns.Length];
         int created = 0;
         try
@@ -339,7 +346,8 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
             for (int i = 0; i < entries.Length; i++)
             {
                 MsQuicConfiguration configuration = MsQuicConfiguration.CreateServer(_registration, [_options.Alpns[i]], certificate, _options.CreateServerSettings(), _options.ServerCredentialMode, _options.ServerKeyStorage);
-                entries[i] = new ConfigurationEntry(this, configuration, generation);
+                entries[i] = new ConfigurationEntry(this, configuration, certificate);
+                lock (_gate) _certificateUses[certificate] = _certificateUses.GetValueOrDefault(certificate) + 1;
                 Interlocked.Increment(ref _openConfigurations);
                 created++;
             }
@@ -350,6 +358,8 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
             {
                 entries[i].Configuration.Close();
                 Interlocked.Decrement(ref _openConfigurations);
+                // The swap failed and the caller still owns the certificate: drop the use without reporting it retired.
+                lock (_gate) DropCertificateUse(certificate);
             }
             throw;
         }
@@ -376,21 +386,38 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
         return -1;
     }
 
-    private void OnConfigurationClosed(CertificateGeneration generation)
+    private void OnConfigurationClosed(X509Certificate2 certificate)
     {
         Interlocked.Decrement(ref _openConfigurations);
-        if (Interlocked.Decrement(ref generation.OpenConfigurations) == 0)
+        // Under the gate: UpdateCertificate cannot hand the same instance out again between its last use ending and the report.
+        lock (_gate)
         {
-            try
+            if (DropCertificateUse(certificate))
             {
-                CertificateRetired?.Invoke(generation.Certificate);
-            }
-            catch (Exception ex)
-            {
-                Diagnose(TransportDiagnosticLevel.Error, "The CertificateRetired callback threw.", ex);
+                try
+                {
+                    CertificateRetired?.Invoke(certificate);
+                }
+                catch (Exception ex)
+                {
+                    Diagnose(TransportDiagnosticLevel.Error, "The CertificateRetired callback threw.", ex);
+                }
             }
         }
         TryCloseRegistration();
+    }
+
+    /// <summary>Drops one configuration's use of <paramref name="certificate"/> (under <see cref="_gate"/>); true when it was the last.</summary>
+    private bool DropCertificateUse(X509Certificate2 certificate)
+    {
+        int uses = _certificateUses.GetValueOrDefault(certificate) - 1;
+        if (uses > 0)
+        {
+            _certificateUses[certificate] = uses;
+            return false;
+        }
+        _certificateUses.Remove(certificate);
+        return true;
     }
 
     private void OnTransportHandlesClosed(MsQuicTransport transport)

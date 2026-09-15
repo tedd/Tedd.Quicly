@@ -155,8 +155,8 @@ public unsafe class MsQuicTransportTests
         Assert.Equal(4, client.OpenStreamCount);
         Assert.Equal(4, client.MaxStreams);
 
-        client.CloseStream(ids[2]); // never started: released at once
-        Assert.Equal(3, client.OpenStreamCount);
+        client.CloseStream(ids[2]); // never started: the id is stale at once; the cleanup work item frees the slot a moment later
+        Assert.True(Spin.Until(() => client.OpenStreamCount == 3, Timeout), $"open streams {client.OpenStreamCount}");
         Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Unidirectional, 5, 32767, out TransportStreamId reused));
         Assert.Equal(ids[2].Slot, reused.Slot);
         Assert.NotEqual(ids[2].Generation, reused.Generation);
@@ -179,8 +179,8 @@ public unsafe class MsQuicTransportTests
         Assert.Throws<ArgumentNullException>(() => client.SendStream(reused, null, 1, 1, TransportSendFlags.Start));
 
         client.AbortStream(ids[0], 3, StreamAbortDirection.Send); // never started: released like CloseStream
-        Assert.Equal(3, client.OpenStreamCount);
         Assert.Equal(TransportStatus.InvalidState, client.StartStream(ids[0]));
+        Assert.True(Spin.Until(() => client.OpenStreamCount == 3, Timeout), $"open streams {client.OpenStreamCount}");
         scope.Finish();
     }
 

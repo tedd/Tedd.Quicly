@@ -22,11 +22,17 @@ public sealed unsafe partial class MsQuicTransport
     /// the generation bumped so stale <see cref="TransportStreamId"/>s are rejected.
     /// </summary>
     /// <remarks>
-    /// <see cref="Guard"/> counts API calls in progress on the stream (low bits) plus <see cref="GuardClosing"/> while the
-    /// native handle is being closed: a closer waits for the count to drain, so a racing call never touches a closed
-    /// handle. <see cref="CloseFlags"/> is the hand-off between <see cref="CloseStream"/> and MsQuic's SHUTDOWN_COMPLETE:
-    /// whichever side sets its flag second closes the handle. <see cref="ReceiveState"/> tracks a pending receive and a
-    /// resume that arrives while the receive callback is still running.
+    /// <para><see cref="Guard"/> counts API calls in progress on the stream (low bits) plus <see cref="GuardClosing"/> while
+    /// the native handle is being closed: the closer waits for the count to drain, so a racing call never touches a closed
+    /// handle.</para>
+    /// <para><see cref="CloseFlags"/> is the hand-off between <see cref="CloseStream"/> (<see cref="AppClosedFlag"/>) and the
+    /// stream's shutdown (<see cref="NativeShutdownFlag"/>: MsQuic's SHUTDOWN_COMPLETE, or the connection's shutdown sweep
+    /// for streams MsQuic never started): whichever side sets its flag second queues the native close. Closing a stream
+    /// MsQuic never started sets both flags at once, so exactly one party ever decides to close a slot. The close is queued
+    /// at most once per incarnation (<see cref="CloseQueued"/>) and run by the cleanup work item under
+    /// <see cref="_cleanupLock"/>, which checks the generation the close was decided for.</para>
+    /// <para><see cref="ReceiveState"/> tracks a pending receive and a resume that arrives while the receive callback is
+    /// still running.</para>
     /// </remarks>
     private sealed class StreamSlot(int index)
     {
@@ -39,11 +45,22 @@ public sealed unsafe partial class MsQuicTransport
         public ulong OpenContext;
         public bool CanSend;
         public bool CanReceive;
+
+        /// <summary>The priority for the stream's start (START_COMPLETE applies it on the worker, where the parameter call runs inline).</summary>
+        public ushort Priority = DefaultStreamPriority;
+        public volatile bool PriorityPending;
         public volatile bool StartRequested;
+
+        /// <summary>StreamStart failed synchronously: the stream never starts, and MsQuic raises no events for it.</summary>
+        public volatile bool StartRefused;
+
+        /// <summary>START_COMPLETE was indicated (possibly inline, inside StreamStart).</summary>
+        public volatile bool StartReported;
         public volatile bool SendClosed;
         public int CloseFlags;
         public int CloseQueued;
         public int DeferredNext = -1;
+        public uint DeferredGeneration;
         public int ReceiveState;
         public long PendingConsumed;
         public long PendingTotal;
@@ -63,10 +80,17 @@ public sealed unsafe partial class MsQuicTransport
     private int _maxStreams;
     private int _deferredHead = -1;
 
+    /// <summary>
+    /// Set under <see cref="_tableLock"/> when the connection's shutdown sweep takes its snapshot of the table (and when the
+    /// transport is refused or released): no stream is published afterwards, so none can miss its
+    /// <see cref="ITransportSink.OnStreamShutdownComplete"/>.
+    /// </summary>
+    private bool _tableClosed;
+
     /// <summary>Capacity of the stream table (<see cref="MsQuicTransportOptions.MaxStreams"/>).</summary>
     public int MaxStreams => _maxStreams;
 
-    /// <summary>Stream slots in use: open streams plus streams whose native close is still pending.</summary>
+    /// <summary>Stream slots in use: open streams plus released streams whose native close the cleanup work item has not run yet.</summary>
     public int OpenStreamCount
     {
         get
@@ -90,7 +114,10 @@ public sealed unsafe partial class MsQuicTransport
     /// <remarks>
     /// Allowed while connecting or connected. Allocates a table slot and opens the MsQuic stream (<c>StreamOpen</c>, one
     /// <see cref="MsQuicStream"/> wrapper per stream) without starting it; the stream consumes peer credit only when it
-    /// starts. <see cref="TransportStatus.OutOfMemory"/> when the table is full.
+    /// starts. A <paramref name="priority"/> other than the default is applied when the stream starts (from its
+    /// START_COMPLETE, on the worker), so the call never waits for the MsQuic worker. <see cref="TransportStatus.OutOfMemory"/>
+    /// when the table is full (a slot released by <see cref="CloseStream"/> is back once the cleanup work item has run);
+    /// <see cref="TransportStatus.InvalidState"/> once the connection has shut down.
     /// </remarks>
     public TransportStatus OpenStream(StreamKind kind, ulong context, ushort priority, out TransportStreamId id)
     {
@@ -98,14 +125,15 @@ public sealed unsafe partial class MsQuicTransport
         int state = Volatile.Read(ref _state);
         if (state is not (StateConnecting or StateConnected) || _connection.IsClosed) return TransportStatus.InvalidState;
         if (kind is not (StreamKind.Unidirectional or StreamKind.Bidirectional)) return TransportStatus.NotSupported;
-        if (HasDeferredCloses && !MsQuicCallbackScope.IsInsideCallback) DrainDeferredCloses();
-        StreamSlot? slot = AllocateSlot();
-        if (slot is null) return TransportStatus.OutOfMemory;
+        StreamSlot? slot = AllocateSlot(out TransportStatus refused);
+        if (slot is null) return refused;
         slot.Local = true;
         slot.Kind = kind;
         slot.OpenContext = context;
         slot.CanSend = true;
         slot.CanReceive = kind == StreamKind.Bidirectional;
+        slot.Priority = priority;
+        slot.PriorityPending = priority != DefaultStreamPriority;
         QUIC_STREAM_OPEN_FLAGS flags = kind == StreamKind.Unidirectional ? QUIC_STREAM_OPEN_FLAGS.UNIDIRECTIONAL : QUIC_STREAM_OPEN_FLAGS.NONE;
         int status = _connection.OpenStream(flags, this, out MsQuicStream? stream);
         if (MsQuicStatus.Failed(status) || stream is null)
@@ -114,18 +142,41 @@ public sealed unsafe partial class MsQuicTransport
             return MapStatus(status, datagramSend: false);
         }
         stream.Tag = slot;
-        if (priority != DefaultStreamPriority) stream.SetPriority(priority);
-        Volatile.Write(ref slot.Stream, stream);
+        if (!TryPublish(slot, stream)) return TransportStatus.InvalidState;
         id = slot.Id;
         return TransportStatus.Success;
+    }
+
+    /// <summary>
+    /// Makes a new local stream visible to the API and to the connection's shutdown sweep, unless that sweep has already
+    /// taken its snapshot: then nobody would ever report the stream, so its native close is queued instead and the open fails.
+    /// </summary>
+    private bool TryPublish(StreamSlot slot, MsQuicStream stream)
+    {
+        lock (_tableLock)
+        {
+            if (!_tableClosed)
+            {
+                Volatile.Write(ref slot.Stream, stream);
+                return true;
+            }
+            // Both halves of the close hand-off: nobody reports this stream and nobody else closes it.
+            Volatile.Write(ref slot.CloseFlags, AppClosedFlag | NativeShutdownFlag);
+            Volatile.Write(ref slot.Stream, stream);
+        }
+        EnqueueDeferredClose(slot, slot.Generation);
+        return false;
     }
 
     /// <inheritdoc/>
     /// <remarks>
     /// <c>StreamStart(FAIL_BLOCKED | SHUTDOWN_ON_FAIL)</c>. MsQuic queues the start (the call returns before it runs), so a
-    /// stream-limit failure normally arrives as <see cref="ITransportSink.OnStreamStarted"/> with
-    /// <see cref="TransportStatus.StreamLimitReached"/>, followed by <see cref="ITransportSink.OnStreamShutdownComplete"/>.
-    /// <see cref="TransportStatus.InvalidState"/> unless connected and the stream is a local stream not started yet.
+    /// start the peer's stream limit refuses is reported asynchronously: <see cref="ITransportSink.OnStreamStarted"/> with
+    /// <see cref="TransportStatus.StreamLimitReached"/>, then <see cref="ITransportSink.OnStreamShutdownComplete"/>. A refused
+    /// stream never starts: a later <see cref="StartStream"/> returns <see cref="TransportStatus.InvalidState"/>; release it
+    /// with <see cref="CloseStream"/> and open a new stream to retry. A synchronous failure is returned directly (nothing
+    /// follows for the stream, and it never starts either). <see cref="TransportStatus.InvalidState"/> unless connected and
+    /// the stream is a local stream whose start was never requested.
     /// </remarks>
     public TransportStatus StartStream(TransportStreamId id)
     {
@@ -134,7 +185,7 @@ public sealed unsafe partial class MsQuicTransport
         if (slot is null) return TransportStatus.InvalidState;
         try
         {
-            return !slot.Local || slot.StartRequested ? TransportStatus.InvalidState : StartCore(slot);
+            return !slot.Local || slot.StartRequested || slot.StartRefused ? TransportStatus.InvalidState : StartCore(slot);
         }
         finally
         {
@@ -148,9 +199,10 @@ public sealed unsafe partial class MsQuicTransport
     /// client context. <see cref="TransportSendFlags.Fin"/> → <c>FIN</c>, <see cref="TransportSendFlags.DelaySend"/> →
     /// <c>DELAY_SEND</c>, <see cref="TransportSendFlags.Priority"/> → <c>PRIORITY_WORK</c>,
     /// <see cref="TransportSendFlags.CancelOnLoss"/> → <c>CANCEL_ON_LOSS</c>; <see cref="TransportSendFlags.Start"/> starts an
-    /// unstarted local stream first (as <see cref="StartStream"/>). <see cref="TransportStatus.InvalidState"/> unless connected,
-    /// for a stream that cannot send (a peer unidirectional stream), after a <c>Fin</c> or an abort of the send direction,
-    /// and for an unstarted stream without <c>Start</c>.
+    /// unstarted local stream first (as <see cref="StartStream"/>; a send accepted with a start the peer's stream limit
+    /// refuses completes canceled). <see cref="TransportStatus.InvalidState"/> unless connected, for a stream that cannot
+    /// send (a peer unidirectional stream), after a <c>Fin</c> or an abort of the send direction, after a refused start, and
+    /// for an unstarted stream without <c>Start</c>.
     /// </remarks>
     public TransportStatus SendStream(TransportStreamId id, TransportSegment* segments, int count, ulong context, TransportSendFlags flags)
     {
@@ -164,7 +216,7 @@ public sealed unsafe partial class MsQuicTransport
             if (!slot.CanSend || slot.SendClosed) return TransportStatus.InvalidState;
             if (!slot.StartRequested)
             {
-                if (!slot.Local || (flags & TransportSendFlags.Start) == 0) return TransportStatus.InvalidState;
+                if (!slot.Local || (flags & TransportSendFlags.Start) == 0 || slot.StartRefused) return TransportStatus.InvalidState;
                 TransportStatus started = StartCore(slot);
                 if (started != TransportStatus.Success) return started;
             }
@@ -223,13 +275,24 @@ public sealed unsafe partial class MsQuicTransport
     }
 
     /// <inheritdoc/>
-    /// <remarks><c>QUIC_PARAM_STREAM_PRIORITY</c> (0 lowest, 65535 highest, 32767 default).</remarks>
+    /// <remarks>
+    /// Before the stream starts the priority is only stored and applied when it starts (no MsQuic call). On a started
+    /// stream it sets <c>QUIC_PARAM_STREAM_PRIORITY</c> (0 lowest, 65535 highest, 32767 default), a parameter call that
+    /// waits for the MsQuic worker when made off it (see the class remarks).
+    /// </remarks>
     public void SetStreamPriority(TransportStreamId id, ushort priority)
     {
         StreamSlot? slot = Enter(id);
         if (slot is null) return;
         try
         {
+            if (!slot.StartRequested)
+            {
+                slot.Priority = priority;
+                slot.PriorityPending = true;
+                // A start requested meanwhile on another thread may already have applied the previous value.
+                if (!slot.StartRequested) return;
+            }
             slot.Stream!.SetPriority(priority);
         }
         finally
@@ -259,7 +322,7 @@ public sealed unsafe partial class MsQuicTransport
     /// Ignored unless a receive on the stream is pending (or its callback is still running and then returns
     /// <c>Pending</c>: the resume is applied when it returns). Calls <c>StreamReceiveComplete</c> with every byte of the
     /// held indication consumed so far and, when bytes remain, <c>StreamReceiveSetEnabled(TRUE)</c> so MsQuic indicates
-    /// them again at once (msquic 2.5.10 pauses a stream after any partial completion).
+    /// them again at once (msquic 2.5.10 pauses a stream after any partial completion). Neither call waits for the worker.
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="bytesConsumed"/> is negative or more than the held-back bytes.</exception>
     public void ResumeStreamReceive(TransportStreamId id, int bytesConsumed)
@@ -301,29 +364,34 @@ public sealed unsafe partial class MsQuicTransport
 
     /// <inheritdoc/>
     /// <remarks>
-    /// After <see cref="ITransportSink.OnStreamShutdownComplete"/> the handle is closed (<c>StreamClose</c>) and the slot
-    /// freed: at once, or on a thread-pool thread when called from inside a callback. Before that the stream is aborted in
-    /// both directions with code 0 and closed when MsQuic reports its shutdown; pending send completions are still
-    /// reported (canceled), the shutdown callback is not. Unknown or stale ids are ignored.
+    /// The native handle is closed (<c>StreamClose</c>) and the slot freed by the cleanup work item on a thread-pool thread,
+    /// never on the calling thread (<c>StreamClose</c> of a stream MsQuic never started waits for the connection's worker):
+    /// the call returns at once and the slot is back in the table a moment later. After
+    /// <see cref="ITransportSink.OnStreamShutdownComplete"/>, or for a stream that was never started, that is all. Before
+    /// that the stream is aborted in both directions with code 0 and closed once MsQuic reports its shutdown: pending send
+    /// completions are still reported (canceled), the shutdown callback is not. Unknown or stale ids are ignored.
     /// </remarks>
     public void CloseStream(TransportStreamId id)
     {
         StreamSlot? slot = Enter(id);
         if (slot is null) return;
-        bool closeNow = false;
+        bool close = false;
         try
         {
-            int old = Interlocked.Or(ref slot.CloseFlags, AppClosedFlag);
+            bool started = slot.StartRequested;
+            // MsQuic raises no events for a stream it never started: take both halves of the hand-off at once, so the
+            // connection's shutdown sweep neither reports this stream nor decides to close it too.
+            int old = Interlocked.Or(ref slot.CloseFlags, started ? AppClosedFlag : AppClosedFlag | NativeShutdownFlag);
             if ((old & AppClosedFlag) != 0) return;
             Interlocked.Exchange(ref slot.ReceiveState, ReceiveIdle);
-            if ((old & NativeShutdownFlag) != 0 || !slot.StartRequested) closeNow = true;
+            if (!started || (old & NativeShutdownFlag) != 0) close = true;
             else slot.Stream!.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT, 0);
         }
         finally
         {
             Exit(slot);
         }
-        if (closeNow) CloseOrDefer(slot);
+        if (close) EnqueueDeferredClose(slot, id.Generation);
     }
 
     private TransportStatus StartCore(StreamSlot slot)
@@ -331,18 +399,32 @@ public sealed unsafe partial class MsQuicTransport
         slot.StartRequested = true;
         int status = slot.Stream!.Start(StartFlags);
         if (MsQuicStatus.Succeeded(status)) return TransportStatus.Success;
+        // From a callback of this connection MsQuic runs the start inline and may already have reported the failure through
+        // START_COMPLETE (OnStreamStarted): that stays the only report, and the stream's shutdown follows as for a queued start.
+        if (slot.StartReported) return TransportStatus.Success;
         slot.StartRequested = false;
+        slot.StartRefused = true;
         return MapStatus(status, datagramSend: false);
     }
 
     // ------------------------------------------------------------------ slot table
 
-    private StreamSlot? AllocateSlot()
+    private StreamSlot? AllocateSlot(out TransportStatus failure)
     {
         lock (_tableLock)
         {
+            failure = TransportStatus.Success;
+            if (_tableClosed)
+            {
+                failure = TransportStatus.InvalidState;
+                return null;
+            }
             if (_freeSlotCount > 0) return _slots[_freeSlots[--_freeSlotCount]];
-            if (_slotHighWater == _maxStreams) return null;
+            if (_slotHighWater == _maxStreams)
+            {
+                failure = TransportStatus.OutOfMemory;
+                return null;
+            }
             if (_slotHighWater == _slots.Length)
             {
                 var grown = new StreamSlot?[Math.Min(_maxStreams, _slots.Length * 2)];
@@ -365,14 +447,18 @@ public sealed unsafe partial class MsQuicTransport
         slot.OpenContext = 0;
         slot.CanSend = false;
         slot.CanReceive = false;
+        slot.Priority = DefaultStreamPriority;
+        slot.PriorityPending = false;
         slot.StartRequested = false;
+        slot.StartRefused = false;
+        slot.StartReported = false;
         slot.SendClosed = false;
-        slot.DeferredNext = -1;
         slot.PendingConsumed = 0;
         slot.PendingTotal = 0;
         slot.EarlyResumeBytes = 0;
         Volatile.Write(ref slot.ReceiveState, ReceiveIdle);
         Volatile.Write(ref slot.CloseFlags, 0);
+        // DeferredNext is left alone: only a push writes it, and a drain has always unlinked the slot before freeing it.
         Volatile.Write(ref slot.CloseQueued, 0);
         slot.Generation = slot.Generation == uint.MaxValue ? 1 : slot.Generation + 1;
         Interlocked.And(ref slot.Guard, ~GuardClosing);
@@ -401,31 +487,33 @@ public sealed unsafe partial class MsQuicTransport
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Exit(StreamSlot slot) => Interlocked.Decrement(ref slot.Guard);
 
-    /// <summary>Closes the native stream and frees the slot. Never on an MsQuic callback thread; callers hold <see cref="_cleanupLock"/>.</summary>
-    private void CloseSlotNative(StreamSlot slot)
+    /// <summary>
+    /// Closes the native stream and frees the slot, provided it still holds the incarnation the close was decided for.
+    /// Callers hold <see cref="_cleanupLock"/>, so closers never overlap, and never run on an MsQuic callback thread.
+    /// </summary>
+    private void CloseSlotNative(StreamSlot slot, uint generation)
     {
         if ((Interlocked.Or(ref slot.Guard, GuardClosing) & GuardClosing) != 0) return;
+        if (slot.Generation != generation || Volatile.Read(ref slot.Stream) is null)
+        {
+            // A stale decision: that incarnation is gone already. No other closer can be waiting on the bit (all run under the lock).
+            Interlocked.And(ref slot.Guard, ~GuardClosing);
+            return;
+        }
         SpinWait spin = default;
         while ((Volatile.Read(ref slot.Guard) & ~GuardClosing) != 0) spin.SpinOnce();
-        slot.Stream?.Close();
+        slot.Stream!.Close();
         FreeSlot(slot);
     }
 
-    private void CloseOrDefer(StreamSlot slot)
-    {
-        if (MsQuicCallbackScope.IsInsideCallback)
-        {
-            EnqueueDeferredClose(slot);
-            return;
-        }
-        lock (_cleanupLock)
-            CloseSlotNative(slot);
-    }
-
-    /// <summary>Pushes the slot on the lock-free deferred-close stack (intrusive, no allocation) and schedules the cleanup work item.</summary>
-    private void EnqueueDeferredClose(StreamSlot slot)
+    /// <summary>
+    /// Queues the native close of <paramref name="slot"/>'s incarnation <paramref name="generation"/> on the lock-free
+    /// deferred-close stack (intrusive, no allocation; at most once per incarnation) and schedules the cleanup work item.
+    /// </summary>
+    private void EnqueueDeferredClose(StreamSlot slot, uint generation)
     {
         if (Interlocked.Exchange(ref slot.CloseQueued, 1) != 0) return;
+        slot.DeferredGeneration = generation;
         int head;
         do
         {
@@ -442,50 +530,64 @@ public sealed unsafe partial class MsQuicTransport
     private void DrainDeferredCloses()
     {
         lock (_cleanupLock)
+            DrainDeferredClosesLocked();
+    }
+
+    private void DrainDeferredClosesLocked()
+    {
+        int index = Interlocked.Exchange(ref _deferredHead, -1);
+        if (index < 0) return;
+        // Every queued slot was allocated before it was pushed, so the current array holds it.
+        StreamSlot?[] slots = Volatile.Read(ref _slots);
+        while (index >= 0)
         {
-            int index = Interlocked.Exchange(ref _deferredHead, -1);
-            StreamSlot?[] slots = Volatile.Read(ref _slots);
-            while (index >= 0)
-            {
-                StreamSlot slot = slots[index]!;
-                int next = slot.DeferredNext;
-                CloseSlotNative(slot);
-                index = next;
-            }
+            StreamSlot slot = slots[index]!;
+            int next = slot.DeferredNext;
+            CloseSlotNative(slot, slot.DeferredGeneration);
+            index = next;
         }
     }
 
-    /// <summary>Closes every stream handle still open (connection teardown, after SHUTDOWN_COMPLETE). Never on a callback thread.</summary>
-    private void CloseAllStreamHandles()
+    /// <summary>Closes every stream handle still open (connection teardown, after SHUTDOWN_COMPLETE). Under <see cref="_cleanupLock"/>.</summary>
+    private void CloseAllStreamHandlesLocked()
     {
-        lock (_cleanupLock)
+        StreamSlot?[] slots;
+        int high;
+        lock (_tableLock)
         {
-            StreamSlot?[] slots = Volatile.Read(ref _slots);
-            int high;
-            lock (_tableLock)
-                high = _slotHighWater;
-            for (int i = 0; i < high; i++)
-            {
-                StreamSlot? slot = slots[i];
-                if (slot is not null && Volatile.Read(ref slot.Stream) is not null) CloseSlotNative(slot);
-            }
+            _tableClosed = true;
+            slots = _slots;
+            high = Math.Min(_slotHighWater, slots.Length);
+        }
+        for (int i = 0; i < high; i++)
+        {
+            StreamSlot? slot = slots[i];
+            // A slot with a queued close is closed by the drain that follows (freeing it here would leave it linked).
+            if (slot is not null && Volatile.Read(ref slot.Stream) is not null && Volatile.Read(ref slot.CloseQueued) == 0) CloseSlotNative(slot, slot.Generation);
         }
     }
 
     /// <summary>
-    /// Connection SHUTDOWN_COMPLETE (worker thread): reports <see cref="ITransportSink.OnStreamShutdownComplete"/> for every
-    /// stream MsQuic did not report (streams never started are not tracked by MsQuic), so it precedes <c>OnClosed</c>.
+    /// Connection SHUTDOWN_COMPLETE (worker thread): reports <see cref="ITransportSink.OnStreamShutdownComplete"/> to
+    /// <paramref name="sink"/> for every stream MsQuic did not report (streams never started are not tracked by MsQuic), so
+    /// it precedes <c>OnClosed</c>, and closes the table to new streams.
     /// </summary>
-    private void ShutdownRemainingStreams(ITransportSink sink)
+    private void ShutdownRemainingStreams(ITransportSink? sink)
     {
-        StreamSlot?[] slots = Volatile.Read(ref _slots);
+        StreamSlot?[] slots;
         int high;
+        // One snapshot under the table lock: the array and its high-water mark must belong together (a concurrent OpenStream
+        // can grow the table), and a stream published after this point is refused instead of never being reported.
         lock (_tableLock)
-            high = _slotHighWater;
+        {
+            _tableClosed = true;
+            slots = _slots;
+            high = Math.Min(_slotHighWater, slots.Length);
+        }
         for (int i = 0; i < high; i++)
         {
             StreamSlot? slot = slots[i];
-            // Pin the slot: a thread-pool drain may be closing and freeing it right now (then it is skipped), and it must
+            // Pin the slot: the cleanup work item may be closing and freeing it right now (then it is skipped), and it must
             // not free it while this loop reads its flags or the sink runs.
             if (slot is null || !TryPin(slot)) continue;
             try
@@ -495,17 +597,14 @@ public sealed unsafe partial class MsQuicTransport
                 if ((old & NativeShutdownFlag) != 0) continue;
                 if ((old & AppClosedFlag) != 0)
                 {
-                    EnqueueDeferredClose(slot);
+                    EnqueueDeferredClose(slot, slot.Generation);
                     continue;
                 }
-                sink.OnStreamShutdownComplete(slot.Id);
+                sink?.OnStreamShutdownComplete(slot.Id);
             }
             catch (Exception ex)
             {
-                Volatile.Write(ref _lastSinkException, ex);
-                Interlocked.Increment(ref _sinkExceptions);
-                MsQuicCallbackScope.OnEscapedException(ex);
-                Diagnose(TransportDiagnosticLevel.Error, "ITransportSink.OnStreamShutdownComplete threw during connection shutdown.", ex);
+                RecordCallbackFailure(ex, "ITransportSink.OnStreamShutdownComplete threw during connection shutdown.");
             }
             finally
             {
@@ -514,7 +613,7 @@ public sealed unsafe partial class MsQuicTransport
         }
     }
 
-    /// <summary>True while <see cref="CloseSlotNative"/> closes the slot's stream (MsQuic may indicate events inline from <c>StreamClose</c>).</summary>
+    /// <summary>True while <see cref="CloseSlotNative"/> closes the slot's stream (MsQuic may indicate its SHUTDOWN_COMPLETE meanwhile).</summary>
     private static bool IsNativeCloseInProgress(StreamSlot slot) => (Volatile.Read(ref slot.Guard) & GuardClosing) != 0;
 
     /// <summary>Pins a slot that holds a stream and is not being closed (see <see cref="StreamSlot.Guard"/>); false otherwise.</summary>
@@ -531,11 +630,14 @@ public sealed unsafe partial class MsQuicTransport
     bool IMsQuicConnectionEvents.PeerStreamStarted(MsQuicConnection connection, MsQuicStream stream, QUIC_STREAM_OPEN_FLAGS flags)
     {
         if (Volatile.Read(ref _closedDelivered) != 0) return false;
-        StreamSlot? slot = AllocateSlot();
+        StreamSlot? slot = AllocateSlot(out TransportStatus failure);
         if (slot is null)
         {
-            Interlocked.Increment(ref _refusedPeerStreams);
-            Diagnose(TransportDiagnosticLevel.Warning, "A peer stream was refused because the stream table is full.", null);
+            if (failure == TransportStatus.OutOfMemory)
+            {
+                Interlocked.Increment(ref _refusedPeerStreams);
+                Diagnose(TransportDiagnosticLevel.Warning, "A peer stream was refused because the stream table is full.", null);
+            }
             return false;
         }
         bool unidirectional = (flags & QUIC_STREAM_OPEN_FLAGS.UNIDIRECTIONAL) != 0;
@@ -544,21 +646,21 @@ public sealed unsafe partial class MsQuicTransport
         slot.CanSend = !unidirectional;
         slot.CanReceive = true;
         slot.StartRequested = true;
+        slot.StartReported = true;
         stream.Events = this;
         stream.Tag = slot;
+        // Serialised with the connection's shutdown sweep (both run on the worker), so no snapshot can miss this stream.
         Volatile.Write(ref slot.Stream, stream);
         // The wrapper attaches the stream's callback only after this handler returns; attach it now so that API calls
         // the sink makes on the new stream from inside OnPeerStreamStarted see their events.
         stream.AttachCallback();
-        ITransportSink? sink = LiveSink;
-        if (sink is null) return true;
         try
         {
-            sink.OnPeerStreamStarted(slot.Id, slot.Kind);
+            LiveSink?.OnPeerStreamStarted(slot.Id, slot.Kind);
         }
         catch (Exception ex)
         {
-            OnSinkException(ex);
+            OnHandlerException(ex);
         }
         return true;
     }
@@ -566,18 +668,23 @@ public sealed unsafe partial class MsQuicTransport
     void IMsQuicStreamEvents.StartComplete(MsQuicStream stream, int status, ulong id, bool peerAccepted)
     {
         var slot = (StreamSlot)stream.Tag!;
-        TransportStatus mapped = MsQuicStatus.Succeeded(status) ? TransportStatus.Success : MapStatus(status, datagramSend: false);
-        if (mapped != TransportStatus.Success) slot.SendClosed = true;
-        if (slot.AppClosed) return;
-        ITransportSink? sink = LiveSink;
-        if (sink is null) return;
+        slot.StartReported = true;
+        bool started = MsQuicStatus.Succeeded(status);
+        if (!started) slot.SendClosed = true;
         try
         {
-            sink.OnStreamStarted(slot.Id, slot.OpenContext, mapped);
+            // The priority OpenStream or SetStreamPriority stored: set it here, on the worker, where the call runs inline.
+            if (started && slot.PriorityPending)
+            {
+                slot.PriorityPending = false;
+                stream.SetPriority(slot.Priority);
+            }
+            if (slot.AppClosed) return;
+            LiveSink?.OnStreamStarted(slot.Id, slot.OpenContext, started ? TransportStatus.Success : MapStatus(status, datagramSend: false));
         }
         catch (Exception ex)
         {
-            OnSinkException(ex);
+            OnHandlerException(ex);
         }
     }
 
@@ -587,61 +694,56 @@ public sealed unsafe partial class MsQuicTransport
         if (slot.AppClosed) return MsQuicReceiveResult.Consumed(totalLength);
         ITransportSink? sink = LiveSink;
         if (sink is null) return MsQuicReceiveResult.Consumed(totalLength);
-        slot.PendingTotal = (long)totalLength;
-        Volatile.Write(ref slot.ReceiveState, ReceiveInCallback);
-        ReceiveResult result;
         try
         {
-            result = sink.OnStreamReceived(slot.Id, new ReadOnlySpan<TransportSegment>(buffers, (int)bufferCount), absoluteOffset, (flags & QUIC_RECEIVE_FLAGS.FIN) != 0);
+            slot.PendingTotal = (long)totalLength;
+            Volatile.Write(ref slot.ReceiveState, ReceiveInCallback);
+            ReceiveResult result = sink.OnStreamReceived(slot.Id, new ReadOnlySpan<TransportSegment>(buffers, (int)bufferCount), absoluteOffset, (flags & QUIC_RECEIVE_FLAGS.FIN) != 0);
+            long consumed = result.BytesConsumed;
+            if (consumed < 0 || (ulong)consumed > totalLength)
+            {
+                throw new InvalidOperationException($"OnStreamReceived consumed {consumed} bytes but {totalLength} were indicated.");
+            }
+            if (result.Pending || (consumed == 0 && totalLength != 0))
+            {
+                // Back-pressure (Consumed(0) of a non-empty indication counts as PendingAfter(0)): hold MsQuic's buffers until
+                // ResumeStreamReceive. Publish the consumed count before the state so a resume on another thread reads it.
+                slot.PendingConsumed = consumed;
+                int previous = Interlocked.CompareExchange(ref slot.ReceiveState, ReceivePending, ReceiveInCallback);
+                if (previous == ReceiveInCallback) return MsQuicReceiveResult.Pending;
+                if (previous != ReceiveEarlyResume) return MsQuicReceiveResult.Consumed(totalLength); // aborted or closed meanwhile
+                consumed = Math.Min(consumed + Volatile.Read(ref slot.EarlyResumeBytes), (long)totalLength);
+                Volatile.Write(ref slot.ReceiveState, ReceiveIdle);
+            }
+            else if (Interlocked.CompareExchange(ref slot.ReceiveState, ReceiveIdle, ReceiveInCallback) != ReceiveInCallback)
+            {
+                // An early resume without a pending receive is meaningless; an abort or close during the call discards the rest.
+                if (Interlocked.Exchange(ref slot.ReceiveState, ReceiveIdle) != ReceiveEarlyResume) return MsQuicReceiveResult.Consumed(totalLength);
+            }
+            if ((ulong)consumed == totalLength) return MsQuicReceiveResult.Consumed(totalLength);
+            // Partial consumption: MsQuic would pause the stream until receives are re-enabled; re-enable them inline so the
+            // remainder is indicated again right away (together with anything that arrived since).
+            stream.ReceiveSetEnabled(true);
+            return MsQuicReceiveResult.Consumed((ulong)consumed);
         }
         catch (Exception ex)
         {
             Interlocked.Exchange(ref slot.ReceiveState, ReceiveIdle);
-            OnSinkException(ex);
+            OnHandlerException(ex);
             return MsQuicReceiveResult.Consumed(totalLength);
         }
-        long consumed = result.BytesConsumed;
-        if (consumed < 0 || (ulong)consumed > totalLength)
-        {
-            Interlocked.Exchange(ref slot.ReceiveState, ReceiveIdle);
-            OnSinkException(new InvalidOperationException($"OnStreamReceived consumed {consumed} bytes but {totalLength} were indicated."));
-            return MsQuicReceiveResult.Consumed(totalLength);
-        }
-        if (result.Pending || (consumed == 0 && totalLength != 0))
-        {
-            // Back-pressure (Consumed(0) of a non-empty indication counts as PendingAfter(0)): hold MsQuic's buffers until
-            // ResumeStreamReceive. Publish the consumed count before the state so a resume on another thread reads it.
-            slot.PendingConsumed = consumed;
-            int previous = Interlocked.CompareExchange(ref slot.ReceiveState, ReceivePending, ReceiveInCallback);
-            if (previous == ReceiveInCallback) return MsQuicReceiveResult.Pending;
-            if (previous != ReceiveEarlyResume) return MsQuicReceiveResult.Consumed(totalLength); // aborted or closed meanwhile
-            consumed = Math.Min(consumed + Volatile.Read(ref slot.EarlyResumeBytes), (long)totalLength);
-            Volatile.Write(ref slot.ReceiveState, ReceiveIdle);
-        }
-        else if (Interlocked.CompareExchange(ref slot.ReceiveState, ReceiveIdle, ReceiveInCallback) != ReceiveInCallback)
-        {
-            // An early resume without a pending receive is meaningless; an abort or close during the call discards the rest.
-            if (Interlocked.Exchange(ref slot.ReceiveState, ReceiveIdle) != ReceiveEarlyResume) return MsQuicReceiveResult.Consumed(totalLength);
-        }
-        if ((ulong)consumed == totalLength) return MsQuicReceiveResult.Consumed(totalLength);
-        // Partial consumption: MsQuic would pause the stream until receives are re-enabled; re-enable them inline so the
-        // remainder is indicated again right away (together with anything that arrived since).
-        stream.ReceiveSetEnabled(true);
-        return MsQuicReceiveResult.Consumed((ulong)consumed);
     }
 
     void IMsQuicStreamEvents.SendComplete(MsQuicStream stream, void* clientContext, bool canceled)
     {
         var slot = (StreamSlot)stream.Tag!;
-        ITransportSink? sink = LiveSink;
-        if (sink is null) return;
         try
         {
-            sink.OnStreamSendCompleted(slot.Id, (ulong)clientContext, canceled);
+            LiveSink?.OnStreamSendCompleted(slot.Id, (ulong)clientContext, canceled);
         }
         catch (Exception ex)
         {
-            OnSinkException(ex);
+            OnHandlerException(ex);
         }
     }
 
@@ -649,15 +751,13 @@ public sealed unsafe partial class MsQuicTransport
     {
         var slot = (StreamSlot)stream.Tag!;
         if (slot.AppClosed) return;
-        ITransportSink? sink = LiveSink;
-        if (sink is null) return;
         try
         {
-            sink.OnStreamPeerSendShutdown(slot.Id);
+            LiveSink?.OnStreamPeerSendShutdown(slot.Id);
         }
         catch (Exception ex)
         {
-            OnSinkException(ex);
+            OnHandlerException(ex);
         }
     }
 
@@ -666,15 +766,13 @@ public sealed unsafe partial class MsQuicTransport
         var slot = (StreamSlot)stream.Tag!;
         Interlocked.Exchange(ref slot.ReceiveState, ReceiveIdle);
         if (slot.AppClosed) return;
-        ITransportSink? sink = LiveSink;
-        if (sink is null) return;
         try
         {
-            sink.OnStreamAborted(slot.Id, errorCode, StreamAbortDirection.Send);
+            LiveSink?.OnStreamAborted(slot.Id, errorCode, StreamAbortDirection.Send);
         }
         catch (Exception ex)
         {
-            OnSinkException(ex);
+            OnHandlerException(ex);
         }
     }
 
@@ -683,41 +781,37 @@ public sealed unsafe partial class MsQuicTransport
         var slot = (StreamSlot)stream.Tag!;
         slot.SendClosed = true;
         if (slot.AppClosed) return;
-        ITransportSink? sink = LiveSink;
-        if (sink is null) return;
         try
         {
-            sink.OnStreamAborted(slot.Id, errorCode, StreamAbortDirection.Receive);
+            LiveSink?.OnStreamAborted(slot.Id, errorCode, StreamAbortDirection.Receive);
         }
         catch (Exception ex)
         {
-            OnSinkException(ex);
+            OnHandlerException(ex);
         }
     }
 
     void IMsQuicStreamEvents.ShutdownComplete(MsQuicStream stream, in MsQuicStreamShutdownInfo info)
     {
         var slot = (StreamSlot)stream.Tag!;
-        // StreamClose of a stream MsQuic never started indicates SHUTDOWN_COMPLETE inline, on the closing thread: the slot
-        // is being closed and freed by that very call, so the event must not queue another close.
+        // The cleanup work item is closing this very stream (StreamClose of a stream MsQuic never started indicates
+        // SHUTDOWN_COMPLETE): that close frees the slot, so the event must not queue another one.
         if (IsNativeCloseInProgress(slot)) return;
         Interlocked.Exchange(ref slot.ReceiveState, ReceiveIdle);
         int old = Interlocked.Or(ref slot.CloseFlags, NativeShutdownFlag);
         if ((old & NativeShutdownFlag) != 0) return;
         if ((old & AppClosedFlag) != 0)
         {
-            EnqueueDeferredClose(slot);
+            EnqueueDeferredClose(slot, slot.Generation);
             return;
         }
-        ITransportSink? sink = LiveSink;
-        if (sink is null) return;
         try
         {
-            sink.OnStreamShutdownComplete(slot.Id);
+            LiveSink?.OnStreamShutdownComplete(slot.Id);
         }
         catch (Exception ex)
         {
-            OnSinkException(ex);
+            OnHandlerException(ex);
         }
     }
 
@@ -725,15 +819,13 @@ public sealed unsafe partial class MsQuicTransport
     {
         var slot = (StreamSlot)stream.Tag!;
         if (slot.AppClosed) return;
-        ITransportSink? sink = LiveSink;
-        if (sink is null) return;
         try
         {
-            sink.OnIdealSendBufferSize(slot.Id, byteCount);
+            LiveSink?.OnIdealSendBufferSize(slot.Id, byteCount);
         }
         catch (Exception ex)
         {
-            OnSinkException(ex);
+            OnHandlerException(ex);
         }
     }
 }

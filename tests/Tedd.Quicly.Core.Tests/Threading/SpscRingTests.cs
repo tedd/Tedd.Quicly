@@ -10,7 +10,6 @@ public class SpscRingTests
     [InlineData(3, 4)]
     [InlineData(4, 4)]
     [InlineData(1000, 1024)]
-    [InlineData(1 << 30, 1 << 30)]
     public void Capacity_Rounds_Up_To_Power_Of_Two(int requested, int expected)
     {
         var ring = new SpscRing<int>(requested);

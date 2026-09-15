@@ -149,10 +149,50 @@ operations per stage plus the free-list ring round trip; a further step (batchin
 free list without interlocked operations) is not worth taking until a real peer-level benchmark shows the table on
 the profile.
 
+**V1.1 (review fix, same day).** Review found an ABA race in V1: `CompletionTable.Complete` checked the slot's
+generation and then `Slot.Complete` read the 32-bit state, wrote `_status` and compare-exchanged the state as
+three separate steps. If the owner released the token and re-allocated the same slot in between (`Allocate`
+reset the state to exactly `Allocated`, so the stale CAS succeeded), the late completion landed on the new
+occupant; a losing duplicate `Complete` could also overwrite `_status` although its transition was ignored.
+Reproduced by `CompletionTableReviewTests` (275 corrupted fresh tokens in 3.2M iterations).
+
+*Fix.* The whole slot state is now one 64-bit word, `generation << 32 | status << 8 | stage bits`; every
+transition is a single compare-exchange whose expected value carries the token's generation, so a stale call
+can never succeed, and the status travels in the same CAS as the stage bit, so an ignored completion never
+touches it. Release changed from a CAS loop that any thread could attempt into an exclusive step: exactly one
+transition per occupancy makes `Done0 | Done1` true with no `Pending` bit set, and the thread that installed
+that word releases the slot with two plain writes (released status, then the free word with the next
+generation). Generations stay odd, step 2. V1 is not archived: it has a correctness defect, so it is not a
+candidate to keep runnable. `TryAllocate` also now waits out a release that another thread has claimed but
+not yet published on the free-list ring instead of reporting exhaustion (`Available > 0` implies success).
+
+*Hypothesis for the numbers.* One interlocked operation fewer on the release path (plain write instead of CAS)
+and one fewer volatile read/write pair for the status; expected: complete-then-await noticeably faster,
+await-then-complete unchanged within noise (its cost is dominated by the core's continuation machinery).
+
+**Measurement (net11.0), two consecutive runs.**
+
+| Method                             | Mean      | Error      | StdDev    | Ratio | RatioSD | Allocated | Alloc Ratio |
+|----------------------------------- |----------:|-----------:|----------:|------:|--------:|----------:|------------:|
+| Table_V1_CompleteThenAwait         |  15.05 ns |  34.18 ns  | 1.874 ns  |  1.01 |    0.15 |         - |          NA |
+| Table_V0_Archive_CompleteThenAwait |  49.37 ns |  60.47 ns  | 3.315 ns  |  3.31 |    0.39 |         - |          NA |
+| Table_V1_AwaitThenComplete         |  77.24 ns | 107.02 ns  | 5.866 ns  |  5.18 |    0.62 |         - |          NA |
+| Table_V0_Archive_AwaitThenComplete | 100.48 ns |  51.43 ns  | 2.819 ns  |  6.74 |    0.70 |         - |          NA |
+|                                    |           |            |           |       |         |           |             |
+| Table_V1_CompleteThenAwait         |  16.70 ns |   7.354 ns |  0.403 ns |  1.00 |    0.03 |         - |          NA |
+| Table_V0_Archive_CompleteThenAwait |  48.62 ns |  47.113 ns |  2.582 ns |  2.91 |    0.15 |         - |          NA |
+| Table_V1_AwaitThenComplete         |  50.42 ns |  82.325 ns |  4.513 ns |  3.02 |    0.24 |         - |          NA |
+| Table_V0_Archive_AwaitThenComplete | 125.88 ns | 213.646 ns | 11.711 ns |  7.54 |    0.63 |         - |          NA |
+
+**Decision.** Complete-then-await halved (30 ns to 15 to 17 ns, consistent across both runs) as predicted;
+await-then-complete is 50 to 77 ns against 59 ns before, i.e. within this config's run-to-run noise (the
+archived V0 moved 77 to 49 ns and 97 to 126 ns between the same runs without any code change), so it is treated
+as unchanged. Still zero allocations. The fixed version ships; no follow-up performance work was triggered.
+
 ## 4. net10.0 cross-check
 
 Same machine, same day, `-f net10.0` (.NET 10.0.12). Every decision above holds on net10.0; the V1/V0 ratios are
-3.1x (SPSC), 7.4x / 3.8x (MPSC, 1 / 4 producers) and 2.7x / 1.8x (table). The framework references move around
+3.1x (SPSC), 7.4x / 3.8x (MPSC, 1 / 4 producers) and 4.3x / 1.8x (table, after the V1.1 fix in section 3). The framework references move around
 between runtimes (`ConcurrentQueue` is slower and `Channel` faster on net10.0 than on net11.0), our rings do not.
 
 | Method              | Mean      | Error      | StdDev    | Ratio | RatioSD | Allocated | Alloc Ratio |
@@ -174,12 +214,12 @@ between runtimes (`ConcurrentQueue` is slower and `Channel` faster on net10.0 th
 | ConcurrentQueue     | 4         | 136.17 ns | 249.904 ns | 13.698 ns |  1.05 |    0.09 |         - |          NA |
 | BoundedChannel      | 4         | 497.00 ns | 467.328 ns | 25.616 ns |  3.84 |    0.18 |         - |          NA |
 
-| Method                             | Mean     | Error     | StdDev    | Ratio | RatioSD | Allocated | Alloc Ratio |
-|----------------------------------- |---------:|----------:|----------:|------:|--------:|----------:|------------:|
-| Table_V1_CompleteThenAwait         | 25.22 ns |  94.62 ns |  5.186 ns |  1.03 |    0.25 |         - |          NA |
-| Table_V0_Archive_CompleteThenAwait | 67.19 ns | 293.58 ns | 16.092 ns |  2.73 |    0.72 |         - |          NA |
-| Table_V1_AwaitThenComplete         | 54.46 ns |  44.32 ns |  2.429 ns |  2.22 |    0.36 |         - |          NA |
-| Table_V0_Archive_AwaitThenComplete | 96.61 ns |  77.86 ns |  4.267 ns |  3.93 |    0.64 |         - |          NA |
+| Method                             | Mean      | Error      | StdDev    | Ratio | RatioSD | Allocated | Alloc Ratio |
+|----------------------------------- |----------:|-----------:|----------:|------:|--------:|----------:|------------:|
+| Table_V1_CompleteThenAwait         |  18.51 ns |   8.067 ns |  0.442 ns |  1.00 |    0.03 |         - |          NA |
+| Table_V0_Archive_CompleteThenAwait |  80.26 ns | 133.833 ns |  7.336 ns |  4.34 |    0.35 |         - |          NA |
+| Table_V1_AwaitThenComplete         |  63.95 ns |  20.903 ns |  1.146 ns |  3.46 |    0.09 |         - |          NA |
+| Table_V0_Archive_AwaitThenComplete | 118.14 ns | 548.675 ns | 30.075 ns |  6.38 |    1.41 |         - |          NA |
 
 ## 5. Notes
 

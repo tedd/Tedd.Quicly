@@ -265,13 +265,13 @@ public sealed class HttpResponse
 
     private void BuildHeaders(long? contentLength)
     {
-        HasStarted = true;
         int status = StatusCode;
         if (status < 100 || status > 999)
             throw new InvalidOperationException("Invalid status code " + status.ToString(System.Globalization.CultureInfo.InvariantCulture) + ".");
+        HasStarted = true;
         bool statusAllowsBody = status >= 200 && status != 204 && status != 304;
         _bodyAllowed = statusAllowsBody && !_isHead;
-        if (_connection.IsStopping)
+        if (_connection.IsStopping || _connection.MustCloseAfterResponse)
             CloseConnection = true;
 
         // Framing decision.

@@ -8,6 +8,7 @@ public class RawProtocolTests
     private static RouteTable EchoRoutes() => new RouteTable()
         .MapPrefix("GET", "/", (ctx, ct) => ctx.Response.SendTextAsync("path=" + ctx.Path + ";host=" + ctx.Host + ";v=" + (int)ctx.Version, cancellationToken: ct))
         .MapPrefix("OPTIONS", "/", (ctx, ct) => ctx.Response.SendTextAsync("path=" + ctx.Path, cancellationToken: ct))
+        .Map("OPTIONS", "*", (ctx, ct) => ctx.Response.SendTextAsync("path=" + ctx.Path, cancellationToken: ct))
         .MapPrefix("POST", "/", async (ctx, ct) =>
         {
             var body = await ctx.ReadBodyAsync(ct);
@@ -214,9 +215,18 @@ public class RawProtocolTests
         using var raw = await RawClient.ConnectAsync(host.EndPoint);
         await raw.SendAsync("GET / HTTP/1.1\r\nHost: a\r\nX-Slow: ");
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        var response = await raw.ReadResponseAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(408, response.StatusCode);
+        Assert.Equal("close", response["Connection"]);
         Assert.True(await raw.WaitForCloseAsync(TimeSpan.FromSeconds(10)));
         Assert.True(sw.Elapsed < TimeSpan.FromSeconds(8));
         await HttpServerTests.WaitUntilAsync(() => host.Server.ActiveConnections == 0);
+        Assert.Equal(1, host.Server.RequestTimeouts);
+
+        // a silent client (no bytes at all) is closed without a response
+        using var silent = await RawClient.ConnectAsync(host.EndPoint);
+        Assert.True(await silent.WaitForCloseAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(1, host.Server.RequestTimeouts);
     }
 
     [Fact]

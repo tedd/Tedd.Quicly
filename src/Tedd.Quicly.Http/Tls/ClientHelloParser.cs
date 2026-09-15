@@ -31,10 +31,26 @@ internal readonly struct ClientHelloInfo
     }
 }
 
+/// <summary>Outcome of <see cref="ClientHelloParser.TryAssemble"/>.</summary>
+internal enum ClientHelloAssembleStatus : byte
+{
+    /// <summary>More bytes are needed to complete the ClientHello.</summary>
+    NeedMore,
+
+    /// <summary>The complete ClientHello handshake message has been copied out.</summary>
+    Complete,
+
+    /// <summary>The bytes are not a TLS handshake (wrong record type/version, zero or oversized record, not a ClientHello).</summary>
+    NotTls,
+
+    /// <summary>The ClientHello is larger than the assembly buffer allows.</summary>
+    TooLarge,
+}
+
 /// <summary>
 /// Minimal TLS ClientHello parser: extracts <c>server_name</c> (type 0) and <c>application_layer_protocol_negotiation</c>
-/// (type 16). Only the first record is examined; a ClientHello that spans records is treated as unparseable, which
-/// simply means the regular (non-ACME) certificate path is used.
+/// (type 16). <see cref="TryAssemble"/> reassembles a ClientHello that the client fragmented over several handshake
+/// records; <see cref="TryParse"/> then reads the extensions from the assembled message.
 /// </summary>
 internal static class ClientHelloParser
 {
@@ -43,6 +59,15 @@ internal static class ClientHelloParser
 
     /// <summary>Record header size.</summary>
     public const int RecordHeaderLength = 5;
+
+    /// <summary>Handshake message header size (type + 24-bit length).</summary>
+    public const int HandshakeHeaderLength = 4;
+
+    /// <summary>Largest ClientHello we are willing to reassemble (header included). Real ones are a few KiB even with post-quantum key shares.</summary>
+    public const int MaxClientHelloLength = 64 * 1024;
+
+    /// <summary>Upper bound on raw bytes buffered while peeking: every record carries a 5-byte header, so a maximal ClientHello spread over minimal records still fits.</summary>
+    public const int MaxPeekBytes = MaxClientHelloLength + 8 * RecordHeaderLength + MaxRecordLength;
 
     /// <summary>
     /// Inspects a buffered record header. Returns the number of bytes the complete first record occupies
@@ -60,14 +85,61 @@ internal static class ClientHelloParser
         return RecordHeaderLength + length;
     }
 
-    /// <summary>Parses the handshake payload of a record (bytes after the 5-byte record header).</summary>
+    /// <summary>
+    /// Walks the handshake records at the start of <paramref name="buffered"/> and copies their payloads into
+    /// <paramref name="handshake"/> until one complete ClientHello message (header included) has been assembled.
+    /// </summary>
+    /// <param name="buffered">Raw bytes received so far.</param>
+    /// <param name="handshake">Scratch buffer of at least <see cref="MaxClientHelloLength"/> bytes.</param>
+    /// <param name="handshakeLength">Length of the assembled message in <paramref name="handshake"/> on <see cref="ClientHelloAssembleStatus.Complete"/>.</param>
+    /// <param name="recordBytes">Number of raw bytes belonging to the records that were consumed on <see cref="ClientHelloAssembleStatus.Complete"/>.</param>
+    public static ClientHelloAssembleStatus TryAssemble(ReadOnlySpan<byte> buffered, Span<byte> handshake, out int handshakeLength, out int recordBytes)
+    {
+        handshakeLength = 0;
+        recordBytes = 0;
+        int pos = 0;
+        int assembled = 0;
+        int needed = -1;
+        while (true)
+        {
+            int recordLength = GetRecordLength(buffered[pos..]);
+            if (recordLength < 0)
+                return ClientHelloAssembleStatus.NotTls;
+            if (recordLength == 0 || buffered.Length - pos < recordLength)
+                return ClientHelloAssembleStatus.NeedMore;
+
+            var payload = buffered.Slice(pos + RecordHeaderLength, recordLength - RecordHeaderLength);
+            if (assembled + payload.Length > handshake.Length)
+                return ClientHelloAssembleStatus.TooLarge;
+            payload.CopyTo(handshake[assembled..]);
+            assembled += payload.Length;
+            pos += recordLength;
+
+            if (needed < 0 && assembled >= HandshakeHeaderLength)
+            {
+                if (handshake[0] != 0x01)
+                    return ClientHelloAssembleStatus.NotTls;
+                needed = HandshakeHeaderLength + ((handshake[1] << 16) | (handshake[2] << 8) | handshake[3]);
+                if (needed > handshake.Length)
+                    return ClientHelloAssembleStatus.TooLarge;
+            }
+            if (needed >= 0 && assembled >= needed)
+            {
+                handshakeLength = needed;
+                recordBytes = pos;
+                return ClientHelloAssembleStatus.Complete;
+            }
+        }
+    }
+
+    /// <summary>Parses an assembled ClientHello handshake message (starting at the handshake type byte).</summary>
     public static bool TryParse(ReadOnlySpan<byte> record, out ClientHelloInfo info)
     {
         info = default;
-        if (record.Length < 4 || record[0] != 0x01)
+        if (record.Length < HandshakeHeaderLength || record[0] != 0x01)
             return false;
         int handshakeLength = (record[1] << 16) | (record[2] << 8) | record[3];
-        record = record[4..];
+        record = record[HandshakeHeaderLength..];
         if (handshakeLength > record.Length)
             return false;
         record = record[..handshakeLength];
@@ -186,8 +258,6 @@ internal static class ClientHelloParser
             scan = scan[(1 + len)..];
             count++;
         }
-        if (scan.Length != 0)
-            return false;
 
         protocols = count == 0 ? [] : new string[count];
         for (int i = 0; i < count; i++)

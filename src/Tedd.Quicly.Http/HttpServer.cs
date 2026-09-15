@@ -16,6 +16,7 @@ public sealed class HttpServer : IAsyncDisposable
     private readonly List<Task> _acceptLoops = [];
     private readonly List<IPEndPoint> _bound = [];
     private readonly Dictionary<long, HttpConnection> _connections = [];
+    private readonly Dictionary<IPAddress, int> _perAddress = [];
     private readonly Lock _lock = new();
     private readonly CancellationTokenSource _acceptCts = new();
     private readonly CancellationTokenSource _idleCts = new();
@@ -24,7 +25,11 @@ public sealed class HttpServer : IAsyncDisposable
     private Task? _stopTask;
     private int _state; // 0 created, 1 running, 2 stopping, 3 stopped
     private long _accepted;
+    private long _rejected;
     private long _acmeHandshakes;
+    private long _handshakeFailures;
+    private long _requestTimeouts;
+    private long _protocolErrors;
 
     /// <summary>Creates a server; call <see cref="Start"/> to bind and accept.</summary>
     public HttpServer(HttpServerOptions options)
@@ -55,17 +60,35 @@ public sealed class HttpServer : IAsyncDisposable
         }
     }
 
-    /// <summary>Total connections accepted since start.</summary>
+    /// <summary>Total connections accepted since start (rejected ones excluded).</summary>
     public long TotalConnectionsAccepted => Volatile.Read(ref _accepted);
+
+    /// <summary>Connections closed immediately because the remote address had <see cref="HttpServerLimits.MaxConnectionsPerAddress"/> open already.</summary>
+    public long ConnectionsRejected => Volatile.Read(ref _rejected);
 
     /// <summary>Number of completed <c>acme-tls/1</c> validation handshakes.</summary>
     public long AcmeTlsAlpnHandshakes => Volatile.Read(ref _acmeHandshakes);
+
+    /// <summary>TLS connections that never completed a handshake (non-TLS bytes, oversized or malformed ClientHello, handshake failure or timeout).</summary>
+    public long HandshakeFailures => Volatile.Read(ref _handshakeFailures);
+
+    /// <summary>Requests whose header section did not arrive within <see cref="HttpServerLimits.HeaderReadTimeout"/> (answered with 408).</summary>
+    public long RequestTimeouts => Volatile.Read(ref _requestTimeouts);
+
+    /// <summary>Requests rejected by the server itself before any handler ran (400, 405, 411, 413, 414, 417, 431, 501, 505).</summary>
+    public long ProtocolErrors => Volatile.Read(ref _protocolErrors);
 
     internal CancellationToken IdleToken => _idleCts.Token;
 
     internal CancellationToken AbortToken => _abortCts.Token;
 
     internal byte[] ServerHeaderLine { get; private set; } = [];
+
+    /// <summary>Largest request body accepted: the server-wide limit or the largest handler opt-in.</summary>
+    internal long EffectiveMaxRequestBodyBytes { get; private set; }
+
+    /// <summary>Pre-rendered <c>Allow</c> header value for 405 responses.</summary>
+    internal string AllowHeaderValue { get; private set; } = string.Empty;
 
     /// <summary>Binds every endpoint and starts accepting. Throws when any bind fails (nothing stays bound).</summary>
     public void Start()
@@ -77,11 +100,25 @@ public sealed class HttpServer : IAsyncDisposable
             if (_options.Endpoints.Count == 0)
                 throw new InvalidOperationException("At least one endpoint is required.");
             _options.Limits.Validate();
+            if (_options.AllowedMethods.Count == 0)
+                throw new InvalidOperationException("At least one request method must be allowed.");
             foreach (var ep in _options.Endpoints)
             {
                 if (ep.Tls is { } tls && tls.CertificateSelector is null && tls.CertificateProvider is null && tls.CertificateSource is null)
                     throw new InvalidOperationException("TLS endpoint " + ep.EndPoint + " has no certificate source, provider or selector.");
             }
+
+            long maxBody = _options.Limits.MaxRequestBodyBytes;
+            foreach (var handler in _options.Handlers)
+            {
+                if (handler is IHttpBodyHandler body)
+                {
+                    HttpServerLimits.ValidateBodyLimit(body.MaxRequestBodyBytes);
+                    maxBody = Math.Max(maxBody, body.MaxRequestBodyBytes);
+                }
+            }
+            EffectiveMaxRequestBodyBytes = maxBody;
+            AllowHeaderValue = string.Join(", ", _options.AllowedMethods);
             ServerHeaderLine = _options.AddServerHeader ? Encoding.Latin1.GetBytes("Server: " + _options.ServerHeaderValue + "\r\n") : [];
             _slots = new SemaphoreSlim(_options.Limits.MaxConnections, _options.Limits.MaxConnections);
 
@@ -160,6 +197,16 @@ public sealed class HttpServer : IAsyncDisposable
                 continue;
             }
 
+            var remote = socket.RemoteEndPoint as IPEndPoint;
+            var connection = new HttpConnection(this, socket, endpoint, remote);
+            if (!TryAdmit(connection, remote?.Address))
+            {
+                Interlocked.Increment(ref _rejected);
+                socket.Dispose();
+                slots.Release();
+                continue;
+            }
+
             Interlocked.Increment(ref _accepted);
             try
             {
@@ -168,21 +215,50 @@ public sealed class HttpServer : IAsyncDisposable
             catch (SocketException)
             {
             }
-            var connection = new HttpConnection(this, socket, endpoint);
-            lock (_lock)
-                _connections[connection.Id] = connection;
             connection.Start();
+        }
+    }
+
+    private bool TryAdmit(HttpConnection connection, IPAddress? address)
+    {
+        lock (_lock)
+        {
+            if (address is not null)
+            {
+                _perAddress.TryGetValue(address, out int count);
+                if (count >= _options.Limits.MaxConnectionsPerAddress)
+                    return false;
+                _perAddress[address] = count + 1;
+            }
+            _connections[connection.Id] = connection;
+            return true;
         }
     }
 
     internal void OnConnectionClosed(HttpConnection connection)
     {
         lock (_lock)
+        {
             _connections.Remove(connection.Id);
+            var address = connection.RemoteEndPoint?.Address;
+            if (address is not null && _perAddress.TryGetValue(address, out int count))
+            {
+                if (count <= 1)
+                    _perAddress.Remove(address);
+                else
+                    _perAddress[address] = count - 1;
+            }
+        }
         _slots?.Release();
     }
 
     internal void OnAcmeTlsAlpnHandshake() => Interlocked.Increment(ref _acmeHandshakes);
+
+    internal void OnHandshakeFailure() => Interlocked.Increment(ref _handshakeFailures);
+
+    internal void OnRequestTimeout() => Interlocked.Increment(ref _requestTimeouts);
+
+    internal void OnProtocolError() => Interlocked.Increment(ref _protocolErrors);
 
     /// <summary>
     /// Stops accepting, closes idle connections, lets in-flight requests finish (their responses carry

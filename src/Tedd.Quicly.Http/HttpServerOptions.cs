@@ -14,6 +14,12 @@ public sealed class HttpServerOptions
     /// <summary>Limits and timeouts.</summary>
     public HttpServerLimits Limits { get; } = new();
 
+    /// <summary>
+    /// Request methods the server accepts (case-sensitive tokens, upper-case by convention). Anything else is answered
+    /// with <c>405</c> and an <c>Allow</c> header before any handler runs. Default: <c>GET</c> and <c>HEAD</c> (ADR 0009).
+    /// </summary>
+    public ISet<string> AllowedMethods { get; } = new HashSet<string>(StringComparer.Ordinal) { "GET", "HEAD" };
+
     /// <summary>Whether to emit a <c>Server</c> response header. Default <see langword="true"/>.</summary>
     public bool AddServerHeader { get; set; } = true;
 
@@ -45,6 +51,18 @@ public sealed class HttpServerOptions
     {
         ArgumentNullException.ThrowIfNull(handler);
         Handlers.Add(handler);
+        return this;
+    }
+
+    /// <summary>Adds <paramref name="methods"/> to <see cref="AllowedMethods"/> (upper-cased).</summary>
+    public HttpServerOptions AllowMethods(params string[] methods)
+    {
+        ArgumentNullException.ThrowIfNull(methods);
+        foreach (var m in methods)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(m);
+            AllowedMethods.Add(m.ToUpperInvariant());
+        }
         return this;
     }
 }

@@ -65,6 +65,9 @@ internal static class HttpParser
     /// <summary>The byte sequence that terminates the header section when preceded by a CRLF-terminated line.</summary>
     public static ReadOnlySpan<byte> HeaderTerminator => "\n\r\n"u8;
 
+    /// <summary>Empty lines tolerated before the request line.</summary>
+    public const int MaxLeadingEmptyLines = 2;
+
     // tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
     private static readonly SearchValues<byte> TokenChars = SearchValues.Create(
         "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"u8);
@@ -110,8 +113,10 @@ internal static class HttpParser
     {
         int pos = 0;
 
-        // RFC 9112 §2.2: ignore at least one empty line received before the request-line.
-        while (input.Length - pos >= 2 && input[pos] == (byte)'\r' && input[pos + 1] == (byte)'\n')
+        // RFC 9112 §2.2: ignore at least one empty line received before the request-line. Two are tolerated (a
+        // client that terminates a body with CRLF and then sends an extra one); anything beyond that is treated
+        // as an empty request line and rejected, so a stream of bare CRLFs cannot keep a connection busy.
+        for (int skipped = 0; skipped < MaxLeadingEmptyLines && input.Length - pos >= 2 && input[pos] == (byte)'\r' && input[pos + 1] == (byte)'\n'; skipped++)
             pos += 2;
 
         // ---- request line ----

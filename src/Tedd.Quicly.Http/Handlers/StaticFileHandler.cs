@@ -9,14 +9,20 @@ public sealed class StaticFileOptions
     /// <summary>Request path prefix the handler owns (default <c>/</c>).</summary>
     public string RequestPathPrefix { get; set; } = "/";
 
-    /// <summary>File names tried when the path names a directory (default <c>index.html</c>).</summary>
+    /// <summary>File names tried when the path names a directory (default <c>index.html</c>). Directories are never listed.</summary>
     public IList<string> DefaultFileNames { get; } = new List<string> { "index.html" };
 
     /// <summary>Value for the <c>Cache-Control</c> header, or <see langword="null"/> to omit it.</summary>
     public string? CacheControl { get; set; }
 
-    /// <summary>Content type for unknown extensions; <see langword="null"/> refuses to serve them (404).</summary>
-    public string? DefaultContentType { get; set; } = "application/octet-stream";
+    /// <summary>
+    /// Content type for extensions missing from <see cref="ContentTypes"/>. <see langword="null"/> (default) refuses to
+    /// serve them, which makes <see cref="ContentTypes"/> an allow-list (ADR 0009).
+    /// </summary>
+    public string? DefaultContentType { get; set; }
+
+    /// <summary>Largest file served, in bytes; larger files are treated as not found. Default 64 MiB.</summary>
+    public long MaxFileSizeBytes { get; set; } = 64L * 1024 * 1024;
 
     /// <summary>Extension (with leading dot) to content type. Pre-populated with common web types; edit freely.</summary>
     public Dictionary<string, string> ContentTypes { get; } = new(StringComparer.OrdinalIgnoreCase)
@@ -62,9 +68,11 @@ public sealed class StaticFileOptions
 /// <summary>
 /// Serves files below a root directory for <c>GET</c>/<c>HEAD</c>. Paths are normalised segment by segment
 /// (<c>..</c>, backslashes, drive/stream separators and control characters are rejected) and the final
-/// full path is verified to lie inside the root. Supports <c>ETag</c>/<c>Last-Modified</c> with
+/// full path is verified to lie inside the root; symbolic links and other reparse points anywhere below the
+/// root are refused. Only extensions in the content-type allow-list are served, up to
+/// <see cref="StaticFileOptions.MaxFileSizeBytes"/>. Supports <c>ETag</c>/<c>Last-Modified</c> with
 /// <c>If-None-Match</c>/<c>If-Modified-Since</c> (304) and an optional <c>Cache-Control</c>.
-/// Missing files are left to the next handler.
+/// Anything not served is left to the next handler (404 by default); directories are never listed.
 /// </summary>
 public sealed class StaticFileHandler : IHttpHandler
 {
@@ -86,6 +94,7 @@ public sealed class StaticFileHandler : IHttpHandler
         ArgumentException.ThrowIfNullOrEmpty(_options.RequestPathPrefix);
         if (_options.RequestPathPrefix[0] != '/')
             throw new ArgumentException("RequestPathPrefix must start with '/'.", nameof(options));
+        ArgumentOutOfRangeException.ThrowIfNegative(_options.MaxFileSizeBytes);
     }
 
     /// <summary>Full path of the root directory.</summary>
@@ -156,6 +165,23 @@ public sealed class StaticFileHandler : IHttpHandler
         return _options.DefaultContentType;
     }
 
+    /// <summary>
+    /// Whether <paramref name="fullPath"/> (inside the root) or any directory between it and the root is a reparse
+    /// point (symbolic link, junction, mount point). The root itself is trusted.
+    /// </summary>
+    public bool ContainsReparsePoint(string fullPath)
+    {
+        ArgumentNullException.ThrowIfNull(fullPath);
+        FileSystemInfo? info = File.Exists(fullPath) ? new FileInfo(fullPath) : Directory.Exists(fullPath) ? new DirectoryInfo(fullPath) : null;
+        while (info is not null && !string.Equals(info.FullName, _root, StringComparison.Ordinal))
+        {
+            if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+                return true;
+            info = info is FileInfo f ? f.Directory : ((DirectoryInfo)info).Parent;
+        }
+        return false;
+    }
+
     /// <inheritdoc/>
     public async ValueTask<bool> TryHandleAsync(HttpRequestContext context, CancellationToken cancellationToken)
     {
@@ -175,6 +201,8 @@ public sealed class StaticFileHandler : IHttpHandler
                 if (file is null)
                     return false;
             }
+            if (ContainsReparsePoint(file.FullName))
+                return false;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
@@ -194,10 +222,12 @@ public sealed class StaticFileHandler : IHttpHandler
         string? contentType = GetContentType(file.Name);
         if (contentType is null)
             return false;
+        long length = file.Length;
+        if (length > _options.MaxFileSizeBytes)
+            return false;
 
         var lastModified = file.LastWriteTimeUtc;
         lastModified = new DateTime(lastModified.Ticks - (lastModified.Ticks % TimeSpan.TicksPerSecond), DateTimeKind.Utc);
-        long length = file.Length;
         string etag = "\"" + lastModified.Ticks.ToString("x", System.Globalization.CultureInfo.InvariantCulture) + "-" + length.ToString("x", System.Globalization.CultureInfo.InvariantCulture) + "\"";
 
         response.Headers.Set("ETag", etag);

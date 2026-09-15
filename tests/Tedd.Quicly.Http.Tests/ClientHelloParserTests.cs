@@ -132,7 +132,7 @@ public class ClientHelloParserTests
         }
 
         // SNI with a non-ASCII host name
-        var badSni = BuildClientHello("exämple", null);
+        var badSni = BuildClientHello(null, null, extraExtension: [0x00, 0x00, 0x00, 0x08, 0x00, 0x06, 0x00, 0x00, 0x03, (byte)'e', (byte)'x', 0xE4]);
         Assert.False(ClientHelloParser.TryParse(badSni.AsSpan(5), out _));
 
         // empty SNI host

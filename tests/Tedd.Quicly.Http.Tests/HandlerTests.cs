@@ -7,6 +7,8 @@ namespace Tedd.Quicly.Http.Tests;
 
 public class Http01ChallengeHandlerTests
 {
+    private const string Tok = "tok-en_1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     [Fact]
     public async Task Publish_serve_remove()
     {
@@ -15,30 +17,30 @@ public class Http01ChallengeHandlerTests
         await using var host = TestHost.Start(o => o.Use(handler));
         using var client = host.CreateClient();
 
-        using var missing = await client.GetAsync(Http01ChallengeHandler.PathPrefix + "tok-en_1");
+        using var missing = await client.GetAsync(Http01ChallengeHandler.PathPrefix + Tok);
         Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
 
-        await responder.PublishAsync("tok-en_1", "tok-en_1.thumbprint", CancellationToken.None);
+        await responder.PublishAsync(Tok, Tok + ".thumbprint", CancellationToken.None);
         Assert.Equal(1, handler.Count);
-        Assert.True(handler.TryGet("tok-en_1", out var ka));
-        Assert.Equal("tok-en_1.thumbprint", ka);
+        Assert.True(handler.TryGet(Tok, out var ka));
+        Assert.Equal(Tok + ".thumbprint", ka);
         Assert.False(handler.TryGet("other", out ka));
         Assert.Equal(string.Empty, ka);
 
-        using var found = await client.GetAsync(Http01ChallengeHandler.PathPrefix + "tok-en_1");
+        using var found = await client.GetAsync(Http01ChallengeHandler.PathPrefix + Tok);
         Assert.Equal(HttpStatusCode.OK, found.StatusCode);
         Assert.Equal("application/octet-stream", found.Content.Headers.ContentType!.MediaType);
-        Assert.Equal("tok-en_1.thumbprint", await found.Content.ReadAsStringAsync());
+        Assert.Equal(Tok + ".thumbprint", await found.Content.ReadAsStringAsync());
         Assert.Equal("no-store", found.Headers.CacheControl!.ToString());
 
-        using var head = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, Http01ChallengeHandler.PathPrefix + "tok-en_1"));
+        using var head = await client.SendAsync(new HttpRequestMessage(HttpMethod.Head, Http01ChallengeHandler.PathPrefix + Tok));
         Assert.Equal(HttpStatusCode.OK, head.StatusCode);
-        Assert.Equal(19, head.Content.Headers.ContentLength);
+        Assert.Equal(Tok.Length + ".thumbprint".Length, head.Content.Headers.ContentLength);
 
-        using var post = await client.PostAsync(Http01ChallengeHandler.PathPrefix + "tok-en_1", new StringContent("x"));
+        using var post = await client.PostAsync(Http01ChallengeHandler.PathPrefix + Tok, new StringContent("x"));
         Assert.Equal(HttpStatusCode.MethodNotAllowed, post.StatusCode);
 
-        using var badToken = await client.GetAsync(Http01ChallengeHandler.PathPrefix + "tok/en");
+        using var badToken = await client.GetAsync(Http01ChallengeHandler.PathPrefix + "tok/en_aaaaaaaaaaaaaaaaaaaaaaaaaa");
         Assert.Equal(HttpStatusCode.NotFound, badToken.StatusCode);
         using var emptyToken = await client.GetAsync(Http01ChallengeHandler.PathPrefix);
         Assert.Equal(HttpStatusCode.NotFound, emptyToken.StatusCode);
@@ -46,9 +48,9 @@ public class Http01ChallengeHandlerTests
         using var other = await client.GetAsync("/.well-known/other");
         Assert.Equal(HttpStatusCode.NotFound, other.StatusCode); // not ours: falls through to the server's 404
 
-        await responder.RemoveAsync("tok-en_1", CancellationToken.None);
+        await responder.RemoveAsync(Tok, CancellationToken.None);
         Assert.Equal(0, handler.Count);
-        using var gone = await client.GetAsync(Http01ChallengeHandler.PathPrefix + "tok-en_1");
+        using var gone = await client.GetAsync(Http01ChallengeHandler.PathPrefix + Tok);
         Assert.Equal(HttpStatusCode.NotFound, gone.StatusCode);
     }
 
@@ -57,9 +59,15 @@ public class Http01ChallengeHandlerTests
     {
         var handler = new Http01ChallengeHandler();
         await Assert.ThrowsAsync<ArgumentException>(async () => await handler.PublishAsync("", "k", CancellationToken.None));
-        await Assert.ThrowsAsync<ArgumentException>(async () => await handler.PublishAsync("a/b", "k", CancellationToken.None));
-        await Assert.ThrowsAsync<ArgumentException>(async () => await handler.PublishAsync("abc", "", CancellationToken.None));
-        await Assert.ThrowsAsync<ArgumentException>(async () => await handler.RemoveAsync("a b", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(async () => await handler.PublishAsync("a/b" + Tok, "k", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(async () => await handler.PublishAsync(Tok, "", CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(async () => await handler.PublishAsync("short-token-21-chars_", "k", CancellationToken.None)); // 21 chars
+        await Assert.ThrowsAsync<ArgumentException>(async () => await handler.RemoveAsync("a b" + Tok, CancellationToken.None));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new Http01ChallengeHandler(lifetime: TimeSpan.Zero));
+        Assert.True(Http01ChallengeHandler.IsValidToken("abcdefghijklmnopqrstuv"));
+        Assert.False(Http01ChallengeHandler.IsValidToken("abcdefghijklmnopqrstu"));
+        Assert.False(Http01ChallengeHandler.IsValidToken("abcdefghijklmnopqrstu+"));
+        Assert.Equal(Http01ChallengeHandler.DefaultLifetime, handler.Lifetime);
         Assert.Throws<ArgumentNullException>(() => handler.TryGet(null!, out _));
         await Assert.ThrowsAsync<ArgumentNullException>(async () => await handler.TryHandleAsync(null!, CancellationToken.None));
     }
@@ -211,7 +219,7 @@ public class StaticFileHandlerTests : IDisposable
     [Fact]
     public async Task Serves_files_with_content_types_and_conditional_requests()
     {
-        var handler = new StaticFileHandler(_root, new StaticFileOptions { CacheControl = "public, max-age=60" });
+        var handler = new StaticFileHandler(_root, new StaticFileOptions { CacheControl = "public, max-age=60", DefaultContentType = "application/octet-stream" });
         Assert.Equal(Path.GetFullPath(_root), handler.RootDirectory);
         await using var host = TestHost.Start(o => o.Use(handler));
         using var client = host.CreateClient();
@@ -323,7 +331,8 @@ public class StaticFileHandlerTests : IDisposable
         Assert.Throws<ArgumentNullException>(() => handler.TryResolve(null!, out _));
         Assert.Throws<ArgumentNullException>(() => handler.GetContentType(null!));
         Assert.Equal("text/html; charset=utf-8", handler.GetContentType("x.HTML"));
-        Assert.Equal("application/octet-stream", handler.GetContentType("noext"));
+        Assert.Null(handler.GetContentType("noext"));
+        Assert.Null(handler.GetContentType("x.unknownext"));
         Assert.Same(handler.Options.ContentTypes, handler.Options.ContentTypes);
     }
 

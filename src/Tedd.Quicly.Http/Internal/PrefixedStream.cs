@@ -6,6 +6,11 @@ namespace Tedd.Quicly.Http.Internal;
 /// A read/write stream that first replays bytes already consumed from the inner stream (the peeked TLS ClientHello)
 /// and then delegates to it. Writes always go straight to the inner stream.
 /// </summary>
+/// <remarks>
+/// <see cref="System.Net.Security.SslStream"/> issues zero-length reads to wait for data availability; while prefix
+/// bytes remain those must complete immediately instead of being forwarded to the socket, otherwise the handshake
+/// deadlocks (the client is waiting for our ServerHello, we are waiting for bytes it already sent).
+/// </remarks>
 internal sealed class PrefixedStream : Stream
 {
     private readonly Stream _inner;
@@ -17,9 +22,14 @@ internal sealed class PrefixedStream : Stream
     public PrefixedStream(Stream inner, byte[] prefix, int prefixLength)
     {
         _inner = inner;
-        _prefix = prefix;
+        _prefix = prefixLength > 0 ? prefix : null;
         _prefixLength = prefixLength;
+        if (prefixLength == 0)
+            ArrayPool<byte>.Shared.Return(prefix);
     }
+
+    /// <summary>Number of replay bytes not yet handed out.</summary>
+    public int PrefixRemaining => _prefix is null ? 0 : _prefixLength - _prefixOffset;
 
     public override bool CanRead => true;
 
@@ -37,26 +47,27 @@ internal sealed class PrefixedStream : Stream
 
     public override int Read(Span<byte> buffer)
     {
-        int n = ReadPrefix(buffer);
-        return n > 0 ? n : _inner.Read(buffer);
+        if (_prefix is not null)
+            return ReadPrefix(buffer);
+        return _inner.Read(buffer);
     }
 
     public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
 
     public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        int n = ReadPrefix(buffer.Span);
-        return n > 0 ? new ValueTask<int>(n) : _inner.ReadAsync(buffer, cancellationToken);
+        if (_prefix is not null)
+            return new ValueTask<int>(ReadPrefix(buffer.Span));
+        return _inner.ReadAsync(buffer, cancellationToken);
     }
 
     public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
         => ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
 
+    /// <summary>Copies prefix bytes; a zero-length destination returns 0 without touching the inner stream (data is available).</summary>
     private int ReadPrefix(Span<byte> destination)
     {
-        var prefix = _prefix;
-        if (prefix is null || destination.IsEmpty)
-            return 0;
+        var prefix = _prefix!;
         int n = Math.Min(destination.Length, _prefixLength - _prefixOffset);
         prefix.AsSpan(_prefixOffset, n).CopyTo(destination);
         _prefixOffset += n;

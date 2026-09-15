@@ -77,6 +77,7 @@ public class HttpParserTests
     [InlineData("G(ET / HTTP/1.1\r\n\r\n")]                    // bad method char
     [InlineData("GET\r\n\r\n")]
     [InlineData("\r\n\r\n\r\n")]                               // only empty lines (CRLF then bare header end)
+    [InlineData("\r\n\r\n\r\nGET / HTTP/1.1\r\n\r\n")]        // more than MaxLeadingEmptyLines empty lines
     public void Rejects_malformed(string req)
     {
         Assert.Equal(HttpParseStatus.Invalid, Parse(req, out _));

@@ -6,9 +6,10 @@ public delegate ValueTask HttpRouteHandler(HttpRequestContext context, Cancellat
 /// <summary>
 /// Exact-path and prefix routes to delegates. Exact routes are tried first, then prefix routes from longest to
 /// shortest. A path that matches only routes for other methods yields <c>405</c> with an <c>Allow</c> header.
-/// <c>GET</c> routes also serve <c>HEAD</c>.
+/// <c>GET</c> routes also serve <c>HEAD</c>. Routes that read request bodies need <see cref="MaxRequestBodyBytes"/>
+/// raised (bodies are refused server-wide otherwise, ADR 0009).
 /// </summary>
-public sealed class RouteTable : IHttpHandler
+public sealed class RouteTable : IHttpBodyHandler
 {
     private struct Route
     {
@@ -25,14 +26,18 @@ public sealed class RouteTable : IHttpHandler
     /// <summary>Number of registered routes.</summary>
     public int Count => _exactCount + _prefixCount;
 
-    /// <summary>Registers an exact-path route. <paramref name="method"/> <see langword="null"/> matches every method.</summary>
+    /// <summary>Largest request body (bytes) the routes in this table accept; 0 (default) refuses bodies.</summary>
+    public long MaxRequestBodyBytes { get; set; }
+
+    /// <summary>Registers an exact-path route. <paramref name="method"/> <see langword="null"/> matches every method; the path <c>*</c> matches <c>OPTIONS *</c>.</summary>
     public RouteTable Map(string? method, string path, HttpRouteHandler handler)
     {
         ValidatePath(path);
         ArgumentNullException.ThrowIfNull(handler);
+        var route = new Route { Method = NormalizeMethod(method), Path = path, Handler = handler };
         if (_exactCount == _exact.Length)
             Array.Resize(ref _exact, _exact.Length * 2);
-        _exact[_exactCount++] = new Route { Method = NormalizeMethod(method), Path = path, Handler = handler };
+        _exact[_exactCount++] = route;
         return this;
     }
 
@@ -41,6 +46,7 @@ public sealed class RouteTable : IHttpHandler
     {
         ValidatePath(prefix);
         ArgumentNullException.ThrowIfNull(handler);
+        var route = new Route { Method = NormalizeMethod(method), Path = prefix, Handler = handler };
         if (_prefixCount == _prefix.Length)
             Array.Resize(ref _prefix, _prefix.Length * 2);
         // keep sorted by descending prefix length so the most specific prefix wins
@@ -50,7 +56,7 @@ public sealed class RouteTable : IHttpHandler
             _prefix[i] = _prefix[i - 1];
             i--;
         }
-        _prefix[i] = new Route { Method = NormalizeMethod(method), Path = prefix, Handler = handler };
+        _prefix[i] = route;
         _prefixCount++;
         return this;
     }
@@ -148,7 +154,7 @@ public sealed class RouteTable : IHttpHandler
     private static void ValidatePath(string path)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
-        if (path[0] != '/')
-            throw new ArgumentException("Route paths must start with '/'.", nameof(path));
+        if (path[0] != '/' && path != "*")
+            throw new ArgumentException("Route paths must start with '/' (or be '*' for OPTIONS *).", nameof(path));
     }
 }

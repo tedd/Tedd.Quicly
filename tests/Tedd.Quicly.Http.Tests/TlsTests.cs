@@ -316,6 +316,8 @@ public class TlsTests
             Assert.True(await raw.WaitForCloseAsync(TimeSpan.FromSeconds(10)));
         }
         await HttpServerTests.WaitUntilAsync(() => host.Server.ActiveConnections == 0);
+        Assert.Equal(4, host.Server.HandshakeFailures);
+        Assert.Equal(0, host.Server.RequestTimeouts);
     }
 
     [Fact]

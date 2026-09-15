@@ -25,10 +25,16 @@ internal sealed class TestHost : IAsyncDisposable
         IsSecure = secure;
     }
 
+    /// <summary>
+    /// Starts a server with test-friendly defaults: every common method allowed and a 1 MiB body budget. The ADR 0009
+    /// defaults (GET/HEAD only, no bodies) are covered by dedicated tests that build <see cref="HttpServerOptions"/> directly.
+    /// </summary>
     public static TestHost Start(Action<HttpServerOptions>? configure = null, HttpTlsOptions? tls = null)
     {
         var options = new HttpServerOptions();
         options.Listen(IPAddress.Loopback, 0, tls);
+        options.AllowMethods("POST", "PUT", "DELETE", "PATCH", "OPTIONS");
+        options.Limits.MaxRequestBodyBytes = 1024 * 1024;
         configure?.Invoke(options);
         var server = new HttpServer(options);
         server.Start();
@@ -84,7 +90,7 @@ internal sealed class RawClient : IDisposable
     }
 
     /// <summary>Reads one response (headers, then a Content-Length body if present) and returns it parsed.</summary>
-    public async Task<RawResponse> ReadResponseAsync(TimeSpan? timeout = null)
+    public async Task<RawResponse> ReadResponseAsync(TimeSpan? timeout = null, bool noBody = false)
     {
         using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromSeconds(15));
         var buffer = new byte[16 * 1024];
@@ -97,7 +103,11 @@ internal sealed class RawClient : IDisposable
                 var head = Encoding.Latin1.GetString(data.Span[..end]);
                 int consumed = end + 4;
                 var response = RawResponse.ParseHead(head);
-                if (response.ContentLength > 0)
+                if (noBody || response.StatusCode < 200 || response.StatusCode is 204 or 304)
+                {
+                    // HEAD responses and 1xx/204/304 carry no body whatever the framing headers say
+                }
+                else if (response.ContentLength > 0)
                 {
                     while (_buffered.Length - consumed < response.ContentLength)
                     {

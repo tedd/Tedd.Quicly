@@ -62,6 +62,8 @@ public sealed class FileCertificateSource : ICertificateSource, IDisposable
     private void Load()
     {
         var info = new FileInfo(_path);
+        if (!info.Exists)
+            throw new FileNotFoundException("Certificate file not found.", _path);
         var lastWrite = info.LastWriteTimeUtc;
         var cert = X509CertificateLoader.LoadPkcs12FromFile(_path, _password, X509KeyStorageFlags.Exportable);
         Volatile.Write(ref _current, cert);

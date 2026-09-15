@@ -68,6 +68,7 @@ public class ServerLifecycleTests
         Check(l => l.MaxRequestBodyBytes = -1);
         Check(l => l.MaxRequestBodyBytes = (long)int.MaxValue + 1);
         Check(l => l.MaxConnections = 0);
+        Check(l => l.MaxConnectionsPerAddress = 0);
         Check(l => l.MaxRequestsPerConnection = 0);
         Check(l => l.HeaderReadTimeout = TimeSpan.Zero);
         Check(l => l.KeepAliveTimeout = TimeSpan.FromSeconds(-1));

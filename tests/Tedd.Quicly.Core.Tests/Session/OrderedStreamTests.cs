@@ -32,6 +32,12 @@ public class OrderedStreamTests
         }
 
         server.Flush();
+
+        // The simulator refuses like MsQuic: the start is accepted; OnStreamStarted(StreamLimitReached), the canceled send and
+        // the shutdown follow at the next step.
+        Assert.Equal(ReliableOrderedEngine.StreamPhase.Starting, OrderedKit.Phase(server, 4));
+        h.Network.Advance(0);
+        server.Poll();
         Assert.Equal(ReliableOrderedEngine.StreamPhase.Blocked, OrderedKit.Phase(server, 4));
         Assert.Equal(3, OrderedKit.Stats(server, 4).QueuedMessages);
         Assert.Equal(0, OrderedKit.Stats(server, 4).Sent);
@@ -91,6 +97,37 @@ public class OrderedStreamTests
 
         Assert.Equal(2u, OrderedKit.StreamSerial(h.Client, 4));
         Assert.True(h.RunUntil(() => tokens.TrueForAll(token => h.Client.GetDeliveryStatus(token) == DeliveryStatus.Delivered)));
+    }
+
+    [Fact]
+    public void A_Start_Refused_Synchronously_Waits_For_Credit_And_Uses_A_New_Stream()
+    {
+        AsyncRefusalConnector? refusal = null;
+        using SessionHarness h = new(table: Table, connector: c => refusal = new AsyncRefusalConnector(c));
+        AsyncRefusalTransport transport = refusal!.Transport!;
+        transport.Synchronous = true;
+        transport.RefuseStarts = 1;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(4, Handlers.Collect(got));
+        for (int i = 0; i < 3; i++)
+        {
+            Assert.True(h.Client.SendCopy(new SendHeader(4), OrderedKit.Payload(i, 20)).IsAdmitted);
+        }
+
+        // The refused stream was released at once (it never started) and the messages stayed first in the queue.
+        h.Client.Flush();
+        Assert.Equal(ReliableOrderedEngine.StreamPhase.Blocked, OrderedKit.Phase(h.Client, 4));
+        Assert.Equal(3, OrderedKit.Stats(h.Client, 4).QueuedMessages);
+        h.Run(20_000);
+        Assert.Empty(got);
+        transport.GrantCredit();
+        Assert.True(h.RunUntil(() => got.Count == 3));
+        for (int i = 0; i < 3; i++)
+        {
+            Assert.Equal(OrderedKit.Payload(i, 20), got[i].Payload);
+        }
+
+        Assert.Equal(2u, OrderedKit.StreamSerial(h.Client, 4));
     }
 
     [Fact]
@@ -265,6 +302,8 @@ public class OrderedStreamTests
         QuiclyPeer server = h.Server!;
         SendToken token = server.SendCopy(new SendHeader(4), [1], SendOptions.Tracked).Token;
         server.Flush();
+        h.Network.Advance(0);
+        server.Poll();
         Assert.Equal(ReliableOrderedEngine.StreamPhase.Blocked, OrderedKit.Phase(server, 4));
         server.Close();
         Assert.True(h.RunUntilClosed());

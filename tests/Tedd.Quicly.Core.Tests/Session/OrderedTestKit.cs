@@ -120,6 +120,9 @@ internal sealed unsafe class AsyncRefusalTransport(ITransport inner, ITransportS
     /// <summary>Starts of engine streams to refuse.</summary>
     public int RefuseStarts { get; set; }
 
+    /// <summary>Refuse synchronously instead: the send returns StreamLimitReached and nothing follows for the stream.</summary>
+    public bool Synchronous { get; set; }
+
     public int Refused { get; private set; }
 
     public int PendingRefusals => _refused.Count;
@@ -166,6 +169,11 @@ internal sealed unsafe class AsyncRefusalTransport(ITransport inner, ITransportS
         {
             RefuseStarts--;
             Refused++;
+            if (Synchronous)
+            {
+                return TransportStatus.StreamLimitReached;
+            }
+
             _refused.Add((id, open, context));
             return TransportStatus.Success;
         }

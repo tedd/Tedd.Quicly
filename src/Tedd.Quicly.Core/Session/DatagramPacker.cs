@@ -181,6 +181,15 @@ internal sealed unsafe class DatagramPacker
     }
 
     /// <summary>
+    /// Hands what the packer holds (the open container, the held message) to the transport now, in the middle of a pass
+    /// (game thread). A stream engine calls it before its own stream sends, so datagrams of channels the scheduler reached
+    /// earlier (higher priority) leave first instead of queueing behind stream data, which matters with
+    /// <see cref="TransportSendFlags.CancelOnBlocked"/>. Messages added later in the pass start a new container.
+    /// </summary>
+    /// <param name="flush">The pass.</param>
+    public void SubmitPending(ref FlushContext flush) => Finish(ref flush);
+
+    /// <summary>
     /// The completion of a container entry (game thread, from the completion routing): the early Sent notice returns the
     /// container's lease (the transport no longer needs the bytes; the slot stays reserved until the final state, ADR 0008
     /// invariant 1) and, when a member is tracked, passes the notice on; the final completion goes to every member's owner

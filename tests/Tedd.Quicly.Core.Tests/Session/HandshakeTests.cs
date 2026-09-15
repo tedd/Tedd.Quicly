@@ -299,10 +299,19 @@ public class HandshakeTests
     public void Stream_Limits_Are_Raised_Only_After_Admission()
     {
         using ServerHarness h = new();
+
+        // Before admission the client has no unidirectional credit: the start is refused (asynchronously, like MsQuic).
         Assert.Equal(TransportStatus.Success, h.Raw.Transport.OpenStream(StreamKind.Unidirectional, 3, 1, out TransportStreamId early));
-        Assert.Equal(TransportStatus.StreamLimitReached, h.Raw.Transport.StartStream(early));
-        Assert.True(h.Admit());
         Assert.Equal(TransportStatus.Success, h.Raw.Transport.StartStream(early));
+        Assert.True(h.RunUntil(() => h.Raw.Sink.OfKind(RecordedEventKind.StreamStarted).Any(e => e.StreamId == early)));
+        Assert.Equal(TransportStatus.StreamLimitReached, h.Raw.Sink.OfKind(RecordedEventKind.StreamStarted).First(e => e.StreamId == early).Status);
+        Assert.True(h.Admit());
+
+        // After admission a new stream starts.
+        Assert.Equal(TransportStatus.Success, h.Raw.Transport.OpenStream(StreamKind.Unidirectional, 4, 1, out TransportStreamId late));
+        Assert.Equal(TransportStatus.Success, h.Raw.Transport.StartStream(late));
+        Assert.True(h.RunUntil(() => h.Raw.Sink.OfKind(RecordedEventKind.StreamStarted).Any(e => e.StreamId == late)));
+        Assert.Equal(TransportStatus.Success, h.Raw.Sink.OfKind(RecordedEventKind.StreamStarted).First(e => e.StreamId == late).Status);
     }
 }
 

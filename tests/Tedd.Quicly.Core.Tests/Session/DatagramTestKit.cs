@@ -51,6 +51,7 @@ internal static class DatagramKit
     public static SimulatedTransport TransportOf(QuiclyPeer peer) => peer.Core.Transport switch
     {
         FlagRecordingTransport recording => (SimulatedTransport)recording.Inner,
+        AsyncRefusalTransport refusal => (SimulatedTransport)refusal.Inner,
         ITransport transport => (SimulatedTransport)transport,
         _ => throw new InvalidOperationException("The peer has no transport."),
     };
@@ -142,7 +143,22 @@ internal sealed unsafe class FlagRecordingTransport(ITransport inner) : ITranspo
 
     public int Refused { get; private set; }
 
-    public TransportCapabilities Capabilities => inner.Capabilities;
+    /// <summary>When set, the <see cref="TransportCapabilities.CancelOnBlocked"/> this transport reports (the simulator's own is true).</summary>
+    public bool? CancelOnBlocked { get; set; }
+
+    public TransportCapabilities Capabilities
+    {
+        get
+        {
+            TransportCapabilities capabilities = inner.Capabilities;
+            if (CancelOnBlocked is { } honoured)
+            {
+                capabilities.CancelOnBlocked = honoured;
+            }
+
+            return capabilities;
+        }
+    }
 
     public TransportState State => inner.State;
 
@@ -195,13 +211,60 @@ internal sealed unsafe class FlagRecordingTransport(ITransport inner) : ITranspo
     public void Dispose() => inner.Dispose();
 }
 
-/// <summary>Wraps the transports of a connector in <see cref="FlagRecordingTransport"/>.</summary>
-internal sealed class FlagRecordingConnector(ITransportConnector inner) : ITransportConnector
+/// <summary>
+/// Wraps the transports of a connector in <see cref="FlagRecordingTransport"/>. With <paramref name="cancelOnBlocked"/> the
+/// transport reports that <see cref="TransportCapabilities.CancelOnBlocked"/> instead of its own, at connect too.
+/// </summary>
+internal sealed class FlagRecordingConnector(ITransportConnector inner, bool? cancelOnBlocked = null) : ITransportConnector
 {
     public FlagRecordingTransport? Transport { get; private set; }
 
-    public ITransport Connect(EndPoint endpoint, string? serverName, ITransportSink sink) =>
-        Transport = new FlagRecordingTransport(inner.Connect(endpoint, serverName, sink));
+    public ITransport Connect(EndPoint endpoint, string? serverName, ITransportSink sink)
+    {
+        ITransportSink target = cancelOnBlocked is { } honoured ? new CapabilityPatchingSink(sink, honoured) : sink;
+        Transport = new FlagRecordingTransport(inner.Connect(endpoint, serverName, target)) { CancelOnBlocked = cancelOnBlocked };
+        return Transport;
+    }
+}
+
+/// <summary>Forwards every callback, reporting a chosen <see cref="TransportCapabilities.CancelOnBlocked"/> at connect.</summary>
+internal sealed class CapabilityPatchingSink(ITransportSink inner, bool cancelOnBlocked) : ITransportSink
+{
+    public void OnConnected(in TransportConnectedInfo info)
+    {
+        TransportConnectedInfo patched = info;
+        patched.Capabilities.CancelOnBlocked = cancelOnBlocked;
+        inner.OnConnected(in patched);
+    }
+
+    public void OnDatagramReceived(ReadOnlySpan<byte> payload) => inner.OnDatagramReceived(payload);
+
+    public void OnPeerStreamStarted(TransportStreamId id, StreamKind kind) => inner.OnPeerStreamStarted(id, kind);
+
+    public void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status) => inner.OnStreamStarted(id, context, status);
+
+    public ReceiveResult OnStreamReceived(TransportStreamId id, ReadOnlySpan<TransportSegment> segments, ulong absoluteOffset, bool fin) =>
+        inner.OnStreamReceived(id, segments, absoluteOffset, fin);
+
+    public void OnStreamSendCompleted(TransportStreamId id, ulong context, bool canceled) => inner.OnStreamSendCompleted(id, context, canceled);
+
+    public void OnDatagramSendStateChanged(ulong context, DatagramSendState state) => inner.OnDatagramSendStateChanged(context, state);
+
+    public void OnStreamAborted(TransportStreamId id, ulong errorCode, StreamAbortDirection direction) => inner.OnStreamAborted(id, errorCode, direction);
+
+    public void OnStreamPeerSendShutdown(TransportStreamId id) => inner.OnStreamPeerSendShutdown(id);
+
+    public void OnStreamShutdownComplete(TransportStreamId id) => inner.OnStreamShutdownComplete(id);
+
+    public void OnDatagramCapabilityChanged(bool enabled, int maxPayload) => inner.OnDatagramCapabilityChanged(enabled, maxPayload);
+
+    public void OnIdealSendBufferSize(TransportStreamId id, ulong bytes) => inner.OnIdealSendBufferSize(id, bytes);
+
+    public void OnStreamsAvailable(ushort bidirectional, ushort unidirectional) => inner.OnStreamsAvailable(bidirectional, unidirectional);
+
+    public void OnPeerAddressChanged(in TransportConnectedInfo info) => inner.OnPeerAddressChanged(in info);
+
+    public void OnClosed(TransportCloseReason reason, ulong errorCode, int transportStatus) => inner.OnClosed(reason, errorCode, transportStatus);
 }
 
 /// <summary>Memory that is not backed by an array (a borrowed send of it is copied, not pinned).</summary>

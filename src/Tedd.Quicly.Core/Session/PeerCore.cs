@@ -83,6 +83,7 @@ internal sealed unsafe class PeerCore : IDisposable
     private volatile int _maxDatagramPayload;
     private volatile bool _datagramsEnabled;
     private volatile bool _datagramStatesReported;
+    private volatile bool _cancelOnBlocked;
     private volatile bool _admitted;
     private volatile bool _transportClosing;
     private volatile bool _transportClosed;
@@ -570,6 +571,16 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>Records whether the transport reports datagram send states (transport thread, at connect).</summary>
     /// <param name="reported">The capability.</param>
     public void SetDatagramStatesReported(bool reported) => _datagramStatesReported = reported;
+
+    /// <summary>
+    /// Records whether the transport honours <see cref="TransportSendFlags.CancelOnBlocked"/> (transport thread: at connect and
+    /// whenever the datagram capability changes).
+    /// </summary>
+    /// <param name="honoured">The capability (<see cref="TransportCapabilities.CancelOnBlocked"/>).</param>
+    public void SetCancelOnBlocked(bool honoured) => _cancelOnBlocked = honoured;
+
+    /// <summary>The transport honours <see cref="TransportSendFlags.CancelOnBlocked"/> (any thread).</summary>
+    public bool CancelOnBlockedHonoured => _cancelOnBlocked;
 
     /// <summary>The peer raised our stream limits (transport thread).</summary>
     public void NoteStreamCredit() => Interlocked.Increment(ref _streamCredit);

@@ -143,6 +143,7 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
             ref OrderedSendState send = ref _send[local];
             send.QueueHead = -1;
             send.QueueTail = -1;
+            send.StartCarrier = -1;
         }
 
         _carrierReserve = count + 1;
@@ -401,7 +402,12 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
         long oldest = long.MaxValue;
         for (int local = 0; local < _channels.Length; local++)
         {
-            int head = _send[local].QueueHead;
+            ref OrderedSendState send = ref _send[local];
+
+            // A carrier whose start is unconfirmed may still come back (a refused start): its messages count as queued.
+            int head = send.StartCarrier >= 0 && send.Phase is StreamPhase.Starting or StreamPhase.Refused
+                ? _core.Entries.BatchHead[send.StartCarrier]
+                : send.QueueHead;
             if (head >= 0)
             {
                 long stamp = _core.GetAdmissionStamp(head);
@@ -635,6 +641,8 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
             flags |= TransportSendFlags.Priority;
         }
 
+        // Datagrams the scheduler handed to the packer earlier in this pass (channels of higher priority) leave first.
+        _core.Packer.SubmitPending(ref flush);
         TransportStatus status = _core.SubmitStream(send.Stream, segments, used, carrier, flags);
         if (status != TransportStatus.Success)
         {
@@ -662,6 +670,7 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
         if (opening)
         {
             send.Phase = StreamPhase.Starting;
+            send.StartCarrier = carrier;
         }
 
         counters.Sent += members;
@@ -720,6 +729,11 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
         if (current)
         {
             send.CarriersOutstanding--;
+        }
+
+        if (send.StartCarrier == carrier)
+        {
+            send.StartCarrier = -1;
         }
 
         _core.Segments.Free((int)carrierEntry.Aux0);
@@ -854,6 +868,7 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
                     if (send.Phase == StreamPhase.Starting)
                     {
                         send.Phase = StreamPhase.Open;
+                        send.StartCarrier = -1;
                     }
 
                     break;
@@ -1148,6 +1163,9 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
 
         /// <summary>Lifecycle of the send stream.</summary>
         [FieldOffset(52)] public StreamPhase Phase;
+
+        /// <summary>The carrier that carried <see cref="TransportSendFlags.Start"/> while the start is unconfirmed, else -1.</summary>
+        [FieldOffset(56)] public int StartCarrier;
     }
 
     /// <summary>Receive-side state of one ordered channel: one cache line, native memory, transport thread only.</summary>

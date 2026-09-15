@@ -209,41 +209,65 @@ public class OrderedDeliveryTests
     [Fact]
     public void Movement_Datagrams_Keep_Flowing_While_A_Large_Ordered_Transfer_Runs()
     {
-        LinkOptions link = new() { DelayMicros = 20_000, BandwidthBitsPerSecond = 8_000_000, StreamReceiveWindowBytes = 64 * 1024 };
-        using SessionHarness h = new(link: link, table: Table, client: o => { OrderedKit.Roomy(o); DatagramKit.Quiet(o); }, server: OrderedKit.Roomy);
+        // DropWhenBlocked is on (the simulator honours CancelOnBlocked): a datagram that meets a busy link is dropped. The send
+        // cap keeps the transfer below the link rate, and within a pass the scheduler hands the tick's movement datagram to
+        // the transport before the ordered channel's stream data, so movement never waits behind the transfer.
+        LinkOptions link = new() { DelayMicros = 20_000, BandwidthBitsPerSecond = 8_000_000 };
+        using SessionHarness h = new(link: link, table: Table, server: OrderedKit.Roomy, client: o =>
+        {
+            OrderedKit.Roomy(o);
+            DatagramKit.Quiet(o);
+            o.MaxSendBytesPerSecond = 500_000;
+        });
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        const int Blocks = 2_048;
         int ordered = 0;
         int moves = 0;
         long worstLatency = 0;
-        h.Server!.RegisterHandler(4, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => ordered++);
-        h.Server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader header, ReadOnlySpan<byte> payload) =>
+        server.RegisterHandler(4, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => ordered++);
+        server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader header, ReadOnlySpan<byte> payload) =>
         {
             worstLatency = Math.Max(worstLatency, header.ReceivedMicros - BitConverter.ToInt64(payload));
             moves++;
         });
-        byte[] block = OrderedKit.Payload(3, 32 * 1024);
+        byte[] block = OrderedKit.Payload(3, 1_024);
         byte[] move = new byte[40];
         int queued = 0;
         int movesSent = 0;
-        for (int tick = 0; tick < 240; tick++)
+        uint tick = 0;
+        for (int i = 0; i < 180; i++)
         {
-            // 2 MiB of ordered data, queued as fast as the channel takes it; one movement datagram per 60 Hz tick.
-            while (queued < 64 && h.Client.SendCopy(new SendHeader(4), block).IsAdmitted)
+            // 2 MiB of ordered data queued as fast as the channel takes it, one movement datagram per 60 Hz tick, one flush per tick.
+            while (queued < Blocks && client.SendCopy(new SendHeader(4), block).IsAdmitted)
             {
                 queued++;
             }
 
             BitConverter.TryWriteBytes(move, h.Clock.NowMicros);
-            if (h.Client.SendCopy(new SendHeader(2), move).IsAdmitted)
+            if (client.SendCopy(new SendHeader(2), move).IsAdmitted)
             {
                 movesSent++;
             }
 
-            h.Run(16_667);
+            client.Flush(++tick);
+            for (int ms = 0; ms < 16; ms++)
+            {
+                h.Network.Advance(1_000);
+                server.Poll();
+                server.Flush();
+                client.Poll();
+            }
+
+            h.Network.Advance(667);
+            server.Poll();
+            server.Flush();
+            client.Poll();
         }
 
-        Assert.True(ordered < 64, "the transfer was still running while the movement flowed");
+        Assert.InRange(ordered, Blocks / 3, Blocks - 1);
         Assert.True(moves >= movesSent * 95 / 100, $"{moves} of {movesSent} movement datagrams arrived");
-        Assert.True(worstLatency < 40_000, $"worst movement latency {worstLatency} µs");
-        Assert.True(h.RunUntil(() => ordered == 64, 30_000_000));
+        Assert.True(worstLatency < 30_000, $"worst movement latency {worstLatency} µs");
+        Assert.True(h.RunUntil(() => ordered == Blocks, 30_000_000));
     }
 }

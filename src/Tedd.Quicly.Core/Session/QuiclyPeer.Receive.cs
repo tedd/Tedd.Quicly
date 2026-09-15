@@ -64,6 +64,7 @@ public sealed unsafe partial class QuiclyPeer
 
         _core.SetDatagramCapability(info.Capabilities.Datagrams, info.Capabilities.MaxDatagramPayload);
         _core.SetDatagramStatesReported(info.Capabilities.DatagramSendState);
+        _core.SetCancelOnBlocked(info.Capabilities.CancelOnBlocked);
         Signal(SignalConnected);
     }
 
@@ -1109,9 +1110,23 @@ public sealed unsafe partial class QuiclyPeer
 
         public void OnDatagramCapabilityChanged(bool enabled, int maxPayload)
         {
-            if (!peer.IsFreed)
+            if (peer.IsFreed)
+            {
+                return;
+            }
+
+            try
             {
                 peer._core.SetDatagramCapability(enabled, maxPayload);
+                if (peer._core.Transport is { } transport)
+                {
+                    // Read again with every change of the datagram capability (a client learns it at OnConnected otherwise).
+                    peer._core.SetCancelOnBlocked(transport.Capabilities.CancelOnBlocked);
+                }
+            }
+            catch (Exception exception)
+            {
+                peer.OnCallbackFault(exception);
             }
         }
 

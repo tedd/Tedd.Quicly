@@ -308,13 +308,12 @@ public sealed unsafe partial class QuiclyPeer
     /// <summary>
     /// PROTOCOL.md §4.5 <c>DropWhenBlocked</c>: unreliable datagrams go out with <see cref="TransportSendFlags.CancelOnBlocked"/>
     /// (a datagram the transport cannot send at once is dropped and completes <c>Expired</c> instead of queueing behind
-    /// congestion) only when the transport reports that it honours the flag. That report is
-    /// <c>TransportCapabilities.CancelOnBlocked</c>, added by the MsQuic transport wave (branch quicly/c3-msquic-transport)
-    /// and not on main yet, so this answers <see langword="false"/> and blocked datagrams are queued by the transport. When
-    /// the field lands: record it in <see cref="PeerCore"/> at <c>OnConnected</c> and return it here; nothing else changes.
+    /// congestion) only when the transport reports that it honours the flag: <see cref="TransportCapabilities.CancelOnBlocked"/>,
+    /// recorded in <see cref="PeerCore"/> at <c>OnConnected</c> and whenever the datagram capability changes. Otherwise
+    /// blocked datagrams are queued by the transport.
     /// </summary>
     /// <returns>Whether unreliable datagrams may carry <see cref="TransportSendFlags.CancelOnBlocked"/>.</returns>
-    private bool TransportHonoursCancelOnBlocked() => false;
+    private bool TransportHonoursCancelOnBlocked() => _core.CancelOnBlockedHonoured;
 
     private void UpdateNextDeadline(long timerDeadline)
     {

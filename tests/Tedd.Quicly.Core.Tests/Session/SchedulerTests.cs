@@ -316,7 +316,7 @@ public class SchedulerTests
     {
         FlagRecordingConnector? recorder = null;
         using SessionHarness h = new(table: Table, client: DatagramKit.Quiet, server: DatagramKit.Quiet,
-            connector: c => recorder = new FlagRecordingConnector(c));
+            connector: c => recorder = new FlagRecordingConnector(c, cancelOnBlocked: false));
         FlagRecordingTransport transport = recorder!.Transport!;
         transport.Datagrams.Clear();
         h.Client.SendCopy(new SendHeader(2), [1]);
@@ -340,6 +340,63 @@ public class SchedulerTests
         ];
         Assert.Equal(expected, transport.Datagrams.Select(d => d.Flags).ToArray());
         Assert.DoesNotContain(transport.Datagrams, d => (d.Flags & (TransportSendFlags.DelaySend | TransportSendFlags.CancelOnBlocked)) != 0);
+    }
+
+    [Fact]
+    public void Unreliable_Datagrams_Carry_CancelOnBlocked_When_The_Transport_Honours_It()
+    {
+        FlagRecordingConnector? recorder = null;
+        using SessionHarness h = new(table: Table, client: DatagramKit.Quiet, server: DatagramKit.Quiet,
+            connector: c => recorder = new FlagRecordingConnector(c, cancelOnBlocked: true));
+        FlagRecordingTransport transport = recorder!.Transport!;
+        transport.Datagrams.Clear();
+        h.Client.SendCopy(new SendHeader(2), [1]);
+        h.Client.Flush();
+        h.Client.SendCopy(new SendHeader(7), [1]);
+        h.Client.Flush();
+        h.Client.SendCopy(new SendHeader(2), [1], SendOptions.Immediate);
+        TransportSendFlags[] expected =
+        [
+            TransportSendFlags.CancelOnBlocked,
+            TransportSendFlags.CancelOnBlocked | TransportSendFlags.Priority,
+            TransportSendFlags.CancelOnBlocked | TransportSendFlags.Priority,
+        ];
+        Assert.Equal(expected, transport.Datagrams.Select(d => d.Flags).ToArray());
+    }
+
+    [Fact]
+    public void A_Datagram_That_Meets_A_Busy_Link_Is_Dropped_As_Expired_When_The_Transport_Honours_CancelOnBlocked()
+    {
+        // The simulator honours the flag: a datagram that finds the serializer busy is canceled instead of queued.
+        using SessionHarness h = new(link: new LinkOptions { BandwidthBitsPerSecond = 1_000_000 }, table: Table,
+            client: DatagramKit.Quiet, server: DatagramKit.Quiet);
+        Assert.True(h.Client.Core.CancelOnBlockedHonoured);
+
+        // Let the handshake's last control datagram leave the serializer first.
+        h.Run(10_000);
+        SendToken first = h.Client.SendCopy(new SendHeader(2), new byte[1_000], SendOptions.Tracked).Token;
+        h.Client.Flush();
+        SendToken second = h.Client.SendCopy(new SendHeader(2), new byte[1_000], SendOptions.Tracked).Token;
+        h.Client.Flush();
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(first) != DeliveryStatus.Pending && h.Client.GetDeliveryStatus(second) != DeliveryStatus.Pending));
+        Assert.Equal(DeliveryStatus.Delivered, h.Client.GetDeliveryStatus(first));
+        Assert.Equal(DeliveryStatus.Expired, h.Client.GetDeliveryStatus(second));
+    }
+
+    [Fact]
+    public void A_Transport_Without_CancelOnBlocked_Queues_The_Datagram_Behind_A_Busy_Link()
+    {
+        FlagRecordingConnector? recorder = null;
+        using SessionHarness h = new(link: new LinkOptions { BandwidthBitsPerSecond = 1_000_000 }, table: Table,
+            client: DatagramKit.Quiet, server: DatagramKit.Quiet, connector: c => recorder = new FlagRecordingConnector(c, cancelOnBlocked: false));
+        Assert.False(h.Client.Core.CancelOnBlockedHonoured);
+        SendToken first = h.Client.SendCopy(new SendHeader(2), new byte[1_000], SendOptions.Tracked).Token;
+        h.Client.Flush();
+        SendToken second = h.Client.SendCopy(new SendHeader(2), new byte[1_000], SendOptions.Tracked).Token;
+        h.Client.Flush();
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(second) != DeliveryStatus.Pending));
+        Assert.Equal(DeliveryStatus.Delivered, h.Client.GetDeliveryStatus(first));
+        Assert.Equal(DeliveryStatus.Delivered, h.Client.GetDeliveryStatus(second));
     }
 
     [Fact]

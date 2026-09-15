@@ -644,11 +644,7 @@ public class CompletionTableTests
         var table = new CompletionTable(8);
         RunLoop(table, 10_000);
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        RunLoop(table, 100_000);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() => RunLoop(table, 20_000));
 
         static void RunLoop(CompletionTable table, int iterations)
         {
@@ -712,14 +708,16 @@ public class CompletionTableTests
             while (Environment.TickCount64 - warmupStart < 500)
                 RunLoop(table, awaiter, remoteAwaiter, ref pendingToken, 1_000);
 
-            long before = GC.GetAllocatedBytesForCurrentThread();
-            RunLoop(table, awaiter, remoteAwaiter, ref pendingToken, 20_000);
-            long after = GC.GetAllocatedBytesForCurrentThread();
+            try
+            {
+                WindowedAllocation.AssertNone(() => RunLoop(table, awaiter, remoteAwaiter, ref pendingToken, 4_000));
+            }
+            finally
+            {
+                Volatile.Write(ref stop, true);
+                transport.Join();
+            }
 
-            Volatile.Write(ref stop, true);
-            transport.Join();
-
-            Assert.Equal(0, after - before);
             Assert.Equal(8, table.Available);
         }
         finally

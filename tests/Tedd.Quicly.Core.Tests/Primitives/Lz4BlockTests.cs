@@ -672,10 +672,7 @@ public class Lz4BlockTests
         int sink = 0;
 
         Run(input, compressed, output, scratch, ref sink);
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        Run(input, compressed, output, scratch, ref sink);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() => Run(input, compressed, output, scratch, ref sink));
         Assert.NotEqual(0, sink);
 
         static void Run(byte[] input, byte[] compressed, byte[] output, int[] scratch, ref int sink)

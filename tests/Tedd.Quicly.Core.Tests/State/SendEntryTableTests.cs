@@ -510,10 +510,7 @@ public unsafe class SendEntryTableTests
         using var table = new SendEntryTable(64);
         RunLoop(table, 1_000);
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        RunLoop(table, 100_000);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() => RunLoop(table, 20_000));
 
         static void RunLoop(SendEntryTable table, int iterations)
         {

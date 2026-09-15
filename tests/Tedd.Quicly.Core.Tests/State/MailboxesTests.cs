@@ -170,10 +170,7 @@ public class MailboxesTests
         using var mailboxes = new Mailboxes(4096);
         int[] buffer = new int[256];
         Run(mailboxes, buffer, 1_000);
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        Run(mailboxes, buffer, 100_000);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() => Run(mailboxes, buffer, 20_000));
 
         static int Run(Mailboxes mailboxes, int[] buffer, int iterations)
         {

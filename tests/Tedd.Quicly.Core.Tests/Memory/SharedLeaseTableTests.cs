@@ -115,9 +115,19 @@ public class SharedLeaseTableTests
         long after = GC.GetAllocatedBytesForCurrentThread();
         Assert.True(after - before >= 12 * SharedLeaseTable.CounterStrideBytes, $"table allocated only {after - before} bytes");
 
-        // Adjacent blocks have independent counters.
-        Assert.True(allocator.TryRent(1, out BufferLease a));
-        Assert.True(allocator.TryRent(1, out BufferLease b));
+        // Adjacent blocks have independent counters. Which blocks a thread gets first depends on its free-list shard, so
+        // rent the whole class, keep blocks 0 and 1 and return the rest.
+        BufferLease[] all = new BufferLease[8];
+        for (int i = 0; i < all.Length; i++)
+            Assert.True(allocator.TryRent(1, out all[i]));
+        BufferLease a = Array.Find(all, lease => lease.BlockIndex == 0);
+        BufferLease b = Array.Find(all, lease => lease.BlockIndex == 1);
+        for (int i = 0; i < all.Length; i++)
+        {
+            if (all[i].BlockIndex > 1)
+                allocator.Return(in all[i]);
+        }
+
         Assert.Equal(1, Math.Abs(a.BlockIndex - b.BlockIndex));
         SharedLease sa = table.Share(a, 3);
         SharedLease sb = table.Share(b, 5);

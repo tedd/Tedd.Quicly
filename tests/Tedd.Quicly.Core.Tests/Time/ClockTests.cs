@@ -34,12 +34,12 @@ public class ClockTests
         for (int i = 0; i < 1000; i++)
             sink += clock.NowMicros;
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 100_000; i++)
-            sink += clock.NowMicros;
-        long after = GC.GetAllocatedBytesForCurrentThread();
+        WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 20_000; i++)
+                sink += clock.NowMicros;
+        });
 
-        Assert.Equal(0, after - before);
         Assert.True(sink > 0);
     }
 

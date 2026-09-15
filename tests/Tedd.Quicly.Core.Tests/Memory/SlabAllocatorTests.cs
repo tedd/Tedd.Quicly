@@ -450,25 +450,45 @@ public unsafe class SlabAllocatorTests
         for (int i = 0; i < 1_000; i++)
             RentWriteReturn(allocator);
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 100_000; i++)
-            RentWriteReturn(allocator);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        // Measured in windows like the other zero-allocation tests: a one-off runtime event on this thread (tier-up or
+        // OSR compilation landing inside a window, observed on .NET 11 previews) does not repeat, while a steady-state
+        // allocation shows up in every window.
+        const int windows = 5;
+        long[] deltas = new long[windows];
+        int allocating = 0;
+        for (int window = 0; window < windows; window++)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 20_000; i++)
+                RentWriteReturn(allocator);
+            deltas[window] = GC.GetAllocatedBytesForCurrentThread() - before;
+            if (deltas[window] != 0)
+                allocating++;
+        }
+
+        Assert.True(allocating <= 1, $"Rent/return allocated in {allocating} of {windows} windows: {string.Join(", ", deltas)} bytes per 20000 calls.");
 
         // Statistics snapshots are allocation-free too (asserting inside the loop would allocate in xunit).
         long rentedSum = 0;
         long capacitySum = 0;
-        before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 10_000; i++)
+        allocating = 0;
+        for (int window = 0; window < windows; window++)
         {
-            SlabStatistics stats = allocator.GetStatistics();
-            rentedSum += stats[0].Rented;
-            SizeClassStatistics one = allocator.GetClassStatistics(1);
-            capacitySum += one.Capacity;
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 2_000; i++)
+            {
+                SlabStatistics stats = allocator.GetStatistics();
+                rentedSum += stats[0].Rented;
+                SizeClassStatistics one = allocator.GetClassStatistics(1);
+                capacitySum += one.Capacity;
+            }
+
+            deltas[window] = GC.GetAllocatedBytesForCurrentThread() - before;
+            if (deltas[window] != 0)
+                allocating++;
         }
-        after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+
+        Assert.True(allocating <= 1, $"Statistics allocated in {allocating} of {windows} windows: {string.Join(", ", deltas)} bytes per 2000 calls.");
         Assert.Equal(0, rentedSum);
         Assert.Equal(40_000, capacitySum);
     }

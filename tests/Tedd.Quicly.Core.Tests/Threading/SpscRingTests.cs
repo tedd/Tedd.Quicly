@@ -137,11 +137,7 @@ public class SpscRingTests
         var ring = new SpscRing<long>(64);
         RunLoop(ring, 10_000);
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        RunLoop(ring, 100_000);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() => RunLoop(ring, 20_000));
 
         static void RunLoop(SpscRing<long> ring, int iterations)
         {

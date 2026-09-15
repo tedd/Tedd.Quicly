@@ -134,7 +134,14 @@ the game thread in Poll/Flush. Game → transport thread: `PeerCore.IsAdmitted` 
 publishes admission). Transport-thread code calls only `AbortStream`, `CloseStream` (after shutdown complete) and `SendDatagram`
 (Pong); never `Close`. Every `Sink` callback is wrapped: an exception is counted (`CallbackFaults`), kept (`LastCallbackFault`)
 and turned into a queued `InternalError` close (`PeerOptions.FailFastOnCallbackException` → `Environment.FailFast`). After the
-transport's `OnClosed` no callback runs; `Dispose` frees native memory then (or at once if it already happened).
+transport's `OnClosed` no callback runs.
+
+**Lifetime.** Native memory (tables, rings, the private allocator) is freed exactly once, by whichever step completes the
+lifetime word: close seen (the `Sink` sets it in the `finally` of `OnClosed`; `Dispose` sets it for a peer that never got a
+transport), dispose requested (`Dispose`, which also closes and disposes the transport) and no game-thread call in progress (a bit
+held from the outermost `Poll`/`Flush` entry to its exit, handler re-entry included). `Dispose` may therefore run inside a
+`StateChanged` or receive handler: the memory stays valid until that `Poll` returns. After `Dispose`, `Release` is a no-op,
+statistics and `Capabilities` read as default, and callbacks that still arrive are ignored (`IsFreed`).
 
 ### 4.1 Send path (game thread)
 
@@ -183,6 +190,8 @@ slot's context. Both publish before the call; on a failed call the entry is back
   * Events ⇒ `engine.OnStreamMessage(ref StreamMessageContext)` (`Start`, `Chunk`, `End`, `BulkHeader`) → `Continue`, `Pend` (the
     parser is restored to its snapshot before the event, the call returns `PendingAfter(bytes before the event)`, the stream id goes to
     `PendedStreams` and Poll calls `ResumeStreamReceive(id, 0)`), `ResetStream(code)` or `CloseConnection(code)`.
+    The context (`Chunk`, `Header`, `Bulk` and the `Cookie` ref) is valid only during the call (the peer declares it `scoped`);
+    copy what you keep.
   * A parser error or a FIN inside a message: ordered stream ⇒ connection `ProtocolViolation`; group/bulk ⇒ reset `ProtocolViolation`.
     The owning engine gets `OnStreamClosed` exactly once per accepted stream (reset by either side, error, or shutdown complete);
     events of locally opened streams (peer STOP_SENDING, shutdown complete) are broadcast to every engine. `CloseStream` follows
@@ -302,7 +311,7 @@ Notes for session-layer tests over the simulator:
 ## 6. Tests that must exist (Core)
 
 Framing: every header shape, every ParseStatus, container rules, non-minimal varints. Channels: validation matrix, hash stability
-vectors. State: KeyTable (insert/find/remove/backward shift/grow/dense), mailboxes concurrency, NativeArray. Session over
+vectors. State: KeyTable (insert/find/remove/backward shift/grow/dense), mailboxes concurrency, NativeArray, SegmentArena. Session over
 SimulatedTransport: handshake (accept/reject/timeout/table mismatch/datagrams required), every mode end to end, coalescing on/off,
 key reuse after RetireKey, ReliableLatest lost final update / lost ack / rollover / retry budget / large value stream supersede,
 fragmentation loss, expiry under a bandwidth cap, group streams with a stream limit of 1, bulk transfer with resume, request/response
@@ -311,7 +320,10 @@ with timeout, ring overflow policies, ping/RTT/offset, close/epoch/reconnect res
 The peer-core tests live in `tests/Tedd.Quicly.Core.Tests/Session/`: `SessionTestKit.cs` (fixtures: `SessionHarness` peer↔peer,
 `ServerHarness` peer server + `RawClient`, `ClientHarness` peer client + raw server, `Frames` builders, `TestEngine` exercising every
 engine seam, `OffsetClock`, `AllocationAssert`), `HandshakeTests`, `CloseTests`, `PingTests`, `PlumbingTests`,
-`SessionZeroAllocationTests`, `SessionUnitTests`.
+`SessionZeroAllocationTests`, `SessionUnitTests` (fake-transport tests of the support types) and `SessionEdgeTests` (control
+frames assembled across packets, engine-bound control routing, control-stream aborts, input after a violation, data on a reset
+stream, stream pong limits, bulk headers, engine faults in stream callbacks, drain paths, `Dispose` from a handler, callbacks after
+the peer was freed).
 
 ## 7. Engine boundary and implementation waves
 

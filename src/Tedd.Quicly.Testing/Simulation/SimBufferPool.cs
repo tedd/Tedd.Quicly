@@ -11,6 +11,10 @@ namespace Tedd.Quicly.Testing.Simulation;
 internal sealed class SimBufferPool
 {
     private const int MinShift = 6;
+
+    /// <summary>Largest array the pool hands out (1 GiB, the largest power of two an <c>int</c> length can hold).</summary>
+    public const int MaxLength = 1 << 30;
+
     private readonly Stack<byte[]>[] _buckets = new Stack<byte[]>[31 - MinShift];
 
     public SimBufferPool()
@@ -26,8 +30,11 @@ internal sealed class SimBufferPool
         return 32 - BitOperations.LeadingZeroCount((uint)length - 1) - MinShift;
     }
 
+    /// <exception cref="InsufficientMemoryException"><paramref name="minimumLength"/> is more than <see cref="MaxLength"/>.</exception>
     public byte[] Rent(int minimumLength)
     {
+        if ((uint)minimumLength > MaxLength)
+            throw new InsufficientMemoryException($"The simulator buffers at most {MaxLength} bytes per send or per stream receive buffer; {minimumLength} requested.");
         int bucket = BucketOf(minimumLength);
         if (_buckets[bucket].TryPop(out byte[]? array))
             return array;

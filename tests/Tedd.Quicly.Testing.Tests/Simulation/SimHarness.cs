@@ -37,7 +37,12 @@ internal sealed class SimHarness : IDisposable
         return id;
     }
 
-    public void Dispose() => Network.Dispose();
+    public void Dispose()
+    {
+        int violations = Network.InvariantViolations;
+        Network.Dispose();
+        Assert.Equal(0, violations);
+    }
 }
 
 internal static unsafe class Sim

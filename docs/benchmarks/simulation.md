@@ -47,6 +47,26 @@ one, hence two rows per method. ShortRun has N = 3, so the *Error* column is wid
 | DatagramPingPongLossy | InProcessEmitToolchain |  1.366 us |  0.3593 us | 0.0197 us |         - |
 | StreamSend64KiB       | InProcessEmitToolchain | 11.457 us |  5.5027 us | 0.3016 us |         - |
 
+### Re-run after the review fixes (2026-09-15, same machine and job)
+
+The fixes changed code on the hot path. They added one counter check per departing datagram and stream packet (targeted
+loss), changed the reassembly merge loop (`SimStream.WriteChunk` ignores empty chunks and drops held entries at or behind
+the frontier), and turned three `Debug.Assert`s into always-on invariant checks.
+
+| Method                | Toolchain              | Mean      | Error      | StdDev    | Allocated |
+|---------------------- |----------------------- |----------:|-----------:|----------:|----------:|
+| DatagramPingPong      | Default                |  1.522 us |  0.7398 us | 0.0406 us |         - |
+| DatagramPingPongLossy | Default                |  1.689 us |  1.7031 us | 0.0934 us |         - |
+| StreamSend64KiB       | Default                | 13.101 us | 38.5750 us | 2.1144 us |         - |
+| DatagramPingPong      | InProcessEmitToolchain |  1.518 us |  0.8898 us | 0.0488 us |         - |
+| DatagramPingPongLossy | InProcessEmitToolchain |  1.596 us |  2.9785 us | 0.1633 us |         - |
+| StreamSend64KiB       | InProcessEmitToolchain | 12.999 us | 31.9505 us | 1.7513 us |         - |
+
+Every workload is still allocation-free, and every change falls inside the ShortRun error bars. Datagram rounds moved by
++0.03 to +0.2 µs, against ±0.7 to ±3 µs of error. `StreamSend64KiB` moved by about +1.5 µs, against ±32 to ±39 µs of error.
+Other agents were running tests on the machine at the same time. Nothing in the changed code adds work in proportion to the
+data size, so the change is treated as noise.
+
 ## Reading
 
 * **Zero allocation** in all three workloads, confirmed independently by the unit tests

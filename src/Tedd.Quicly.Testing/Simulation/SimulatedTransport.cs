@@ -25,10 +25,19 @@ namespace Tedd.Quicly.Testing.Simulation;
 /// and delivered as one segment per packet; a send completes one one-way delay after all of its bytes (and every
 /// byte before them) reached the peer's transport. Flow control is not modelled; receive back-pressure is
 /// <see cref="ReceiveResult.PendingAfter"/>. Consuming fewer bytes than delivered without <c>Pending</c> keeps the
-/// remainder, which is delivered again together with the next data to arrive. <see cref="ITransportSink.OnStreamAborted"/>
-/// reports the direction the peer aborted: <see cref="StreamAbortDirection.Send"/> (reset: our receive side is dead) or
-/// <see cref="StreamAbortDirection.Receive"/> (stop-sending: our pending sends are canceled). Peer stream limits count
-/// concurrently open streams, like MsQuic: a stream's credit returns to its opener when the peer's side has shut down.
+/// remainder, which is delivered again together with the next data to arrive; once the FIN has been indicated no more
+/// data can arrive, so the remainder is indicated again at the next advance step if the call consumed at least one
+/// byte (consuming nothing after the FIN without <c>Pending</c> stalls the stream: use <c>PendingAfter</c>).
+/// <see cref="ITransportSink.OnStreamAborted"/> reports the direction the peer aborted:
+/// <see cref="StreamAbortDirection.Send"/> (reset: our receive side is dead) or <see cref="StreamAbortDirection.Receive"/>
+/// (stop-sending: our pending sends are canceled). Aborts are causal: the peer keeps delivering data it already holds
+/// until the reset arrives one one-way delay later. Peer stream limits count concurrently open streams, like MsQuic: a
+/// stream's credit returns to its opener when the peer's side has shut down.
+/// </para>
+/// <para>
+/// Fault injection: <see cref="DropNextDatagrams"/> and <see cref="LoseNextStreamPackets"/> hit specific packets without
+/// seed hunting. Zero-allocation measurements need a warm-up that reaches the run's peak of concurrent events, streams
+/// and sends first (the tables grow to it and then stay), which can take many thousands of operations under jitter.
 /// </para>
 /// <para>
 /// <see cref="ITransport.CloseStream"/> before <see cref="ITransportSink.OnStreamShutdownComplete"/> aborts both
@@ -66,6 +75,8 @@ public sealed unsafe partial class SimulatedTransport : ITransport
     private ulong _recvPackets;
     private ulong _suspectedLost;
     private long _bytesInFlight;
+    private int _forcedDatagramLosses;
+    private int _forcedStreamLosses;
     internal SimulatedLinkStatistics LinkStats;
 
     internal SimulatedTransport(SimulatedNetwork network, SimulatedLink link, bool isClient, ITransportSink? sink, IPEndPoint localEndPoint)
@@ -156,12 +167,43 @@ public sealed unsafe partial class SimulatedTransport : ITransport
             statistics = LinkStats;
     }
 
+    /// <summary>
+    /// Targeted loss: the next <paramref name="count"/> datagrams that leave this end (in departure order, that is when
+    /// the serializer finishes them under a bandwidth limit) are lost in flight and report
+    /// <see cref="DatagramSendState.LostDiscarded"/>, whatever <see cref="LinkOptions.LossPercent"/> says. Datagrams
+    /// dropped by a full queue or canceled do not count. Calls accumulate.
+    /// </summary>
+    /// <param name="count">Number of datagrams to drop; non-negative.</param>
+    public void DropNextDatagrams(int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        lock (_network.Gate)
+            _forcedDatagramLosses = checked(_forcedDatagramLosses + count);
+    }
+
+    /// <summary>
+    /// Targeted stream loss: each of the next <paramref name="count"/> stream packets that leave this end is lost once
+    /// (on top of any random <see cref="LinkOptions.StreamLossPercent"/> losses), so it arrives one
+    /// <see cref="LinkOptions.RetransmitDelayMicros"/> late and later packets overtake it. Stream data is never lost.
+    /// Calls accumulate.
+    /// </summary>
+    /// <param name="count">Number of stream packets to delay by a retransmission; non-negative.</param>
+    public void LoseNextStreamPackets(int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        lock (_network.Gate)
+            _forcedStreamLosses = checked(_forcedStreamLosses + count);
+    }
+
     /// <inheritdoc/>
     /// <remarks>
     /// The next advance step completes every in-flight send of this end as canceled, raises
     /// <see cref="ITransportSink.OnStreamShutdownComplete"/> for every stream not yet shut down and then
     /// <see cref="ITransportSink.OnClosed"/> with <see cref="TransportCloseReason.Local"/>. The peer does the same one
     /// one-way delay later with <see cref="TransportCloseReason.Peer"/> and <paramref name="errorCode"/>. Further calls are ignored.
+    /// As in QUIC, stream data and datagrams that already left this end still reach the peer if they arrive before the
+    /// close does (they are reported canceled here all the same); data still queued behind a bandwidth limit is lost.
+    /// A link cut (<see cref="LinkOptions.DisconnectAtMicros"/>) loses everything in flight.
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="reason"/> is longer than <see cref="MaxReasonBytes"/>.</exception>
     public void Close(ulong errorCode, ReadOnlySpan<byte> reason)
@@ -195,9 +237,13 @@ public sealed unsafe partial class SimulatedTransport : ITransport
 
     internal void ScheduleConnect(long capabilityAt, long connectAt)
     {
-        Post(SimEventKind.CapabilityChanged, capabilityAt, this);
-        Post(SimEventKind.Connected, connectAt, this);
+        ScheduleCapability(capabilityAt);
+        ScheduleConnected(connectAt);
     }
+
+    internal void ScheduleCapability(long at) => Post(SimEventKind.CapabilityChanged, at, this);
+
+    internal void ScheduleConnected(long at) => Post(SimEventKind.Connected, at, this);
 
     internal void Dispatch(ref SimEvent e)
     {
@@ -294,11 +340,16 @@ public sealed unsafe partial class SimulatedTransport : ITransport
         _tx.Clear(_scratch);
         _scratch.Clear();
         _txBusy = false;
-        CancelAllStreamSends();
-        CancelAllDatagrams();
+        // Packets already on the wire still reach a peer that has not closed (as in QUIC, where packets sent before
+        // CONNECTION_CLOSE are processed); only what has not left this end is lost.
+        bool keepForPeer = reason != TransportCloseReason.Transport
+            && Peer is { _closedDelivered: false, _state: TransportState.Connecting or TransportState.Connected };
+        CancelAllStreamSends(keepForPeer);
+        CancelAllDatagrams(keepForPeer);
         ShutdownAllStreams();
         _state = TransportState.Closed;
         _closedDelivered = true;
+        Peer?.ReleaseOrphans(); // this end receives nothing any more
         sink.OnClosed(reason, errorCode, transportStatus);
     }
 

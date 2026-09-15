@@ -132,9 +132,16 @@ internal sealed class SimStream
     /// <summary>True when every byte of the stream (and the FIN) has arrived contiguously.</summary>
     public bool FinArrived => FinalSize >= 0 && Frontier == FinalSize;
 
-    /// <summary>Stores a chunk at its absolute offset; returns true when the contiguous frontier advanced.</summary>
+    /// <summary>Stores a chunk at its absolute offset; returns true when the contiguous frontier advanced (or the FIN arrived in order).</summary>
+    /// <remarks>
+    /// A chunk that carries no bytes and no FIN (a zero-length send) holds nothing and is ignored: holding it could park
+    /// an entry behind the frontier that the merge would never reach. Held entries at or behind the frontier are
+    /// dropped by the merge rather than stopping it.
+    /// </remarks>
     public bool WriteChunk(SimBufferPool pool, ReadOnlySpan<byte> data, long offset, bool fin)
     {
+        if (data.Length == 0 && !fin)
+            return false;
         long end = offset + data.Length;
         if (fin)
             FinalSize = end;
@@ -144,29 +151,30 @@ internal sealed class SimStream
         if (end > HighWater)
             HighWater = end;
 
-        if (offset != Frontier)
+        if (offset > Frontier)
         {
             int i = 0;
-            while (i < _held.Count && _held[i].Start < offset)
+            while (i < _held.Count && _held[i].Start <= offset)
                 i++;
             _held.Insert(i, (offset, end));
             return false;
         }
 
         long before = Frontier;
-        Advance(end);
-        while (_held.Count > 0 && _held[0].Start == Frontier)
+        if (end > Frontier)
+            Advance(end);
+        while (_held.Count > 0 && _held[0].Start <= Frontier)
         {
-            Advance(_held[0].End);
+            if (_held[0].End > Frontier)
+                Advance(_held[0].End);
             _held.RemoveAt(0);
         }
         return Frontier != before || fin;
     }
 
+    /// <summary>Moves the frontier forward to <paramref name="end"/> (callers guarantee <c>end &gt; Frontier</c>) and records the chunk boundary.</summary>
     private void Advance(long end)
     {
-        if (end == Frontier)
-            return;
         Frontier = end;
         if (_boundaryCount == _boundaries.Length)
         {

@@ -184,12 +184,54 @@ arrays except through the rings/mailboxes/`Interlocked` state transitions.
 
 ## 5. SimulatedTransport (Tedd.Quicly.Testing)
 
-`SimulatedNetwork(VirtualClock, seed)` creates `SimulatedLink` pairs; each end is an `ITransport` whose sink is set at creation
-(`CreatePair(sinkA, sinkB, LinkOptions)`). `LinkOptions`: `DelayMicros`, `JitterMicros`, `LossPercent`, `ReorderPercent`, `BandwidthBitsPerSecond`,
-`MaxDatagramPayload`, `DatagramsEnabled`, `DatagramSendStateReporting`, `PeerUnidiStreams`, `MtuChangeAt`, `DisconnectAt`.
-`network.Advance(micros)` delivers due events in order on the calling thread (simulating the transport thread); every sink callback
-happens inside `Advance`. Stream sends complete (acknowledged) at delivery + one-way delay; datagram states go Sent immediately,
-then Acknowledged/LostDiscarded at delivery time. Also `RecordingTransport` decorator (optional, later).
+Namespace `Tedd.Quicly.Testing.Simulation`. `SimulatedNetwork(VirtualClock, seed)` owns one deterministic event queue (min-heap by due
+time, FIFO among equal times) and one seeded random generator: the same seed and the same calls give the same callbacks.
+`CreatePair(sinkA, sinkB, LinkOptions)` returns two `SimulatedTransport` ends (A is the client). `SimulatedConnector` /
+`SimulatedListener` implement `ITransportConnector` / `ITransportListener` (PreHandshake reject, Accept returning null), so client and
+server layers run without MsQuic. `RecordingSink` records every callback with payload copies (thread-safe, with wait helpers).
+
+`LinkOptions` (copied at link creation): `DelayMicros` (one way), `JitterMicros`, `LossPercent` (datagrams), `StreamLossPercent` (stream
+packets, modelled as a retransmission delay of `RetransmitDelayMicros`, never as missing data), `ReorderPercent`, `BandwidthBitsPerSecond`
+(0 = unlimited; a per-direction serialization queue served highest priority first: priority datagrams, then datagrams, then streams
+by priority), `MaxQueueBytes` (datagrams beyond it are dropped), `MaxDatagramPayload` (default 1200, also the stream packet size),
+`DatagramsEnabled`, `DatagramSendStateReporting`, `PeerUnidiStreams` / `PeerBidiStreams` (default 0 / 1, like MsQuic before admission),
+`MtuChanges` (list of `(AtMicros, MaxDatagramPayload)`), `DisconnectAtMicros`, `ConnectDelayMicros` (default one round trip; the
+connector ignores it: the client connects after one RTT, the server half an RTT later).
+
+Timing. `network.Advance(micros)`, `AdvanceTo` and `RunUntilIdle(maxMicros)` deliver due events in order on the calling thread (the
+simulated transport thread). Every sink callback happens inside them. Unlike MsQuic, a callback never runs inline in an API call: a
+completion due "now" arrives at the next `Advance(0)`. `CreatePair` raises `OnDatagramCapabilityChanged` on both ends before
+`OnConnected` on either.
+- Datagrams: `Sent` at the next advance step (or when the serializer starts on the datagram), then exactly one final state:
+  `Acknowledged` at delivery + one-way delay, `LostDiscarded` one RTT after a loss, or `Canceled` (on close, when an MTU drop makes a
+  queued datagram too large, or with `CancelOnBlocked` when the serializer is busy). `TooLarge` is returned synchronously.
+- Streams: `OnStreamStarted` locally at the next step, `OnPeerStreamStarted` one one-way delay later. Data is cut into packets of the
+  current payload size, reassembled in order and indicated one segment per packet. A send completes at delivery of it and of every
+  byte before it + one-way delay. `PendingAfter` holds bytes back until `ResumeStreamReceive`. Aborts are causal: the peer keeps
+  delivering what it holds until the reset arrives. `OnStreamShutdownComplete` comes once both directions are done, and `CloseStream`
+  then bumps the slot generation. A stream's peer credit returns to its opener when the peer side has shut down.
+- `Close`: in-flight sends complete canceled, streams shut down, then `OnClosed` (Local). One one-way delay later the peer does the same
+  (Peer, code, reason). Data already on the wire still reaches the peer before its close, as in QUIC. Data queued behind a bandwidth
+  limit, or in flight when the link is cut, is lost. No callbacks follow `OnClosed`.
+
+Fault injection: `DropNextDatagrams(n)` and `LoseNextStreamPackets(n)` on a transport hit specific packets (lost final update, lost ack,
+lost fragment) without seed hunting. `GetLinkStatistics` exposes per-direction counters.
+
+Notes for session-layer tests over the simulator:
+1. After an API call, `Advance(0)` before expecting its callback.
+2. Payloads are copied when a send is accepted, so the simulator cannot catch a caller that reuses a buffer before its completion
+   (ADR 0008 invariant 1). Cover that rule in the session layer's own tests or end to end over MsQuic.
+3. Stream flow control is not modelled. Sends complete while the receiver stays Pending, and the receive buffer is unbounded, so
+   sender-side back-pressure cannot be exercised here yet.
+4. Stream limits count concurrently open streams. The defaults are 1 bidi and 0 uni until `UpdatePeerStreamLimits`.
+5. A partial consume without `Pending` keeps the remainder. It is indicated again with the next data, or at the next step after the FIN
+   when the call consumed at least one byte. Consuming nothing after the FIN without `Pending` stalls the stream.
+6. Zero-allocation tests need a warm-up that reaches the run's peak of concurrent events, streams and sends; the tables grow to that peak
+   and then stay. A stream-per-message workload under jitter needs about 15,000 messages.
+7. `OnIdealSendBufferSize` and `OnPeerAddressChanged` are never raised. `IdealSendBufferSize` and `AppOwnedReceiveBuffers` are false.
+8. Link options are fixed at creation. There is no mid-run change of loss, delay or bandwidth; use the targeted drops or a new link.
+9. `CloseStream` before shutdown aborts both directions with code 0. Pending completions are still reported (canceled), but the shutdown
+   callback is not.
 
 ## 6. Tests that must exist (Core)
 

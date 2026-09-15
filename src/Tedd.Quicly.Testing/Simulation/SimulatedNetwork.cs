@@ -69,10 +69,22 @@ public sealed class SimulatedNetwork : IDisposable
 
     internal bool IsDisposed => _disposed;
 
+    /// <summary>Internal consistency checks that failed (always 0 unless the simulator has a bug); tests assert it.</summary>
+    internal int InvariantViolations;
+
+    /// <summary>Counts a failed internal consistency check (a real check in every build, unlike <c>Debug.Assert</c>).</summary>
+    internal bool Invariant(bool condition)
+    {
+        if (!condition)
+            InvariantViolations++;
+        return condition;
+    }
+
     /// <summary>
     /// Creates a connected pair over a new link. Both ends start in <see cref="TransportState.Connecting"/>; the next
     /// <c>Advance</c> raises <see cref="ITransportSink.OnDatagramCapabilityChanged"/> on A then B, and after
     /// <see cref="LinkOptions.ConnectDelayMicros"/> (default one round trip) <see cref="ITransportSink.OnConnected"/> on A then B.
+    /// Both capability reports come before either connect, also when the connect delay is zero.
     /// A is the client (client-initiated QUIC stream ids).
     /// </summary>
     /// <param name="sinkA">Receives the callbacks of end A.</param>
@@ -94,8 +106,11 @@ public sealed class SimulatedNetwork : IDisposable
             Attach(link, a, b);
             long now = NowMicros;
             long connectAt = now + (copy.ConnectDelayMicros ?? 2 * copy.DelayMicros);
-            a.ScheduleConnect(now, connectAt);
-            b.ScheduleConnect(now, connectAt);
+            // Both capability reports come before both connects, even when the connect delay is zero.
+            a.ScheduleCapability(now);
+            b.ScheduleCapability(now);
+            a.ScheduleConnected(connectAt);
+            b.ScheduleConnected(connectAt);
             link.ScheduleTimeline();
             return (a, b);
         }

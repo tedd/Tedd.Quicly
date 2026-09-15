@@ -7,6 +7,9 @@ public sealed unsafe partial class SimulatedTransport
     private const ushort DefaultStreamPriority = 32767;
     private const int MaxLossesPerPacket = 32;
 
+    /// <summary>Largest payload one <see cref="SendStream"/> call accepts (1 GiB); larger sends return <see cref="TransportStatus.TooLarge"/>.</summary>
+    public const int MaxStreamSendBytes = SimBufferPool.MaxLength;
+
     private struct SendRecord
     {
         public uint Generation;
@@ -14,6 +17,8 @@ public sealed unsafe partial class SimulatedTransport
         public bool Fin;
         public bool CompletionPosted;
         public bool Canceled;
+        /// <summary>Completed (canceled) by this end's close but kept alive so chunks already on the wire still reach the peer.</summary>
+        public bool Orphaned;
         public int Stream;
         public uint StreamGeneration;
         public ulong Context;
@@ -91,7 +96,7 @@ public sealed unsafe partial class SimulatedTransport
                 return TransportStatus.InvalidState;
             if (!s.CanSend || s.FinQueued || s.SendDone)
                 return TransportStatus.InvalidState;
-            if (total > int.MaxValue)
+            if (total > MaxStreamSendBytes)
                 return TransportStatus.TooLarge;
             if (!s.Started)
             {
@@ -219,8 +224,10 @@ public sealed unsafe partial class SimulatedTransport
 
     /// <inheritdoc/>
     /// <remarks>
-    /// While connecting the new limits travel with the handshake; once connected the peer sees them one one-way delay
-    /// later through <see cref="ITransportSink.OnStreamsAvailable"/>.
+    /// A peer that has not connected yet reads the new limits when it connects (they travel with the handshake). A
+    /// peer that is already connected sees them one one-way delay later through
+    /// <see cref="ITransportSink.OnStreamsAvailable"/>, whether or not this end has finished connecting. A peer that
+    /// connects while the update is in flight reads it at connect and then also gets the (redundant) callback.
     /// </remarks>
     public void UpdatePeerStreamLimits(ushort bidirectional, ushort unidirectional)
     {
@@ -230,8 +237,9 @@ public sealed unsafe partial class SimulatedTransport
                 return;
             AllowPeerBidi = bidirectional;
             AllowPeerUni = unidirectional;
-            if (_state == TransportState.Connected && Peer is not null)
-                Post(SimEventKind.StreamsAvailable, _network.NowMicros + Link.Options.DelayMicros, Peer, bidirectional, 0, unidirectional);
+            SimulatedTransport? peer = Peer;
+            if (peer is not null && (_state == TransportState.Connected || peer._state == TransportState.Connected))
+                Post(SimEventKind.StreamsAvailable, _network.NowMicros + Link.Options.DelayMicros, peer, bidirectional, 0, unidirectional);
         }
     }
 
@@ -299,6 +307,7 @@ public sealed unsafe partial class SimulatedTransport
         r.InUse = true;
         r.CompletionPosted = false;
         r.Canceled = false;
+        r.Orphaned = false;
         r.Generation = r.Generation % uint.MaxValue + 1;
         generation = r.Generation;
         return index;
@@ -368,6 +377,11 @@ public sealed unsafe partial class SimulatedTransport
         _sendBytes += (ulong)length;
         long arrival = now + o.DelayMicros + random.NextInt64(o.JitterMicros + 1);
         int losses = 0;
+        if (_forcedStreamLosses > 0)
+        {
+            _forcedStreamLosses--;
+            losses = 1;
+        }
         while (losses < MaxLossesPerPacket && random.Chance(o.StreamLossPercent))
             losses++;
         if (losses > 0)
@@ -396,7 +410,8 @@ public sealed unsafe partial class SimulatedTransport
         _recvBytes += (ulong)length;
         bool advanced = s.WriteChunk(_network.Pool, r.Buffer.AsSpan(bufferOffset, length), e.L0, e.B0 != 0);
         r.ChunksRemaining--;
-        sender.PostEligibleCompletions(r.Stream, s.Frontier);
+        if (!sender._closedDelivered) // an orphaned send of a closed sender has already completed canceled
+            sender.PostEligibleCompletions(r.Stream, s.Frontier);
         if (advanced)
             TryDeliver(e.I0, s);
     }
@@ -444,8 +459,12 @@ public sealed unsafe partial class SimulatedTransport
             CheckShutdown(slot, s);
     }
 
-    /// <summary>Cancels every send of the stream not yet reported: inline (inside a dispatch) or at the next advance step.</summary>
-    private void CancelPendingSends(int slot, SimStream s, bool inline)
+    /// <summary>
+    /// Cancels every send of the stream not yet reported: inline (inside a dispatch) or at the next advance step. With
+    /// <paramref name="keepForPeer"/> (connection close) a send with chunks still to arrive keeps its payload (orphaned)
+    /// so what is already on the wire still reaches the peer; <see cref="ReleaseOrphans"/> frees it.
+    /// </summary>
+    private void CancelPendingSends(int slot, SimStream s, bool inline, bool keepForPeer = false)
     {
         if (inline)
         {
@@ -454,7 +473,10 @@ public sealed unsafe partial class SimulatedTransport
             {
                 int record = s.DequeueSend();
                 ulong context = _sends[record].Context;
-                FreeSend(record);
+                if (keepForPeer && !_sends[record].Canceled && _sends[record].ChunksRemaining > 0)
+                    _sends[record].Orphaned = true;
+                else
+                    FreeSend(record);
                 Sink!.OnStreamSendCompleted(id, context, true);
             }
             return;
@@ -494,8 +516,12 @@ public sealed unsafe partial class SimulatedTransport
             s.FinIndicated = fin;
             return;
         }
-        if (fin && s.Head == s.Frontier)
+        if (!fin)
+            return;
+        if (s.Head == s.Frontier)
             CompleteReceive(slot, s);
+        else if (result.BytesConsumed > 0)
+            Post(SimEventKind.StreamDeliver, _network.NowMicros, this, slot, generation); // no more data will come: indicate the rest again
     }
 
     private void CompleteReceive(int slot, SimStream s)
@@ -517,12 +543,11 @@ public sealed unsafe partial class SimulatedTransport
         {
             s.SendDone = true;
             s.FinQueued = true;
+            // The peer keeps delivering what it already holds until the reset arrives; chunks of the canceled sends
+            // still in flight are dropped on arrival (their records are marked canceled).
             CancelPendingSends(slot, s, inline: false);
             if (ps is not null)
-            {
-                ps.DiscardIncoming = true;
                 Post(SimEventKind.StreamReset, due, peer!, s.PeerSlot, s.PeerGeneration, u0: errorCode);
-            }
         }
         if ((direction & StreamAbortDirection.Receive) != 0 && s.CanReceive && !s.RecvDone)
         {
@@ -548,13 +573,28 @@ public sealed unsafe partial class SimulatedTransport
 
     // ------------------------------------------------------------------ close helpers
 
-    private void CancelAllStreamSends()
+    private void CancelAllStreamSends(bool keepForPeer)
     {
         for (int slot = 0; slot < _streamHighWater; slot++)
         {
             SimStream? s = _streams[slot];
             if (s is not null && s.InUse && s.PendingCount > 0)
-                CancelPendingSends(slot, s, inline: true);
+                CancelPendingSends(slot, s, inline: true, keepForPeer);
+        }
+    }
+
+    /// <summary>Frees the sends and datagrams kept alive by this end's close; called when the peer can no longer receive them.</summary>
+    internal void ReleaseOrphans()
+    {
+        for (int i = 0; i < _sendHighWater; i++)
+        {
+            if (_sends[i].InUse && _sends[i].Orphaned)
+                FreeSend(i);
+        }
+        for (int i = 0; i < _datagramHighWater; i++)
+        {
+            if (_datagrams[i].InUse && _datagrams[i].Orphaned)
+                FreeDatagram(i);
         }
     }
 

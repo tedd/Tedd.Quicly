@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Tedd.Quicly.Core.Transport;
 
 namespace Tedd.Quicly.Testing.Simulation;
@@ -15,6 +14,8 @@ public sealed unsafe partial class SimulatedTransport
         public bool InUse;
         public bool SentReported;
         public bool InFlight;
+        /// <summary>Completed (canceled) by this end's close but kept alive so an arrival already on the wire still reaches the peer.</summary>
+        public bool Orphaned;
         public ulong Context;
         public byte[]? Buffer;
         public int Length;
@@ -64,10 +65,11 @@ public sealed unsafe partial class SimulatedTransport
                 return TransportStatus.Success;
             }
 
+            bool cancelOnBlocked = (flags & TransportSendFlags.CancelOnBlocked) != 0;
             if (_tx.QueuedBytes + total > o.MaxQueueBytes)
             {
                 LinkStats.DatagramsDropped++;
-                if ((flags & TransportSendFlags.CancelOnBlocked) != 0)
+                if (cancelOnBlocked)
                 {
                     LinkStats.DatagramsCanceled++;
                     Post(SimEventKind.DatagramFinal, now, this, index, generation, b0: (byte)DatagramSendState.Canceled);
@@ -77,6 +79,13 @@ public sealed unsafe partial class SimulatedTransport
                     Post(SimEventKind.DatagramSent, now, this, index, generation);
                     Post(SimEventKind.DatagramFinal, now + 2 * o.DelayMicros, this, index, generation, b0: (byte)DatagramSendState.LostDiscarded);
                 }
+                return TransportStatus.Success;
+            }
+            if (cancelOnBlocked && (_txBusy || _tx.Count > 0))
+            {
+                // Cannot go out immediately: CancelOnBlocked drops instead of queueing.
+                LinkStats.DatagramsCanceled++;
+                Post(SimEventKind.DatagramFinal, now, this, index, generation, b0: (byte)DatagramSendState.Canceled);
                 return TransportStatus.Success;
             }
 
@@ -115,6 +124,7 @@ public sealed unsafe partial class SimulatedTransport
         record.InUse = true;
         record.SentReported = false;
         record.InFlight = false;
+        record.Orphaned = false;
         record.Generation = record.Generation % uint.MaxValue + 1;
         generation = record.Generation;
         return index;
@@ -183,7 +193,17 @@ public sealed unsafe partial class SimulatedTransport
         _sendPackets++;
         _sendBytes += (ulong)record.Length;
         ref DeterministicRandom random = ref _network.Random;
-        if (random.Chance(o.LossPercent))
+        bool lost;
+        if (_forcedDatagramLosses > 0)
+        {
+            _forcedDatagramLosses--;
+            lost = true;
+        }
+        else
+        {
+            lost = random.Chance(o.LossPercent);
+        }
+        if (lost)
         {
             LinkStats.DatagramsLost++;
             _suspectedLost++;
@@ -205,17 +225,22 @@ public sealed unsafe partial class SimulatedTransport
     /// </remarks>
     private void OnDatagramSentEvent(ref SimEvent e)
     {
+        if (!_network.Invariant(IsLiveDatagram(e.I0, e.G0) && !_datagrams[e.I0].SentReported))
+            return;
         ref DatagramRecord record = ref _datagrams[e.I0];
-        Debug.Assert(IsLiveDatagram(e.I0, e.G0) && !record.SentReported);
         record.SentReported = true;
         Sink!.OnDatagramSendStateChanged(record.Context, DatagramSendState.Sent);
     }
 
     /// <summary>Runs on the receiver; the record lives on the sender (<see cref="SimEvent.Obj"/>).</summary>
+    /// <remarks>
+    /// The record is live: its final state is posted only after this arrival (or instead of it, on loss), and a sender
+    /// close keeps an in-flight record (orphaned) until this end has closed, after which no event reaches this end.
+    /// </remarks>
     private void OnDatagramArriveEvent(ref SimEvent e)
     {
         SimulatedTransport sender = (SimulatedTransport)e.Obj!;
-        if (!sender.IsLiveDatagram(e.I0, e.G0))
+        if (!_network.Invariant(sender.IsLiveDatagram(e.I0, e.G0)))
             return;
         ref DatagramRecord record = ref sender._datagrams[e.I0];
         long now = _network.NowMicros;
@@ -240,7 +265,8 @@ public sealed unsafe partial class SimulatedTransport
     /// </remarks>
     private void OnDatagramFinalEvent(ref SimEvent e)
     {
-        Debug.Assert(IsLiveDatagram(e.I0, e.G0));
+        if (!_network.Invariant(IsLiveDatagram(e.I0, e.G0)))
+            return;
         ref DatagramRecord record = ref _datagrams[e.I0];
         DatagramSendState state = (DatagramSendState)e.B0;
         ulong context = record.Context;
@@ -250,25 +276,32 @@ public sealed unsafe partial class SimulatedTransport
             Sink!.OnDatagramSendStateChanged(context, state);
     }
 
-    /// <summary>Completes a datagram as canceled right now (inside a dispatch).</summary>
-    private void CancelDatagram(int index, uint generation)
+    /// <summary>
+    /// Completes a datagram as canceled right now (inside a dispatch). With <paramref name="keepForPeer"/> a datagram
+    /// already on the wire keeps its payload (orphaned) so it can still arrive; <see cref="ReleaseOrphans"/> frees it.
+    /// </summary>
+    private void CancelDatagram(int index, uint generation, bool keepForPeer = false)
     {
-        Debug.Assert(IsLiveDatagram(index, generation));
+        if (!_network.Invariant(IsLiveDatagram(index, generation)))
+            return;
         ref DatagramRecord record = ref _datagrams[index];
         ulong context = record.Context;
         bool report = Link.Options.DatagramSendStateReporting || !record.SentReported;
-        FreeDatagram(index);
+        if (keepForPeer && record.InFlight)
+            record.Orphaned = true;
+        else
+            FreeDatagram(index);
         LinkStats.DatagramsCanceled++;
         if (report)
             Sink!.OnDatagramSendStateChanged(context, DatagramSendState.Canceled);
     }
 
-    private void CancelAllDatagrams()
+    private void CancelAllDatagrams(bool keepForPeer)
     {
         for (int i = 0; i < _datagramHighWater; i++)
         {
             if (_datagrams[i].InUse)
-                CancelDatagram(i, _datagrams[i].Generation);
+                CancelDatagram(i, _datagrams[i].Generation, keepForPeer);
         }
     }
 

@@ -49,8 +49,7 @@ internal sealed class ClientFixture : IAsyncDisposable
         ServerOptions options = new() { Channels = Tables.Default, ExpectedPeers = 8, MaxPeers = 32, ShutdownTimeout = TimeSpan.Zero };
         options.PeerOptions.Clock = Clock;
         options.PeerOptions.AllocatorOptions = Pools.Small();
-        options.Admission.MinResumeInterval = TimeSpan.Zero;
-        server?.Invoke(options);
+        server?.Invoke(options); // the resume rate keeps its production defaults (MinResumeInterval 1 s, ResumeBurst 3)
         Server = new QuiclyServer(options, Listener);
         Server.PeerAdmitted += peer => ServerAdmitted.Add((peer.SessionId, peer.Epoch));
         Server.StartAsync(TestContext.Current.CancellationToken).GetAwaiter().GetResult();

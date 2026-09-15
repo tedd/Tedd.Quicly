@@ -101,8 +101,9 @@ public readonly struct SharedSendResult
 /// <param name="SessionId">The session.</param>
 /// <param name="Tag">The <see cref="QuiclyPeer.Tag"/> its last connection ended with (for example a player id set by the application).</param>
 /// <param name="Expired">
-/// <see langword="true"/> when the grace period after a lost connection ran out; <see langword="false"/> when the session
-/// ended with its connection (a deliberate close by either side, or a zero grace period).
+/// <see langword="true"/> when the session waited for a resume after a lost connection and none came: its grace period ran
+/// out, or the server stopped; <see langword="false"/> when the session ended with its connection (a deliberate close by
+/// either side, or a zero grace period).
 /// </param>
 public readonly record struct SessionEndInfo(ulong SessionId, ulong Tag, bool Expired);
 
@@ -121,7 +122,7 @@ public struct ServerStatistics
     /// <summary>Sessions in the registry: connected, or within their grace period.</summary>
     public int Sessions;
 
-    /// <summary>Per-peer shared sends whose buffer was not released yet.</summary>
+    /// <summary>Per-peer shared sends whose buffer was not released yet (including those of force-closed peers whose transport has not reported its close).</summary>
     public int SharedSendsOutstanding;
 
     /// <summary>Connections accepted by the listener callbacks.</summary>
@@ -136,7 +137,7 @@ public struct ServerStatistics
     /// <summary>Sessions resumed on a new connection.</summary>
     public long SessionsResumed;
 
-    /// <summary>Live connections closed with <c>SessionReplaced</c> by a resume.</summary>
+    /// <summary>Open connections closed with <c>SessionReplaced</c> by a resume (a connection that was already closing does not count).</summary>
     public long SessionsReplaced;
 
     /// <summary>Sessions whose grace period ran out.</summary>
@@ -156,4 +157,10 @@ public struct ServerStatistics
 
     /// <summary>Exceptions thrown by <see cref="QuiclyServer.AdmissionFailed"/> and <see cref="QuiclyServer.CertificateConsumerFailed"/> handlers (swallowed).</summary>
     public long EventHandlerFaults;
+
+    /// <summary>
+    /// <see cref="QuiclyServer.AdmissionFailed"/> and <see cref="QuiclyServer.CertificateConsumerFailed"/> events found on other
+    /// threads and dropped because too many were waiting for <see cref="QuiclyServer.PollAll"/>.
+    /// </summary>
+    public long EventsDropped;
 }

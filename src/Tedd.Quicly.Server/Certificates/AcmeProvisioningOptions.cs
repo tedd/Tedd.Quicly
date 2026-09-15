@@ -193,6 +193,13 @@ public sealed class AcmeProvisioningOptions
     /// </summary>
     public IPEndPoint TlsAlpnEndpoint { get; set; } = new(IPAddress.IPv6Any, 443);
 
+    /// <summary>
+    /// How long the TLS endpoint gives one handshake, counted from accept
+    /// (<see cref="Http.HttpServerLimits.TlsHandshakeTimeout"/>): the CA's validation client and normal clients alike, with
+    /// the server's own credential setup (building a certificate's chain the first time it is served) inside it. Default 10 s.
+    /// </summary>
+    public TimeSpan TlsHandshakeTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
     /// <summary>Redirect every other plain-HTTP request on the challenge endpoint to HTTPS (ADR 0009 default). Default true.</summary>
     public bool RedirectToHttps { get; set; } = true;
 
@@ -413,6 +420,11 @@ public sealed class AcmeProvisioningOptions
         if (ChallengeCleanupTimeout <= TimeSpan.Zero || ChallengeCleanupTimeout > MaxTimeout)
         {
             throw Invalid("ChallengeCleanupTimeout must be positive and at most 30 days.");
+        }
+
+        if (TlsHandshakeTimeout != Timeout.InfiniteTimeSpan && (TlsHandshakeTimeout <= TimeSpan.Zero || TlsHandshakeTimeout > MaxTimeout))
+        {
+            throw Invalid("TlsHandshakeTimeout must be positive and at most 30 days (or Timeout.InfiniteTimeSpan).");
         }
 
         try

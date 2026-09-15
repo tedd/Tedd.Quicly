@@ -20,10 +20,10 @@ namespace Tedd.Quicly.Server;
 /// <remarks>
 /// <para><b>Threads.</b> The game thread (whichever thread calls <see cref="PollAll"/>, <see cref="FlushAll"/>,
 /// <see cref="SendShared"/>, <see cref="BeginShutdown"/> and the peers' own members, one at a time) owns the slot table,
-/// the sessions and the events: <see cref="PeerAdmitted"/>, <see cref="PeerClosed"/> and <see cref="SessionEnded"/> are
-/// raised from <see cref="PollAll"/>. The listener's callbacks run on transport threads; they reserve a slot and create
-/// the peer, which the next <see cref="PollAll"/> activates. <see cref="CompleteAdmission(QuiclyPeer, bool, string?)"/> may
-/// be called from any thread; the decision is applied by the next <see cref="PollAll"/>.</para>
+/// the sessions and the events: every event is raised on it, from <see cref="PollAll"/> (or <see cref="StopAsync"/>). The
+/// listener's callbacks run on transport threads; they reserve a slot and create the peer, which the next
+/// <see cref="PollAll"/> activates, and queue the failures they find. <see cref="CompleteAdmission(QuiclyPeer, bool, string?)"/>
+/// may be called from any thread; the decision is applied by the next <see cref="PollAll"/>.</para>
 /// <para><b>Work tracking.</b> The server hands each transport a sink that forwards to the peer and then sets the peer's
 /// bit in an atomic work bitset, and it keeps every peer's next deadline in a dense array. <see cref="PollAll"/> polls only
 /// peers with a set bit or a due deadline, so idle peers cost a bit test and a (vectorised) deadline comparison.</para>
@@ -39,6 +39,12 @@ public sealed partial class QuiclyServer : IAsyncDisposable
     private const int StateRunning = 2;
     private const int StateStopping = 3;
     private const int StateStopped = 4;
+
+    /// <summary>Most <see cref="AdmissionFailed"/> or <see cref="CertificateConsumerFailed"/> events waiting for <see cref="PollAll"/>.</summary>
+    internal const int MaxQueuedEvents = 4096;
+
+    /// <summary>Default replay-cache entries per expected peer (a consumed token is held until it expires).</summary>
+    internal const int ReplayEntriesPerExpectedPeer = 32;
 
     private readonly ITransportListener _listener;
     private readonly ChannelTable _table;
@@ -69,6 +75,10 @@ public sealed partial class QuiclyServer : IAsyncDisposable
     private readonly CertificateBinderOptions? _binderOptions;
     private readonly bool _waitForCertificate;
     private readonly HttpSideOptions? _httpSide;
+    private readonly EventQueue<AdmissionFailure> _failures = new(MaxQueuedEvents);
+    private readonly EventQueue<CertificateConsumerFailure> _consumerFailures = new(MaxQueuedEvents);
+    private readonly Action<AdmissionFailure> _raiseFailure;
+    private readonly Action<CertificateConsumerFailure> _raiseConsumerFailure;
     private IAdmissionPolicy _policy;
     private int _state;
     private int _disposing;
@@ -85,6 +95,8 @@ public sealed partial class QuiclyServer : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(listener);
         options.Validate();
         _listener = listener;
+        _raiseFailure = RaiseFailure;
+        _raiseConsumerFailure = RaiseConsumerFailure;
         _table = options.Channels!;
         PeerOptions template = options.PeerOptions;
         _clock = template.Clock ?? throw new ArgumentException("PeerOptions.Clock is required.", nameof(options));
@@ -95,7 +107,7 @@ public sealed partial class QuiclyServer : IAsyncDisposable
         _maxPerAddress = admission.MaxConnectionsPerAddress;
         _ipv6PrefixLength = admission.IPv6PrefixLength;
         _graceMicros = ToMicros(options.Sessions.Grace);
-        _tokenLifetimeMicros = ToMicros(options.Sessions.TokenLifetime ?? options.Sessions.Grace);
+        _tokenLifetimeMicros = ToMicros(options.Sessions.TokenLifetime);
         _autoFlushMicros = ToMicros(template.AutoFlushInterval);
         _shutdownTimeout = options.ShutdownTimeout;
         _shutdownReason = options.ShutdownReason;
@@ -135,7 +147,7 @@ public sealed partial class QuiclyServer : IAsyncDisposable
             _sharedLeases = new SharedLeaseTable(_allocator);
             int replay = options.Sessions.ReplayCacheCapacity != 0
                 ? options.Sessions.ReplayCacheCapacity
-                : (int)Math.Clamp((long)options.ExpectedPeers * 4, SessionTokenAuthority.DefaultReplayCacheCapacity, 1 << 22);
+                : (int)Math.Clamp((long)options.ExpectedPeers * ReplayEntriesPerExpectedPeer, SessionTokenAuthority.DefaultReplayCacheCapacity, 1 << 22);
             byte[] key = options.Sessions.Key.IsEmpty ? RandomNumberGenerator.GetBytes(SessionTokenAuthority.KeyLength) : options.Sessions.Key.ToArray();
             try
             {
@@ -203,20 +215,30 @@ public sealed partial class QuiclyServer : IAsyncDisposable
     /// its slot released right after the handlers return. Its session may still be resumed within the grace period
     /// (<see cref="SessionEnded"/> says when it cannot); a resumed session arrives as a new peer through
     /// <see cref="PeerAdmitted"/> with a higher <see cref="QuiclyPeer.Epoch"/> and the same <see cref="QuiclyPeer.SessionId"/>.
+    /// When a resume replaces a connection that was still open, <see cref="PeerAdmitted"/> of the new peer can come first: the
+    /// replaced peer's <see cref="PeerClosed"/> (with <see cref="QuiclyErrorCode.SessionReplaced"/>) follows once its close
+    /// completed, so key per-session state by <see cref="QuiclyPeer.SessionId"/> and check the <see cref="QuiclyPeer.Epoch"/>.
     /// </summary>
     public event Action<QuiclyPeer, CloseReason>? PeerClosed;
 
-    /// <summary>A session can no longer be resumed: its grace period ran out, or it ended with a deliberate close (raised from <see cref="PollAll"/>).</summary>
+    /// <summary>
+    /// A session can no longer be resumed: its grace period ran out, it ended with a deliberate close, or the server stopped
+    /// while it waited for a resume. Raised once per session, from <see cref="PollAll"/> (or <see cref="StopAsync"/>).
+    /// </summary>
     public event Action<SessionEndInfo>? SessionEnded;
 
     /// <summary>
-    /// An admission was refused, with the real cause (the client only sees a HelloAck status). Raised on the thread that
-    /// refused it: a transport thread before the handshake, the game thread for a Hello. Handlers must be thread-safe and
-    /// must not block; exceptions they throw are swallowed and counted (<see cref="ServerStatistics.EventHandlerFaults"/>).
+    /// An admission was refused, with the real cause (the client only sees a HelloAck status). Raised on the game thread:
+    /// at once for a Hello, from the next <see cref="PollAll"/> for a refusal before the handshake (found on a transport
+    /// thread and queued; at most 4 096 wait, more are dropped and counted in <see cref="ServerStatistics.EventsDropped"/>).
+    /// Exceptions handlers throw are swallowed and counted (<see cref="ServerStatistics.EventHandlerFaults"/>).
     /// </summary>
     public event Action<AdmissionFailure>? AdmissionFailed;
 
-    /// <summary>A certificate consumer threw while switching to a new certificate (it keeps presenting its previous one).</summary>
+    /// <summary>
+    /// A certificate consumer threw while switching to a new certificate (it keeps presenting its previous one). Found on the
+    /// thread that applied the certificate and raised from the next <see cref="PollAll"/>, like <see cref="AdmissionFailed"/>.
+    /// </summary>
     public event Action<CertificateConsumerFailure>? CertificateConsumerFailed;
 
     /// <summary>The sizes the server derived from <see cref="ServerOptions.ExpectedPeers"/>.</summary>
@@ -325,7 +347,8 @@ public sealed partial class QuiclyServer : IAsyncDisposable
 
     /// <summary>
     /// Makes <paramref name="newKey"/> the session-token signing key. Tokens signed with the previous key keep verifying for
-    /// the token lifetime (so connected clients can still resume); the key before that stops verifying at once.
+    /// the token lifetime, their maximum age (so connected clients can still resume); the key before that stops verifying at
+    /// once.
     /// </summary>
     /// <param name="newKey">The new 32-byte key (copied).</param>
     /// <exception cref="ArgumentException">The key is not 32 bytes.</exception>
@@ -348,7 +371,7 @@ public sealed partial class QuiclyServer : IAsyncDisposable
 
         statistics.AdmittedPeers = _admittedSet.Count;
         statistics.Sessions = _sessions.Count;
-        statistics.SharedSendsOutstanding = _sharedOutstanding;
+        statistics.SharedSendsOutstanding = _sharedOutstanding + Volatile.Read(ref _sharedHeld);
         statistics.ConnectionsAccepted = Interlocked.Read(ref _connectionsAccepted);
         statistics.ConnectionsRefused = Interlocked.Read(ref _connectionsRefused);
         statistics.SessionsCreated = _sessionsCreated;
@@ -360,30 +383,24 @@ public sealed partial class QuiclyServer : IAsyncDisposable
         statistics.PollAllCalls = _pollAllCalls;
         statistics.PeersPolled = _peersPolled;
         statistics.EventHandlerFaults = Interlocked.Read(ref _eventHandlerFaults);
+        statistics.EventsDropped = _failures.Dropped + _consumerFailures.Dropped;
     }
 
     internal static long ToMicros(TimeSpan value) => value.Ticks / TimeSpan.TicksPerMicrosecond;
 
-    /// <summary>Reports a refused admission (any thread); handler exceptions are swallowed and counted.</summary>
-    internal void ReportFailure(in AdmissionFailure failure)
-    {
-        Action<AdmissionFailure>? handler = AdmissionFailed;
-        if (handler is null)
-        {
-            return;
-        }
+    /// <summary>Reports a refused admission now (game thread); handler exceptions are swallowed and counted.</summary>
+    internal void ReportFailure(in AdmissionFailure failure) => RaiseFailure(failure);
 
-        try
+    /// <summary>Reports a refused admission found on another thread: queued for the next <see cref="PollAll"/>.</summary>
+    internal void QueueFailure(in AdmissionFailure failure)
+    {
+        if (AdmissionFailed is not null)
         {
-            handler(failure);
-        }
-        catch (Exception)
-        {
-            Interlocked.Increment(ref _eventHandlerFaults);
+            _failures.Enqueue(in failure);
         }
     }
 
-    /// <summary>Mints a session token for (<paramref name="sessionId"/>, <paramref name="epoch"/>) expiring one token lifetime from now.</summary>
+    /// <summary>Mints a session token for (<paramref name="sessionId"/>, <paramref name="epoch"/>) whose expiry is one token lifetime (its maximum age) from now.</summary>
     internal byte[] MintToken(ulong sessionId, uint epoch, long nowMicros)
     {
         byte[] token = new byte[SessionTokenAuthority.TokenLength];
@@ -392,6 +409,44 @@ public sealed partial class QuiclyServer : IAsyncDisposable
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
+
+    /// <summary>Raises the events other threads queued (game thread).</summary>
+    private void RaiseQueuedEvents()
+    {
+        if (_failures.HasItems)
+        {
+            _failures.Drain(_raiseFailure);
+        }
+
+        if (_consumerFailures.HasItems)
+        {
+            _consumerFailures.Drain(_raiseConsumerFailure);
+        }
+    }
+
+    private void RaiseFailure(AdmissionFailure failure)
+    {
+        try
+        {
+            AdmissionFailed?.Invoke(failure);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _eventHandlerFaults);
+        }
+    }
+
+    private void RaiseConsumerFailure(CertificateConsumerFailure failure)
+    {
+        try
+        {
+            CertificateConsumerFailed?.Invoke(failure);
+        }
+        catch (Exception)
+        {
+            Interlocked.Increment(ref _eventHandlerFaults);
+        }
+    }
 
     private void PruneTrackedSets()
     {

@@ -41,12 +41,16 @@ public class SignalingTests
         ValueTask waiting = signal.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
         signal.Set();
         await waiting;
+        Assert.True(signal.LastWaitSignaled);
         signal.Set();
         signal.Set(); // already signalled: no-op
         await signal.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
-        await signal.WaitAsync(TimeSpan.FromMilliseconds(5), TestContext.Current.CancellationToken); // times out quietly
+        Assert.True(signal.LastWaitSignaled); // the first of the two Sets released it (a lost wake-up would sleep 30 s here)
+        await signal.WaitAsync(TimeSpan.FromMilliseconds(5), TestContext.Current.CancellationToken);
+        Assert.False(signal.LastWaitSignaled); // the second Set released nothing: this wait timed out quietly
         signal.Dispose();
         signal.Set(); // a late transport callback after the client was disposed
+        await Assert.ThrowsAsync<ObjectDisposedException>(async () => await signal.WaitAsync(TimeSpan.FromMilliseconds(5), TestContext.Current.CancellationToken));
     }
 
     [Fact]

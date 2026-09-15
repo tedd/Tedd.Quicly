@@ -53,8 +53,7 @@ internal sealed class ServerFixture : IAsyncDisposable
         Options.PeerOptions.Clock = Clock;
         Options.PeerOptions.AllocatorOptions = Pools.Small();
         Options.Admission.MaxUnadmittedConnections = 32;
-        Options.Admission.MinResumeInterval = TimeSpan.Zero;
-        configure?.Invoke(Options);
+        configure?.Invoke(Options); // the resume rate keeps its production defaults (MinResumeInterval 1 s, ResumeBurst 3)
         Server = new QuiclyServer(Options, listener ?? SimListener);
         Server.DelayOverride = (_, _) =>
         {

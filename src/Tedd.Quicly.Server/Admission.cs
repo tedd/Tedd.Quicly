@@ -43,7 +43,8 @@ public enum AuthTokenDecision : byte
 
     /// <summary>
     /// Validation continues asynchronously; call <see cref="QuiclyServer.CompleteAdmission(QuiclyPeer, bool, string?)"/>
-    /// with the outcome (from any thread) within <see cref="PeerOptions.AdmissionTimeout"/>.
+    /// with the outcome (from any thread) within <see cref="PeerOptions.AdmissionTimeout"/>. A decision for a connection that
+    /// closed meanwhile is ignored.
     /// </summary>
     Pending = 2,
 }
@@ -61,7 +62,8 @@ public readonly ref struct AuthTokenContext
 
     /// <summary>
     /// The connection being admitted. For a resume its <see cref="QuiclyPeer.Tag"/> already holds the session's tag (the
-    /// tag its previous connection ended with), so the validator can check that the token belongs to the same identity.
+    /// current tag of the connection being replaced, or the tag the session's last connection ended with), so the validator
+    /// can check that the token belongs to the same identity.
     /// </summary>
     public QuiclyPeer Peer { get; init; }
 
@@ -145,7 +147,11 @@ public enum AdmissionFailureReason : byte
     /// <summary>The session's grace period ran out before the resume.</summary>
     SessionExpired,
 
-    /// <summary>The session was admitted less than <see cref="ServerAdmissionOptions.MinResumeInterval"/> ago.</summary>
+    /// <summary>
+    /// The session resumed too often (<see cref="ServerAdmissionOptions.MinResumeInterval"/>,
+    /// <see cref="ServerAdmissionOptions.ResumeBurst"/>). Answered <see cref="HelloStatus.Rejected"/> but not charged to the
+    /// failure rate limiter; the token stays usable.
+    /// </summary>
     ResumeTooSoon,
 
     /// <summary><see cref="ServerOptions.MaxPeers"/> sessions are admitted (answered <see cref="HelloStatus.ServerFull"/>).</summary>
@@ -153,6 +159,12 @@ public enum AdmissionFailureReason : byte
 
     /// <summary>The server peer could not be created (see <see cref="AdmissionFailure.Exception"/>).</summary>
     PeerCreationFailed,
+
+    /// <summary>
+    /// The session ended with a deliberate close of its connection (a goodbye, or a kick by the server) that was still under
+    /// way when the resume arrived.
+    /// </summary>
+    SessionEnded,
 }
 
 /// <summary>A refused admission, with its real cause (<see cref="QuiclyServer.AdmissionFailed"/>).</summary>
@@ -176,5 +188,5 @@ public readonly record struct AdmissionFailure(
         or AdmissionFailureReason.SessionTokenExpired or AdmissionFailureReason.SessionTokenReplayed
         or AdmissionFailureReason.SessionTokenReplayCacheFull or AdmissionFailureReason.SessionUnknown
         or AdmissionFailureReason.SessionTokenSuperseded or AdmissionFailureReason.SessionExpired
-        or AdmissionFailureReason.ResumeTooSoon;
+        or AdmissionFailureReason.SessionEnded;
 }

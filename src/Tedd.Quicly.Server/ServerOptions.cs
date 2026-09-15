@@ -193,10 +193,20 @@ public sealed class ServerAdmissionOptions
     public int AuthFailureTrackedAddresses { get; set; } = AuthFailureRateLimiter.DefaultCapacity;
 
     /// <summary>
-    /// Shortest time between two admissions of one session; a faster resume is refused like a bad token (it would let one
-    /// client fill the token replay cache, see <see cref="SessionTokenAuthority"/>). Default 1 s.
+    /// Sustained shortest time between two admissions of one session (its creation or a resume); <see cref="ResumeBurst"/>
+    /// resumes may come faster, back to back. A resume beyond that is answered <see cref="HelloStatus.Rejected"/>
+    /// (<see cref="AdmissionFailureReason.ResumeTooSoon"/>), is not charged to the failure rate limiter and leaves the token
+    /// usable. The cap keeps one client from filling the token replay cache (see <see cref="SessionTokenAuthority"/>). Zero
+    /// disables it; at most one day. Default 1 s.
     /// </summary>
     public TimeSpan MinResumeInterval { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Resumes of one session allowed in quick succession, faster than <see cref="MinResumeInterval"/> (a connection that
+    /// drops right after its admission, or flaps): a token bucket that holds this many resumes and regains one every
+    /// <see cref="MinResumeInterval"/>. 0 to 1 000; default 3.
+    /// </summary>
+    public int ResumeBurst { get; set; } = 3;
 
     internal void Validate()
     {
@@ -212,6 +222,12 @@ public sealed class ServerAdmissionOptions
         }
 
         OptionChecks.NonNegative(MinResumeInterval, nameof(MinResumeInterval));
+        if (MinResumeInterval > TimeSpan.FromDays(1))
+        {
+            throw new ArgumentException("MinResumeInterval must be at most one day.", nameof(MinResumeInterval));
+        }
+
+        OptionChecks.Range(ResumeBurst, 0, 1000, nameof(ResumeBurst));
         foreach (string alpn in AllowedAlpns)
         {
             if (string.IsNullOrEmpty(alpn) || alpn.Length > 255 || !Ascii.IsValid(alpn))
@@ -240,21 +256,27 @@ public sealed class ServerSessionOptions
     public ReadOnlyMemory<byte> Key { get; set; }
 
     /// <summary>
-    /// How long a session survives the loss of its connection: a resume must arrive within this time, otherwise it is
-    /// rejected and the session ends (<see cref="QuiclyServer.SessionEnded"/>). Sent to clients as <c>HelloAck.graceMicros</c>.
-    /// Zero ends every session with its connection. Default 30 s.
+    /// How long a session survives the loss of its connection, counted by the server from the moment that connection was lost
+    /// (the session registry decides it; a live session stays resumable for its token's <see cref="TokenLifetime"/>). A resume
+    /// after it is rejected and the session ends (<see cref="QuiclyServer.SessionEnded"/>). Sent to clients as
+    /// <c>HelloAck.graceMicros</c>. Zero ends every session with its connection. Default 30 s.
     /// </summary>
     public TimeSpan Grace { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// Validity of a minted token, counted from its HelloAck; <see langword="null"/> (the default) uses <see cref="Grace"/> as
-    /// PROTOCOL.md §4.1 specifies (<c>expiry = issue time + graceMicros</c>). Tokens are only rotated in HelloAcks, so a
-    /// connection older than this cannot be resumed; raise it for long sessions (consumed tokens occupy the replay cache
-    /// until they expire, see <see cref="ReplayCacheCapacity"/>).
+    /// Maximum age of a session token, counted from the HelloAck that carried it: its <c>expiry</c> field (PROTOCOL.md §4.1).
+    /// Tokens are only rotated in HelloAcks, so a connection older than this cannot be resumed even while it is live; how
+    /// long a lost session waits for a resume is <see cref="Grace"/>. Consumed tokens stay in the replay cache until they
+    /// expire, so size <see cref="ReplayCacheCapacity"/> for the resumes of one lifetime. At least <see cref="Grace"/>, at
+    /// most 30 days. Default 24 hours.
     /// </summary>
-    public TimeSpan? TokenLifetime { get; set; }
+    public TimeSpan TokenLifetime { get; set; } = TimeSpan.FromHours(24);
 
-    /// <summary>Consumed, unexpired tokens remembered for single use; 0 (the default) sizes it from <see cref="ServerOptions.ExpectedPeers"/> (at least 16 384).</summary>
+    /// <summary>
+    /// Consumed, unexpired tokens remembered for single use (each until its token expires, one <see cref="TokenLifetime"/>
+    /// after issue); while it is full, resumes fail closed (the client starts a fresh session). 0 (the default) sizes it from
+    /// <see cref="ServerOptions.ExpectedPeers"/>: 32 per expected peer, at least 16 384, at most 4 194 304.
+    /// </summary>
     public int ReplayCacheCapacity { get; set; }
 
     internal void Validate()
@@ -270,13 +292,15 @@ public sealed class ServerSessionOptions
             throw new ArgumentException("Grace must be at most one day.", nameof(Grace));
         }
 
-        if (TokenLifetime is { } lifetime)
+        OptionChecks.Positive(TokenLifetime, nameof(TokenLifetime));
+        if (TokenLifetime > TimeSpan.FromDays(30))
         {
-            OptionChecks.Positive(lifetime, nameof(TokenLifetime));
-            if (lifetime > TimeSpan.FromDays(30))
-            {
-                throw new ArgumentException("TokenLifetime must be at most 30 days.", nameof(TokenLifetime));
-            }
+            throw new ArgumentException("TokenLifetime must be at most 30 days.", nameof(TokenLifetime));
+        }
+
+        if (TokenLifetime < Grace)
+        {
+            throw new ArgumentException("TokenLifetime must be at least Grace: a lost session could not be resumed for its whole grace period.", nameof(TokenLifetime));
         }
 
         OptionChecks.Range(ReplayCacheCapacity, 0, 1 << 22, nameof(ReplayCacheCapacity));

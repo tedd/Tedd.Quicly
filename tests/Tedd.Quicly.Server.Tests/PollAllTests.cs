@@ -194,7 +194,7 @@ public sealed class MeasurementCollection;
 public class ThousandPeerTests(ITestOutputHelper output)
 {
     [Fact]
-    public async Task Thousand_Peers_Connect_Exchange_Messages_And_Idle_PollAll_Is_Cheap()
+    public async Task A_Thousand_Peers_Connect_And_PollAll_Polls_Only_The_Peers_With_Work()
     {
         const int Peers = 1000;
         await using ServerFixture f = new(o =>
@@ -287,8 +287,10 @@ public class ThousandPeerTests(ITestOutputHelper output)
         output.WriteLine("Poll of every peer (naive loop), 1 000 peers: " + naiveMicros.ToString("F1") + " us per call");
         output.WriteLine("PollAll at 1 ms ticks with 1 Hz pings: " + tickMicros.ToString("F2") + " us per call, " + peersPerTick.ToString("F2") + " peers polled per call");
         Console.WriteLine("MEASURE idle=" + idleMicros.ToString("F3") + "us naive=" + naiveMicros.ToString("F1") + "us tick=" + tickMicros.ToString("F2") + "us peersPerTick=" + peersPerTick.ToString("F2"));
-        Assert.True(idleMicros < 50, "Idle PollAll took " + idleMicros + " us.");
-        Assert.True(idleMicros < naiveMicros, "Idle PollAll (" + idleMicros + " us) should beat polling every peer (" + naiveMicros + " us).");
+        // What PollAll does, not how fast this machine is (the timings above are output only): idle calls poll no peer and
+        // allocate nothing, and a tick polls only the few peers whose ping or pong is due, not all 1 000.
+        Assert.True(peersPerTick < 10, peersPerTick.ToString("F2") + " peers polled per tick");
+        AllocationAssert.NoAllocations(() => server.PollAll(), iterations: 10_000);
         Assert.All(clients, c => Assert.Equal(PeerState.Connected, c.State));
     }
 

@@ -1,3 +1,4 @@
+using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Transport;
 
 namespace Tedd.Quicly.Server;
@@ -6,7 +7,8 @@ namespace Tedd.Quicly.Server;
 /// The sink a server hands to an accepted transport. It forwards every callback to the peer's own sink and then marks the
 /// peer's slot as having work, so <see cref="QuiclyServer.PollAll"/> polls only peers whose transport did something (the
 /// peer offers no public "has work" signal). It also carries the connection's per-address key (guarded by the server's
-/// gate) and tracks when the peer's memory is freed, so the server's shared pool is disposed only after every peer let go.
+/// gate), tracks when the peer's memory is freed, so the server's shared pool is disposed only after every peer let go, and
+/// keeps the shared references of a force-closed peer until its transport reported its close.
 /// </summary>
 /// <remarks>Callbacks never throw: the peer's sink wraps its own work, and the server's parts are lock-and-count only.</remarks>
 internal sealed class WorkSignalSink : ITransportSink
@@ -17,6 +19,9 @@ internal sealed class WorkSignalSink : ITransportSink
     private readonly QuiclyServer _server;
     private readonly ITransportSink _inner;
     private readonly int _slot;
+    private readonly Lock _heldGate = new();
+    private List<SharedLease>? _held;
+    private bool _transportClosed;
     private int _retired;
     private int _lifetime;
     private int _limitClose;
@@ -53,6 +58,25 @@ internal sealed class WorkSignalSink : ITransportSink
 
     /// <summary>Takes a pending limit-close request (game thread).</summary>
     public bool TakeLimitClose() => Volatile.Read(ref _limitClose) != 0 && Interlocked.Exchange(ref _limitClose, 0) != 0;
+
+    /// <summary>
+    /// Keeps one reference of a shared payload until the transport reported its close (game thread, a forced close).
+    /// Returns <see langword="false"/> when it already did: the caller then drops the reference itself.
+    /// </summary>
+    public bool HoldUntilClosed(in SharedLease lease)
+    {
+        lock (_heldGate)
+        {
+            if (_transportClosed)
+            {
+                return false;
+            }
+
+            _held ??= [];
+            _held.Add(lease);
+            return true;
+        }
+    }
 
     public void OnConnected(in TransportConnectedInfo info)
     {
@@ -144,7 +168,28 @@ internal sealed class WorkSignalSink : ITransportSink
     {
         _inner.OnClosed(reason, errorCode, transportStatus);
         Signal();
-        SetLifetime(LifetimeClosed);
+        ReleaseHeld();
+        SetLifetime(LifetimeClosed); // last: it may dispose the shared pool the held references belong to
+    }
+
+    /// <summary>The transport closed: it reads no payload any more, so the shared references kept for it go now.</summary>
+    private void ReleaseHeld()
+    {
+        List<SharedLease>? held;
+        lock (_heldGate)
+        {
+            _transportClosed = true;
+            held = _held;
+            _held = null;
+        }
+
+        if (held is not null)
+        {
+            foreach (SharedLease lease in held)
+            {
+                _server.ReleaseHeldShared(in lease);
+            }
+        }
     }
 
     private void Signal()

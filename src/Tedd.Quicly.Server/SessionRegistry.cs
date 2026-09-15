@@ -19,10 +19,14 @@ internal sealed class SessionRecord
     /// <summary>The <see cref="QuiclyPeer.Tag"/> the session's last connection had (restored on the resuming connection).</summary>
     public ulong Tag;
 
-    /// <summary>When the session was last admitted (resume rate cap).</summary>
-    public long LastAdmittedMicros;
+    /// <summary>
+    /// The resume rate's virtual time: every admission moves it one <see cref="ServerAdmissionOptions.MinResumeInterval"/>
+    /// past max(itself, now); a resume is allowed while it is at most <see cref="ServerAdmissionOptions.ResumeBurst"/>
+    /// intervals ahead of now.
+    /// </summary>
+    public long ResumeTat;
 
-    /// <summary>When a disconnected session ends; <see cref="long.MaxValue"/> while connected.</summary>
+    /// <summary>When a disconnected session ends (the loss of its connection plus the grace period); <see cref="long.MaxValue"/> while connected.</summary>
     public long ExpiresMicros = long.MaxValue;
 
     /// <summary>Position in the registry's disconnected list, or -1.</summary>
@@ -30,8 +34,11 @@ internal sealed class SessionRecord
 }
 
 /// <summary>
-/// The sessions of a server, keyed by id, with the disconnected ones in a list swept for expiry. Game thread only (the
-/// admission policy and the close handling both run inside <see cref="QuiclyServer.PollAll"/>).
+/// The sessions of a server, keyed by id, with the disconnected ones in a list swept for expiry. The registry decides how
+/// long a session outlives its connection: the grace period runs from the moment the connection was lost
+/// (<see cref="Disconnect"/>), while a live session stays resumable for as long as its token is valid (its maximum age,
+/// checked by the token authority). Game thread only (the admission policy and the close handling both run inside
+/// <see cref="QuiclyServer.PollAll"/>).
 /// </summary>
 internal sealed class SessionRegistry(int expectedSessions)
 {
@@ -51,7 +58,7 @@ internal sealed class SessionRegistry(int expectedSessions)
     public SessionRecord? Find(ulong sessionId) => _byId.GetValueOrDefault(sessionId);
 
     /// <summary>Creates a fresh session (epoch 1) for <paramref name="peer"/> with a new random id.</summary>
-    public SessionRecord Create(QuiclyPeer peer, long nowMicros)
+    public SessionRecord Create(QuiclyPeer peer)
     {
         ulong id;
         do
@@ -60,18 +67,17 @@ internal sealed class SessionRegistry(int expectedSessions)
         }
         while (id == 0 || _byId.ContainsKey(id));
 
-        SessionRecord record = new() { SessionId = id, Epoch = 1, Peer = peer, Tag = peer.Tag, LastAdmittedMicros = nowMicros };
+        SessionRecord record = new() { SessionId = id, Epoch = 1, Peer = peer, Tag = peer.Tag };
         _byId.Add(id, record);
         return record;
     }
 
     /// <summary>Binds a resumed session to its new connection and epoch.</summary>
-    public void Attach(SessionRecord record, QuiclyPeer peer, uint epoch, long nowMicros)
+    public void Attach(SessionRecord record, QuiclyPeer peer, uint epoch)
     {
         Detach(record);
         record.Peer = peer;
         record.Epoch = epoch;
-        record.LastAdmittedMicros = nowMicros;
         record.ExpiresMicros = long.MaxValue;
     }
 
@@ -120,6 +126,24 @@ internal sealed class SessionRegistry(int expectedSessions)
         }
 
         EarliestExpiry = earliest;
+    }
+
+    /// <summary>
+    /// Removes every session (the server stops) and reports it in <paramref name="ended"/>; a session waiting for a resume
+    /// counts as expired.
+    /// </summary>
+    public void EndAll(List<SessionEndInfo> ended)
+    {
+        foreach (SessionRecord record in _byId.Values)
+        {
+            ended.Add(new SessionEndInfo(record.SessionId, record.Peer?.Tag ?? record.Tag, Expired: record.Peer is null));
+            record.Peer = null;
+            record.DisconnectedIndex = -1;
+        }
+
+        _byId.Clear();
+        _disconnected.Clear();
+        EarliestExpiry = long.MaxValue;
     }
 
     private void Detach(SessionRecord record)

@@ -23,7 +23,13 @@ namespace Tedd.Quicly.Client;
 /// <see cref="PeerState.Reconnecting"/> and <see cref="Peer"/> is the closed old peer (sends answer
 /// <see cref="SendStatus.NotConnected"/>).</para>
 /// <para><b>Threads.</b> Not thread-safe: one thread at a time (the game thread, or <see cref="ConnectAsync"/>'s continuation
-/// while it runs). Events are raised on that thread.</para>
+/// while it runs). Events are raised on that thread. <see cref="Dispose"/> is the exception: it may be called while
+/// <see cref="ConnectAsync"/> waits (from another thread too), which ends that connect with an
+/// <see cref="ObjectDisposedException"/> and disposes its peer.</para>
+/// <para><b>Dispatch timing.</b> A peer dispatches received messages to its handlers whenever it is polled, and the client
+/// polls a connecting peer itself: handlers registered in <see cref="ClientOptions.PeerCreated"/> can run before
+/// <see cref="ConnectAsync"/> returns (the server's first messages right after its HelloAck), and a reconnect attempt's
+/// handlers can run before <see cref="Reconnected"/> is raised.</para>
 /// </remarks>
 public sealed class QuiclyClient : IDisposable
 {
@@ -32,6 +38,7 @@ public sealed class QuiclyClient : IDisposable
 
     private readonly ITransportConnector _connector;
     private readonly WorkSignal _signal = new();
+    private readonly CancellationTokenSource _disposeCts = new();
     private readonly SignalingConnector _signaling;
     private ChannelTable? _table;
     private PeerOptions? _peerOptions;
@@ -55,7 +62,7 @@ public sealed class QuiclyClient : IDisposable
     private CloseReason _lastReason;
     private bool _closeRequested;
     private bool _connecting;
-    private bool _disposed;
+    private volatile bool _disposed; // Dispose may run while ConnectAsync waits
 
     /// <summary>Creates a client that connects through <paramref name="connector"/>.</summary>
     /// <param name="connector">Creates the transports.</param>
@@ -123,8 +130,9 @@ public sealed class QuiclyClient : IDisposable
 
     /// <summary>
     /// Connects to <paramref name="endpoint"/> and completes once the server admitted the session (or resumed the one named
-    /// by <see cref="PeerOptions.SessionToken"/>). The peer is polled while the call waits; the wait ends on transport
-    /// callbacks and deadlines, bounded by <see cref="PeerOptions.AdmissionTimeout"/>.
+    /// by <see cref="PeerOptions.SessionToken"/>). The peer is polled while the call waits, so its handlers may already run
+    /// before the call returns; the wait ends on transport callbacks and deadlines, bounded by
+    /// <see cref="PeerOptions.AdmissionTimeout"/>.
     /// </summary>
     /// <param name="endpoint">The server.</param>
     /// <param name="options">Channels, peer options, auth token, server name, reconnect policy.</param>
@@ -134,6 +142,7 @@ public sealed class QuiclyClient : IDisposable
     /// <exception cref="InvalidOperationException">The client is connected, connecting or reconnecting.</exception>
     /// <exception cref="QuiclyConnectException">The transport failed or the server refused the session.</exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> fired.</exception>
+    /// <exception cref="ObjectDisposedException">The client is disposed, or was disposed while the connect ran (its peer is disposed too).</exception>
     public async ValueTask<QuiclyPeer> ConnectAsync(EndPoint endpoint, ClientOptions options, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -175,13 +184,17 @@ public sealed class QuiclyClient : IDisposable
             throw;
         }
 
+        // Dispose cancels the wait through this token; the connect then ends with ObjectDisposedException.
+        using CancellationTokenSource waitCancel = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
         try
         {
             while (true)
             {
+                ObjectDisposedException.ThrowIf(_disposed, this);
                 cancellationToken.ThrowIfCancellationRequested();
                 peer.Poll();
                 peer.Flush();
+                ObjectDisposedException.ThrowIf(_disposed, this); // a handler disposed the client
                 if (peer.State == PeerState.Connected)
                 {
                     _peer = peer;
@@ -196,7 +209,14 @@ public sealed class QuiclyClient : IDisposable
                     throw Failure(peer);
                 }
 
-                await WaitAsync(peer, cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await WaitAsync(peer, waitCancel.Token).ConfigureAwait(false);
+                }
+                catch (Exception) when (_disposed)
+                {
+                    // Dispose cancelled the wait (or disposed the signal under it): the check above ends the connect.
+                }
             }
         }
         catch
@@ -210,9 +230,10 @@ public sealed class QuiclyClient : IDisposable
 
     /// <summary>
     /// Runs the client on the game thread: polls the current peer (see <see cref="QuiclyPeer.Poll"/>) and notices a lost
-    /// connection, or drives the scheduled reconnect attempts. Returns 0 while <see cref="ConnectAsync"/> runs.
+    /// connection, or drives the scheduled reconnect attempts (polling the attempt's peer, whose handlers may run before
+    /// <see cref="Reconnected"/> is raised). Returns 0 while <see cref="ConnectAsync"/> runs.
     /// </summary>
-    /// <param name="maxItems">Most messages to dispatch to handlers.</param>
+    /// <param name="maxItems">Most messages to dispatch to handlers (the current peer's, or the reconnect attempt's).</param>
     /// <returns>Messages dispatched.</returns>
     /// <exception cref="ObjectDisposedException">The client is disposed.</exception>
     public int Poll(int maxItems = int.MaxValue)
@@ -250,8 +271,7 @@ public sealed class QuiclyClient : IDisposable
 
                 return dispatched;
             case PeerState.Reconnecting:
-                DriveReconnect(now);
-                return 0;
+                return DriveReconnect(now, maxItems);
             default:
                 return 0;
         }
@@ -313,7 +333,10 @@ public sealed class QuiclyClient : IDisposable
         }
     }
 
-    /// <summary>Disposes the peers (closing their transports) and the client.</summary>
+    /// <summary>
+    /// Disposes the peers (closing their transports) and the client. A <see cref="ConnectAsync"/> that is waiting ends with an
+    /// <see cref="ObjectDisposedException"/> and disposes the peer it drives, so no connection outlives the client.
+    /// </summary>
     public void Dispose()
     {
         if (_disposed)
@@ -322,6 +345,7 @@ public sealed class QuiclyClient : IDisposable
         }
 
         _disposed = true;
+        _disposeCts.Cancel(); // wakes a waiting ConnectAsync
         _attempt?.Dispose();
         _peer?.Dispose();
         _attempt = null;
@@ -396,13 +420,13 @@ public sealed class QuiclyClient : IDisposable
         Reconnecting?.Invoke(this, new ReconnectingInfo(_attemptNumber, delay, _lastReason));
     }
 
-    private void DriveReconnect(long now)
+    private int DriveReconnect(long now, int maxItems)
     {
         if (_attempt is null)
         {
             if (now < _nextAttemptMicros)
             {
-                return;
+                return 0;
             }
 
             try
@@ -415,22 +439,22 @@ public sealed class QuiclyClient : IDisposable
                 // The connector failed synchronously (no transport): count it like a failed attempt.
                 _lastReason = new CloseReason(QuiclyErrorCode.InternalError, Truncate(exception.Message)) { Source = CloseSource.Transport };
                 AttemptFailed(now, HelloStatus.Accepted);
-                return;
+                return 0;
             }
         }
 
         QuiclyPeer attempt = _attempt;
-        attempt.Poll();
+        int dispatched = attempt.Poll(maxItems);
         attempt.Flush();
         if (attempt.State == PeerState.Connected)
         {
             CompleteReconnect(attempt);
-            return;
+            return dispatched;
         }
 
         if (attempt.State != PeerState.Closed)
         {
-            return;
+            return dispatched;
         }
 
         _attempt = null;
@@ -438,6 +462,7 @@ public sealed class QuiclyClient : IDisposable
         _lastReason = attempt.CloseReason;
         attempt.Dispose();
         AttemptFailed(now, status);
+        return dispatched;
     }
 
     private void AttemptFailed(long now, HelloStatus status)

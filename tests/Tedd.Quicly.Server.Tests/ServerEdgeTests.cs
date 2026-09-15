@@ -1,6 +1,7 @@
 using System.Net;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
+using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Threading;
@@ -27,7 +28,7 @@ public class ServerEdgeTests
     }
 
     [Fact]
-    public async Task A_Decision_For_A_Peer_The_Application_Completed_Itself_Is_Ignored()
+    public async Task A_Server_Peer_The_Application_Admitted_Itself_Is_Closed_And_Never_Admitted_By_The_Server()
     {
         QuiclyPeer? pending = null;
         await using ServerFixture f = new(o => o.Admission.AuthTokenValidator = (in AuthTokenContext c) =>
@@ -38,9 +39,15 @@ public class ServerEdgeTests
         QuiclyPeer client = f.Connect();
         Assert.True(f.RunUntil(() => pending is not null));
         f.Server.CompleteAdmission(pending!, AdmissionResult.Accept());
-        pending!.CompleteAdmission(AdmissionResult.Accept()); // bypassing the server: its queued decision finds nothing pending
-        Assert.True(f.RunUntil(() => client.State == PeerState.Connected));
-        Assert.Single(f.Admitted);
+        pending!.CompleteAdmission(AdmissionResult.Accept()); // bypasses MaxPeers and the sessions: the server closes the peer
+        Assert.True(f.RunUntil(() => client.State == PeerState.Closed));
+        Assert.Equal(QuiclyErrorCode.InternalError, client.CloseReason.Code);
+        Assert.Empty(f.Admitted);
+        AdmissionFailure failure = Assert.Single(f.FailuresOf(AdmissionFailureReason.PolicyFault));
+        Assert.Contains("QuiclyServer.CompleteAdmission", failure.Detail, StringComparison.Ordinal);
+        f.Server.GetStatistics(out ServerStatistics statistics);
+        Assert.Equal(0, statistics.SessionsCreated);
+        Assert.Equal(0, statistics.AdmittedPeers);
     }
 
     [Fact]
@@ -70,8 +77,10 @@ public class ServerEdgeTests
         Assert.Equal(0, f.Server.Peers.Length);
         f.Server.BeginShutdown();
         Assert.Equal(1, f.Server.Peers.Length);
+        Assert.Equal(PeerState.Closing, f.Server.Peers[0].Peer!.State); // activated and closed at once
         Assert.True(f.RunUntil(() => f.Server.IsShutdownComplete));
         Assert.Equal(PeerState.Closed, client.State);
+        Assert.Empty(f.Admitted);
     }
 
     [Fact]
@@ -86,6 +95,8 @@ public class ServerEdgeTests
         }, start: false);
         f.Server.CertificateConsumerFailed += failures.Add;
         await f.Server.StartAsync(TestContext.Current.CancellationToken);
+        Assert.Empty(failures); // found on the thread that applied the certificate: raised from the next PollAll
+        f.Server.PollAll();
         Assert.Single(failures);
         f.Server.GetStatistics(out ServerStatistics statistics);
         Assert.Equal(0, statistics.EventHandlerFaults);

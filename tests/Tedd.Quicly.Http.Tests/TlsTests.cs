@@ -287,6 +287,7 @@ public class TlsTests
         using var cert = TestCertificates.CreateSelfSigned("localhost", "localhost");
         await using var host = TestHost.Start(o =>
         {
+            o.Limits.TlsHandshakeTimeout = TimeSpan.FromMilliseconds(500); // the handshake has its own budget
             o.Limits.HeaderReadTimeout = TimeSpan.FromMilliseconds(500);
             o.Use(Routes());
         }, HttpTlsOptions.FromCertificate(cert));
@@ -318,6 +319,7 @@ public class TlsTests
         }
         await HttpServerTests.WaitUntilAsync(() => host.Server.ActiveConnections == 0);
         Assert.Equal(4, host.Server.HandshakeFailures);
+        Assert.Equal(2, host.Server.HandshakeTimeouts); // the record that never completed, and the client that sent nothing
         Assert.Equal(0, host.Server.RequestTimeouts);
     }
 

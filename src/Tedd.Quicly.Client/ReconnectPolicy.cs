@@ -34,9 +34,9 @@ public sealed class ReconnectPolicy
     public bool ResumeSession { get; set; } = true;
 
     /// <summary>
-    /// When the server refuses the resume (<see cref="HelloStatus.Rejected"/>: the token expired or the session ended), try a
-    /// fresh session instead of giving up; <see cref="ReconnectedInfo.Resumed"/> then reports the new identity. Default
-    /// <see langword="true"/>.
+    /// When the server refuses the resume (<see cref="HelloStatus.Rejected"/>: the token expired, the session ended, or it
+    /// resumed more often than the server's resume rate allows), try a fresh session instead of giving up;
+    /// <see cref="ReconnectedInfo.Resumed"/> then reports the new identity. Default <see langword="true"/>.
     /// </summary>
     public bool FallBackToNewSession { get; set; } = true;
 

@@ -89,7 +89,8 @@ public class SessionTests
         QuiclyPeer late = f.Resume(first);
         Assert.True(f.RunUntil(() => late.State == PeerState.Closed));
         Assert.Equal(HelloStatus.Rejected, late.HandshakeStatus);
-        Assert.Single(f.FailuresOf(AdmissionFailureReason.SessionTokenExpired));
+        Assert.Single(f.FailuresOf(AdmissionFailureReason.SessionUnknown)); // the registry's decision: the token is still valid
+        Assert.Empty(f.FailuresOf(AdmissionFailureReason.SessionTokenExpired));
         f.Server.GetStatistics(out ServerStatistics statistics);
         Assert.Equal(1, statistics.SessionsExpired);
         Assert.Equal(0, statistics.Sessions);
@@ -179,17 +180,32 @@ public class SessionTests
     }
 
     [Fact]
-    public async Task Resumes_Faster_Than_The_Minimum_Interval_Are_Refused_And_Keep_The_Token()
+    public async Task Resumes_Beyond_The_Burst_Wait_For_The_Minimum_Interval_Uncharged_And_Keep_The_Token()
     {
-        await using ServerFixture f = new(o => o.Admission.MinResumeInterval = TimeSpan.FromSeconds(1));
-        QuiclyPeer first = f.ConnectAdmitted();
-        QuiclyPeer tooSoon = f.Resume(first);
+        // The production resume rate (MinResumeInterval 1 s, ResumeBurst 3); a single charged failure would block the address.
+        await using ServerFixture f = new(o => o.Admission.AuthFailureBurst = 1);
+        Assert.Equal(TimeSpan.FromSeconds(1), f.Options.Admission.MinResumeInterval);
+        Assert.Equal(3, f.Options.Admission.ResumeBurst);
+        QuiclyPeer current = f.ConnectAdmitted();
+        for (int i = 0; i < 3; i++)
+        {
+            QuiclyPeer next = f.Resume(current); // a connection that flaps right after its admission
+            Assert.True(f.RunUntil(() => next.State == PeerState.Connected));
+            current = next;
+        }
+
+        QuiclyPeer tooSoon = f.Resume(current);
         Assert.True(f.RunUntil(() => tooSoon.State == PeerState.Closed));
-        Assert.Single(f.FailuresOf(AdmissionFailureReason.ResumeTooSoon));
+        Assert.Equal(HelloStatus.Rejected, tooSoon.HandshakeStatus);
+        Assert.False(Assert.Single(f.FailuresOf(AdmissionFailureReason.ResumeTooSoon)).IsTokenFailure);
+        Assert.Equal(PeerState.Connected, current.State);
+
         f.Run(1_000_000, step: 10_000);
-        QuiclyPeer later = f.Resume(first);
+        QuiclyPeer later = f.Resume(current); // the refused resume did not spend the token
         Assert.True(f.RunUntil(() => later.State == PeerState.Connected));
-        Assert.Equal(first.SessionId, later.SessionId);
+        Assert.Equal(current.SessionId, later.SessionId);
+        Assert.Equal(5u, later.Epoch);
+        Assert.Empty(f.FailuresOf(AdmissionFailureReason.AddressRateLimited));
     }
 
     [Fact]

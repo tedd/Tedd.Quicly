@@ -53,6 +53,13 @@ public sealed partial class QuiclyServer
 
         ref long word = ref _workBits[slot >> 6];
         long bit = 1L << (slot & 63);
+
+        // The caller published the peer's work first (a ring entry, a signal bit). The full fence orders that publication
+        // before the read of the word: x86/x64 may otherwise satisfy the read early (a store followed by a load of another
+        // location can be reordered), see the bit still set and skip the Or while PollMarked's Exchange clears it and misses
+        // the work, and nothing would mark the slot again. The read keeps the common case (bit already set) off the write
+        // path of a line that many transport threads share.
+        Interlocked.MemoryBarrier();
         if ((Volatile.Read(ref word) & bit) == 0)
         {
             Interlocked.Or(ref word, bit);
@@ -120,7 +127,7 @@ public sealed partial class QuiclyServer
         }
         catch (Exception exception)
         {
-            ReportFailure(new AdmissionFailure(AdmissionStage.PreHandshake, AdmissionFailureReason.PolicyFault, info.RemoteEndPoint, Exception: exception));
+            QueueFailure(new AdmissionFailure(AdmissionStage.PreHandshake, AdmissionFailureReason.PolicyFault, info.RemoteEndPoint, Exception: exception));
             decision = PreHandshakeDecision.Reject;
         }
 
@@ -163,7 +170,7 @@ public sealed partial class QuiclyServer
         if (refusal is { } reason)
         {
             Interlocked.Increment(ref _connectionsRefused);
-            ReportFailure(new AdmissionFailure(AdmissionStage.PreHandshake, reason, remote));
+            QueueFailure(new AdmissionFailure(AdmissionStage.PreHandshake, reason, remote));
             return null;
         }
 
@@ -187,7 +194,7 @@ public sealed partial class QuiclyServer
 
             Interlocked.Decrement(ref _alivePeers);
             Interlocked.Increment(ref _connectionsRefused);
-            ReportFailure(new AdmissionFailure(AdmissionStage.PreHandshake, AdmissionFailureReason.PeerCreationFailed, remote, Exception: exception));
+            QueueFailure(new AdmissionFailure(AdmissionStage.PreHandshake, AdmissionFailureReason.PeerCreationFailed, remote, Exception: exception));
             return null;
         }
 
@@ -276,6 +283,14 @@ public sealed partial class QuiclyServer
             {
                 _highWater = slot + 1;
             }
+
+            if (_shutdownBegun)
+            {
+                // Accepted by the listener just before (or while) the shutdown began: it is closed like every other peer,
+                // and never admitted (OnHello and Apply refuse while the server is not accepting).
+                activation.Peer.Close(_shutdownClose);
+                MarkWork(slot);
+            }
         }
 
         batch.Clear();
@@ -315,7 +330,10 @@ public sealed partial class QuiclyServer
             }
         }
 
-        ReleaseAllShared(slot, peer);
+        // A forced close (the peer is not Closed yet) leaves the transport open until the Dispose below closes it, and the
+        // transport may read the payloads of its shared sends until it reported that close (ADR 0008 invariant 1): those
+        // references go to the sink, which drops them when OnClosed arrives.
+        ReleaseAllShared(slot, peer, info.Sink);
         try
         {
             if (admitted)
@@ -337,7 +355,7 @@ public sealed partial class QuiclyServer
     /// Whether a session survives this close for its grace period: lost connections and timeouts do; a deliberate close does
     /// not (the client said goodbye, or the server closed the peer itself, for example to kick a player).
     /// </summary>
-    private static bool IsResumable(in CloseReason reason) =>
+    internal static bool IsResumable(in CloseReason reason) =>
         reason.Source == CloseSource.Transport
         || reason.Code == QuiclyErrorCode.Timeout
         || (reason.Source == CloseSource.Peer && reason.Code != QuiclyErrorCode.NoError);

@@ -48,6 +48,7 @@ public class CertificateHostingTests
         f.Server.CertificateConsumerFailed += failures.Add;
         f.Server.CertificateConsumerFailed += _ => throw new InvalidOperationException("handler");
         await f.Server.StartAsync(TestContext.Current.CancellationToken);
+        f.Server.PollAll(); // raises the failure the binder found while the server started
         CertificateConsumerFailure failure = Assert.Single(failures);
         Assert.IsType<InvalidOperationException>(failure.Exception);
         f.Server.GetStatistics(out ServerStatistics statistics);

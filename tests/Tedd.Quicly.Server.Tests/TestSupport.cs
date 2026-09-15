@@ -26,6 +26,7 @@ internal sealed class AcmeTestEnvironment : IAsyncDisposable
         Ca.Http01ValidationHost = "127.0.0.1";
         Ca.TlsAlpnValidationHost = "127.0.0.1";
         Ca.DnsTxtLookup = Dns.Lookup;
+        Ca.ValidationTimeout = TimeSpan.FromSeconds(60); // a loaded build machine needs more than the 10 s default
         Ca.Start();
     }
 
@@ -54,6 +55,7 @@ internal sealed class AcmeTestEnvironment : IAsyncDisposable
             HttpClient = Http,
             HttpChallengeEndpoint = new IPEndPoint(IPAddress.Loopback, 0),
             TlsAlpnEndpoint = new IPEndPoint(IPAddress.Loopback, 0),
+            TlsHandshakeTimeout = TimeSpan.FromSeconds(60), // generous: a first handshake also builds the certificate's chain
             Dns01Provider = Dns,
             Retry = new AcmeRetryOptions { MaxAttempts = 3, InitialDelay = TimeSpan.FromMilliseconds(20), MaxDelay = TimeSpan.FromMilliseconds(100), Jitter = 0 },
             ClientOptions = new AcmeClientOptions { PollInterval = TimeSpan.FromMilliseconds(20), MaxPollAttempts = 50 },

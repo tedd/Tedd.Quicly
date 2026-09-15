@@ -4,23 +4,34 @@ using Tedd.Quicly.Core.Session;
 
 namespace Tedd.Quicly.Server;
 
-// Game thread: PollAll (work bits, deadlines, session expiry, auto flush) and FlushAll.
+// Game thread: PollAll (work bits, deadlines, session expiry, queued events, auto flush) and FlushAll.
 public sealed partial class QuiclyServer
 {
     private readonly List<SessionEndInfo> _endedSessions = [];
+    private int _endedHead;
     private bool _inPollAll;
+    private int _pollCursor;
     private long _nextAutoFlush;
     private long _pollAllCalls;
     private long _peersPolled;
 
+    /// <summary>Test seam: replaces the peers' <see cref="QuiclyPeer.Poll"/> inside PollAll (the placeholder engines of wave C1 step 1 dispatch nothing).</summary>
+    internal Func<QuiclyPeer, int, int>? PollOverride { get; set; }
+
     /// <summary>
     /// Runs the game-thread side of every peer that has something to do (game thread): activates newly accepted connections,
     /// applies admission decisions, then polls each peer whose transport raised a callback since its last poll or whose
-    /// next deadline (ping, timeout, linger) is due. Raises <see cref="PeerAdmitted"/>, <see cref="PeerClosed"/> and
-    /// <see cref="SessionEnded"/>, releases closed peers and runs the <see cref="PeerOptions.AutoFlushInterval"/> flush.
-    /// Idle peers are skipped; allocation-free in steady state. Handler exceptions propagate (the remaining peers keep their
-    /// work for the next call). A call from inside one of its own events returns 0.
+    /// next deadline (ping, timeout, linger) is due. Raises <see cref="PeerAdmitted"/>, <see cref="PeerClosed"/>,
+    /// <see cref="SessionEnded"/> and the events other threads queued (<see cref="AdmissionFailed"/>,
+    /// <see cref="CertificateConsumerFailed"/>), releases closed peers and runs the
+    /// <see cref="PeerOptions.AutoFlushInterval"/> flush. Idle peers are skipped; allocation-free in steady state. Handler
+    /// exceptions propagate (the remaining peers keep their work, and the remaining <see cref="SessionEnded"/> events stay
+    /// queued, for the next call). A call from inside one of its own events returns 0.
     /// </summary>
+    /// <remarks>
+    /// With a <paramref name="maxItems"/> budget the peers with work are served round-robin: a call that runs out of budget
+    /// makes the next one start after the peer that used the budget up, so a busy peer in a low slot cannot starve the others.
+    /// </remarks>
     /// <param name="maxItems">Most messages to dispatch to handlers in this call, across all peers.</param>
     /// <returns>Messages dispatched to handlers.</returns>
     /// <exception cref="ObjectDisposedException">The server is disposed.</exception>
@@ -60,12 +71,18 @@ public sealed partial class QuiclyServer
                 SweepSessions(now);
             }
 
+            if (_endedHead < _endedSessions.Count)
+            {
+                RaiseEndedSessions();
+            }
+
             if (_autoFlushMicros > 0 && now >= _nextAutoFlush)
             {
                 _nextAutoFlush = now + _autoFlushMicros;
                 FlushAll();
             }
 
+            RaiseQueuedEvents();
             return dispatched;
         }
         finally
@@ -123,34 +140,62 @@ public sealed partial class QuiclyServer
         return dispatched;
     }
 
+    /// <summary>
+    /// Polls the peers whose work bit is set, round-robin from <see cref="_pollCursor"/>: the bits of the cursor's word from the
+    /// cursor up, the words after it, the words before it, and last the bits of the cursor's word below the cursor.
+    /// </summary>
     private int PollMarked(ref int budget)
     {
-        int dispatched = 0;
         long[] words = _workBits;
         int count = (_highWater + 63) >> 6;
-        for (int w = 0; w < count; w++)
+        if (count == 0)
         {
+            return 0;
+        }
+
+        int cursor = _pollCursor < _highWater ? _pollCursor : 0;
+        int start = cursor >> 6;
+        long below = (1L << (cursor & 63)) - 1;
+        int dispatched = 0;
+        for (int i = 0; i < count; i++)
+        {
+            int w = start + i < count ? start + i : start + i - count;
             if (Volatile.Read(ref words[w]) == 0)
             {
                 continue;
             }
 
-            long pending = Interlocked.Exchange(ref words[w], 0);
-            try
+            // In the cursor's word only the bits from the cursor up are taken now; the ones below stay set for the end.
+            long pending = i == 0 && below != 0 ? Interlocked.And(ref words[w], below) & ~below : Interlocked.Exchange(ref words[w], 0);
+            dispatched += PollWord(w, pending, ref budget);
+        }
+
+        if (below != 0 && (Volatile.Read(ref words[start]) & below) != 0)
+        {
+            dispatched += PollWord(start, Interlocked.And(ref words[start], ~below) & below, ref budget);
+        }
+
+        return dispatched;
+    }
+
+    /// <summary>Polls the slots whose bits are in <paramref name="pending"/> (taken from word <paramref name="w"/>).</summary>
+    private int PollWord(int w, long pending, ref int budget)
+    {
+        int dispatched = 0;
+        try
+        {
+            while (pending != 0)
             {
-                while (pending != 0)
-                {
-                    int slot = (w << 6) + BitOperations.TrailingZeroCount(pending);
-                    dispatched += PollSlot(slot, ref budget);
-                    pending &= pending - 1;
-                }
+                int slot = (w << 6) + BitOperations.TrailingZeroCount(pending);
+                dispatched += PollSlot(slot, ref budget);
+                pending &= pending - 1;
             }
-            finally
+        }
+        finally
+        {
+            if (pending != 0)
             {
-                if (pending != 0)
-                {
-                    Interlocked.Or(ref words[w], pending); // a handler threw: keep the rest (and the thrower) for the next call
-                }
+                Interlocked.Or(ref _workBits[w], pending); // a handler threw: keep the rest (and the thrower) for the next call
             }
         }
 
@@ -164,47 +209,62 @@ public sealed partial class QuiclyServer
         long[] deadlines = _deadlines;
         int count = _highWater;
         int slot = 0;
-        if (Vector.IsHardwareAccelerated && count >= Vector<long>.Count)
+
+        // Deadlines set while the scan runs (the polled peers' next ones, peers a handler activated through FlushAll) lower
+        // _earliestDeadline again, and the scan's own minimum is merged in at the end. A handler that throws leaves it no
+        // later than before, so the next call scans again.
+        long previous = _earliestDeadline;
+        _earliestDeadline = long.MaxValue;
+        bool scanned = false;
+        try
         {
-            Vector<long> nowVector = new(now);
-            Vector<long> minimum = new(long.MaxValue);
-            int last = count - Vector<long>.Count;
-            for (; slot <= last; slot += Vector<long>.Count)
+            if (Vector.IsHardwareAccelerated && count >= Vector<long>.Count)
             {
-                Vector<long> block = new(deadlines, slot);
-                if (Vector.LessThanOrEqualAny(block, nowVector))
+                Vector<long> nowVector = new(now);
+                Vector<long> minimum = new(long.MaxValue);
+                int last = count - Vector<long>.Count;
+                for (; slot <= last; slot += Vector<long>.Count)
                 {
-                    for (int k = slot; k < slot + Vector<long>.Count; k++)
+                    Vector<long> block = new(deadlines, slot);
+                    if (Vector.LessThanOrEqualAny(block, nowVector))
                     {
-                        if (deadlines[k] <= now)
+                        for (int k = slot; k < slot + Vector<long>.Count; k++)
                         {
-                            dispatched += PollSlot(k, ref budget);
+                            if (deadlines[k] <= now)
+                            {
+                                dispatched += PollSlot(k, ref budget);
+                            }
                         }
+
+                        block = new Vector<long>(deadlines, slot);
                     }
 
-                    block = new Vector<long>(deadlines, slot);
+                    minimum = Vector.Min(minimum, block);
                 }
 
-                minimum = Vector.Min(minimum, block);
+                for (int k = 0; k < Vector<long>.Count; k++)
+                {
+                    earliest = Math.Min(earliest, minimum[k]);
+                }
             }
 
-            for (int k = 0; k < Vector<long>.Count; k++)
+            for (; slot < count; slot++)
             {
-                earliest = Math.Min(earliest, minimum[k]);
-            }
-        }
+                if (deadlines[slot] <= now)
+                {
+                    dispatched += PollSlot(slot, ref budget);
+                }
 
-        for (; slot < count; slot++)
+                earliest = Math.Min(earliest, deadlines[slot]);
+            }
+
+            scanned = true;
+        }
+        finally
         {
-            if (deadlines[slot] <= now)
-            {
-                dispatched += PollSlot(slot, ref budget);
-            }
-
-            earliest = Math.Min(earliest, deadlines[slot]);
+            _earliestDeadline = Math.Min(_earliestDeadline, scanned ? earliest : previous);
         }
 
-        _earliestDeadline = earliest;
         return dispatched;
     }
 
@@ -224,13 +284,17 @@ public sealed partial class QuiclyServer
         }
 
         int given = budget;
-        int dispatched = peer.Poll(given);
+        int dispatched = PollOverride is { } poll ? poll(peer, given) : peer.Poll(given);
         if (given != int.MaxValue)
         {
             budget = Math.Max(0, given - dispatched);
             if (dispatched >= given)
             {
                 MarkWork(slot); // the budget ran out: the peer may hold more messages
+                if (given > 0)
+                {
+                    _pollCursor = slot + 1; // the next budget-limited call starts after the peer that used it up
+                }
             }
         }
 
@@ -263,18 +327,46 @@ public sealed partial class QuiclyServer
 
     private void SweepSessions(long now)
     {
-        _endedSessions.Clear();
+        int before = _endedSessions.Count;
         _sessions.Sweep(now, _endedSessions);
-        _sessionsExpired += _endedSessions.Count;
-        Action<SessionEndInfo>? handler = SessionEnded;
-        if (handler is null)
+        _sessionsExpired += _endedSessions.Count - before;
+    }
+
+    /// <summary>
+    /// Raises <see cref="SessionEnded"/> for the queued ends, oldest first. A handler that throws leaves the rest queued for the
+    /// next call.
+    /// </summary>
+    private void RaiseEndedSessions()
+    {
+        while (_endedHead < _endedSessions.Count)
         {
-            return;
+            SessionEndInfo ended = _endedSessions[_endedHead++];
+            if (_endedHead == _endedSessions.Count)
+            {
+                _endedSessions.Clear();
+                _endedHead = 0;
+            }
+
+            SessionEnded?.Invoke(ended);
+        }
+    }
+
+    /// <summary>Raises every queued <see cref="SessionEnded"/> (the shutdown): all handlers run, and the first exception is returned.</summary>
+    private Exception? RaiseAllEndedSessions()
+    {
+        Exception? first = null;
+        while (_endedHead < _endedSessions.Count)
+        {
+            try
+            {
+                RaiseEndedSessions();
+            }
+            catch (Exception exception)
+            {
+                first ??= exception;
+            }
         }
 
-        for (int i = 0; i < _endedSessions.Count; i++)
-        {
-            handler(_endedSessions[i]);
-        }
+        return first;
     }
 }

@@ -23,9 +23,10 @@ public class ServerConfigurationTests
     public static TheoryData<string> InvalidOptions() =>
     [
         "channels", "peer-options", "listen", "expected-0", "max-peers", "shutdown-timeout", "shutdown-code", "shutdown-reason",
-        "per-address", "prefix", "unadmitted", "burst", "tracked", "refill-zero", "refill-long", "resume-interval", "alpn-empty",
-        "alpn-long", "alpn-unicode", "server-name", "key", "grace-negative", "grace-long", "lifetime-zero", "lifetime-long",
-        "replay", "http-endpoint", "https-port", "health-path", "http-handler", "consumer", "acme-conflict",
+        "per-address", "prefix", "unadmitted", "burst", "tracked", "refill-zero", "refill-long", "resume-interval",
+        "resume-interval-long", "resume-burst", "alpn-empty", "alpn-long", "alpn-unicode", "server-name", "key", "grace-negative",
+        "grace-long", "lifetime-zero", "lifetime-long", "lifetime-below-grace", "replay", "http-endpoint", "https-port",
+        "health-path", "http-handler", "consumer", "acme-conflict",
     ];
 
     [Theory]
@@ -51,6 +52,8 @@ public class ServerConfigurationTests
             case "refill-zero": options.Admission.AuthFailureRefillInterval = TimeSpan.Zero; break;
             case "refill-long": options.Admission.AuthFailureRefillInterval = TimeSpan.FromDays(2); break;
             case "resume-interval": options.Admission.MinResumeInterval = TimeSpan.FromSeconds(-1); break;
+            case "resume-interval-long": options.Admission.MinResumeInterval = TimeSpan.FromDays(2); break;
+            case "resume-burst": options.Admission.ResumeBurst = 1001; break;
             case "alpn-empty": options.Admission.AllowedAlpns.Add(""); break;
             case "alpn-long": options.Admission.AllowedAlpns.Add(new string('a', 256)); break;
             case "alpn-unicode": options.Admission.AllowedAlpns.Add("quïcly"); break;
@@ -60,6 +63,7 @@ public class ServerConfigurationTests
             case "grace-long": options.Sessions.Grace = TimeSpan.FromDays(2); break;
             case "lifetime-zero": options.Sessions.TokenLifetime = TimeSpan.Zero; break;
             case "lifetime-long": options.Sessions.TokenLifetime = TimeSpan.FromDays(31); break;
+            case "lifetime-below-grace": options.Sessions.TokenLifetime = TimeSpan.FromSeconds(10); break;
             case "replay": options.Sessions.ReplayCacheCapacity = -1; break;
             case "http-endpoint": options.Http = new ServerHttpOptions { EndPoint = null! }; break;
             case "https-port": options.Http = new ServerHttpOptions { HttpsPort = 70_000 }; break;

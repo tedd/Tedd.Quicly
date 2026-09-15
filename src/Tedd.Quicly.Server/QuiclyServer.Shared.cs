@@ -15,6 +15,7 @@ public sealed partial class QuiclyServer
     private int _sharedFree = -1;
     private int _sharedNext;
     private int _sharedOutstanding;
+    private int _sharedHeld; // references sinks keep for force-closed peers until their transport closed (Interlocked)
 
     /// <summary>How <see cref="SendShared"/> reaches the peers (a test seam; the default uses the peers' public API).</summary>
     internal ISharedSendPort SharedPort { get; set; } = PeerSharedSendPort.Instance;
@@ -167,8 +168,12 @@ public sealed partial class QuiclyServer
         }
     }
 
-    /// <summary>The peer is closed (its transport holds nothing any more) or being force-closed: drop every reference it holds.</summary>
-    private void ReleaseAllShared(int slot, QuiclyPeer peer)
+    /// <summary>
+    /// The peer is closed or being force-closed: drops the tracking of every shared send it holds. Each reference goes at
+    /// once when the transport already reported its close, otherwise to <paramref name="sink"/>, which drops it when the
+    /// transport does (after a forced close the transport may still read the payload until then).
+    /// </summary>
+    private void ReleaseAllShared(int slot, QuiclyPeer peer, WorkSignalSink? sink)
     {
         ISharedSendPort port = SharedPort;
         int entry = _sharedHead[slot];
@@ -178,8 +183,36 @@ public sealed partial class QuiclyServer
             ref SharedEntry tracked = ref _sharedEntries[entry];
             int next = tracked.Next;
             port.Abandon(peer, ref tracked);
-            FreeShared(entry);
+            SharedLease lease = tracked.Lease;
+            tracked = default;
+            tracked.Next = _sharedFree;
+            _sharedFree = entry;
+            _sharedOutstanding--;
+            Interlocked.Increment(ref _sharedHeld);
+            if (sink is null || !sink.HoldUntilClosed(in lease))
+            {
+                Interlocked.Decrement(ref _sharedHeld);
+                _sharedLeases.Release(in lease);
+            }
+
             entry = next;
+        }
+    }
+
+    /// <summary>Drops a shared reference a sink kept for a force-closed peer (transport thread; never throws).</summary>
+    internal void ReleaseHeldShared(in SharedLease lease)
+    {
+        try
+        {
+            _sharedLeases.Release(in lease);
+        }
+        catch (ObjectDisposedException)
+        {
+            // The application disposed the pool it supplied (PeerOptions.Allocator) before the transport closed.
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _sharedHeld);
         }
     }
 

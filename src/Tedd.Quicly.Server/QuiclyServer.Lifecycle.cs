@@ -19,6 +19,7 @@ public sealed partial class QuiclyServer
     private CertificateBinder? _binder;
     private HttpServer? _http;
     private bool _shutdownBegun;
+    private CloseReason _shutdownClose;
 
     /// <summary>Test seam: replaces the real-time delay of <see cref="StopAsync"/>'s wait loop (a simulated network advances here).</summary>
     internal Func<TimeSpan, CancellationToken, Task>? DelayOverride { get; set; }
@@ -98,6 +99,7 @@ public sealed partial class QuiclyServer
             Volatile.Write(ref _accepting, false);
         }
 
+        _shutdownClose = close; // also for connections the listener accepted before it stopped (ActivatePending closes them)
         if (!_shutdownBegun)
         {
             _shutdownBegun = true;
@@ -127,8 +129,10 @@ public sealed partial class QuiclyServer
     /// <summary>
     /// Shuts down gracefully: <see cref="BeginShutdown"/>, then polls and flushes the peers until they closed or
     /// <see cref="ServerOptions.ShutdownTimeout"/> passed, disposes the rest (raising <see cref="PeerClosed"/> for admitted
-    /// ones), and stops the HTTP endpoint and the certificate provisioning. Call it from the game thread, and stop calling
-    /// <see cref="PollAll"/> yourself while it runs. A server that never started just becomes stopped.
+    /// ones), ends the sessions still waiting for a resume (<see cref="SessionEnded"/>), and stops the HTTP endpoint and the
+    /// certificate provisioning. Call it from the game thread, and stop calling <see cref="PollAll"/> yourself while it runs.
+    /// Every step runs even when an event handler throws in an earlier one; the first exception is rethrown at the end. A
+    /// server that never started just becomes stopped.
     /// </summary>
     /// <param name="cancellationToken">Cuts the wait short (the remaining peers are disposed).</param>
     public async Task StopAsync(CancellationToken cancellationToken = default)
@@ -149,40 +153,54 @@ public sealed partial class QuiclyServer
             return;
         }
 
-        BeginShutdown();
-        long started = Stopwatch.GetTimestamp();
-        while (!IsShutdownComplete && !cancellationToken.IsCancellationRequested && Stopwatch.GetElapsedTime(started) < _shutdownTimeout)
-        {
-            PollAll();
-            FlushAll();
-            if (IsShutdownComplete)
-            {
-                break;
-            }
-
-            try
-            {
-                await (DelayOverride?.Invoke(ShutdownPollInterval, cancellationToken) ?? Task.Delay(ShutdownPollInterval, cancellationToken)).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-        }
-
+        ExceptionDispatchInfo? failure = null;
         try
         {
-            ForceCloseAll();
+            BeginShutdown();
+            long started = Stopwatch.GetTimestamp();
+            while (!IsShutdownComplete && !cancellationToken.IsCancellationRequested && Stopwatch.GetElapsedTime(started) < _shutdownTimeout)
+            {
+                try
+                {
+                    PollAll();
+                    FlushAll();
+                }
+                catch (Exception exception)
+                {
+                    KeepFirst(ref failure, exception); // an event handler threw: the other peers keep closing
+                }
+
+                if (IsShutdownComplete)
+                {
+                    break;
+                }
+
+                try
+                {
+                    await (DelayOverride?.Invoke(ShutdownPollInterval, cancellationToken) ?? Task.Delay(ShutdownPollInterval, cancellationToken)).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
         }
-        finally
+        catch (Exception exception)
         {
-            await StopSideServicesAsync().ConfigureAwait(false);
-            Volatile.Write(ref _state, StateStopped);
+            KeepFirst(ref failure, exception); // the listener's Stop threw
         }
+
+        KeepFirst(ref failure, Capture(ForceCloseAll));
+        KeepFirst(ref failure, Capture(EndRemainingSessions));
+        KeepFirst(ref failure, await CaptureAsync(StopSideServicesAsync).ConfigureAwait(false));
+        RaiseQueuedEvents();
+        Volatile.Write(ref _state, StateStopped);
+        failure?.Throw();
     }
 
     /// <summary>
-    /// Stops the server if it runs (<see cref="StopAsync"/>), then disposes the listener and the session token keys. The
+    /// Stops the server if it runs (<see cref="StopAsync"/>), then disposes the listener and the session token keys; the HTTP
+    /// side endpoint and the certificate provisioning are stopped even when an event handler threw during the stop. The
     /// shared buffer pool is disposed once every peer's transport has reported its close.
     /// </summary>
     public async ValueTask DisposeAsync()
@@ -209,17 +227,55 @@ public sealed partial class QuiclyServer
         finally
         {
             // Dispose the listener, then close whatever it accepted while the shutdown ran: once it is disposed no callback
-            // can add another. Both run even when the other fails.
+            // can add another. Every step runs even when another fails, and the side services are stopped here as well in
+            // case StopAsync did not get to them.
             Exception? listenerFailure = Capture(_listener.Dispose);
             Exception? closeFailure = Capture(ForceCloseAll);
+            Exception? sessionFailure = Capture(EndRemainingSessions);
+            Exception? sideFailure = await CaptureAsync(StopSideServicesAsync).ConfigureAwait(false);
             _disposed = true;
             _tokens.Dispose();
             Volatile.Write(ref _allocatorReleaseRequested, 1);
             TryReleaseAllocator();
-            if ((listenerFailure ?? closeFailure) is { } failure)
+            if ((listenerFailure ?? closeFailure ?? sessionFailure ?? sideFailure) is { } failure)
             {
                 ExceptionDispatchInfo.Throw(failure);
             }
+        }
+    }
+
+    private static async Task<Exception?> CaptureAsync(Func<Task> action)
+    {
+        try
+        {
+            await action().ConfigureAwait(false);
+            return null;
+        }
+        catch (Exception exception)
+        {
+            return exception;
+        }
+    }
+
+    private static void KeepFirst(ref ExceptionDispatchInfo? first, Exception? exception)
+    {
+        if (first is null && exception is not null)
+        {
+            first = ExceptionDispatchInfo.Capture(exception);
+        }
+    }
+
+    /// <summary>
+    /// The server stops: every session it still holds ends now (one waiting for a resume with
+    /// <see cref="SessionEndInfo.Expired"/> set), and the queued <see cref="SessionEnded"/> events are raised. Every handler
+    /// runs; the first exception is rethrown.
+    /// </summary>
+    private void EndRemainingSessions()
+    {
+        _sessions.EndAll(_endedSessions);
+        if (RaiseAllEndedSessions() is { } failure)
+        {
+            ExceptionDispatchInfo.Throw(failure);
         }
     }
 
@@ -286,21 +342,12 @@ public sealed partial class QuiclyServer
         }
     }
 
+    /// <summary>The binder reports this under its lock on whichever thread applied the certificate: queued for <see cref="PollAll"/>.</summary>
     private void OnCertificateConsumerFailed(CertificateConsumerFailure failure)
     {
-        Action<CertificateConsumerFailure>? handler = CertificateConsumerFailed;
-        if (handler is null)
+        if (CertificateConsumerFailed is not null)
         {
-            return;
-        }
-
-        try
-        {
-            handler(failure);
-        }
-        catch (Exception)
-        {
-            Interlocked.Increment(ref _eventHandlerFaults);
+            _consumerFailures.Enqueue(in failure);
         }
     }
 

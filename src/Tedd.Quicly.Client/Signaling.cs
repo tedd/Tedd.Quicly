@@ -30,15 +30,27 @@ internal sealed class WorkSignal : IDisposable
         }
     }
 
-    /// <summary>Waits until <see cref="Set"/> or <paramref name="timeout"/>.</summary>
+    /// <summary>Whether the last <see cref="WaitAsync"/> ended because of a <see cref="Set"/> rather than its timeout (tests).</summary>
+    internal bool LastWaitSignaled { get; private set; }
+
+    /// <summary>Waits until <see cref="Set"/> or <paramref name="timeout"/>; the caller then polls the peer.</summary>
     /// <remarks>
-    /// The pending flag is cleared before waiting, so a <see cref="Set"/> racing the wait releases again and is never lost;
-    /// at worst a stale release makes the next wait return at once.
+    /// The pending flag is cleared when the wait ends, before the caller polls: a <see cref="Set"/> for work published during
+    /// that poll finds the flag clear and releases again, so the next wait returns at once instead of sleeping its timeout.
+    /// A <see cref="Set"/> between the wake-up and the clear is covered by the poll that follows (its work was published
+    /// first). The clear is a full fence (<see cref="Interlocked.Exchange(ref int, int)"/>), so the poll's reads cannot move
+    /// before it. At worst a stale release makes a later wait return at once.
     /// </remarks>
     public async ValueTask WaitAsync(TimeSpan timeout, CancellationToken cancellationToken)
     {
-        Volatile.Write(ref _pending, 0);
-        await _semaphore.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            LastWaitSignaled = await _semaphore.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _pending, 0);
+        }
     }
 
     public void Dispose() => _semaphore.Dispose();

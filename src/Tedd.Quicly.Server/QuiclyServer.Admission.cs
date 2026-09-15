@@ -21,10 +21,18 @@ public sealed partial class QuiclyServer
     /// Completes an admission whose auth validation returned <see cref="AuthTokenDecision.Pending"/> (or whose custom policy
     /// returned <see cref="AdmissionResult.Pending"/>). Thread-safe: the decision is queued and applied on the game thread by
     /// the next <see cref="PollAll"/>, which then runs the remaining checks (capacity, session commit) of the default policy.
-    /// Ignored when the connection closed meanwhile (for example after <see cref="PeerOptions.AdmissionTimeout"/>) or no
-    /// decision is pending. A rejection reaches the client as <see cref="HelloStatus.Rejected"/>; <paramref name="reason"/>
-    /// is reported only server-side (<see cref="AdmissionFailure.Detail"/>).
+    /// Ignored when the connection closed meanwhile (for example after <see cref="PeerOptions.AdmissionTimeout"/>): nothing is
+    /// committed for it, no session is created or resumed. Also ignored when no decision is pending. A rejection reaches the
+    /// client as <see cref="HelloStatus.Rejected"/>; <paramref name="reason"/> is reported only server-side
+    /// (<see cref="AdmissionFailure.Detail"/>).
     /// </summary>
+    /// <remarks>
+    /// Complete the admission of a server peer through the server only. <see cref="QuiclyPeer.CompleteAdmission"/> on a server
+    /// peer bypasses <see cref="ServerOptions.MaxPeers"/> and the session handling, so the server closes a peer admitted that
+    /// way (<see cref="QuiclyErrorCode.InternalError"/>, reported as <see cref="AdmissionFailureReason.PolicyFault"/>);
+    /// <see cref="QuiclyPeer.CompleteAdmission"/> is for peers created with <see cref="QuiclyPeer.CreateServerPeer"/> outside a
+    /// server.
+    /// </remarks>
     /// <param name="peer">The connection whose admission is pending.</param>
     /// <param name="accepted">The outcome of the validation.</param>
     /// <param name="reason">Why it was rejected (server-side diagnostics only).</param>
@@ -87,17 +95,22 @@ public sealed partial class QuiclyServer
         }
     }
 
-    /// <summary>A resume took the session over: close its previous connection with <see cref="QuiclyErrorCode.SessionReplaced"/>.</summary>
-    internal void ReplaceConnection(QuiclyPeer previous)
+    /// <summary>
+    /// A resume took <paramref name="record"/> over from <paramref name="previous"/>: keeps that connection's tag in the
+    /// session, detaches the session from it and closes it with <see cref="QuiclyErrorCode.SessionReplaced"/>. Only a
+    /// connection that was still open counts as replaced.
+    /// </summary>
+    internal void ReplaceConnection(SessionRecord record, QuiclyPeer previous)
     {
+        record.Tag = previous.Tag;
         if (InfoOf(previous) is { } info)
         {
             info.Session = null;
         }
 
-        _sessionsReplaced++;
         if (previous.State is not (PeerState.Closing or PeerState.Closed))
         {
+            _sessionsReplaced++;
             previous.Close(new CloseReason(QuiclyErrorCode.SessionReplaced, "the session was resumed on another connection"));
         }
 
@@ -152,11 +165,26 @@ public sealed partial class QuiclyServer
             return;
         }
 
-        info.AwaitingDecision = false;
-        AdmissionResult result;
-        if (info.Pending is { } state)
+        if (peer.State != PeerState.Handshaking)
         {
-            info.Pending = null;
+            // Closed while the decision was pending (admission timeout, client gone): nothing is committed for it. Admitted
+            // behind the server's back (QuiclyPeer.CompleteAdmission): OnPeerStateChanged closes it.
+            if (peer.State is PeerState.Closing or PeerState.Closed)
+            {
+                info.AwaitingDecision = false;
+                info.Pending = null;
+            }
+
+            return;
+        }
+
+        info.AwaitingDecision = false;
+        PendingAdmission? state = info.Pending;
+        info.Pending = null;
+        // A shutdown closes every connection, the waiting ones too, so a decision applied here never meets a stopping server.
+        AdmissionResult result;
+        if (state is not null)
+        {
             result = _defaultPolicy.CompletePending(peer, state, decision.Accepted, decision.Reason);
         }
         else if (decision.Result is { } explicitResult)
@@ -174,15 +202,7 @@ public sealed partial class QuiclyServer
         }
 
         result = AfterDecision(info, result, peer.RemoteEndPoint);
-        try
-        {
-            peer.CompleteAdmission(result);
-        }
-        catch (InvalidOperationException)
-        {
-            // The peer no longer waits for a decision; it is closing and its slot is released as usual.
-        }
-
+        peer.CompleteAdmission(result); // Handshaking with a decision pending: the peer takes it (or ignores it once closing)
         MarkWork(peer.Index);
     }
 
@@ -194,6 +214,8 @@ public sealed partial class QuiclyServer
             return AdmissionResult.Reject(HelloStatus.InternalError);
         }
 
+        // A connection accepted just before a shutdown began is closed when it is activated (ActivatePending), so it never gets
+        // here during a shutdown: a closing peer ignores its Hello, whatever the policy would say.
         AdmissionResult result;
         try
         {
@@ -274,16 +296,34 @@ public sealed partial class QuiclyServer
                 return; // re-raised after an earlier handler threw
             }
 
+            if (info.AwaitingDecision)
+            {
+                // QuiclyPeer.CompleteAdmission was called on this server peer directly, which bypassed MaxPeers and the session
+                // handling: the server does not admit it.
+                info.AwaitingDecision = false;
+                info.Pending = null;
+                ReportFailure(new AdmissionFailure(AdmissionStage.Hello, AdmissionFailureReason.PolicyFault, peer.RemoteEndPoint,
+                    Detail: "QuiclyPeer.CompleteAdmission was called on a server peer; complete its admission with QuiclyServer.CompleteAdmission."));
+                peer.Close(new CloseReason(QuiclyErrorCode.InternalError, "the admission was completed outside the server"));
+                return;
+            }
+
             TryReserve(info, allowOverCapacity: true);
             info.Admitted = true;
             _slots[slot] = new PeerSlot(peer, _slots[slot].Generation, PeerSlotState.Admitted);
             _admittedSet.AddCore(slot);
             PeerAdmitted?.Invoke(peer);
         }
-        else if (to == PeerState.Closing && _slots[slot].State != PeerSlotState.Closing)
+        else if (to == PeerState.Closing)
         {
-            _slots[slot] = new PeerSlot(peer, _slots[slot].Generation, PeerSlotState.Closing);
-            _admittedSet.RemoveCore(slot);
+            // A decision completed from now on has nothing left to admit.
+            info.AwaitingDecision = false;
+            info.Pending = null;
+            if (_slots[slot].State != PeerSlotState.Closing)
+            {
+                _slots[slot] = new PeerSlot(peer, _slots[slot].Generation, PeerSlotState.Closing);
+                _admittedSet.RemoveCore(slot);
+            }
         }
     }
 

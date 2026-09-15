@@ -47,6 +47,8 @@ public class SendSharedTests
 
         // Wave C1 step 1 ships placeholder engines, which refuse every send (NotSupported); with the datagram engines the
         // two peers admit it and hold a reference each until their transport released the payload.
+        // TODO(C1 merge): once the session layer's datagram engines replace the placeholders, assert SendStatus.Admitted for
+        // both peers (and AdmittedCount == 2) instead of accepting NotSupported.
         foreach (QuiclyPeer peer in new[] { peers[0], peers[2] })
         {
             Assert.True(result.GetStatus(peer.Index) is SendStatus.NotSupported or SendStatus.Admitted);
@@ -162,7 +164,13 @@ public class SendSharedTests
         f.Server.SendShared(set, new SendHeader(2), lease, 64);
         Assert.Equal(3, f.Server.SharedLeases.GetReferenceCount(in lease));
         await f.Server.StopAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(3, f.Server.SharedLeases.GetReferenceCount(in lease)); // forced close: kept until the transports closed
+        f.Server.GetStatistics(out ServerStatistics statistics);
+        Assert.Equal(2, statistics.SharedSendsOutstanding);
+        f.Network.RunUntilIdle(1_000_000);
         Assert.Equal(1, f.Server.SharedLeases.GetReferenceCount(in lease));
+        f.Server.GetStatistics(out statistics);
+        Assert.Equal(0, statistics.SharedSendsOutstanding);
         f.Server.SharedLeases.Release(in lease);
     }
 

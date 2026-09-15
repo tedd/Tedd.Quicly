@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -162,6 +163,9 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     internal TlsAlpn01Responder? TlsAlpn01Challenges => _tlsAlpn01;
 
     /// <summary>Loads the served certificate from PKCS#12 bytes (test seam for load failures).</summary>
+    /// <summary>The intermediates each served certificate was loaded with, keyed by the leaf (an entry dies with it).</summary>
+    private static readonly ConditionalWeakTable<X509Certificate2, X509Certificate2Collection> s_intermediates = new();
+
     internal Func<byte[], string?, X509KeyStorageFlags, X509Certificate2> CertificateLoader { get; set; } = LoadServedCertificate;
 
     /// <summary>
@@ -774,6 +778,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     private HttpServer CreateTlsServer(AcmeProvisioningOptions o, TlsAlpn01Responder responder)
     {
         HttpServerOptions options = new() { OnError = ReportError };
+        options.Limits.TlsHandshakeTimeout = o.TlsHandshakeTimeout;
 
         // Normal clients get the current certificate (read per handshake, so renewals apply at once); clients offering
         // only acme-tls/1 for a published name get the challenge certificate. The health endpoint is served on the HTTP
@@ -1299,12 +1304,14 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
 
     /// <summary>
     /// Loads the certificate with a private key from PKCS#12 with the given key storage, without <c>Exportable</c>
-    /// (ADR 0009), disposing the chain certificates that come with it.
+    /// (ADR 0009), and keeps the chain certificates that come with it: a TLS handshake has to send the intermediates and
+    /// never downloads them (<see cref="ICertificateChainSource"/>).
     /// </summary>
     internal static X509Certificate2 LoadServedCertificate(byte[] pfx, string? password, X509KeyStorageFlags keyStorageFlags)
     {
         X509Certificate2Collection all = X509CertificateLoader.LoadPkcs12Collection(pfx, password, keyStorageFlags);
         X509Certificate2? leaf = null;
+        X509Certificate2Collection intermediates = [];
         foreach (X509Certificate2 certificate in all)
         {
             if (leaf is null && certificate.HasPrivateKey)
@@ -1313,12 +1320,32 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
             }
             else
             {
-                certificate.Dispose();
+                intermediates.Add(certificate);
             }
         }
 
-        return leaf ?? throw new CryptographicException("The PKCS#12 data contains no certificate with a private key.");
+        if (leaf is null)
+        {
+            foreach (X509Certificate2 certificate in all)
+            {
+                certificate.Dispose();
+            }
+
+            throw new CryptographicException("The PKCS#12 data contains no certificate with a private key.");
+        }
+
+        if (intermediates.Count > 0)
+        {
+            // They carry no private key and live no longer than the leaf they belong to.
+            s_intermediates.AddOrUpdate(leaf, intermediates);
+        }
+
+        return leaf;
     }
+
+    /// <summary>The intermediates <paramref name="certificate"/> was loaded with, or <see langword="null"/>.</summary>
+    internal static X509Certificate2Collection? IntermediatesOf(X509Certificate2 certificate) =>
+        s_intermediates.TryGetValue(certificate, out X509Certificate2Collection? intermediates) ? intermediates : null;
 
     // ---- publishing and events --------------------------------------------------------------------------------------
 
@@ -1417,12 +1444,15 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
     /// handshake is refused with an <see cref="AuthenticationException"/>, which the HTTP server counts as an expected
     /// handshake failure (anyone can connect to a public port) instead of reporting an error for every client.
     /// </summary>
-    private sealed class CurrentCertificateSelector(CertificateProvisioner owner) : ICertificateSelector
+    private sealed class CurrentCertificateSelector(CertificateProvisioner owner) : ICertificateSelector, ICertificateChainSource
     {
         public X509Certificate2? SelectCertificate(string? serverName)
         {
             return owner.Current ?? throw new AuthenticationException("No certificate has been obtained yet; TLS handshakes are refused until the first one is available.");
         }
+
+        /// <summary>The chain the served certificate was loaded with: a handshake sends it and never downloads it.</summary>
+        public X509Certificate2Collection? GetIntermediates(X509Certificate2 certificate) => IntermediatesOf(certificate);
     }
 
     /// <summary>An order the loop runs outside the renewal schedule: requested through <see cref="RenewNowAsync"/>, or an internal retry.</summary>

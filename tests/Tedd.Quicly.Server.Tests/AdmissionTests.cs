@@ -194,12 +194,14 @@ public class AdmissionTests
         });
         QuiclyPeer client = f.Connect();
         Assert.True(f.RunUntil(() => pending is not null));
-        f.Server.BeginShutdown();
+        f.Server.BeginShutdown(); // closes the waiting connection too
         f.Server.CompleteAdmission(pending!, accepted: true);
         f.Server.PollAll();
-        Assert.Single(f.FailuresOf(AdmissionFailureReason.ServerStopping));
         Assert.True(f.RunUntil(() => client.State == PeerState.Closed));
+        Assert.Equal("server shutting down", client.CloseReason.Reason);
         Assert.Empty(f.Admitted);
+        f.Server.GetStatistics(out ServerStatistics statistics);
+        Assert.Equal(0, statistics.SessionsCreated);
     }
 
     [Fact]
@@ -344,11 +346,13 @@ public class AdmissionTests
         info.RemoteEndPoint = connector.RemoteAddress;
         (SimulatedTransport _, SimulatedTransport server) = f.Network.CreatePair(new RecordingSink(), new RecordingSink());
         Assert.Null(listener.Accept!(server, in info));
+        f.Server.PollAll(); // raises the refusal the listener's callback queued
         Assert.Single(f.FailuresOf(AdmissionFailureReason.TooManyConnectionsFromAddress));
 
         // A transport the peer refuses: the reservation is undone.
         info.RemoteEndPoint = new IPEndPoint(IPAddress.Parse("198.51.100.7"), 1);
         Assert.Null(listener.Accept!(null!, in info));
+        f.Server.PollAll();
         AdmissionFailure failure = Assert.Single(f.FailuresOf(AdmissionFailureReason.PeerCreationFailed));
         Assert.IsType<ArgumentNullException>(failure.Exception);
         Assert.Equal(1, f.Server.PeerCount);
@@ -407,6 +411,7 @@ public class AdmissionTests
 
         QuiclyPeer blocked = f.Connect("good", connector: connector);
         Assert.Equal(PreHandshakeDecision.Reject, connector.LastDecision);
+        f.Server.PollAll(); // raises the refusal the pre-handshake callback queued
         Assert.Equal(AdmissionStage.PreHandshake, Assert.Single(f.FailuresOf(AdmissionFailureReason.AddressRateLimited)).Stage);
         Assert.True(f.RunUntil(() => blocked.State == PeerState.Closed));
 
@@ -446,6 +451,7 @@ public class AdmissionTests
         connector.RemoteAddress = new IPEndPoint(IPAddress.Parse("192.0.2.50"), 1);
         f.Connect(connector: connector);
         Assert.Equal(PreHandshakeDecision.Reject, connector.LastDecision);
+        f.Server.PollAll(); // raises the refusal the pre-handshake callback queued
         Assert.Single(f.FailuresOf(AdmissionFailureReason.ServerStopping));
 
         NewConnectionInfo info = default;

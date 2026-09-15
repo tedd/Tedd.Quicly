@@ -8,6 +8,11 @@ namespace Tedd.Quicly.Testing.Simulation;
 /// <see cref="SimulatedConnector"/> to <see cref="LocalEndPoint"/> run the pre-handshake callback, then the accept
 /// callback with the new <see cref="SimulatedTransport"/>; both run inside <see cref="SimulatedNetwork.Advance"/>.
 /// </summary>
+/// <remarks>
+/// The contract forbids calling members of the new transport inside the accept callback (<see cref="AcceptCallback"/>);
+/// the simulator does not enforce it (a limit raised there travels with the handshake), so code that must also run on
+/// MsQuic keeps to the rule. A transport the accept callback refuses is <see cref="TransportState.Closed"/> at once.
+/// </remarks>
 public sealed class SimulatedListener : ITransportListener
 {
     private readonly SimulatedNetwork _network;

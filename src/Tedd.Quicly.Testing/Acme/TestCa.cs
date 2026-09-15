@@ -3,7 +3,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Tedd.Quicly.Acme.Models;
 
-namespace Tedd.Quicly.Acme.Tests.Fake;
+namespace Tedd.Quicly.Testing.Acme;
 
 /// <summary>A self-signed in-test root CA that issues leaf certificates from CSRs.</summary>
 public sealed class TestCa : IDisposable
@@ -11,6 +11,7 @@ public sealed class TestCa : IDisposable
     private readonly ECDsa _key;
     private long _serial = 1;
 
+    /// <summary>Creates a root CA named <paramref name="name"/> with a fresh P-256 key, valid for ten years.</summary>
     public TestCa(string name)
     {
         Name = name;
@@ -23,8 +24,10 @@ public sealed class TestCa : IDisposable
         Root = request.CreateSelfSigned(now.AddDays(-1), now.AddYears(10));
     }
 
+    /// <summary>The common name of the root.</summary>
     public string Name { get; }
 
+    /// <summary>The self-signed root certificate, with its private key.</summary>
     public X509Certificate2 Root { get; }
 
     /// <summary>Issues a certificate for the CSR's public key with the given SANs (no private key attached).</summary>
@@ -78,6 +81,7 @@ public sealed class TestCa : IDisposable
         return X509CertificateLoader.LoadPkcs12(withKey.Export(X509ContentType.Pkcs12), null, X509KeyStorageFlags.Exportable);
     }
 
+    /// <summary>Releases the root certificate and its key.</summary>
     public void Dispose()
     {
         Root.Dispose();

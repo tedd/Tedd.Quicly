@@ -7,5 +7,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />
+    <!-- The in-process fake ACME CA (Acme/) drives the real Tedd.Quicly.Acme types. Test-only: no production project references Testing. -->
+    <ProjectReference Include="..\Tedd.Quicly.Acme\Tedd.Quicly.Acme.csproj" />
   </ItemGroup>
 </Project>

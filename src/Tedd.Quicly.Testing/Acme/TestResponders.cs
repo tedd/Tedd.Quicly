@@ -4,7 +4,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Tedd.Quicly.Acme.Challenges;
 
-namespace Tedd.Quicly.Acme.Tests.Fake;
+namespace Tedd.Quicly.Testing.Acme;
 
 /// <summary>An <see cref="IHttp01Responder"/> that really serves the key authorization over HTTP on a loopback port.</summary>
 public sealed class Http01TestResponder : IHttp01Responder, IAsyncDisposable
@@ -15,25 +15,32 @@ public sealed class Http01TestResponder : IHttp01Responder, IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private Task? _loop;
 
+    /// <summary>Starts serving on a free loopback port.</summary>
     public Http01TestResponder()
     {
         BaseUri = FreePort.StartOnFreePort(_listener);
         _loop = Task.Run(LoopAsync);
     }
 
+    /// <summary>Base URL of the responder (<c>http://127.0.0.1:{port}/</c>).</summary>
     public Uri BaseUri { get; }
 
+    /// <summary>Tokens published, in order.</summary>
     public List<string> Published { get; } = [];
 
+    /// <summary>Tokens removed, in order.</summary>
     public List<string> Removed { get; } = [];
 
+    /// <summary>Makes <see cref="RemoveAsync"/> throw, to simulate a failing cleanup.</summary>
     public bool FailRemove { get; set; }
 
+    /// <summary>Number of tokens currently served.</summary>
     public int ActiveTokenCount
     {
         get { lock (_lock) { return _tokens.Count; } }
     }
 
+    /// <inheritdoc/>
     public ValueTask PublishAsync(string token, string keyAuthorization, CancellationToken cancellationToken)
     {
         lock (_lock)
@@ -45,6 +52,7 @@ public sealed class Http01TestResponder : IHttp01Responder, IAsyncDisposable
         return ValueTask.CompletedTask;
     }
 
+    /// <inheritdoc/>
     public ValueTask RemoveAsync(string token, CancellationToken cancellationToken)
     {
         if (FailRemove)
@@ -109,6 +117,7 @@ public sealed class Http01TestResponder : IHttp01Responder, IAsyncDisposable
         }
     }
 
+    /// <summary>Stops serving.</summary>
     public async ValueTask DisposeAsync()
     {
         _cts.Cancel();
@@ -126,14 +135,19 @@ public sealed class InMemoryDns01Provider : IDns01Provider
 {
     private readonly object _lock = new();
 
+    /// <summary>TXT values by record name.</summary>
     public Dictionary<string, List<string>> Records { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Every record created, in order.</summary>
     public List<(string Name, string Value)> Created { get; } = [];
 
+    /// <summary>Every record removed, in order.</summary>
     public List<(string Name, string Value)> Removed { get; } = [];
 
+    /// <summary>Makes <see cref="CreateTxtAsync"/> throw, to simulate a failing DNS provider.</summary>
     public bool FailCreate { get; set; }
 
+    /// <inheritdoc/>
     public ValueTask CreateTxtAsync(string name, string value, CancellationToken cancellationToken)
     {
         if (FailCreate)
@@ -155,6 +169,7 @@ public sealed class InMemoryDns01Provider : IDns01Provider
         return ValueTask.CompletedTask;
     }
 
+    /// <inheritdoc/>
     public ValueTask RemoveTxtAsync(string name, string value, CancellationToken cancellationToken)
     {
         lock (_lock)
@@ -170,6 +185,7 @@ public sealed class InMemoryDns01Provider : IDns01Provider
         return ValueTask.CompletedTask;
     }
 
+    /// <summary>The TXT values published under <paramref name="name"/>; plug it into <see cref="FakeAcmeServer.DnsTxtLookup"/>.</summary>
     public IReadOnlyList<string> Lookup(string name)
     {
         lock (_lock)
@@ -184,12 +200,16 @@ public sealed class InMemoryTlsAlpn01Responder : ITlsAlpn01Responder
 {
     private readonly object _lock = new();
 
+    /// <summary>Published validation certificates (copies) by domain.</summary>
     public Dictionary<string, X509Certificate2> Certificates { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Domains published, in order.</summary>
     public List<string> Published { get; } = [];
 
+    /// <summary>Domains removed, in order.</summary>
     public List<string> Removed { get; } = [];
 
+    /// <inheritdoc/>
     public ValueTask PublishAsync(string domain, X509Certificate2 certificate, CancellationToken cancellationToken)
     {
         lock (_lock)
@@ -202,6 +222,7 @@ public sealed class InMemoryTlsAlpn01Responder : ITlsAlpn01Responder
         return ValueTask.CompletedTask;
     }
 
+    /// <inheritdoc/>
     public ValueTask RemoveAsync(string domain, CancellationToken cancellationToken)
     {
         lock (_lock)
@@ -213,6 +234,7 @@ public sealed class InMemoryTlsAlpn01Responder : ITlsAlpn01Responder
         return ValueTask.CompletedTask;
     }
 
+    /// <summary>The certificate published for <paramref name="domain"/>; plug it into <see cref="FakeAcmeServer.TlsAlpnLookup"/>.</summary>
     public X509Certificate2? Lookup(string domain)
     {
         lock (_lock)
@@ -222,8 +244,10 @@ public sealed class InMemoryTlsAlpn01Responder : ITlsAlpn01Responder
     }
 }
 
+/// <summary>Free loopback TCP ports for listeners that cannot bind port 0 themselves, such as <see cref="HttpListener"/>.</summary>
 public static class FreePort
 {
+    /// <summary>Returns a TCP port that was free on 127.0.0.1 a moment ago. Another process may take it first, so prefer binding port 0.</summary>
     public static int Get()
     {
         TcpListener listener = new(IPAddress.Loopback, 0);

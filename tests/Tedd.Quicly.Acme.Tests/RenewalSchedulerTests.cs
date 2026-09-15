@@ -1,7 +1,7 @@
 using System.Security.Cryptography.X509Certificates;
 using Tedd.Quicly.Acme.Challenges;
 using Tedd.Quicly.Acme.Models;
-using Tedd.Quicly.Acme.Tests.Fake;
+using Tedd.Quicly.Testing.Acme;
 
 namespace Tedd.Quicly.Acme.Tests;
 

@@ -203,8 +203,11 @@ public class AsyncApiTests
         using SessionHarness h = new(table: Table, client: o => o.CompletionMode = CompletionMode.ThreadPool);
         SendToken token = h.Client.SendCopy(new SendHeader(4), [1], SendOptions.Tracked).Token;
         Task<DeliveryStatus> delivered = h.Client.WaitAsync(token, CompletionStage.RemoteAccepted).AsTask();
-        Assert.True(h.RunUntil(() => delivered.IsCompleted));
-        Assert.Equal(DeliveryStatus.Delivered, await delivered);
+
+        // The stage completes on the simulated transport's thread and the task's continuation then runs on the thread pool,
+        // in real time: wait for the stage in simulated time and for the task in real time.
+        Assert.True(h.RunUntil(() => h.Client.Core.Completions.IsCompleted(token, CompletionStage.RemoteAccepted)));
+        Assert.Equal(DeliveryStatus.Delivered, await delivered.WaitAsync(TimeSpan.FromSeconds(30)));
     }
 
     [Fact]

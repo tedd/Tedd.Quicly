@@ -36,7 +36,14 @@ internal sealed class PlaceholderEngine(ChannelMode mode) : ChannelEngine
     }
 
     /// <inheritdoc/>
-    public override void OnSendCompleted(int entrySlot, in CompletionEntry completion) => _core.CompleteEntry(entrySlot, DeliveryStatus.Failed);
+    public override void OnSendCompleted(int entrySlot, in CompletionEntry completion)
+    {
+        // A placeholder never submits entries; complete defensively so a slot can never leak.
+        if (completion.Final)
+        {
+            _core.CompleteEntry(entrySlot, DeliveryStatus.Failed);
+        }
+    }
 
     /// <inheritdoc/>
     public override void OnEpochReset(bool resumed)
@@ -44,7 +51,7 @@ internal sealed class PlaceholderEngine(ChannelMode mode) : ChannelEngine
     }
 
     /// <inheritdoc/>
-    public override void OnDatagram(in MessageHeader header, ReadOnlySpan<byte> payload, long nowMicros) => _core.CountReceiveDropped(header.Channel);
+    public override void OnDatagram(in MessageHeader header, ReadOnlySpan<byte> payload, long nowMicros) => _core.CountDatagramDropped(header.Channel);
 
     /// <inheritdoc/>
     public override StreamAccept OnStreamOpened(TransportStreamId id, ushort channel, ulong groupId) => StreamAccept.Reject(QuiclyErrorCode.UnsupportedChannel);

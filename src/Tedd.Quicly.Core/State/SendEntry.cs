@@ -38,6 +38,11 @@ public enum SendEntryFlags : byte
     Retry = 32,
     /// <summary>The payload is caller memory pinned through a handle in <see cref="SendEntryTable.PinHandles"/> that must be released on completion.</summary>
     Pinned = 64,
+    /// <summary>
+    /// The owning engine decides the delivery status on the game thread (for example ReliableLatest, whose Delivered comes
+    /// from a LatestAck): in <c>CompletionMode.ThreadPool</c> the transport thread never signals this entry's token directly.
+    /// </summary>
+    EngineCompletes = 128,
 }
 
 /// <summary>

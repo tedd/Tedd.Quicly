@@ -49,4 +49,7 @@ public enum DeliveryStatus : byte
 
     /// <summary>The session ended before the message was delivered.</summary>
     Disconnected,
+
+    /// <summary>The transport declared the datagram lost (unreliable sends whose transport reports datagram send state).</summary>
+    Lost,
 }

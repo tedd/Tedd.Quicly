@@ -28,16 +28,17 @@ internal enum SendPayloadKind : byte
 
 /// <summary>
 /// One admission request handed from a public <c>Send*</c> call to the owning engine (game thread). The peer has already
-/// resolved the channel and checked the connection state; the engine validates size, key and queue limits, fills a send
-/// entry and queues it. It never calls the transport (that happens in <see cref="ChannelEngine.Flush"/>) except for
-/// <see cref="SendMode.Immediate"/> sends, which it may flush at the end of the call.
+/// resolved the channel and checked that the session is <see cref="PeerState.Connected"/>; the engine validates size,
+/// key and queue limits, fills a send entry and queues it. It never calls the transport (that happens in
+/// <see cref="ChannelEngine.Flush"/>) except for <see cref="SendMode.Immediate"/> sends, which it may flush at the end of
+/// the call. On any status other than <see cref="SendStatus.Admitted"/> the caller keeps ownership of the payload.
 /// </summary>
 internal unsafe ref struct SendRequest
 {
     /// <summary>The channel.</summary>
     public ChannelDefinition Channel;
 
-    /// <summary>Dense index of the channel in the table (counters, handlers).</summary>
+    /// <summary>Dense index of the channel in the table (counters, handlers, <see cref="PeerCore.SendCounters"/>).</summary>
     public int ChannelIndex;
 
     /// <summary>Key (keyed channels).</summary>
@@ -64,13 +65,13 @@ internal unsafe ref struct SendRequest
     /// <summary><see cref="SendPayloadKind.Borrowed"/>: the payload.</summary>
     public ReadOnlyMemory<byte> Borrowed;
 
-    /// <summary><see cref="SendPayloadKind.Gather"/>: the pages.</summary>
+    /// <summary><see cref="SendPayloadKind.Gather"/>: the pages (at most <see cref="QuiclyPeer.MaxGatherSegments"/>).</summary>
     public ReadOnlySpan<BufferLease> Gather;
 
     /// <summary>Request id for request/response channels (0 = plain message).</summary>
     public uint RequestId;
 
-    /// <summary>Set by the engine for a tracked, admitted send.</summary>
+    /// <summary>Set by the engine for a tracked, admitted send (<see cref="PeerCore.TryTrack"/>).</summary>
     public SendToken Token;
 }
 
@@ -89,7 +90,7 @@ internal struct FlushContext
     /// <summary>Whether datagrams can be sent right now.</summary>
     public bool DatagramsEnabled;
 
-    /// <summary>Earliest time-driven deadline so far; engines lower it.</summary>
+    /// <summary>Earliest time-driven deadline so far (clock micros, <see cref="long.MaxValue"/> = none); engines lower it.</summary>
     public long NextDeadline;
 }
 
@@ -99,17 +100,20 @@ internal enum CompletionKind : byte
     /// <summary><c>OnStreamSendCompleted</c>.</summary>
     Stream = 0,
 
-    /// <summary>A final <c>OnDatagramSendStateChanged</c> (or <c>Sent</c> when the transport does not report send states).</summary>
+    /// <summary><c>OnDatagramSendStateChanged</c>.</summary>
     Datagram = 1,
 }
 
 /// <summary>
-/// A transport completion of one send entry, pushed by the transport thread into the completion ring (capacity = send
-/// table + 1, so it cannot overflow: at most one completion per entry) and drained on the game thread.
+/// A transport completion of one send entry, pushed by the transport thread into the completion ring and drained on the
+/// game thread (<see cref="ChannelEngine.OnSendCompleted"/>). Per entry the ring carries at most one non-final
+/// <see cref="DatagramSendState.Sent"/> notice (only for <see cref="State.SendEntryFlags.Tracked"/> or
+/// <see cref="State.SendEntryFlags.Container"/> datagram entries, so the payload can be released early) and exactly one
+/// final completion; the ring holds <c>2 × send table + 1</c> items, so it cannot overflow.
 /// </summary>
 internal struct CompletionEntry
 {
-    /// <summary>Send entry slot (the entry is in state <c>Completed</c>).</summary>
+    /// <summary>Send entry slot.</summary>
     public int Slot;
 
     /// <summary>The entry generation the completion was validated against.</summary>
@@ -118,37 +122,66 @@ internal struct CompletionEntry
     /// <summary>Stream or datagram.</summary>
     public CompletionKind Kind;
 
-    /// <summary>Datagram: the reported state.</summary>
+    /// <summary>Datagram: the reported state (a final state, or <see cref="DatagramSendState.Sent"/>).</summary>
     public DatagramSendState DatagramState;
 
     /// <summary>The data was not delivered (stream canceled, datagram canceled).</summary>
     public bool Canceled;
+
+    /// <summary>
+    /// True for the final completion: the entry is in state <c>Completed</c> and the engine must eventually call
+    /// <see cref="PeerCore.CompleteEntry"/>. False for the early <see cref="DatagramSendState.Sent"/> notice (the entry
+    /// stays in flight; the payload may be released with <see cref="PeerCore.ReleasePayload"/>).
+    /// </summary>
+    public bool Final;
+}
+
+/// <summary>What the peer does with a peer-opened stream after <see cref="ChannelEngine.OnStreamOpened"/>.</summary>
+internal enum StreamAcceptAction : byte
+{
+    /// <summary>The engine takes the stream.</summary>
+    Accept = 0,
+
+    /// <summary>Reset the stream (RESET_STREAM/STOP_SENDING) with the code; the connection survives.</summary>
+    Reset = 1,
+
+    /// <summary>Close the connection with the code (for example a duplicate persistent ordered stream).</summary>
+    CloseConnection = 2,
 }
 
 /// <summary>Answer of <see cref="ChannelEngine.OnStreamOpened"/>.</summary>
 internal readonly struct StreamAccept
 {
-    private StreamAccept(bool accepted, QuiclyErrorCode resetCode, long cookie)
+    private StreamAccept(StreamAcceptAction action, QuiclyErrorCode code, long cookie)
     {
-        Accepted = accepted;
-        ResetCode = resetCode;
+        Action = action;
+        ResetCode = code;
         Cookie = cookie;
     }
 
-    /// <summary>The engine takes the stream.</summary>
-    public bool Accepted { get; }
+    /// <summary>The action.</summary>
+    public StreamAcceptAction Action { get; }
 
-    /// <summary>When refused: the RESET_STREAM/STOP_SENDING code.</summary>
+    /// <summary>The engine takes the stream.</summary>
+    public bool Accepted => Action == StreamAcceptAction.Accept;
+
+    /// <summary>When refused: the RESET_STREAM/STOP_SENDING (or connection close) code.</summary>
     public QuiclyErrorCode ResetCode { get; }
 
     /// <summary>Engine-owned per-stream value handed back in every <see cref="StreamMessageContext"/>.</summary>
     public long Cookie { get; }
 
     /// <summary>Takes the stream.</summary>
-    public static StreamAccept Accept(long cookie = 0) => new(true, QuiclyErrorCode.NoError, cookie);
+    /// <param name="cookie">Engine-owned per-stream value.</param>
+    public static StreamAccept Accept(long cookie = 0) => new(StreamAcceptAction.Accept, QuiclyErrorCode.NoError, cookie);
 
     /// <summary>Refuses the stream; the peer resets it with <paramref name="code"/>.</summary>
-    public static StreamAccept Reject(QuiclyErrorCode code) => new(false, code, 0);
+    /// <param name="code">The reset code.</param>
+    public static StreamAccept Reject(QuiclyErrorCode code) => new(StreamAcceptAction.Reset, code, 0);
+
+    /// <summary>Refuses the stream and closes the connection with <paramref name="code"/> (queued to Poll).</summary>
+    /// <param name="code">The connection close code.</param>
+    public static StreamAccept CloseConnection(QuiclyErrorCode code) => new(StreamAcceptAction.CloseConnection, code, 0);
 }
 
 /// <summary>What the peer does after <see cref="ChannelEngine.OnStreamMessage"/>.</summary>
@@ -158,11 +191,11 @@ internal enum StreamConsumeAction : byte
     Continue = 0,
 
     /// <summary>
-    /// Back-pressure: the event is un-read (the parser is restored), the transport holds the bytes back
-    /// (<see cref="ReceiveResult.PendingAfter"/>) and the stream is resumed from <see cref="QuiclyPeer.Poll"/>. Allowed at
-    /// <see cref="StreamMessagePhase.Start"/> and <see cref="StreamMessagePhase.Chunk"/> only: an engine reserves its
-    /// receive-ring slot at the start of a message (<see cref="PeerCore.TryReserveReceive"/>), so publishing at the end
-    /// never fails.
+    /// Back-pressure: the event is un-read (the parser is restored to its state before the event), the transport holds the
+    /// bytes back (<see cref="ReceiveResult.PendingAfter"/>) and the stream is resumed from <see cref="QuiclyPeer.Poll"/>
+    /// (<see cref="PeerCore.NotePendedStream"/>). Intended for <see cref="StreamMessagePhase.Start"/> and
+    /// <see cref="StreamMessagePhase.Chunk"/>: an engine reserves its receive-ring slot at the start of a message
+    /// (<see cref="PeerCore.TryReserveReceive"/>), so publishing at the end never fails.
     /// </summary>
     Pend = 1,
 
@@ -195,9 +228,11 @@ internal readonly struct StreamConsume
     public static StreamConsume Pend => new(StreamConsumeAction.Pend, QuiclyErrorCode.NoError);
 
     /// <summary>Reset the stream.</summary>
+    /// <param name="code">The reset code.</param>
     public static StreamConsume ResetStream(QuiclyErrorCode code) => new(StreamConsumeAction.ResetStream, code);
 
     /// <summary>Close the connection.</summary>
+    /// <param name="code">The close code.</param>
     public static StreamConsume CloseConnection(QuiclyErrorCode code) => new(StreamConsumeAction.CloseConnection, code);
 }
 
@@ -225,6 +260,9 @@ internal ref struct StreamMessageContext
 
     /// <summary>The preamble's channel.</summary>
     public ushort Channel;
+
+    /// <summary>Dense index of <see cref="Channel"/>.</summary>
+    public int ChannelIndex;
 
     /// <summary>Group id (group streams; the version for large ReliableLatest values).</summary>
     public ulong GroupId;

@@ -14,11 +14,14 @@ internal enum StreamTag : byte
     /// <summary>The control stream (parsed by the peer).</summary>
     Control = 1,
 
-    /// <summary>A peer-opened unidirectional stream routed to the engine of its channel's mode.</summary>
-    Engine = 2,
+    /// <summary>A peer-opened unidirectional stream whose preamble has not been parsed yet.</summary>
+    Preamble = 2,
 
-    /// <summary>A stream this end reset or refused: remaining data is consumed and dropped.</summary>
-    Discard = 3,
+    /// <summary>A peer-opened unidirectional stream accepted by the engine of its channel's mode.</summary>
+    Engine = 3,
+
+    /// <summary>A stream this end reset or refused (or whose engine already saw it end): remaining data is consumed and dropped.</summary>
+    Discard = 4,
 }
 
 /// <summary>
@@ -27,19 +30,33 @@ internal enum StreamTag : byte
 /// </summary>
 internal struct StreamRecord
 {
+    /// <summary>The transport stream.</summary>
     public TransportStreamId Id;
+
+    /// <summary>Use of the record.</summary>
     public StreamTag Tag;
+
+    /// <summary>Mode of the preamble's channel (engine streams).</summary>
     public ChannelMode Mode;
-    public bool Accepted;
+
+    /// <summary>Preamble channel id (engine streams).</summary>
     public ushort Channel;
+
+    /// <summary>Dense index of <see cref="Channel"/> (engine streams).</summary>
+    public int ChannelIndex;
+
+    /// <summary>Engine-owned per-stream value (<see cref="Engines.StreamAccept.Cookie"/>).</summary>
     public long Cookie;
+
+    /// <summary>The stream's parser (a mutable struct: always accessed by reference).</summary>
     public StreamFrameParser Parser;
 }
 
 /// <summary>
 /// The peer's stream table (docs/design/session-layer.md §4): receive-side records indexed by the transport's stream
 /// slot and validated by generation. Transport thread only; grows (and allocates) only while the peak number of
-/// concurrent streams rises during warm-up.
+/// concurrent streams rises during warm-up. Locally opened unidirectional send streams have no record: their events
+/// are broadcast to the engines (<see cref="Engines.ChannelEngine.OnStreamClosed"/>).
 /// </summary>
 internal sealed class StreamTable
 {
@@ -50,6 +67,7 @@ internal sealed class StreamTable
 
     /// <summary>The record of <paramref name="id"/>, or a null reference (<see cref="Unsafe.IsNullRef{T}(ref readonly T)"/>).</summary>
     /// <param name="id">The stream.</param>
+    /// <returns>A reference into the table; valid until the next <see cref="Add"/>.</returns>
     public ref StreamRecord Find(TransportStreamId id)
     {
         StreamRecord[] records = _records;
@@ -68,7 +86,8 @@ internal sealed class StreamTable
     /// <summary>Creates (or replaces) the record of <paramref name="id"/>.</summary>
     /// <param name="id">The stream.</param>
     /// <param name="tag">Its use.</param>
-    /// <returns>The zeroed record.</returns>
+    /// <returns>The zeroed record; valid until the next <see cref="Add"/>.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">The slot is negative.</exception>
     public ref StreamRecord Add(TransportStreamId id, StreamTag tag)
     {
         if (id.Slot < 0)

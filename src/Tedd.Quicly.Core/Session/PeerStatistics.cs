@@ -85,6 +85,9 @@ public struct PeerStatistics
     /// <summary>Pings not answered because of the Pong rate limit.</summary>
     public long PingsIgnored;
 
+    /// <summary>Pongs whose echoed time matched no outstanding Ping (late, duplicate or forged).</summary>
+    public long UnmatchedPongs;
+
     /// <summary>Transport completions whose context no longer matched a live send (ignored, ADR 0008 invariant 2).</summary>
     public long StaleCompletions;
 
@@ -99,6 +102,9 @@ public struct PeerStatistics
 
     /// <summary>Compressed messages dropped because decoding failed or exceeded the decode budget.</summary>
     public long DecodeFailures;
+
+    /// <summary>Control messages (Ping, Pong, Hello, HelloAck, Close) that could not be handed to the transport.</summary>
+    public long ControlSendFailures;
 
     /// <summary>Send lease bytes held now.</summary>
     public long SendBytesOutstanding;

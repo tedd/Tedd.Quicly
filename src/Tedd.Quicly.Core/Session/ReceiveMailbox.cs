@@ -1,6 +1,6 @@
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.State;
-using Tedd.Quicly.Threading = Tedd.Quicly.Core.Threading;
+using Tedd.Quicly.Core.Threading;
 
 namespace Tedd.Quicly.Core.Session;
 
@@ -21,7 +21,7 @@ internal sealed class ReceiveMailbox : IDisposable
 {
     private readonly NativeArray<ReceiveEntry> _records;
     private readonly int[] _free;
-    private readonly Threading.SpscRing<int> _returned;
+    private readonly SpscRing<int> _returned;
     private int _freeCount;
 
     /// <summary>Creates mailboxes for <paramref name="keySlots"/> key slots of <paramref name="channel"/>.</summary>
@@ -42,7 +42,7 @@ internal sealed class ReceiveMailbox : IDisposable
         }
 
         _freeCount = records;
-        _returned = new Threading.SpscRing<int>(records);
+        _returned = new SpscRing<int>(records);
     }
 
     /// <summary>Channel id.</summary>

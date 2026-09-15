@@ -135,6 +135,53 @@ public struct StreamFrameParser
     /// </summary>
     public readonly int MaxMessageSize => _limit;
 
+    /// <summary>
+    /// The state a message event changes (<see cref="StreamEvent.MessageStart"/>, <see cref="StreamEvent.PayloadChunk"/>,
+    /// <see cref="StreamEvent.MessageEnd"/>). Take it with <see cref="GetMark"/> before <see cref="Read"/>; <see cref="Rewind"/>
+    /// then un-reads the event (the caller hands the input back from the offset it had before the call), at a fraction of the
+    /// cost of copying the whole parser. It does not cover the preamble or the header of a bulk stream: copy the parser to
+    /// un-read those.
+    /// </summary>
+    public readonly struct Mark
+    {
+        internal readonly StreamMessageHeader Message;
+        internal readonly ulong BulkDecoded;
+        internal readonly int Remaining;
+        internal readonly byte State;
+        internal readonly byte BufferLength;
+        internal readonly byte ControlType;
+
+        internal Mark(in StreamMessageHeader message, ulong bulkDecoded, int remaining, byte state, byte bufferLength, byte controlType)
+        {
+            Message = message;
+            BulkDecoded = bulkDecoded;
+            Remaining = remaining;
+            State = state;
+            BufferLength = bufferLength;
+            ControlType = controlType;
+        }
+    }
+
+    /// <summary>The mark of the current state (see <see cref="Mark"/>).</summary>
+    /// <returns>The mark.</returns>
+    public readonly Mark GetMark() => new(in _message, _bulkDecoded, _remaining, (byte)_state, _bufferLength, _controlType);
+
+    /// <summary>
+    /// Restores a <see cref="Mark"/> taken just before the last <see cref="Read"/>, whose event was a message event: the event is
+    /// un-read. Bytes of a header that straddled segments stay in the internal buffer, so the caller hands back only the bytes
+    /// of the current input from the offset it had before that call.
+    /// </summary>
+    /// <param name="mark">The mark.</param>
+    public void Rewind(in Mark mark)
+    {
+        _message = mark.Message;
+        _bulkDecoded = mark.BulkDecoded;
+        _remaining = mark.Remaining;
+        _state = (State)mark.State;
+        _bufferLength = mark.BufferLength;
+        _controlType = mark.ControlType;
+    }
+
     /// <summary>Prepares the parser for a new stream.</summary>
     /// <param name="role">
     /// <see cref="StreamRole.Control"/> for the control stream (preamble must be 0); <see cref="StreamRole.Unknown"/>

@@ -10,7 +10,7 @@ using Tedd.Quicly.Core.Transport;
 namespace Tedd.Quicly.Core.Session.Engines;
 
 /// <summary>
-/// The <see cref="ChannelMode.ReliableOrdered"/> engine (PROTOCOL.md §3.1; docs/design/session-layer.md §7.3): every
+/// The <see cref="ChannelMode.ReliableOrdered"/> engine (PROTOCOL.md §3.1; docs/design/session-layer.md §7.2): every
 /// message, in order, per channel and direction, over one persistent unidirectional stream per channel per direction. One
 /// instance per peer owns the structure-of-arrays state of all ordered channels.
 /// </summary>

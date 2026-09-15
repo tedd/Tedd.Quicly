@@ -10,7 +10,7 @@ using Tedd.Quicly.Testing.Simulation;
 namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
-/// The persistent ordered stream's lifecycle and limits (PROTOCOL.md §3, §6, §7; docs/design/session-layer.md §7.3): stream
+/// The persistent ordered stream's lifecycle and limits (PROTOCOL.md §3, §6, §7; docs/design/session-layer.md §7.2): stream
 /// credit, refused starts (synchronous and MsQuic-style asynchronous), a stream stopped by the peer, a duplicate stream,
 /// size limits, receive back-pressure, expiry, close, and the send table reserve.
 /// </summary>
@@ -356,5 +356,83 @@ public class OrderedStreamTests
         // A message larger than the limit still goes alone.
         Assert.True(h.RunUntil(() => OrderedKit.Stats(h.Client, 7).InFlightMessages == 0 && OrderedKit.Stats(h.Client, 7).QueuedMessages == 0));
         Assert.True(h.Client.SendCopy(new SendHeader(7), new byte[65_000]).IsAdmitted);
+    }
+
+    [Fact]
+    public void A_Receiver_That_Stops_Polling_Pushes_Back_Until_The_Sender_Gets_QueueFull_And_Recovers_When_It_Polls_Again()
+    {
+        // Back-pressure end to end: the receiver's ring fills, its stream is held back (Pend), the transport's flow-control
+        // window fills, the sender's stream sends stop completing, and its channel reaches its queue limit (64 KiB).
+        LinkOptions link = new() { DelayMicros = 5_000, StreamReceiveWindowBytes = 64 * 1024 };
+        using SessionHarness h = new(link: link, table: Table, client: OrderedKit.Roomy, server: o =>
+        {
+            OrderedKit.Roomy(o);
+            o.ReceiveRingCapacity = 16;
+        });
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        int received = 0;
+        string? failure = null;
+        server.RegisterHandler(7, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) =>
+        {
+            if (failure is null && !OrderedKit.Matches(payload, received, 1_024))
+            {
+                failure = $"message {received} out of order";
+            }
+
+            received++;
+        });
+        int sent = 0;
+
+        // The receiver polls: everything flows.
+        for (int i = 0; i < 20; i++)
+        {
+            Assert.True(client.SendCopy(new SendHeader(7), OrderedKit.Payload(sent, 1_024)).IsAdmitted);
+            sent++;
+        }
+
+        Assert.True(h.RunUntil(() => received == sent));
+
+        // The receiver stops polling: the sender keeps sending until its channel answers QueueFull.
+        int admittedWhileStalled = 0;
+        SendStatus status = SendStatus.Admitted;
+        for (int ms = 0; ms < 2_000 && status == SendStatus.Admitted; ms++)
+        {
+            while ((status = client.SendCopy(new SendHeader(7), OrderedKit.Payload(sent, 1_024)).Status) == SendStatus.Admitted)
+            {
+                sent++;
+                admittedWhileStalled++;
+            }
+
+            client.Flush();
+            h.Network.Advance(1_000);
+            client.Poll();
+            if (status == SendStatus.QueueFull)
+            {
+                // Completions may still free room while the window fills; only a queue that stays full counts.
+                h.Network.Advance(20_000);
+                client.Poll();
+                status = client.SendCopy(new SendHeader(7), OrderedKit.Payload(sent, 1_024)).Status;
+                if (status == SendStatus.Admitted)
+                {
+                    sent++;
+                    admittedWhileStalled++;
+                }
+            }
+        }
+
+        Assert.Equal(SendStatus.QueueFull, status);
+        Assert.InRange(received, 20, 20 + 16);
+        Assert.True(admittedWhileStalled >= 64, $"{admittedWhileStalled} messages admitted before the push-back");
+        Assert.True(DatagramKit.Statistics(server).StreamReceivePends > 0);
+        Assert.True(OrderedKit.Stats(client, 7).InFlightMessages > 0);
+
+        // The receiver polls again: the stream resumes, the window reopens, the sender's queue drains and it sends again.
+        Assert.True(h.RunUntil(() => received == sent));
+        Assert.True(client.SendCopy(new SendHeader(7), OrderedKit.Payload(sent, 1_024)).IsAdmitted);
+        sent++;
+        Assert.True(h.RunUntil(() => received == sent));
+        Assert.Null(failure);
+        Assert.Equal(0, DatagramKit.Statistics(server).ReceiveRingDrops);
     }
 }

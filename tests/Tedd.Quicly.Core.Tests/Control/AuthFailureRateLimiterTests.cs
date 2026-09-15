@@ -151,8 +151,10 @@ public class AuthFailureRateLimiterTests
             limiter.RecordFailure([192, 168, (byte)(i >> 8), (byte)i]);
         }
 
-        Assert.Equal(1024, limiter.ActiveCount);
-        Assert.Equal(3000 - 1024, limiter.Evictions);
+        // Every new address either takes a free way of its 8-way bucket or evicts; the buckets come from a keyed hash with a
+        // random seed, so a bucket may (rarely) see fewer than eight of the 3 000 addresses and stay short of full.
+        Assert.InRange(limiter.ActiveCount, 1000, 1024);
+        Assert.Equal(3000, limiter.ActiveCount + limiter.Evictions);
     }
 
     [Fact]

@@ -680,13 +680,22 @@ public sealed unsafe partial class QuiclyPeer
     {
         ChannelTable table = _core.Table;
         int consumed = 0;
+        StreamFrameParser snapshot = default;
         for (int i = 0; i < segments.Length; i++)
         {
             ReadOnlySpan<byte> segment = segments[i].AsSpan();
             ReadOnlySpan<byte> input = segment;
             while (true)
             {
-                StreamFrameParser snapshot = record.Parser;
+                // Pend un-reads the event: a message event from a small mark (StreamFrameParser.Mark), a bulk stream's header
+                // from a copy of the whole parser. Nothing before the preamble can be pended.
+                bool copy = record.Parser.Role == StreamRole.Bulk;
+                StreamFrameParser.Mark mark = record.Parser.GetMark();
+                if (copy)
+                {
+                    snapshot = record.Parser;
+                }
+
                 int before = segment.Length - input.Length;
                 StreamEvent streamEvent = record.Parser.Read(table, ref input, out ReadOnlySpan<byte> payload);
                 if (streamEvent == StreamEvent.NeedMore)
@@ -746,7 +755,15 @@ public sealed unsafe partial class QuiclyPeer
                 {
                     case StreamConsumeAction.Pend:
                         // Un-read the event; the transport holds the rest until Poll resumes the stream.
-                        record.Parser = snapshot;
+                        if (copy)
+                        {
+                            record.Parser = snapshot;
+                        }
+                        else
+                        {
+                            record.Parser.Rewind(in mark);
+                        }
+
                         _core.NotePendedStream(id);
                         return ReceiveResult.PendingAfter(consumed + before);
                     case StreamConsumeAction.ResetStream:

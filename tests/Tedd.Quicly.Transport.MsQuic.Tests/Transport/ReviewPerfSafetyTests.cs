@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Testing.Conformance;
 using Tedd.Quicly.Testing.Simulation;
@@ -104,7 +106,7 @@ public class ReviewPerfSafetyTests
             var opener = new Thread(() => c.OpenStream(StreamKind.Bidirectional, 99, 32767, out _)) { IsBackground = true, Name = "game thread" };
             opener.Start();
             // The 17th OpenStream has passed its state check (still connected) and waits for _tableLock to grow the table.
-            Assert.True(Spin.Until(() => (opener.ThreadState & ThreadState.WaitSleepJoin) != 0, Timeout), "OpenStream never blocked on _tableLock");
+            Assert.True(Spin.Until(() => (opener.ThreadState & System.Threading.ThreadState.WaitSleepJoin) != 0, Timeout), "OpenStream never blocked on _tableLock");
             Thread.Sleep(50);
 
             server.Close(7, default);
@@ -129,11 +131,126 @@ public class ReviewPerfSafetyTests
         return (closed, detail);
     }
 
+    /// <summary>
+    /// <c>OpenStream</c> with a priority other than the default calls <c>QUIC_PARAM_STREAM_PRIORITY</c> — a blocking
+    /// <c>SetParam</c> — on the calling thread, so the game thread waits for the connection's MsQuic worker: about 13 µs when
+    /// the worker is idle (13× a default-priority open, measured) and for as long as the worker is busy otherwise. Bulk
+    /// transfers open low-priority streams (ARCHITECTURE §7), so this is a Flush/Poll path.
+    /// </summary>
+    [Fact]
+    public unsafe void OpenStream_with_a_priority_does_not_wait_for_the_msquic_worker()
+    {
+        var harness = new MsQuicTransportHarness();
+        byte* payload = (byte*)NativeMemory.AllocZeroed(16);
+        var segment = (TransportSegment*)NativeMemory.AllocZeroed((nuint)sizeof(TransportSegment));
+        *segment = new TransportSegment(payload, 16);
+        try
+        {
+            var blocker = new WorkerBlockingSink();
+            (MsQuicTransport client, MsQuicTransport server, _) = Connect(harness, blocker);
+            Assert.True(Spin.Until(() => server.Capabilities.Datagrams, Timeout), "datagrams");
+            TimeSpan plain = WhileClientWorkerIsBusy(server, blocker, segment, () => Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Bidirectional, 1, 32767, out _)));
+            TimeSpan prioritised = WhileClientWorkerIsBusy(server, blocker, segment, () => Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Bidirectional, 2, 100, out _)));
+            Assert.True(plain < BusyBudget, $"control: a default-priority OpenStream took {plain.TotalMilliseconds:F1} ms");
+            Assert.True(prioritised < BusyBudget, $"OpenStream(priority 100) waited {prioritised.TotalMilliseconds:F0} ms for the connection's MsQuic worker (a default-priority OpenStream: {plain.TotalMilliseconds:F1} ms)");
+        }
+        finally
+        {
+            harness.Dispose();
+            NativeMemory.Free(segment);
+            NativeMemory.Free(payload);
+        }
+        Assert.Null(harness.CleanupError);
+    }
+
+    /// <summary>
+    /// Releasing a stream that never started (<c>AbortStream</c>, or <c>CloseStream</c> outside a callback) runs
+    /// <c>StreamClose</c> on the calling thread. For a never-started stream msquic 2.5.10 executes that close on the
+    /// connection's worker and waits for it (16 µs idle, unbounded while the worker is busy; measured), so the game thread
+    /// stalls. ADR 0008 §7: <c>StreamClose</c> runs on a dedicated shutdown path, never inside Poll.
+    /// </summary>
+    [Fact]
+    public unsafe void Releasing_a_never_started_stream_does_not_wait_for_the_msquic_worker()
+    {
+        var harness = new MsQuicTransportHarness();
+        byte* payload = (byte*)NativeMemory.AllocZeroed(16);
+        var segment = (TransportSegment*)NativeMemory.AllocZeroed((nuint)sizeof(TransportSegment));
+        *segment = new TransportSegment(payload, 16);
+        try
+        {
+            var blocker = new WorkerBlockingSink();
+            (MsQuicTransport client, MsQuicTransport server, _) = Connect(harness, blocker);
+            Assert.True(Spin.Until(() => server.Capabilities.Datagrams, Timeout), "datagrams");
+            Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Bidirectional, 1, 32767, out TransportStreamId aborted));
+            Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Bidirectional, 2, 32767, out TransportStreamId closed));
+            TimeSpan abort = WhileClientWorkerIsBusy(server, blocker, segment, () => client.AbortStream(aborted, 5, StreamAbortDirection.Both));
+            TimeSpan close = WhileClientWorkerIsBusy(server, blocker, segment, () => client.CloseStream(closed));
+            Assert.True(
+                abort < BusyBudget && close < BusyBudget,
+                $"releasing a never-started stream waited for the connection's MsQuic worker: AbortStream {abort.TotalMilliseconds:F0} ms, CloseStream {close.TotalMilliseconds:F0} ms");
+        }
+        finally
+        {
+            harness.Dispose();
+            NativeMemory.Free(segment);
+            NativeMemory.Free(payload);
+        }
+        Assert.Null(harness.CleanupError);
+    }
+
     // ------------------------------------------------------------------ helpers
 
-    private static (MsQuicTransport Client, MsQuicTransport Server, RecordingSink ClientSink) Connect(MsQuicTransportHarness harness)
+    /// <summary>A call that does not need the worker returns well within this while the worker is blocked for a second.</summary>
+    private static readonly TimeSpan BusyBudget = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>Blocks the client connection's MsQuic worker inside <c>OnDatagramReceived</c> until released (at most 3 s).</summary>
+    private sealed class WorkerBlockingSink : NullTransportSink
     {
-        var clientSink = new RecordingSink();
+        public ManualResetEventSlim? Entered;
+        public ManualResetEventSlim? Release;
+
+        public override void OnDatagramReceived(ReadOnlySpan<byte> payload)
+        {
+            if (Interlocked.Exchange(ref Entered, null) is not { } entered) return;
+            entered.Set();
+            Release!.Wait(TimeSpan.FromSeconds(3));
+        }
+    }
+
+    /// <summary>
+    /// Makes the server send a datagram that the client's sink holds inside its callback for one second (so the client
+    /// connection's worker is busy), runs <paramref name="call"/> on this thread meanwhile and returns how long it took.
+    /// </summary>
+    private static unsafe TimeSpan WhileClientWorkerIsBusy(MsQuicTransport server, WorkerBlockingSink blocker, TransportSegment* segment, Action call)
+    {
+        var entered = new ManualResetEventSlim();
+        var release = new ManualResetEventSlim();
+        blocker.Release = release;
+        Volatile.Write(ref blocker.Entered, entered);
+        Assert.Equal(TransportStatus.Success, server.SendDatagram(segment, 1, 1, TransportSendFlags.None));
+        Assert.True(entered.Wait(Timeout), "the client's worker never entered the blocking callback");
+        var releaser = new Thread(() =>
+        {
+            Thread.Sleep(1000);
+            release.Set();
+        }) { IsBackground = true, Name = "review worker releaser" };
+        releaser.Start();
+        var watch = Stopwatch.StartNew();
+        try
+        {
+            call();
+        }
+        finally
+        {
+            watch.Stop();
+            releaser.Join(Timeout);
+        }
+        return watch.Elapsed;
+    }
+
+    private static (MsQuicTransport Client, MsQuicTransport Server, RecordingSink ClientSink) Connect(MsQuicTransportHarness harness, ITransportSink? clientInner = null)
+    {
+        var clientSink = new RecordingSink(null, clientInner);
         var serverSink = new RecordingSink();
         ConformancePair pair = harness.CreatePair(clientSink, serverSink);
         clientSink.Transport = pair.Client;

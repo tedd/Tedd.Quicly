@@ -9,6 +9,9 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="BenchmarkDotNet" />
+    <!-- Reference implementations the primitives are compared against. -->
+    <PackageReference Include="System.IO.Hashing" />
+    <PackageReference Include="K4os.Compression.LZ4" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Tedd.Quicly.Acme\Tedd.Quicly.Acme.csproj" />

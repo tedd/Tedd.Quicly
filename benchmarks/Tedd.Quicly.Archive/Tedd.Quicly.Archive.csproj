@@ -5,4 +5,8 @@
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CA1822;IDE0051</NoWarn>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- Archived versions reuse the public value types (tokens, enums) of the code that replaced them. -->
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />
+  </ItemGroup>
 </Project>

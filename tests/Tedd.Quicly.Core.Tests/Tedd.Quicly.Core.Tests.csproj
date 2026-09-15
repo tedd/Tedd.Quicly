@@ -2,6 +2,9 @@
   <ItemGroup>
     <PackageReference Include="xunit.v3" />
     <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" />
+    <!-- Reference implementations for cross-validation only. -->
+    <PackageReference Include="System.IO.Hashing" />
+    <PackageReference Include="K4os.Compression.LZ4" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />

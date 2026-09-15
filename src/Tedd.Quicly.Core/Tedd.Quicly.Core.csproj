@@ -2,4 +2,7 @@
   <PropertyGroup>
     <Description>Tedd.Quicly.Core</Description>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Tedd.Quicly.Core.Tests" />
+  </ItemGroup>
 </Project>

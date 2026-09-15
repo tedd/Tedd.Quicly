@@ -40,7 +40,9 @@ public abstract unsafe class MsQuicTransportBenchBase
     [GlobalSetup]
     public void Setup()
     {
-        _registration = new MsQuicRegistration("quicly-bench");
+        // The borrowed registration decides the worker execution profile: use the one the transport options default to
+        // (LOW_LATENCY), as a connector or listener that owns its registration would.
+        _registration = new MsQuicRegistration("quicly-bench", new MsQuicTransportOptions().ExecutionProfile);
         _certificate = TestCertificates.CreateSelfSigned("CN=localhost", TimeSpan.FromDays(1), ecdsa: true, "localhost");
         ServerSink = new BenchSink();
         ClientSink = new BenchSink();

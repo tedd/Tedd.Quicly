@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <Description>Tedd.Quicly.Acme</Description>
+    <Description>RFC 8555 ACME v2 client (Let's Encrypt, ZeroSSL, Buypass, Google Trust Services, SSL.com, Pebble, any ACME CA) with External Account Binding, http-01 / dns-01 / tls-alpn-01 challenge helpers, CSR building and renewal scheduling.</Description>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Tedd.Quicly.Acme.Tests" />
+    <InternalsVisibleTo Include="Tedd.Quicly.Benchmarks" />
+  </ItemGroup>
 </Project>

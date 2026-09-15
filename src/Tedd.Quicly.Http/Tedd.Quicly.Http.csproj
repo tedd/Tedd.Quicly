@@ -3,7 +3,7 @@
     <Description>Tedd.Quicly.Http</Description>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..$r$r.csproj" />
-    <ProjectReference Include="..$r$r.csproj" />
+    <ProjectReference Include="..\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />
+    <ProjectReference Include="..\Tedd.Quicly.Acme\Tedd.Quicly.Acme.csproj" />
   </ItemGroup>
 </Project>

@@ -435,4 +435,26 @@ public class OrderedStreamTests
         Assert.Null(failure);
         Assert.Equal(0, DatagramKit.Statistics(server).ReceiveRingDrops);
     }
+
+    [Fact]
+    public void A_Tiny_Segment_Arena_Still_Delivers_Everything_In_Order()
+    {
+        // Eight segments: a stream send carries at most four messages (three with the preamble), and the arena stays full
+        // while that send is in flight, so the queue drains one send per round trip.
+        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 5_000 }, table: Table, client: o => o.SegmentArenaCapacity = 8);
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(4, Handlers.Collect(got));
+        for (int i = 0; i < 100; i++)
+        {
+            Assert.True(h.Client.SendCopy(new SendHeader(4), OrderedKit.Payload(i, 30)).IsAdmitted);
+        }
+
+        Assert.True(h.RunUntil(() => got.Count == 100));
+        for (int i = 0; i < 100; i++)
+        {
+            Assert.Equal(OrderedKit.Payload(i, 30), got[i].Payload);
+        }
+
+        Assert.True(DatagramKit.Statistics(h.Client).StreamSends >= 25);
+    }
 }

@@ -690,7 +690,7 @@ public sealed unsafe partial class QuiclyPeer
                 // Pend un-reads the event: a message event from a small mark (StreamFrameParser.Mark), a bulk stream's header
                 // from a copy of the whole parser. Nothing before the preamble can be pended.
                 bool copy = record.Parser.Role == StreamRole.Bulk;
-                StreamFrameParser.Mark mark = record.Parser.GetMark();
+                record.Parser.GetMark(out StreamFrameParser.Mark mark);
                 if (copy)
                 {
                     snapshot = record.Parser;

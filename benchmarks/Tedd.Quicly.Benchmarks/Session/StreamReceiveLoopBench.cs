@@ -88,7 +88,7 @@ public class StreamReceiveLoopBench
         while (true)
         {
             bool copy = parser.Role == StreamRole.Bulk;
-            StreamFrameParser.Mark mark = parser.GetMark();
+            parser.GetMark(out StreamFrameParser.Mark mark);
             if (copy)
             {
                 snapshot = parser;

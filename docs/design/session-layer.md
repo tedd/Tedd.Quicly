@@ -67,6 +67,7 @@ static class StreamFraming   // PROTOCOL §3.1/3.2 message framing (Length, Key,
 public struct StreamFrameParser   // incremental, resumable; holds at most 32 bytes of partial header; never copies payload
 {
     void Reset(in ChannelDefinition ch, StreamRole role /*Ordered|Group|Bulk|Control*/);
+    void GetMark(out Mark mark); void Rewind(in Mark mark);   // un-reads the last message event cheaply (the Pend of the session layer)
     // Feed(segment) returns events: NeedMore, PreambleParsed, MessageHeader(h, payloadLength) then PayloadBytes(span) ... MessageComplete, Error(code)
     // A message's payload is delivered as zero or more PayloadBytes callbacks straight from the transport's segments.
 }
@@ -202,7 +203,7 @@ is back in `Filling` and still owned by the caller.
     reset `UnsupportedChannel`; malformed ⇒ reset `ProtocolViolation`; otherwise `engine.OnStreamOpened(id, channel, groupId)` →
     `Accept(cookie)` / `Reject(code)` (reset) / `CloseConnection(code)`.
   * Events ⇒ `engine.OnStreamMessage(ref StreamMessageContext)` (`Start`, `Chunk`, `End`, `BulkHeader`) → `Continue`, `Pend` (the
-    parser is restored to its snapshot before the event, the call returns `PendingAfter(bytes before the event)`, the stream id goes to
+    parser is restored from a `StreamFrameParser.Mark` taken before the event, a whole copy on bulk streams; the call returns `PendingAfter(bytes before the event)`, the stream id goes to
     `PendedStreams` and Poll calls `ResumeStreamReceive(id, 0)`), `ResetStream(code)` or `CloseConnection(code)`.
     The context (`Chunk`, `Header`, `Bulk` and the `Cookie` ref) is valid only during the call (the peer declares it `scoped`);
     copy what you keep.

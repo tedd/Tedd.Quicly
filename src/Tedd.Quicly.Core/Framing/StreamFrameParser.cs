@@ -142,29 +142,28 @@ public struct StreamFrameParser
     /// cost of copying the whole parser. It does not cover the preamble or the header of a bulk stream: copy the parser to
     /// un-read those.
     /// </summary>
-    public readonly struct Mark
+    public struct Mark
     {
-        internal readonly StreamMessageHeader Message;
-        internal readonly ulong BulkDecoded;
-        internal readonly int Remaining;
-        internal readonly byte State;
-        internal readonly byte BufferLength;
-        internal readonly byte ControlType;
-
-        internal Mark(in StreamMessageHeader message, ulong bulkDecoded, int remaining, byte state, byte bufferLength, byte controlType)
-        {
-            Message = message;
-            BulkDecoded = bulkDecoded;
-            Remaining = remaining;
-            State = state;
-            BufferLength = bufferLength;
-            ControlType = controlType;
-        }
+        internal StreamMessageHeader Message;
+        internal ulong BulkDecoded;
+        internal int Remaining;
+        internal byte State;
+        internal byte BufferLength;
+        internal byte ControlType;
     }
 
-    /// <summary>The mark of the current state (see <see cref="Mark"/>).</summary>
-    /// <returns>The mark.</returns>
-    public readonly Mark GetMark() => new(in _message, _bulkDecoded, _remaining, (byte)_state, _bufferLength, _controlType);
+    /// <summary>Takes the mark of the current state (see <see cref="Mark"/>), written in place.</summary>
+    /// <param name="mark">Receives the mark.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly void GetMark(out Mark mark)
+    {
+        mark.Message = _message;
+        mark.BulkDecoded = _bulkDecoded;
+        mark.Remaining = _remaining;
+        mark.State = (byte)_state;
+        mark.BufferLength = _bufferLength;
+        mark.ControlType = _controlType;
+    }
 
     /// <summary>
     /// Restores a <see cref="Mark"/> taken just before the last <see cref="Read"/>, whose event was a message event: the event is
@@ -172,6 +171,7 @@ public struct StreamFrameParser
     /// of the current input from the offset it had before that call.
     /// </summary>
     /// <param name="mark">The mark.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Rewind(in Mark mark)
     {
         _message = mark.Message;

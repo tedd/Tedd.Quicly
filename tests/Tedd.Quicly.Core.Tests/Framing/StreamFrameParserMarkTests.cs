@@ -70,7 +70,7 @@ public class StreamFrameParserMarkTests
             int next = end;
             while (true)
             {
-                StreamFrameParser.Mark mark = parser.GetMark();
+                parser.GetMark(out StreamFrameParser.Mark mark);
                 int before = segment.Length - input.Length;
                 StreamEvent streamEvent = parser.Read(Table, ref input, out ReadOnlySpan<byte> chunk);
                 if (streamEvent == StreamEvent.NeedMore)
@@ -148,7 +148,7 @@ public class StreamFrameParserMarkTests
         StreamFrameParser.Mark mark = default;
         while (last == StreamEvent.NeedMore)
         {
-            mark = parser.GetMark();
+            parser.GetMark(out mark);
             input = data.AsSpan(offset, 1);
             last = parser.Read(Table, ref input, out _);
             offset++;

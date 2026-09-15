@@ -234,4 +234,31 @@ public class AsyncApiTests
         Assert.Equal(new byte[] { 1 }, got[0].Payload);
         Assert.False(server.TryCancel(a));
     }
+
+    [Fact]
+    public async Task SendAsync_Waits_For_The_Send_Budget_On_An_Ordered_Channel()
+    {
+        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 20_000 }, table: Table, client: o => o.SendBudgetBytes = 16 * 1024);
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(4, Handlers.Collect(got));
+        int queued = 0;
+        SendStatus status;
+        while ((status = h.Client.SendCopy(new SendHeader(4), OrderedKit.Payload(queued, 4_000)).Status) == SendStatus.Admitted)
+        {
+            queued++;
+        }
+
+        // Four 4 KiB leases fill the 16 KiB budget until the peer acknowledges them.
+        Assert.Equal(SendStatus.OutOfBuffers, status);
+        Assert.Equal(4, queued);
+        ValueTask<SendResult> wait = h.Client.SendAsync(new SendHeader(4), OrderedKit.Payload(queued, 4_000));
+        Assert.False(wait.IsCompleted);
+        Assert.True(h.RunUntil(() => wait.IsCompleted));
+        Assert.Equal(SendStatus.Admitted, (await wait).Status);
+        Assert.True(h.RunUntil(() => got.Count == queued + 1));
+        for (int i = 0; i <= queued; i++)
+        {
+            Assert.Equal(OrderedKit.Payload(i, 4_000), got[i].Payload);
+        }
+    }
 }

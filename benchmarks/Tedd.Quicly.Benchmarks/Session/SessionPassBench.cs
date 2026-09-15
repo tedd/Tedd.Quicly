@@ -33,10 +33,22 @@ public class SessionPassBench
     public void Setup()
     {
         _fixture = new SessionFixture(Pairs, compact: true);
-        for (int i = 0; i < 50; i++)
+
+        // With one invocation per iteration, BenchmarkDotNet's own warm-up calls each method only a few times, so in a fresh
+        // process the measured code would still be tier 0. Run the paths here until tiered compilation has promoted them
+        // (call counts first, then the background compile after a quiet period).
+        for (int round = 0; round < 3; round++)
         {
-            AdmitEverywhere();
-            _fixture.Cycle();
+            for (int i = 0; i < 200; i++)
+            {
+                AdmitEverywhere();
+                Flush100Buffered();
+                _fixture.Cycle();
+                SendCopy();
+                _fixture.Cycle();
+            }
+
+            Thread.Sleep(300);
         }
     }
 

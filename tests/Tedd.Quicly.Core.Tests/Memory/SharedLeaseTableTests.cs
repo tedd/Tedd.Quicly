@@ -147,13 +147,19 @@ public class SharedLeaseTableTests
         var negative = new SharedLease(Forge(classIndex: 0, blockIndex: -1, length: 64));
         Assert.Throws<ArgumentException>(() => table.GetReferenceCount(negative));
 
-        // Block 1 was never touched by the rejected calls.
-        Assert.True(allocator.TryRent(1, out BufferLease a));
-        Assert.True(allocator.TryRent(1, out BufferLease b));
-        SharedLease sharedB = table.Share(b.BlockIndex == 1 ? b : a, 1);
-        Assert.Equal(1, table.GetReferenceCount(sharedB));
-        Assert.True(table.Release(sharedB));
-        allocator.Return(b.BlockIndex == 1 ? a : b);
+        // Block 1 was never touched by the rejected calls. Which blocks come out first depends on the calling
+        // thread's free-list shard, so rent the whole class to be sure of getting block 1.
+        var all = new BufferLease[allocator.SizeClasses[0].BlockCount];
+        for (int i = 0; i < all.Length; i++)
+            Assert.True(allocator.TryRent(1, out all[i]));
+        SharedLease shared = table.Share(Assert.Single(all, l => l.BlockIndex == 1), 1);
+        Assert.Equal(1, table.GetReferenceCount(shared));
+        Assert.True(table.Release(shared));
+        foreach (BufferLease lease in all)
+        {
+            if (lease.BlockIndex != 1)
+                allocator.Return(lease);
+        }
     }
 
     private static BufferLease Forge(int classIndex, int blockIndex, int length)

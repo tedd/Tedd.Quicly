@@ -210,7 +210,8 @@ public unsafe class MsQuicTransportTests
         Assert.True(Spin.Until(() => server.RefusedPeerStreamCount == 1, Timeout), $"refused {server.RefusedPeerStreamCount}");
         Assert.Equal(4, ss.CountOf(RecordedEventKind.PeerStreamStarted));
         Assert.Equal(4, server.OpenStreamCount);
-        Assert.Contains(diagnostics, m => m.Contains("stream table is full", StringComparison.Ordinal));
+        // The refusal is counted just before the diagnostic is logged on the worker thread: wait for the message.
+        Assert.True(Spin.Until(() => diagnostics.Any(m => m.Contains("stream table is full", StringComparison.Ordinal)), Timeout));
         scope.Finish();
     }
 

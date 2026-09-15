@@ -23,12 +23,18 @@ namespace Tedd.Quicly.Core.Control;
 /// owns a whole /64).
 /// </para>
 /// <para>
+/// The limiter only ever refuses addresses it is tracking: an address without an entry has no recorded failures and
+/// is always admitted, so a failure flood from other addresses can never lock out a client that has not failed.
+/// </para>
+/// <para>
 /// Bounded memory: a table of <c>capacity</c> entries organised as 8-way buckets, indexed by a keyed (per-instance
 /// random seed) xxHash64 so a remote party cannot aim addresses at one bucket. An entry whose bucket has fully
-/// refilled is free for reuse. When an address has no entry and every entry of its bucket is still active, its
-/// failures are charged to a single shared <em>overflow</em> bucket, and untracked addresses in full buckets are
-/// admitted only while that overflow bucket allows it: under a many-address attack the limiter degrades to a global
-/// limit for the addresses it cannot track, rather than forgetting the ones it does.
+/// refilled is free for reuse. When a failure arrives for an untracked address and every entry of its bucket is still
+/// active, the entry with the smallest arrival time (the one closest to fully refilled, so blocked addresses go last)
+/// is evicted and counted in <see cref="Evictions"/>. Under a many-address attack the attacker's addresses churn through
+/// the table; an evicted address is forgotten and can fail again up to <c>burst</c> times before it is refused. That
+/// bounds brute force per address only while the table can hold the attack's working set: size <c>capacity</c> for the
+/// failure load, and watch <see cref="Evictions"/>.
 /// </para>
 /// <para>Thread-safe (one short lock per call); allocation-free after construction.</para>
 /// </remarks>
@@ -62,8 +68,7 @@ public sealed class AuthFailureRateLimiter
     private readonly ulong _hiMask;
     private readonly ulong _loMask;
     private readonly ulong _seed;
-    private long _overflowTat = long.MinValue;
-    private long _overflowFailures;
+    private long _evictions;
 
     /// <summary>Creates a limiter.</summary>
     /// <param name="clock">Time source.</param>
@@ -108,14 +113,17 @@ public sealed class AuthFailureRateLimiter
     /// <summary>Number of table entries (the requested capacity rounded up to a power of two).</summary>
     public int Capacity { get; }
 
-    /// <summary>Failures charged to the shared overflow bucket because the address's bucket was full (diagnostics).</summary>
-    public long OverflowFailures
+    /// <summary>
+    /// Active entries evicted to make room for a newly failing address because its bucket was full (diagnostics). A
+    /// sustained non-zero rate means the table is too small for the failure load, or a many-address attack.
+    /// </summary>
+    public long Evictions
     {
         get
         {
             lock (_lock)
             {
-                return _overflowFailures;
+                return _evictions;
             }
         }
     }
@@ -144,6 +152,7 @@ public sealed class AuthFailureRateLimiter
 
     /// <summary>Returns whether an attempt from <paramref name="address"/> may proceed.</summary>
     /// <param name="address">The remote address.</param>
+    /// <returns><see langword="false"/> only for a tracked address with <c>burst</c> failures outstanding.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="address"/> is null.</exception>
     public bool IsAllowed(IPAddress address)
     {
@@ -153,6 +162,7 @@ public sealed class AuthFailureRateLimiter
 
     /// <summary>Returns whether an attempt from the address in <paramref name="address"/> may proceed.</summary>
     /// <param name="address">Network-order address bytes: 4 (IPv4) or 16 (IPv6).</param>
+    /// <returns><see langword="false"/> only for a tracked address with <c>burst</c> failures outstanding.</returns>
     /// <exception cref="ArgumentException"><paramref name="address"/> is neither 4 nor 16 bytes.</exception>
     public bool IsAllowed(ReadOnlySpan<byte> address)
     {
@@ -161,19 +171,16 @@ public sealed class AuthFailureRateLimiter
         long now = _clock.NowMicros;
         lock (_lock)
         {
-            bool hasFreeSlot = false;
             for (int i = first; i < first + Ways; i++)
             {
                 if (_hi[i] == hi && _lo[i] == lo)
                 {
                     return _tat[i] <= now + _allowance;
                 }
-
-                hasFreeSlot |= _tat[i] <= now;
             }
-
-            return hasFreeSlot || _overflowTat <= now + _allowance;
         }
+
+        return true; // untracked: no failures on record
     }
 
     /// <summary>Charges one failed attempt to <paramref name="address"/>.</summary>
@@ -196,6 +203,7 @@ public sealed class AuthFailureRateLimiter
         lock (_lock)
         {
             int free = -1;
+            int oldest = first;
             for (int i = first; i < first + Ways; i++)
             {
                 if (_hi[i] == hi && _lo[i] == lo)
@@ -208,18 +216,22 @@ public sealed class AuthFailureRateLimiter
                 {
                     free = i;
                 }
+
+                if (_tat[i] < _tat[oldest])
+                {
+                    oldest = i;
+                }
             }
 
-            if (free >= 0)
+            if (free < 0)
             {
-                _hi[free] = hi;
-                _lo[free] = lo;
-                _tat[free] = Charge(long.MinValue, now);
-                return;
+                free = oldest; // every entry is active: evict the one closest to fully refilled
+                _evictions++;
             }
 
-            _overflowTat = Charge(_overflowTat, now);
-            _overflowFailures++;
+            _hi[free] = hi;
+            _lo[free] = lo;
+            _tat[free] = Charge(long.MinValue, now);
         }
     }
 

@@ -9,7 +9,7 @@ namespace Tedd.Quicly.Core.Tests.Control;
 
 /// <summary>
 /// Review findings (quicly/b2-control-codec). Each test states the property the implementation must have; the tests in
-/// this class FAIL against the reviewed code and document a defect.
+/// this class failed against the reviewed code and are kept as regression guards for the fixes.
 /// </summary>
 public class ControlReviewTests
 {
@@ -46,7 +46,7 @@ public class ControlReviewTests
     }
 
     /// <summary>
-    /// BUG: <see cref="SessionTokenAuthority"/> validates against a key snapshot read before the clock, while
+    /// Fixed defect: <see cref="SessionTokenAuthority"/> validates against a key snapshot read before the clock, while
     /// <see cref="SessionTokenAuthority.RotateKey"/> zeroes the outgoing "previous" key array in place. A validation that
     /// overlaps a rotation therefore computes HMAC with an all-zero key, so a token forged with the all-zero key (which
     /// anyone can compute) is accepted as <see cref="SessionTokenStatus.Valid"/> for any sessionId. The re-entrant clock
@@ -67,7 +67,7 @@ public class ControlReviewTests
     }
 
     /// <summary>
-    /// BUG (same root cause): <see cref="SessionTokenAuthority.Dispose"/> zeroes the current key while a validation that
+    /// Fixed defect (same root cause): <see cref="SessionTokenAuthority.Dispose"/> zeroes the current key while a validation that
     /// already passed the disposed check is still running, so the zero-key forgery is accepted during shutdown.
     /// </summary>
     [Fact]
@@ -92,7 +92,7 @@ public class ControlReviewTests
     }
 
     /// <summary>
-    /// BUG / spec deviation (PROTOCOL.md §4.1: "failed auth attempts are rate-limited per remote address"): once every
+    /// Fixed defect / spec deviation (PROTOCOL.md §4.1: "failed auth attempts are rate-limited per remote address"): once every
     /// 8-way bucket is occupied and the single shared overflow bucket is exhausted, <see cref="AuthFailureRateLimiter.IsAllowed(ReadOnlySpan{byte})"/>
     /// refuses every address it is not tracking, including addresses that have never failed. With the defaults an attacker
     /// holding one IPv6 /48 (65 536 /64 keys) locks out all new clients: ~41 k failed handshakes keep every slot busy for
@@ -129,6 +129,54 @@ public class ControlReviewTests
         }
 
         Assert.True(refused == 0, $"{refused}/256 addresses with no failures were refused after {attackerFailures} failures from other addresses.");
+    }
+
+    /// <summary>
+    /// Follow-up (spec gap: the HelloAck, table included, must fit in one 16384-byte frame): the budget returned by
+    /// <see cref="ControlCodec.GetMaxHelloAckTableLength"/> is exact even with worst-case (8-byte) varint fields.
+    /// </summary>
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(SessionTokenAuthority.TokenLength, 0)]
+    [InlineData(SessionTokenAuthority.TokenLength, ControlCodec.MaxReasonLength)]
+    [InlineData(63, 63)]
+    [InlineData(64, 64)]
+    [InlineData(ControlCodec.MaxTokenLength, ControlCodec.MaxReasonLength)]
+    public void HelloAck_Table_Budget_Is_Exact(int tokenLength, int reasonLength)
+    {
+        int budget = ControlCodec.GetMaxHelloAckTableLength(tokenLength, reasonLength);
+        byte[] token = Bytes(tokenLength);
+        byte[] reason = Bytes(reasonLength, (byte)'r');
+        byte[] buffer = new byte[ControlCodec.MaxEncodedStreamFrameLength];
+        byte[] fits = TableOfLength(budget);
+        byte[] tooLarge = TableOfLength(budget + 1);
+
+        Assert.True(ControlCodec.TryWrite(buffer, Ack(fits), out int written));
+        Assert.Equal(ControlParseStatus.Ok, ControlCodec.TryReadStream(buffer.AsSpan(0, written), out ControlType type, out ReadOnlySpan<byte> body, out _));
+        Assert.Equal(ControlType.HelloAck, type);
+        Assert.Equal(ControlParseStatus.Ok, ControlCodec.TryParse(body, out HelloAck parsed));
+        Assert.Equal(budget, parsed.Table.Length);
+        Assert.ThrowsAny<ArgumentException>(() => ControlCodec.TryWrite(buffer, Ack(tooLarge), out _));
+
+        HelloAck Ack(byte[] table) => new()
+        {
+            SessionToken = token,
+            Table = table,
+            Reason = reason,
+            MaxMessageSize = VarInt.MaxValue,
+            HeartbeatMicros = VarInt.MaxValue,
+            GraceMicros = VarInt.MaxValue,
+        };
+    }
+
+    [Fact]
+    public void HelloAck_Table_Budget_Argument_Validation()
+    {
+        Assert.Equal(15_756, ControlCodec.GetMaxHelloAckTableLength(SessionTokenAuthority.TokenLength, ControlCodec.MaxReasonLength));
+        Assert.Throws<ArgumentOutOfRangeException>(() => ControlCodec.GetMaxHelloAckTableLength(-1, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => ControlCodec.GetMaxHelloAckTableLength(ControlCodec.MaxTokenLength + 1, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => ControlCodec.GetMaxHelloAckTableLength(0, -1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => ControlCodec.GetMaxHelloAckTableLength(0, ControlCodec.MaxReasonLength + 1));
     }
 }
 

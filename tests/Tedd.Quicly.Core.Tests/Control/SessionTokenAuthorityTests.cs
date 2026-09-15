@@ -257,6 +257,145 @@ public class SessionTokenAuthorityTests
     }
 
     [Fact]
+    public void Retired_Keys_Are_Wiped_Only_When_The_Last_Lease_Is_Released()
+    {
+        VirtualClock clock = new(0);
+        SessionTokenAuthority authority = new(Key(0x51), Key(0x52), long.MaxValue, clock);
+        SessionTokenAuthority.KeySet first = authority.AcquireKeys(); // an in-flight validation
+        authority.RotateKey(Key(0x53), long.MaxValue);
+        Assert.False(first.IsWiped);
+        Assert.Equal(Key(0x51), first.Current);
+        Assert.Equal(Key(0x52), first.Previous);
+
+        SessionTokenAuthority.KeySet second = authority.AcquireKeys();
+        Assert.NotSame(first, second);
+        Assert.Equal(Key(0x53), second.Current);
+        Assert.Equal(Key(0x51), second.Previous);
+        Assert.NotSame(first.Current, second.Previous); // every set owns private copies
+
+        first.Release();
+        Assert.True(first.IsWiped);
+        Assert.All(first.Current, b => Assert.Equal(0, b));
+        Assert.All(first.Previous!, b => Assert.Equal(0, b));
+        Assert.Equal(Key(0x51), second.Previous); // the newer set's copy of the outgoing key is untouched
+
+        authority.Dispose();
+        Assert.False(second.IsWiped); // still leased
+        Assert.Equal(Key(0x53), second.Current);
+        second.Release();
+        Assert.True(second.IsWiped);
+        Assert.All(second.Current, b => Assert.Equal(0, b));
+        Assert.All(second.Previous!, b => Assert.Equal(0, b));
+    }
+
+    [Fact]
+    public void Unleased_Retired_Keys_Are_Wiped_At_Once_And_Wiping_Is_Idempotent()
+    {
+        VirtualClock clock = new(0);
+        using SessionTokenAuthority authority = new(Key(0x61), clock);
+        SessionTokenAuthority.KeySet keys = authority.AcquireKeys();
+        keys.Release();
+        Assert.False(keys.IsWiped);
+
+        authority.RotateKey(Key(0x62), long.MaxValue);
+        Assert.True(keys.IsWiped);
+        Assert.All(keys.Current, b => Assert.Equal(0, b));
+        Assert.Null(keys.Previous);
+
+        // A lease attempt that raced the retirement counts a reference on the retired set and then drops it.
+        keys.AddReference();
+        keys.Release();
+        Assert.True(keys.IsWiped);
+
+        // The outgoing key still verifies through the new set's own copy.
+        using SessionTokenAuthority old = new(Key(0x61), clock);
+        byte[] token = Mint(old, 5, 1, 1_000);
+        Assert.Equal(SessionTokenStatus.Valid, authority.TryInspect(token, out ulong id, out _));
+        Assert.Equal(5UL, id);
+    }
+
+    [Fact]
+    public void Concurrent_Rotation_And_Dispose_Never_Accept_A_Zero_Key_Forgery()
+    {
+        byte[] forged = new byte[SessionTokenAuthority.TokenLength];
+        forged[0] = SessionTokenAuthority.FormatVersion;
+        BinaryPrimitives.WriteUInt64LittleEndian(forged.AsSpan(1), 0xBAD_5E55);
+        BinaryPrimitives.WriteUInt32LittleEndian(forged.AsSpan(9), 1);
+        BinaryPrimitives.WriteInt64LittleEndian(forged.AsSpan(13), long.MaxValue);
+        HMACSHA256.HashData(new byte[SessionTokenAuthority.KeyLength], forged.AsSpan(0, 37), forged.AsSpan(37, 32));
+
+        int totalFreshValid = 0;
+        for (int round = 0; round < 10; round++)
+        {
+            VirtualClock clock = new(0);
+            SessionTokenAuthority authority = new(Key(0x70), Key(0x71), long.MaxValue, clock);
+            int started = 0;
+            int forgedAccepted = 0;
+            int freshValid = 0;
+            int freshOther = 0;
+            Thread[] validators = new Thread[4];
+            for (int v = 0; v < validators.Length; v++)
+            {
+                validators[v] = new Thread(() =>
+                {
+                    byte[] scratch = new byte[SessionTokenAuthority.TokenLength];
+                    Interlocked.Increment(ref started);
+                    while (true)
+                    {
+                        try
+                        {
+                            if (authority.TryInspect(forged, out _, out _) == SessionTokenStatus.Valid)
+                            {
+                                Interlocked.Increment(ref forgedAccepted);
+                            }
+
+                            // A fresh token verifies unless two rotations dropped its key in between (BadSignature).
+                            authority.Mint(1, 1, long.MaxValue, scratch);
+                            SessionTokenStatus fresh = authority.TryInspect(scratch, out _, out _);
+                            if (fresh == SessionTokenStatus.Valid)
+                            {
+                                Interlocked.Increment(ref freshValid);
+                            }
+                            else if (fresh != SessionTokenStatus.BadSignature)
+                            {
+                                Interlocked.Increment(ref freshOther);
+                            }
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            return;
+                        }
+                    }
+                });
+                validators[v].Start();
+            }
+
+            while (Volatile.Read(ref started) < validators.Length)
+            {
+                Thread.Yield();
+            }
+
+            for (int i = 0; i < 300; i++)
+            {
+                authority.RotateKey(Key((byte)(0x72 + (i % 100))), long.MaxValue);
+                Thread.SpinWait(2_000);
+            }
+
+            authority.Dispose();
+            foreach (Thread validator in validators)
+            {
+                validator.Join();
+            }
+
+            Assert.True(forgedAccepted == 0, $"Round {round}: zero-key forgery accepted {forgedAccepted} times.");
+            Assert.True(freshOther == 0, $"Round {round}: {freshOther} fresh tokens failed with an unexpected status.");
+            totalFreshValid += freshValid;
+        }
+
+        Assert.True(totalFreshValid > 0, "No freshly minted token verified during rotation.");
+    }
+
+    [Fact]
     public void Token_Comparisons_Use_FixedTimeEquals()
     {
         // Code inspection: the MAC check and the auth-token helper must call CryptographicOperations.FixedTimeEquals,

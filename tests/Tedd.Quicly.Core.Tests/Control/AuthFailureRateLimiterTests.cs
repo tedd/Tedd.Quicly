@@ -99,34 +99,45 @@ public class AuthFailureRateLimiterTests
     }
 
     [Fact]
-    public void Full_Bucket_Falls_Back_To_The_Shared_Overflow_Bucket()
+    public void Full_Bucket_Evicts_The_Entry_Closest_To_Refilled_And_Untracked_Addresses_Stay_Admitted()
     {
         VirtualClock clock = new(0);
         AuthFailureRateLimiter limiter = new(clock, capacity: 8, burst: 3, refillIntervalMicros: 1000); // one 8-way bucket
         Assert.Equal(8, limiter.Capacity);
-        for (int i = 1; i <= 8; i++)
+        Fail(limiter, IPAddress.Parse("10.0.0.1"), 3); // tat 3000: blocked
+        for (int i = 2; i <= 8; i++)
         {
-            limiter.RecordFailure([10, 0, 0, (byte)i]);
+            clock.Set(i * 10);
+            limiter.RecordFailure([10, 0, 0, (byte)i]); // tat i×10 + 1000: 10.0.0.2 is closest to refilled
         }
 
         Assert.Equal(8, limiter.ActiveCount);
-        Assert.Equal(0, limiter.OverflowFailures);
-        Assert.True(limiter.IsAllowed([10, 0, 1, 1])); // untracked, overflow bucket still full
+        Assert.Equal(0, limiter.Evictions);
+        Assert.False(limiter.IsAllowed([10, 0, 0, 1]));
+        Assert.True(limiter.IsAllowed([10, 0, 1, 1])); // untracked: admitted although the bucket is full
 
-        for (int i = 1; i <= 3; i++)
+        limiter.RecordFailure([10, 0, 1, 1]);
+        Assert.Equal(1, limiter.Evictions);
+        Assert.Equal(8, limiter.ActiveCount);
+        Assert.False(limiter.IsAllowed([10, 0, 0, 1])); // the blocked address was not the one evicted
+        limiter.RecordFailure([10, 0, 1, 1]);
+        Assert.True(limiter.IsAllowed([10, 0, 1, 1]));
+        limiter.RecordFailure([10, 0, 1, 1]);
+        Assert.False(limiter.IsAllowed([10, 0, 1, 1])); // the newcomer is tracked like any other address
+
+        for (int i = 0; i < 256; i++)
         {
-            limiter.RecordFailure([10, 0, 1, (byte)i]);
+            Assert.True(limiter.IsAllowed([10, 0, 2, (byte)i])); // addresses that never failed are never refused
         }
 
-        Assert.Equal(3, limiter.OverflowFailures);
-        Assert.False(limiter.IsAllowed([10, 0, 2, 1])); // every untracked address now shares the exhausted overflow bucket
-        Assert.True(limiter.IsAllowed([10, 0, 0, 1]));  // tracked addresses keep their own state
+        limiter.RecordFailure([10, 0, 0, 2]); // was evicted, so it starts over; evicts 10.0.0.3 (tat 1030)
+        Assert.Equal(2, limiter.Evictions);
+        Assert.True(limiter.IsAllowed([10, 0, 0, 2]));
 
-        clock.AdvanceMicros(1000); // tracked entries (one failure each) are idle again
+        clock.AdvanceMicros(10_000); // every entry has refilled
         Assert.Equal(0, limiter.ActiveCount);
-        Assert.True(limiter.IsAllowed([10, 0, 2, 1]));
-        limiter.RecordFailure([10, 0, 3, 1]);
-        Assert.Equal(3, limiter.OverflowFailures);
+        limiter.RecordFailure([10, 0, 3, 1]); // takes a free entry
+        Assert.Equal(2, limiter.Evictions);
         Assert.Equal(1, limiter.ActiveCount);
     }
 
@@ -141,7 +152,7 @@ public class AuthFailureRateLimiterTests
         }
 
         Assert.Equal(1024, limiter.ActiveCount);
-        Assert.Equal(3000 - 1024, limiter.OverflowFailures);
+        Assert.Equal(3000 - 1024, limiter.Evictions);
     }
 
     [Fact]

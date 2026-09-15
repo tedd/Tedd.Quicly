@@ -131,7 +131,17 @@ public static partial class ControlCodec
         type = 0;
         body = default;
         consumed = 0;
-        if (source.IsEmpty || source.Length < VarInt.PeekLength(source[0]))
+        if (source.IsEmpty)
+        {
+            return ControlParseStatus.NeedMoreData;
+        }
+
+        if (source[0] >= 0xC0)
+        {
+            return ControlParseStatus.InvalidFrameLength; // an 8-byte Length is non-minimal or above MaxFrameLength
+        }
+
+        if (source.Length < VarInt.PeekLength(source[0]))
         {
             return ControlParseStatus.NeedMoreData;
         }

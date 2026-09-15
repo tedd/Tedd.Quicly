@@ -13,15 +13,16 @@ public class ControlZeroAllocationTests
 {
     private const int Warmup = 1_000;
     private const int Iterations = 2_000;
-    private const int Attempts = 3;
+    private const int Windows = 5;
 
     private static readonly ControlCarrier[] Carriers = [ControlCarrier.Datagram, ControlCarrier.Stream];
 
     /// <summary>
-    /// Warms <paramref name="body"/> up, then measures windows of <see cref="Iterations"/> calls until one window
-    /// allocates nothing (at most <see cref="Attempts"/> windows). A steady-state allocation shows up in every window;
-    /// a one-off runtime event on this thread (tier-up or OSR compilation landing inside a window) does not repeat, so
-    /// it cannot fail the test on its own.
+    /// Warms <paramref name="body"/> up, then measures <see cref="Windows"/> consecutive windows of
+    /// <see cref="Iterations"/> calls; at most one window may allocate. A one-off runtime event on this thread (tier-up
+    /// or OSR compilation landing inside a window) does not repeat, so it cannot fail the test on its own, while a
+    /// steady-state allocation, including an amortised one that recurs only every few thousand calls (a rarely
+    /// resized buffer), shows up in at least two windows.
     /// </summary>
     private static void AssertNoAllocations(Action body)
     {
@@ -30,8 +31,9 @@ public class ControlZeroAllocationTests
             body();
         }
 
-        long[] deltas = new long[Attempts];
-        for (int attempt = 0; attempt < Attempts; attempt++)
+        long[] deltas = new long[Windows];
+        int allocatingWindows = 0;
+        for (int window = 0; window < Windows; window++)
         {
             long before = GC.GetAllocatedBytesForCurrentThread();
             for (int i = 0; i < Iterations; i++)
@@ -39,14 +41,15 @@ public class ControlZeroAllocationTests
                 body();
             }
 
-            deltas[attempt] = GC.GetAllocatedBytesForCurrentThread() - before;
-            if (deltas[attempt] == 0)
+            deltas[window] = GC.GetAllocatedBytesForCurrentThread() - before;
+            if (deltas[window] != 0)
             {
-                return;
+                allocatingWindows++;
             }
         }
 
-        Assert.Fail($"Allocated in every window: {string.Join(", ", deltas)} bytes per {Iterations} calls.");
+        Assert.True(allocatingWindows <= 1,
+            $"Allocated in {allocatingWindows} of {Windows} windows: {string.Join(", ", deltas)} bytes per {Iterations} calls.");
     }
 
     private static ReadOnlySpan<byte> ReadFrame(ReadOnlySpan<byte> frame, ControlCarrier carrier, out ControlType type)
@@ -161,7 +164,7 @@ public class ControlZeroAllocationTests
     {
         VirtualClock clock = new(0);
         using SessionTokenAuthority authority = new(Bytes(32, 7), clock);
-        const int tokenCount = Warmup + (Attempts * Iterations);
+        const int tokenCount = Warmup + (Windows * Iterations);
         byte[] tokens = new byte[tokenCount * SessionTokenAuthority.TokenLength];
         for (int i = 0; i < tokenCount; i++)
         {

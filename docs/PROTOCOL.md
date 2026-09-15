@@ -251,6 +251,11 @@ Control-message bounds (clarifications; they apply to both endpoints, and a viol
   malformed) is the §1 canonical table encoding followed by exactly `count` names in the same ascending-id
   order, each `len varint (≤ 64) + utf8`. It has no length prefix: the receiver finds the `reason` that follows
   by walking that structure. Channel ids in the section MUST be in [2, 16383].
+* The whole HelloAck, table section included, is one control message, so `Length` ≤ 16384 bounds it too. The
+  table section gets what the other fields leave: 15 756 bytes with a 69-byte session token, a 512-byte reason
+  and worst-case 8-byte varints (roughly 200 channels with 64-byte names, a few thousand with short ones).
+  *(Clarification: version 1 has no multi-frame table response. A server MUST NOT be configured with a channel
+  table whose section exceeds that budget; implementations reject such a table at configuration time.)*
 * `HelloAck.sessionToken` is bounded like Hello's tokens: ≤ 4096 bytes. `HelloAck.status` values other than
   0–4, 6, 7 and 0xFF are malformed.
 * Hello with `version` ≠ 1: only `magic` and `version` are interpreted (a later version may lay out the rest
@@ -288,8 +293,12 @@ Control-message bounds (clarifications; they apply to both endpoints, and a viol
   closed: status 3, the client starts a fresh session) rather than an entry evicted. "A newer token was issued"
   is enforced by the session registry comparing the token's `epoch` with the session's current epoch. Key
   rotation keeps accepting the previous key until a deadline (typically `graceMicros` after the rotation). The
-  per-address failure limiter keys IPv4 (and IPv4-mapped IPv6) by address and IPv6 by /64 prefix; addresses its
-  bounded table cannot track share one global overflow bucket.
+  server inspects a presented token at admission and consumes it only when the resume commits, so a resume
+  refused for another reason (status 2, 4 or 7) leaves the token usable. The per-address failure limiter keys
+  IPv4 (and IPv4-mapped IPv6) by address and IPv6 by /64 prefix. It only ever refuses addresses it is tracking:
+  an address with no recorded failures is always admitted, so failures from other addresses never lock a client
+  out. When its bounded table has no room for a newly failing address, the tracked entry closest to fully
+  refilled is evicted (blocked addresses are evicted last).
 * `epoch` is allocated by the server, strictly increasing per `sessionId`, starting at 1; the client's
   `lastEpoch` is informational. Every sequence/version/counter is scoped to the current epoch.
 * A valid resume for a session that still has a live connection replaces that connection (the old one is

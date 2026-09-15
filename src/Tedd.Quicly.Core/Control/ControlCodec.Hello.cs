@@ -10,6 +10,29 @@ public static partial class ControlCodec
     // status 1, sessionId 8, epoch 4, maxReceiveDatagram 2, caps 2, tableIncluded 1 (varints and length prefixes are extra).
     private const int HelloAckFixedLength = 18;
 
+    /// <summary>
+    /// Largest HelloAck table section (<see cref="HelloAck.Table"/>) guaranteed to fit in one control frame next to a
+    /// session token of <paramref name="sessionTokenLength"/> bytes and a reason of <paramref name="reasonLength"/>
+    /// bytes, whatever the values of the varint fields (PROTOCOL.md §3.4: the whole HelloAck is one control message,
+    /// <c>Length</c> ≤ 16384). A server checks its channel table section against this budget when it is configured; a
+    /// larger section cannot be sent (<see cref="TryWrite(Span{byte}, in HelloAck, out int)"/> throws).
+    /// </summary>
+    /// <param name="sessionTokenLength">Session token length in bytes (0 … <see cref="MaxTokenLength"/>).</param>
+    /// <param name="reasonLength">Reason length in bytes (0 … <see cref="MaxReasonLength"/>).</param>
+    /// <returns>The table-section budget in bytes (15 756 for a 69-byte token and a 512-byte reason).</returns>
+    /// <exception cref="ArgumentOutOfRangeException">A length is out of range.</exception>
+    public static int GetMaxHelloAckTableLength(int sessionTokenLength, int reasonLength)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(sessionTokenLength);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(sessionTokenLength, MaxTokenLength);
+        ArgumentOutOfRangeException.ThrowIfNegative(reasonLength);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(reasonLength, MaxReasonLength);
+        const int WorstCaseVarInts = 3 * 8; // maxMessageSize, heartbeatMicros, graceMicros
+        return MaxFrameLength - 1 - HelloAckFixedLength - WorstCaseVarInts
+            - VarInt.GetLength((ulong)sessionTokenLength) - sessionTokenLength
+            - VarInt.GetLength((ulong)reasonLength) - reasonLength;
+    }
+
     // Canonical entry: id varint (≥ 1), mode u8, flags u8, priority u8, maxMessageSize varint (≥ 1); plus a name length (≥ 1).
     private const int MinTableChannelLength = 6;
 

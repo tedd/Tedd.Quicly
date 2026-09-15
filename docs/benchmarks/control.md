@@ -104,3 +104,38 @@ every call, so a 37-byte message costs four SHA-256 compressions. A reusable key
 no per-call hash object, which could plausibly halve the cost. It was not pursued. Tokens are validated once per
 admission, next to a full TLS handshake, so ~0.8 µs is noise at that point. A reusable state would also need
 per-thread instances or a lock around the MAC. Revisit only if admission throughput is measured as a bottleneck.
+
+## After the review fixes
+
+Three hot-path changes came out of the review:
+
+* Session tokens: minting and validation now lease the key set (one `Interlocked` increment, a re-check and one
+  decrement around the HMAC). A rotation or `Dispose` therefore never wipes key bytes that an in-flight HMAC is
+  still reading.
+* Auth-failure limiter: `IsAllowed` admits untracked addresses without consulting a shared overflow bucket, and
+  `RecordFailure` evicts the entry with the smallest arrival time when a bucket is full.
+* `TryReadStream` rejects a `0b11`-prefixed Length on its first byte.
+
+Same setup and command as above (both classes in one run), mean ns per call, every row 0 B allocated:
+
+| Method                             | Default  | InProcessEmit |
+|------------------------------------|---------:|--------------:|
+| PingPong_Datagram                  |    56.18 |    49.33      |
+| PingPong_Stream                    |    54.06 |    63.72      |
+| LatestAck32_Encode                 |   150.18 |   165.57      |
+| LatestAck32_Decode_V0              |   418.72 |   400.19      |
+| LatestAck32_Decode (V1)            |   196.82 |   210.07      |
+| LatestAck32_RoundTrip              |   395.98 |   362.35      |
+| Token_Mint                         |   529.46 |   549.73      |
+| Token_Inspect_Valid                |   609.26 |   664.13      |
+| Token_Validate_Replayed            |   562.94 |   645.60      |
+| Token_Validate_Tampered            |   562.87 |   643.74      |
+| Token_Inspect_PreviousKey          | 1 266.69 | 1 542.81      |
+| AuthFailures_IPv4_Check_And_Record |    38.24 |    41.87      |
+| AuthFailures_IPv6_Check_And_Record |    47.32 |    52.18      |
+
+The key lease costs nothing measurable: every token row is at or below the earlier measurement. The drop is
+machine load, not the change; HMAC still dominates, and two uncontended interlocked operations are a few ns
+against ~550 ns. The limiter got cheaper, because `IsAllowed` no longer tracks a free slot or reads the overflow
+state. The codec rows are within the run-to-run spread of the earlier V1 measurement. No hypothesis loop was run
+for these changes: they are correctness fixes with no measurable cost.

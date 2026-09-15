@@ -17,16 +17,41 @@ namespace Tedd.Quicly.Core.Control;
 /// survive a restart, which matches sessions not surviving one.
 /// </para>
 /// <para>
+/// Admission: check a presented token with <see cref="TryInspect"/> (does not consume it) and call
+/// <see cref="TryValidate"/> only when the resume commits, i.e. after every other admission check (auth token, server
+/// capacity, channel table, datagram support, session still in the registry) has passed. A resume refused after the
+/// inspection therefore leaves the client's token usable, as PROTOCOL.md §4.1 requires (a token is spent only by a
+/// resume that <em>succeeded</em>). <see cref="TryValidate"/> re-checks everything, so of two concurrent resumes with the
+/// same token exactly one commits and the other sees <see cref="SessionTokenStatus.Replayed"/>.
+/// </para>
+/// <para>
 /// Single use: <see cref="TryValidate"/> records the token's random part in a bounded replay cache (entries expire
 /// with their token); presenting it again yields <see cref="SessionTokenStatus.Replayed"/>. When the cache holds
 /// <c>replayCacheCapacity</c> unexpired entries a new token is refused with
 /// <see cref="SessionTokenStatus.ReplayCacheFull"/> (fail closed). Invalidating older tokens once a newer one was issued
-/// is the session registry's job: it compares the returned <c>epoch</c> with the session's current epoch.
+/// is the session registry's job: it compares the returned <c>epoch</c> with the session's current epoch and bumps the
+/// epoch on every successful resume, which on its own already makes a token single-use; the replay cache is defence in
+/// depth that keeps this class self-contained. Its exposure: every consumed token occupies a slot until it expires, so
+/// one client that resumes faster than <c>replayCacheCapacity / grace</c> per second (about 546/s with the defaults and
+/// a 30 s grace) can fill it and make every other client's resume fail closed until entries expire. The session layer
+/// should therefore cap resumes per session (for example one per heartbeat interval) and charge refused resumes to
+/// <see cref="AuthFailureRateLimiter"/>. While the cache is full and entries are expiring, an insert sweeps the whole
+/// table (O(capacity), under the lock).
 /// </para>
 /// <para>
 /// Rotation: <see cref="RotateKey"/> (or the two-key constructor) keeps accepting tokens signed with the previous key
-/// until a deadline; new tokens are always signed with the current key. MACs are compared with
-/// <see cref="CryptographicOperations.FixedTimeEquals(ReadOnlySpan{byte}, ReadOnlySpan{byte})"/>.
+/// until a deadline; new tokens are always signed with the current key. Only one previous key is kept: rotating again
+/// before the previous key's deadline drops it immediately, so tokens it signed stop verifying early. MACs are compared
+/// with <see cref="CryptographicOperations.FixedTimeEquals(ReadOnlySpan{byte}, ReadOnlySpan{byte})"/>.
+/// </para>
+/// <para>
+/// Key lifetime: the keys in use form an immutable key set that owns private copies of its key bytes. Minting and
+/// validation lease the current set (a reference count, re-checked after it is taken) for the duration of the HMAC.
+/// <see cref="RotateKey"/> and <see cref="Dispose"/> publish the replacement first and then drop the authority's own
+/// reference; a retired set's keys are wiped by whoever releases its last reference. Key bytes are therefore never
+/// modified while a computation can still read them (an HMAC under a half-wiped or all-zero key would let anyone forge
+/// a token). The clock is read before a lease is taken, so a clock that calls back into the authority never runs while
+/// a lease is held.
 /// </para>
 /// <para>
 /// Thread-safe. <see cref="Mint"/>, <see cref="TryValidate"/> and <see cref="TryInspect"/> do not allocate (HMAC is
@@ -57,7 +82,7 @@ public sealed class SessionTokenAuthority : IDisposable
 
     private readonly IClock _clock;
     private readonly ReplayCache _replayCache;
-    private readonly Lock _lock = new();
+    private readonly Lock _lock = new(); // guards the replay cache and serialises RotateKey / Dispose
     private KeySet? _keys;
 
     /// <summary>Creates an authority with a single key.</summary>
@@ -119,7 +144,7 @@ public sealed class SessionTokenAuthority : IDisposable
     /// <exception cref="ObjectDisposedException">The authority was disposed.</exception>
     public int Mint(ulong sessionId, uint epoch, long expiryMicros, Span<byte> destination)
     {
-        KeySet keys = Volatile.Read(ref _keys) ?? throw new ObjectDisposedException(nameof(SessionTokenAuthority));
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _keys) is null, this);
         if (destination.Length < TokenLength)
         {
             throw new ArgumentException($"A session token needs {TokenLength} bytes.", nameof(destination));
@@ -131,7 +156,16 @@ public sealed class SessionTokenAuthority : IDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(token.Slice(EpochOffset), epoch);
         BinaryPrimitives.WriteInt64LittleEndian(token.Slice(ExpiryOffset), expiryMicros);
         RandomNumberGenerator.Fill(token.Slice(RandomOffset, RandomLength));
-        HMACSHA256.HashData(keys.Current, token.Slice(0, MacOffset), token.Slice(MacOffset, MacLength));
+        KeySet keys = AcquireKeys();
+        try
+        {
+            HMACSHA256.HashData(keys.Current, token.Slice(0, MacOffset), token.Slice(MacOffset, MacLength));
+        }
+        finally
+        {
+            keys.Release();
+        }
+
         return TokenLength;
     }
 
@@ -139,6 +173,12 @@ public sealed class SessionTokenAuthority : IDisposable
     /// Validates <paramref name="token"/> and consumes it (single use): on <see cref="SessionTokenStatus.Valid"/> the same
     /// token is <see cref="SessionTokenStatus.Replayed"/> from then on.
     /// </summary>
+    /// <remarks>
+    /// Call this only when the resume commits. Use <see cref="TryInspect"/> for the admission checks that come first,
+    /// so that a resume refused for another reason (server full, table mismatch, datagrams required, session gone)
+    /// does not burn the client's token. This call repeats every check, so a token consumed concurrently since the
+    /// inspection yields <see cref="SessionTokenStatus.Replayed"/>.
+    /// </remarks>
     /// <param name="token">The presented token (untrusted).</param>
     /// <param name="sessionId">The session named by the token when valid, otherwise 0.</param>
     /// <param name="epoch">The epoch the token was issued in when valid, otherwise 0.</param>
@@ -148,6 +188,7 @@ public sealed class SessionTokenAuthority : IDisposable
         Validate(token, consume: true, out sessionId, out epoch);
 
     /// <summary>Validates <paramref name="token"/> like <see cref="TryValidate"/> but does not consume it.</summary>
+    /// <remarks>This is the admission-time check; <see cref="TryValidate"/> follows only when the resume commits.</remarks>
     /// <param name="token">The presented token (untrusted).</param>
     /// <param name="sessionId">The session named by the token when valid, otherwise 0.</param>
     /// <param name="epoch">The epoch the token was issued in when valid, otherwise 0.</param>
@@ -158,7 +199,8 @@ public sealed class SessionTokenAuthority : IDisposable
 
     /// <summary>
     /// Makes <paramref name="newKey"/> the signing key; the current key becomes the previous key and keeps verifying
-    /// until <paramref name="previousKeyValidUntilMicros"/>. The key it replaces as "previous" is wiped.
+    /// until <paramref name="previousKeyValidUntilMicros"/>. The key it replaces as "previous" stops verifying at once
+    /// and is wiped as soon as no in-flight mint or validation still uses it.
     /// </summary>
     /// <param name="newKey">The new 32-byte key (copied).</param>
     /// <param name="previousKeyValidUntilMicros">Deadline for tokens signed with the outgoing key (typically <c>now + graceMicros</c>).</param>
@@ -171,31 +213,46 @@ public sealed class SessionTokenAuthority : IDisposable
         lock (_lock)
         {
             KeySet old = _keys ?? throw new ObjectDisposedException(nameof(SessionTokenAuthority));
-            Volatile.Write(ref _keys, new KeySet(copy, old.Current, previousKeyValidUntilMicros));
-            if (old.Previous is not null)
-            {
-                CryptographicOperations.ZeroMemory(old.Previous);
-            }
+
+            // The new set gets its own copy of the outgoing key: every set owns (and eventually wipes) its arrays, so
+            // retiring `old` never wipes bytes a newer set still verifies with. `old.Current` is not modified while
+            // `old` is published, and only code holding this lock retires it.
+            KeySet next = new(copy, old.Current.AsSpan().ToArray(), previousKeyValidUntilMicros);
+            Interlocked.Exchange(ref _keys, next); // full fence: pairs with the re-check in AcquireKeys
+            old.Release();
         }
     }
 
-    /// <summary>Wipes the keys. Further calls throw <see cref="ObjectDisposedException"/>.</summary>
+    /// <summary>
+    /// Wipes the keys (at once, or when the last in-flight mint or validation finishes). Further calls to other members
+    /// throw <see cref="ObjectDisposedException"/>.
+    /// </summary>
     public void Dispose()
     {
         lock (_lock)
         {
-            KeySet? keys = _keys;
-            if (keys is null)
+            Interlocked.Exchange(ref _keys, null)?.Release();
+        }
+    }
+
+    /// <summary>
+    /// Leases the current key set; the caller must <see cref="KeySet.Release"/> it. The re-check after the reference is
+    /// counted guarantees the set was still published at that point, so its retirement (which happens after it is
+    /// unpublished) sees the lease and leaves the wipe to the lease's release.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The authority was disposed.</exception>
+    internal KeySet AcquireKeys()
+    {
+        while (true)
+        {
+            KeySet keys = Volatile.Read(ref _keys) ?? throw new ObjectDisposedException(nameof(SessionTokenAuthority));
+            keys.AddReference(); // full fence
+            if (ReferenceEquals(Volatile.Read(ref _keys), keys))
             {
-                return;
+                return keys;
             }
 
-            Volatile.Write(ref _keys, null);
-            CryptographicOperations.ZeroMemory(keys.Current);
-            if (keys.Previous is not null)
-            {
-                CryptographicOperations.ZeroMemory(keys.Previous);
-            }
+            keys.Release(); // retired between the two reads: possibly already wiped, so never used
         }
     }
 
@@ -203,14 +260,25 @@ public sealed class SessionTokenAuthority : IDisposable
     {
         sessionId = 0;
         epoch = 0;
-        KeySet keys = Volatile.Read(ref _keys) ?? throw new ObjectDisposedException(nameof(SessionTokenAuthority));
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _keys) is null, this);
         if (token.Length != TokenLength || token[0] != FormatVersion)
         {
             return SessionTokenStatus.Malformed;
         }
 
-        long now = _clock.NowMicros;
-        if (!VerifyMac(keys, token, now))
+        long now = _clock.NowMicros; // read before the lease: the clock is caller code
+        bool macValid;
+        KeySet keys = AcquireKeys();
+        try
+        {
+            macValid = VerifyMac(keys, token, now);
+        }
+        finally
+        {
+            keys.Release();
+        }
+
+        if (!macValid)
         {
             return SessionTokenStatus.BadSignature;
         }
@@ -276,13 +344,42 @@ public sealed class SessionTokenAuthority : IDisposable
         }
     }
 
-    /// <summary>Immutable key pair, replaced atomically on rotation so validators never see a torn pair.</summary>
-    private sealed class KeySet(byte[] current, byte[]? previous, long previousValidUntilMicros)
+    /// <summary>
+    /// Immutable key pair, replaced atomically on rotation so validators never see a torn pair. Owns its arrays
+    /// exclusively and wipes them when the last reference (the authority's own, or an in-flight lease) is released.
+    /// </summary>
+    internal sealed class KeySet(byte[] current, byte[]? previous, long previousValidUntilMicros)
     {
+        private int _references = 1; // the authority's reference, released when the set is retired
+        private int _wiped;
+
         public byte[] Current { get; } = current;
 
         public byte[]? Previous { get; } = previous;
 
         public long PreviousValidUntilMicros { get; } = previousValidUntilMicros;
+
+        /// <summary>Whether the keys have been wiped (diagnostics and tests).</summary>
+        public bool IsWiped => Volatile.Read(ref _wiped) != 0;
+
+        public void AddReference() => Interlocked.Increment(ref _references);
+
+        public void Release()
+        {
+            if (Interlocked.Decrement(ref _references) != 0)
+            {
+                return;
+            }
+
+            // Idempotent: a lease taken on an already-retired set (and dropped after the failed re-check) can bring the
+            // count back to zero a second time.
+            CryptographicOperations.ZeroMemory(Current);
+            if (Previous is not null)
+            {
+                CryptographicOperations.ZeroMemory(Previous);
+            }
+
+            Volatile.Write(ref _wiped, 1);
+        }
     }
 }

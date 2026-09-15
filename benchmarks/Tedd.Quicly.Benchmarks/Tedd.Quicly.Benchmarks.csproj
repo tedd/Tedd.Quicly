@@ -11,6 +11,7 @@
     <PackageReference Include="BenchmarkDotNet" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Acme\Tedd.Quicly.Acme.csproj" />
     <ProjectReference Include="..\..\src\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />
     <ProjectReference Include="..\..\src\Tedd.Quicly.Http3\Tedd.Quicly.Http3.csproj" />
     <ProjectReference Include="..\..\src\Tedd.Quicly.Transport.MsQuic\Tedd.Quicly.Transport.MsQuic.csproj" />

@@ -52,12 +52,15 @@ public enum SendEntryFlags : byte
 /// <item><term>4</term><description><see cref="Generation"/> (<see cref="uint"/>, odd, bumped per allocation).</description></item>
 /// <item><term>8</term><description><see cref="Channel"/> (<see cref="ushort"/>).</description></item>
 /// <item><term>10</term><description><see cref="Flags"/> (<see cref="SendEntryFlags"/>, 1 byte).</description></item>
-/// <item><term>11</term><description><see cref="HeaderLength"/> (1 byte; valid bytes in <see cref="HeaderScratch"/>).</description></item>
+/// <item><term>11</term><description><see cref="HeaderLength"/> (1 byte; valid bytes in the slot's header block).</description></item>
 /// <item><term>12</term><description>reserved (4 bytes, zero).</description></item>
-/// <item><term>16</term><description><see cref="Header"/> (<see cref="TransportSegment"/>, 16 bytes) — normally points at <see cref="HeaderScratch"/>.</description></item>
+/// <item><term>16</term><description><see cref="Header"/> (<see cref="TransportSegment"/>, 16 bytes) — normally points at the slot's 32-byte header block (<see cref="SendEntryTable.GetHeaderBlock"/>).</description></item>
 /// <item><term>32</term><description><see cref="Payload"/> (<see cref="TransportSegment"/>, 16 bytes) — the message bytes.</description></item>
-/// <item><term>48</term><description><see cref="HeaderScratch"/> (16 bytes) — the encoded message header.</description></item>
+/// <item><term>48</term><description><see cref="Aux0"/>, <see cref="Aux1"/> (8 bytes each) — scratch words owned by the engine that queued the entry.</description></item>
 /// </list>
+/// <para>The encoded header does not live in the entry: the largest datagram header is 24 bytes, so header bytes are
+/// kept in a cold native array of 32-byte blocks indexed by slot (ADR 0008 invariant 1 as amended). A block stays
+/// reserved with its slot until the completion is observed.</para>
 /// <para>Ownership: the game thread writes every field while the entry is <see cref="SendEntryState.Filling"/>
 /// and never again until it has observed the completion; the transport thread only reads
 /// <see cref="Generation"/>, <see cref="Channel"/>, <see cref="Flags"/> and the segments, and only changes
@@ -84,10 +87,8 @@ public unsafe struct SendEntry
     public const int HeaderOffset = 16;
     /// <summary>Byte offset of <see cref="Payload"/>.</summary>
     public const int PayloadOffset = 32;
-    /// <summary>Byte offset of <see cref="HeaderScratch"/>.</summary>
-    public const int HeaderScratchOffset = 48;
-    /// <summary>Capacity of <see cref="HeaderScratch"/> in bytes.</summary>
-    public const int HeaderScratchSize = 16;
+    /// <summary>Byte offset of <see cref="Aux0"/>; <see cref="Aux1"/> follows immediately.</summary>
+    public const int AuxOffset = 48;
 
     /// <summary>Current <see cref="SendEntryState"/>. Read with <see cref="Volatile"/>, changed with CAS once published.</summary>
     [FieldOffset(StateOffset)] public int State;
@@ -101,7 +102,7 @@ public unsafe struct SendEntry
     /// <summary>Entry flags.</summary>
     [FieldOffset(FlagsOffset)] public SendEntryFlags Flags;
 
-    /// <summary>Number of valid header bytes in <see cref="HeaderScratch"/> (0 … <see cref="HeaderScratchSize"/>).</summary>
+    /// <summary>Number of valid bytes in the slot's header block (0 … <see cref="SendEntryTable.HeaderBlockSize"/>).</summary>
     [FieldOffset(HeaderLengthOffset)] public byte HeaderLength;
 
     /// <summary>First of the two contiguous transport segments (<c>QUIC_BUFFER[0]</c>): the encoded header.</summary>
@@ -110,6 +111,9 @@ public unsafe struct SendEntry
     /// <summary>Second transport segment (<c>QUIC_BUFFER[1]</c>): the payload.</summary>
     [FieldOffset(PayloadOffset)] public TransportSegment Payload;
 
-    /// <summary>Inline storage for the encoded header, so a header needs no separate buffer.</summary>
-    [FieldOffset(HeaderScratchOffset)] public fixed byte HeaderScratch[HeaderScratchSize];
+    /// <summary>Engine-owned scratch word (game thread), zeroed at allocation.</summary>
+    [FieldOffset(AuxOffset)] public long Aux0;
+
+    /// <summary>Engine-owned scratch word (game thread), zeroed at allocation.</summary>
+    [FieldOffset(AuxOffset + 8)] public long Aux1;
 }

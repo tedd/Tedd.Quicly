@@ -11,8 +11,15 @@ namespace Tedd.Quicly.Acme;
 /// <summary>
 /// RFC 8555 ACME v2 client for any directory URL. Handles directory caching, the nonce pool (harvesting the
 /// <c>Replay-Nonce</c> of every response, <c>HEAD newNonce</c> on demand), a single automatic retry on
-/// <c>badNonce</c>, <c>Retry-After</c>-aware polling and structured problem documents (<see cref="AcmeException"/>).
+/// <c>badNonce</c> (with the nonce that response carried), <c>Retry-After</c>-aware polling and structured problem
+/// documents (<see cref="AcmeException"/>).
 /// </summary>
+/// <remarks>
+/// Only <c>https</c> URLs are requested (RFC 8555 §6.1), except loopback hosts or with
+/// <see cref="AcmeClientOptions.AllowInsecureHttp"/>. Certificate validation is done by the injected
+/// <see cref="HttpClient"/>; use <see cref="CreateHttpHandler"/> to trust a private or mock CA root without turning
+/// validation off (ADR 0009).
+/// </remarks>
 public sealed class AcmeClient
 {
     private const string JoseContentType = "application/jose+json";
@@ -37,13 +44,25 @@ public sealed class AcmeClient
     /// <param name="accountKey">The account key.</param>
     /// <param name="accountUrl">Existing account URL (<c>kid</c>); <see langword="null"/> until an account is created / found.</param>
     /// <param name="options">Polling / retry options.</param>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="directoryUrl"/> is not absolute, or not HTTPS while its host is not loopback and
+    /// <see cref="AcmeClientOptions.AllowInsecureHttp"/> is off (RFC 8555 §6.1).
+    /// </exception>
     public AcmeClient(HttpClient httpClient, Uri directoryUrl, AcmeAccountKey accountKey, Uri? accountUrl = null, AcmeClientOptions? options = null)
     {
         _http = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
-        DirectoryUrl = directoryUrl ?? throw new ArgumentNullException(nameof(directoryUrl));
+        ArgumentNullException.ThrowIfNull(directoryUrl);
         AccountKey = accountKey ?? throw new ArgumentNullException(nameof(accountKey));
-        AccountUrl = accountUrl;
         Options = options ?? new AcmeClientOptions();
+        if (!IsAllowedUrl(directoryUrl, Options.AllowInsecureHttp))
+        {
+            throw new ArgumentException(
+                "The directory URL '" + directoryUrl + "' must be an absolute https:// URL (RFC 8555 §6.1); plain http is only accepted for loopback hosts or with AcmeClientOptions.AllowInsecureHttp.",
+                nameof(directoryUrl));
+        }
+
+        DirectoryUrl = directoryUrl;
+        AccountUrl = accountUrl;
     }
 
     /// <summary>The directory URL.</summary>
@@ -61,7 +80,36 @@ public sealed class AcmeClient
     /// <summary>Number of unused nonces currently pooled.</summary>
     public int PooledNonceCount => _nonces.Count;
 
+    /// <summary>
+    /// Creates an HTTP handler whose TLS server-certificate validation trusts exactly <paramref name="trustAnchors"/>
+    /// (custom root trust), for a private or mock CA such as Pebble: <c>new HttpClient(AcmeClient.CreateHttpHandler(roots))</c>.
+    /// Host-name validation stays on. Revocation is not checked, since private CA roots rarely publish CRL / OCSP; build your
+    /// own <see cref="SocketsHttpHandler"/> when that is needed.
+    /// </summary>
+    /// <param name="trustAnchors">Root certificate(s) that anchor the CA's TLS chain.</param>
+    /// <exception cref="ArgumentException"><paramref name="trustAnchors"/> is empty.</exception>
+    public static SocketsHttpHandler CreateHttpHandler(X509Certificate2Collection trustAnchors)
+    {
+        ArgumentNullException.ThrowIfNull(trustAnchors);
+        if (trustAnchors.Count == 0)
+        {
+            throw new ArgumentException("At least one trust anchor is required.", nameof(trustAnchors));
+        }
+
+        X509ChainPolicy policy = new()
+        {
+            TrustMode = X509ChainTrustMode.CustomRootTrust,
+            RevocationMode = X509RevocationMode.NoCheck,
+        };
+        policy.CustomTrustStore.AddRange(trustAnchors);
+        return new SocketsHttpHandler
+        {
+            SslOptions = new System.Net.Security.SslClientAuthenticationOptions { CertificateChainPolicy = policy },
+        };
+    }
+
     /// <summary>Fetches (once) and caches the directory.</summary>
+    /// <exception cref="AcmeException">The directory cannot be fetched or parsed, or advertises a non-HTTPS URL (<see cref="AcmeErrorTypes.InsecureUrl"/>).</exception>
     public async ValueTask<AcmeDirectory> GetDirectoryAsync(CancellationToken cancellationToken = default)
     {
         if (_directory is { } cached)
@@ -77,6 +125,15 @@ public sealed class AcmeClient
         }
 
         AcmeDirectory directory = Parse(response, AcmeJsonContext.Default.AcmeDirectory);
+
+        // Fail early (before any key material is sent) when the directory points somewhere the client would refuse anyway.
+        EnsureAllowedUrl(directory.NewNonce);
+        EnsureAllowedUrl(directory.NewAccount);
+        EnsureAllowedUrl(directory.NewOrder);
+        EnsureAllowedOptionalUrl(directory.NewAuthz);
+        EnsureAllowedOptionalUrl(directory.RevokeCert);
+        EnsureAllowedOptionalUrl(directory.KeyChange);
+        EnsureAllowedOptionalUrl(directory.RenewalInfo);
         _directory = directory;
         return directory;
     }
@@ -329,7 +386,7 @@ public sealed class AcmeClient
         List<Uri> alternates = [];
         for (int i = 0; i < response.Links.Count; i++)
         {
-            if (string.Equals(response.Links[i].Rel, "alternate", StringComparison.OrdinalIgnoreCase))
+            if (HasRelation(response.Links[i].Rel, "alternate"))
             {
                 alternates.Add(response.Links[i].Url);
             }
@@ -342,11 +399,8 @@ public sealed class AcmeClient
     public async ValueTask RevokeCertificateAsync(byte[] certificateDer, AcmeRevocationReason? reason = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(certificateDer);
-        AcmeDirectory directory = await GetDirectoryAsync(cancellationToken).ConfigureAwait(false);
-        Uri url = directory.RevokeCert ?? throw AcmeException.Client(AcmeErrorTypes.InvalidResponse, "The directory advertises no revokeCert URL.");
-        RevokeRequest payload = new() { Certificate = Base64UrlCodec.Encode(certificateDer), Reason = reason is null ? null : (int)reason.Value };
-        byte[] body = JsonSerializer.SerializeToUtf8Bytes(payload, AcmeJsonContext.Default.RevokeRequest);
-        await SendSignedAsync(url, body, embedJwk: false, accept: null, cancellationToken).ConfigureAwait(false);
+        Uri url = await GetRevokeUrlAsync(cancellationToken).ConfigureAwait(false);
+        await SendSignedAsync(url, CreateRevokeBody(certificateDer, reason), embedJwk: false, accept: null, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Revokes a certificate using the account key.</summary>
@@ -354,6 +408,26 @@ public sealed class AcmeClient
     {
         ArgumentNullException.ThrowIfNull(certificate);
         return RevokeCertificateAsync(certificate.RawData, reason, cancellationToken);
+    }
+
+    /// <summary>
+    /// Revokes a certificate (DER) with a JWS signed by the certificate's own private key, which is embedded as <c>jwk</c>
+    /// (RFC 8555 §7.6). No account is needed, so this works when the account key is lost, and it is the natural path for
+    /// <see cref="AcmeRevocationReason.KeyCompromise"/>.
+    /// </summary>
+    /// <param name="certificateDer">The certificate to revoke.</param>
+    /// <param name="certificateKey">
+    /// The certificate's private key, wrapped as an <see cref="AcmeAccountKey"/> (P-256 or RSA 2048+, as created by
+    /// <see cref="CsrBuilder.CreateKey"/>), for example <c>new AcmeAccountKey(cert.GetECDsaPrivateKey()!)</c>. Not disposed.
+    /// </param>
+    /// <param name="reason">Revocation reason.</param>
+    /// <param name="cancellationToken">Cancellation.</param>
+    public async ValueTask RevokeCertificateWithKeyAsync(byte[] certificateDer, AcmeAccountKey certificateKey, AcmeRevocationReason? reason = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(certificateDer);
+        ArgumentNullException.ThrowIfNull(certificateKey);
+        Uri url = await GetRevokeUrlAsync(cancellationToken).ConfigureAwait(false);
+        await SendSignedAsync(url, CreateRevokeBody(certificateDer, reason), embedJwk: true, accept: null, cancellationToken, certificateKey).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -402,6 +476,169 @@ public sealed class AcmeClient
         throw new ArgumentException("The certificate carries no Authority Key Identifier with a key identifier; ARI cannot identify it.", nameof(certificate));
     }
 
+    /// <summary>
+    /// True when <paramref name="url"/> may be requested: absolute <c>https</c>, or <c>http</c> to a loopback host or with
+    /// <paramref name="allowInsecureHttp"/> (RFC 8555 §6.1).
+    /// </summary>
+    internal static bool IsAllowedUrl(Uri url, bool allowInsecureHttp)
+    {
+        if (!url.IsAbsoluteUri)
+        {
+            return false;
+        }
+
+        if (string.Equals(url.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return string.Equals(url.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) && (allowInsecureHttp || url.IsLoopback);
+    }
+
+    /// <summary>True for a non-empty base64url nonce of sane length (RFC 8555 §6.5.1).</summary>
+    internal static bool IsValidNonce(string? nonce)
+    {
+        if (string.IsNullOrEmpty(nonce) || nonce.Length > MaxNonceLength)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < nonce.Length; i++)
+        {
+            char c = nonce[i];
+            if (!(char.IsAsciiLetterOrDigit(c) || c == '-' || c == '_'))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Parses one <c>Link</c> header value (RFC 8288): <c>&lt;URI&gt; *( ";" param )</c> entries separated by <c>,</c>. The
+    /// URI is taken verbatim between the angle brackets and parameter values may be quoted strings, so commas or
+    /// semicolons inside either do not split an entry. Only absolute URIs are kept; the first <c>rel</c> wins.
+    /// </summary>
+    internal static void ParseLinkHeader(string value, List<(Uri Url, string Rel)> links)
+    {
+        int i = 0;
+        while (i < value.Length)
+        {
+            int open = value.IndexOf('<', i);
+            if (open < 0)
+            {
+                return;
+            }
+
+            int close = value.IndexOf('>', open + 1);
+            if (close < 0)
+            {
+                return;
+            }
+
+            string target = value.Substring(open + 1, close - open - 1);
+            string? rel = null;
+            i = close + 1;
+            while (i < value.Length && value[i] != ',')
+            {
+                if (value[i] != ';')
+                {
+                    i++;
+                    continue;
+                }
+
+                i++;
+                (string name, string paramValue) = ReadLinkParam(value, ref i);
+                if (rel is null && string.Equals(name, "rel", StringComparison.OrdinalIgnoreCase))
+                {
+                    rel = paramValue;
+                }
+            }
+
+            i++; // skip the ',' separating link-values
+            if (Uri.TryCreate(target.Trim(), UriKind.Absolute, out Uri? url))
+            {
+                links.Add((url, rel ?? string.Empty));
+            }
+        }
+    }
+
+    /// <summary>Reads <c>name[=value]</c> at <paramref name="i"/> (after a <c>;</c>), stopping before the next <c>;</c> or <c>,</c> outside quotes.</summary>
+    private static (string Name, string Value) ReadLinkParam(string s, ref int i)
+    {
+        int nameStart = i;
+        while (i < s.Length && s[i] is not ('=' or ';' or ','))
+        {
+            i++;
+        }
+
+        string name = s[nameStart..i].Trim();
+        if (i >= s.Length || s[i] != '=')
+        {
+            return (name, string.Empty);
+        }
+
+        i++; // '='
+        while (i < s.Length && s[i] is ' ' or '\t')
+        {
+            i++;
+        }
+
+        if (i < s.Length && s[i] == '"')
+        {
+            System.Text.StringBuilder quoted = new();
+            i++;
+            while (i < s.Length && s[i] != '"')
+            {
+                if (s[i] == '\\' && i + 1 < s.Length)
+                {
+                    i++; // quoted-pair
+                }
+
+                quoted.Append(s[i]);
+                i++;
+            }
+
+            i++; // closing quote
+            return (name, quoted.ToString());
+        }
+
+        int valueStart = i;
+        while (i < s.Length && s[i] is not (';' or ','))
+        {
+            i++;
+        }
+
+        return (name, s[valueStart..i].Trim());
+    }
+
+    /// <summary>True when the space-separated relation types in <paramref name="rel"/> include <paramref name="relation"/> (case-insensitive).</summary>
+    private static bool HasRelation(string rel, string relation)
+    {
+        foreach (string part in rel.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (string.Equals(part, relation, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private async ValueTask<Uri> GetRevokeUrlAsync(CancellationToken cancellationToken)
+    {
+        AcmeDirectory directory = await GetDirectoryAsync(cancellationToken).ConfigureAwait(false);
+        return directory.RevokeCert ?? throw AcmeException.Client(AcmeErrorTypes.InvalidResponse, "The directory advertises no revokeCert URL.");
+    }
+
+    private static byte[] CreateRevokeBody(byte[] certificateDer, AcmeRevocationReason? reason)
+    {
+        RevokeRequest payload = new() { Certificate = Base64UrlCodec.Encode(certificateDer), Reason = reason is null ? null : (int)reason.Value };
+        return JsonSerializer.SerializeToUtf8Bytes(payload, AcmeJsonContext.Default.RevokeRequest);
+    }
+
     private Uri RequireAccountUrl()
     {
         return AccountUrl ?? throw new InvalidOperationException("AccountUrl (kid) is not set; call CreateAccountAsync or FindAccountAsync first.");
@@ -415,7 +652,7 @@ public sealed class AcmeClient
             delay = ra < TimeSpan.Zero ? TimeSpan.Zero : ra > Options.MaxRetryAfter ? Options.MaxRetryAfter : ra;
         }
 
-        return Task.Delay(delay, Options.TimeProvider, cancellationToken);
+        return AcmeTimers.Delay(delay, Options.TimeProvider, cancellationToken);
     }
 
     private static IReadOnlyList<AcmeProblem>? CollectChallengeErrors(AcmeAuthorization authz)
@@ -432,13 +669,20 @@ public sealed class AcmeClient
         return errors;
     }
 
-    private async Task<AcmeResponse> SendSignedAsync(Uri url, ReadOnlyMemory<byte> payload, bool embedJwk, string? accept, CancellationToken cancellationToken)
+    /// <param name="url">Request URL (also the JWS <c>url</c> header).</param>
+    /// <param name="payload">JSON payload; empty for POST-as-GET.</param>
+    /// <param name="embedJwk">Embed the public key as <c>jwk</c> instead of the account <c>kid</c> (newAccount / revokeCert).</param>
+    /// <param name="accept">Optional <c>Accept</c> media type.</param>
+    /// <param name="cancellationToken">Cancellation.</param>
+    /// <param name="signingKey">Key to sign with; <see langword="null"/> for <see cref="AccountKey"/>.</param>
+    private async Task<AcmeResponse> SendSignedAsync(Uri url, ReadOnlyMemory<byte> payload, bool embedJwk, string? accept, CancellationToken cancellationToken, AcmeAccountKey? signingKey = null)
     {
         Uri? kid = embedJwk ? null : RequireAccountUrl();
+        string? retryNonce = null;
         for (int attempt = 0; ; attempt++)
         {
-            string nonce = await GetNonceAsync(cancellationToken).ConfigureAwait(false);
-            byte[] body = JwsSigner.SignToUtf8(AccountKey, url, nonce, payload.Span, kid);
+            string nonce = retryNonce ?? await GetNonceAsync(cancellationToken).ConfigureAwait(false);
+            byte[] body = JwsSigner.SignToUtf8(signingKey ?? AccountKey, url, nonce, payload.Span, kid);
             using HttpRequestMessage request = new(HttpMethod.Post, url) { Content = new ByteArrayContent(body) };
             request.Content.Headers.ContentType = new MediaTypeHeaderValue(JoseContentType);
             if (accept is not null)
@@ -446,39 +690,80 @@ public sealed class AcmeClient
                 request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue(accept));
             }
 
-            AcmeResponse response = await SendAsync(request, cancellationToken).ConfigureAwait(false);
+            AcmeResponse response = await SendAsync(request, cancellationToken, harvestNonces: false).ConfigureAwait(false);
             if (response.IsSuccess)
             {
+                HarvestNonces(response.Nonces);
                 return response;
             }
 
             AcmeException error = CreateException(response);
             if (attempt == 0 && error.IsType(AcmeErrorTypes.BadNonce))
             {
+                // RFC 8555 §6.5: retry with the nonce carried by this badNonce response. Nonces pooled before it were
+                // harvested at the same time as the rejected one (typically before a long idle), so drop them too.
+                _nonces.Clear();
+                retryNonce = response.Nonces.Count > 0 ? response.Nonces[^1] : null;
                 continue;
             }
 
+            HarvestNonces(response.Nonces);
             throw error;
         }
     }
 
-    private async Task<AcmeResponse> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    /// <summary>Adds nonces to the pool, which is bounded so a hostile server cannot grow it without limit (ADR 0009).</summary>
+    private void HarvestNonces(List<string> nonces)
     {
+        for (int i = 0; i < nonces.Count && _nonces.Count < MaxPooledNonces; i++)
+        {
+            _nonces.Enqueue(nonces[i]);
+        }
+    }
+
+    private void EnsureAllowedOptionalUrl(Uri? url)
+    {
+        if (url is not null)
+        {
+            EnsureAllowedUrl(url);
+        }
+    }
+
+    private void EnsureAllowedUrl(Uri? url)
+    {
+        if (url is null || !IsAllowedUrl(url, Options.AllowInsecureHttp))
+        {
+            throw AcmeException.Client(
+                AcmeErrorTypes.InsecureUrl,
+                "Refusing to request '" + url + "': ACME requires https (RFC 8555 §6.1); plain http is only accepted for loopback hosts or with AcmeClientOptions.AllowInsecureHttp.");
+        }
+    }
+
+    private async Task<AcmeResponse> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken, bool harvestNonces = true)
+    {
+        // Every URL that reaches the wire passes here: the directory URL, directory entries, Location / Link targets and
+        // the order, authorization, challenge, certificate and renewalInfo URLs the server hands out.
+        EnsureAllowedUrl(request.RequestUri);
         request.Headers.UserAgent.ParseAdd(Options.UserAgent);
         using HttpResponseMessage response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         byte[] body = await ReadBoundedAsync(response.Content, Options.MaxResponseBytes, cancellationToken).ConfigureAwait(false);
 
-        if (response.Headers.TryGetValues("Replay-Nonce", out IEnumerable<string>? nonces))
+        List<string> nonces = [];
+        if (response.Headers.TryGetValues("Replay-Nonce", out IEnumerable<string>? nonceValues))
         {
-            foreach (string nonce in nonces)
+            foreach (string nonce in nonceValues)
             {
-                // RFC 8555 §6.5.1: the value is base64url; clients MUST ignore invalid values. The pool is bounded so a
-                // hostile server cannot grow it without limit (ADR 0009).
-                if (IsValidNonce(nonce) && _nonces.Count < MaxPooledNonces)
+                // RFC 8555 §6.5.1: the value is base64url; clients MUST ignore invalid values.
+                if (IsValidNonce(nonce) && nonces.Count < MaxPooledNonces)
                 {
-                    _nonces.Enqueue(nonce);
+                    nonces.Add(nonce);
                 }
             }
+        }
+
+        if (harvestNonces)
+        {
+            HarvestNonces(nonces);
         }
 
         List<(Uri Url, string Rel)> links = [];
@@ -503,7 +788,7 @@ public sealed class AcmeClient
             location = new Uri(request.RequestUri!, location);
         }
 
-        return new AcmeResponse(response.StatusCode, body, response.Content.Headers.ContentType?.MediaType, location, links, retryAfter);
+        return new AcmeResponse(response.StatusCode, body, response.Content.Headers.ContentType?.MediaType, location, links, retryAfter, nonces);
     }
 
     /// <summary>Reads the body, refusing (before buffering it) anything larger than <paramref name="maxBytes"/>.</summary>
@@ -539,55 +824,6 @@ public sealed class AcmeClient
         static AcmeException TooLarge(int max) => AcmeException.Client(
             AcmeErrorTypes.InvalidResponse,
             "The server response exceeds MaxResponseBytes (" + max.ToString(System.Globalization.CultureInfo.InvariantCulture) + ").");
-    }
-
-    /// <summary>True for a non-empty base64url nonce of sane length (RFC 8555 §6.5.1).</summary>
-    internal static bool IsValidNonce(string? nonce)
-    {
-        if (string.IsNullOrEmpty(nonce) || nonce.Length > MaxNonceLength)
-        {
-            return false;
-        }
-
-        for (int i = 0; i < nonce.Length; i++)
-        {
-            char c = nonce[i];
-            if (!(char.IsAsciiLetterOrDigit(c) || c == '-' || c == '_'))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private static void ParseLinkHeader(string value, List<(Uri Url, string Rel)> links)
-    {
-        // Link: <https://a>;rel="alternate", <https://b>;rel="index"
-        foreach (string part in value.Split(','))
-        {
-            string[] segments = part.Split(';');
-            string urlPart = segments[0].Trim();
-            if (urlPart.Length < 2 || urlPart[0] != '<' || urlPart[^1] != '>')
-            {
-                continue;
-            }
-
-            string rel = string.Empty;
-            for (int i = 1; i < segments.Length; i++)
-            {
-                string param = segments[i].Trim();
-                if (param.StartsWith("rel=", StringComparison.OrdinalIgnoreCase))
-                {
-                    rel = param[4..].Trim('"');
-                }
-            }
-
-            if (Uri.TryCreate(urlPart[1..^1], UriKind.Absolute, out Uri? url))
-            {
-                links.Add((url, rel));
-            }
-        }
     }
 
     private static T Parse<T>(AcmeResponse response, JsonTypeInfo<T> typeInfo)
@@ -630,13 +866,15 @@ public sealed class AcmeClient
         return new AcmeException(problem, response.StatusCode) { RetryAfter = response.RetryAfter };
     }
 
+    // Nonces: the valid Replay-Nonce values of the response (already pooled unless the caller harvests them itself).
     private sealed record AcmeResponse(
         HttpStatusCode StatusCode,
         byte[] Body,
         string? ContentType,
         Uri? Location,
         List<(Uri Url, string Rel)> Links,
-        TimeSpan? RetryAfter)
+        TimeSpan? RetryAfter,
+        List<string> Nonces)
     {
         public bool IsSuccess => (int)StatusCode is >= 200 and < 300;
     }

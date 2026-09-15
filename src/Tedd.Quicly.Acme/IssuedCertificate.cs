@@ -4,10 +4,16 @@ using System.Security.Cryptography.X509Certificates;
 namespace Tedd.Quicly.Acme;
 
 /// <summary>
-/// An issued certificate chain combined with its private key. The leaf is imported through a PKCS#12 round trip with
-/// <see cref="X509KeyStorageFlags.Exportable"/> (not ephemeral) so it works with Schannel / MsQuic on Windows
-/// (see ADR 0006).
+/// An issued certificate chain combined with its private key, produced through a PKCS#12 round trip.
 /// </summary>
+/// <remarks>
+/// <see cref="Certificate"/> is loaded with <see cref="X509KeyStorageFlags.Exportable"/> because this library needs to
+/// export the key (<see cref="AcmeCertificateManagerOptions.ReuseKey"/>); it is not the object to hand to Schannel /
+/// MsQuic. Per ADR 0009 (which amends ADR 0006) the TLS glue should pass <see cref="Pfx"/> as a PKCS#12 credential, or
+/// load it with <see cref="Load(byte[], string?, X509KeyStorageFlags)"/> using
+/// <see cref="X509KeyStorageFlags.PersistKeySet"/> plus <see cref="X509KeyStorageFlags.UserKeySet"/> (interactive) or
+/// <see cref="X509KeyStorageFlags.MachineKeySet"/> (services).
+/// </remarks>
 public sealed class IssuedCertificate : IDisposable
 {
     private IssuedCertificate(X509Certificate2 certificate, X509Certificate2Collection chain, byte[] pfx)
@@ -61,12 +67,20 @@ public sealed class IssuedCertificate : IDisposable
         return Load(pfx, password);
     }
 
-    /// <summary>Loads a PKCS#12 produced by <see cref="Create"/> / <see cref="Save"/>.</summary>
+    /// <summary>Loads a PKCS#12 produced by <see cref="Create"/> / <see cref="Save"/> with <see cref="X509KeyStorageFlags.Exportable"/> (ADR 0006).</summary>
     /// <exception cref="ArgumentException">The PKCS#12 contains no certificate with a private key.</exception>
-    public static IssuedCertificate Load(byte[] pfx, string? password = null)
+    public static IssuedCertificate Load(byte[] pfx, string? password = null) => Load(pfx, password, X509KeyStorageFlags.Exportable);
+
+    /// <summary>
+    /// Loads a PKCS#12 produced by <see cref="Create"/> / <see cref="Save"/> with caller-chosen key storage flags, so the
+    /// TLS glue can pick what its certificate path needs (for example <see cref="X509KeyStorageFlags.PersistKeySet"/> with
+    /// a user or machine key set for MsQuic's <c>CERTIFICATE_CONTEXT</c> on Windows, ADR 0009).
+    /// </summary>
+    /// <exception cref="ArgumentException">The PKCS#12 contains no certificate with a private key.</exception>
+    public static IssuedCertificate Load(byte[] pfx, string? password, X509KeyStorageFlags keyStorageFlags)
     {
         ArgumentNullException.ThrowIfNull(pfx);
-        X509Certificate2Collection all = X509CertificateLoader.LoadPkcs12Collection(pfx, password, X509KeyStorageFlags.Exportable);
+        X509Certificate2Collection all = X509CertificateLoader.LoadPkcs12Collection(pfx, password, keyStorageFlags);
         X509Certificate2? leaf = null;
         X509Certificate2Collection chain = [];
         foreach (X509Certificate2 cert in all)

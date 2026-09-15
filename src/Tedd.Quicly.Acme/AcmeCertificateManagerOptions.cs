@@ -61,6 +61,13 @@ public sealed class AcmeCertificateManagerOptions
     /// <summary>Delay between publishing a challenge and asking the CA to validate it (DNS propagation). Default zero.</summary>
     public TimeSpan ChallengePropagationDelay { get; init; } = TimeSpan.Zero;
 
+    /// <summary>
+    /// Wall-clock bound on removing a challenge response. Cleanup always runs (even after cancellation), so this is what
+    /// stops a responder whose <c>RemoveAsync</c> hangs from blocking the flow forever; a timed-out cleanup is reported
+    /// and ignored. Default 30 s.
+    /// </summary>
+    public TimeSpan ChallengeCleanupTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
     /// <summary>When set, every issued certificate is written here as PKCS#12 and can be reloaded on restart.</summary>
     public string? CertificatePath { get; init; }
 

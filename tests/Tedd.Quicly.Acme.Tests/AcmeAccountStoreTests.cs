@@ -19,7 +19,7 @@ public class AcmeAccountStoreTests : IDisposable
     [InlineData(AcmeKeyAlgorithm.RS256)]
     public void SaveLoad_RoundTrips_AndCreatesDirectory(AcmeKeyAlgorithm algorithm)
     {
-        AcmeAccountStore store = new(Path.Combine(_dir, "nested", "account.json"));
+        AcmeAccountStore store = new(Path.Combine(_dir, "nested", "account.json"), AcmeStoreProtection.None);
         Assert.False(store.Exists);
         Assert.Null(store.Load());
         Assert.Null(store.LoadKey());
@@ -121,7 +121,7 @@ public class AcmeAccountStoreTests : IDisposable
         Assert.Equal(key.Thumbprint, store.LoadKey()!.Thumbprint);
 
         // A plain store reads DPAPI files (and vice versa): protection is a write-time choice.
-        AcmeAccountStore plain = new(path);
+        AcmeAccountStore plain = new(path, AcmeStoreProtection.None);
         Assert.Equal(AcmeStoreProtection.None, plain.Protection);
         Assert.Equal(state, plain.Load());
         plain.SavePendingOrder(new AcmePendingOrder { OrderUrl = new Uri("https://ca.test/order/9"), Identifiers = [AcmeIdentifier.Dns("x.test")], CertificateKeyPem = "k" });

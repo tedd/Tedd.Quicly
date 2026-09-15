@@ -25,11 +25,24 @@ public enum AcmeStoreProtection
 /// </summary>
 public sealed class AcmeAccountStore
 {
+    /// <summary>
+    /// Creates a store backed by <paramref name="path"/> with the platform default protection
+    /// (<see cref="DefaultProtection"/>): DPAPI for the current user on Windows, a <c>0600</c> plain file elsewhere (ADR 0009).
+    /// </summary>
+    /// <param name="path">JSON file path (created on first <see cref="Save"/>).</param>
+    public AcmeAccountStore(string path)
+        : this(path, DefaultProtection)
+    {
+    }
+
     /// <summary>Creates a store backed by <paramref name="path"/>.</summary>
     /// <param name="path">JSON file path (created on first <see cref="Save"/>).</param>
-    /// <param name="protection">On-disk protection; DPAPI modes require Windows.</param>
+    /// <param name="protection">
+    /// On-disk protection; DPAPI modes require Windows. Use <see cref="AcmeStoreProtection.DpapiLocalMachine"/> when the
+    /// process runs under changing accounts, or <see cref="AcmeStoreProtection.None"/> when the file must be portable.
+    /// </param>
     /// <exception cref="PlatformNotSupportedException">A DPAPI mode was requested on a non-Windows platform.</exception>
-    public AcmeAccountStore(string path, AcmeStoreProtection protection = AcmeStoreProtection.None)
+    public AcmeAccountStore(string path, AcmeStoreProtection protection)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         if (protection != AcmeStoreProtection.None && !OperatingSystem.IsWindows())
@@ -40,6 +53,13 @@ public sealed class AcmeAccountStore
         Path = System.IO.Path.GetFullPath(path);
         Protection = protection;
     }
+
+    /// <summary>
+    /// The protection used by <see cref="AcmeAccountStore(string)"/>: <see cref="AcmeStoreProtection.DpapiCurrentUser"/>
+    /// on Windows (ADR 0009: "account key stored via DPAPI on Windows"), <see cref="AcmeStoreProtection.None"/> (a
+    /// <c>0600</c> file) elsewhere.
+    /// </summary>
+    public static AcmeStoreProtection DefaultProtection => OperatingSystem.IsWindows() ? AcmeStoreProtection.DpapiCurrentUser : AcmeStoreProtection.None;
 
     /// <summary>Absolute path of the JSON file.</summary>
     public string Path { get; }

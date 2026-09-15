@@ -9,9 +9,22 @@ namespace Tedd.Quicly.Acme;
 /// External Account Binding credentials (RFC 8555 §7.3.4) issued by the CA (ZeroSSL, Google Trust Services, SSL.com, ...).
 /// </summary>
 /// <param name="KeyId">The CA-provided EAB key identifier (becomes the <c>kid</c> of the EAB JWS).</param>
-/// <param name="HmacKey">The CA-provided HMAC key, base64url encoded (standard base64 with <c>+</c>/<c>/</c>/padding is accepted too).</param>
-public sealed record ExternalAccountBinding(string KeyId, string HmacKey)
+/// <param name="HmacKey">
+/// The CA-provided HMAC key, base64url encoded (standard base64 with <c>+</c>/<c>/</c>/padding is accepted too). Secret:
+/// <see cref="object.ToString"/> and the debugger view redact it.
+/// </param>
+[System.Diagnostics.DebuggerDisplay("{ToString(),nq}")]
+public sealed record ExternalAccountBinding(
+    string KeyId,
+    [property: System.Diagnostics.DebuggerBrowsable(System.Diagnostics.DebuggerBrowsableState.Never)] string HmacKey)
 {
+    // Replaces the compiler-generated member printer used by ToString(): the HMAC key is never printed (ADR 0009).
+    private bool PrintMembers(StringBuilder builder)
+    {
+        builder.Append("KeyId = ").Append(KeyId).Append(", HmacKey = ").Append(SecretText.Redacted);
+        return true;
+    }
+
     /// <summary>Decodes <see cref="HmacKey"/> to raw bytes.</summary>
     /// <exception cref="FormatException">The key is not valid base64url / base64.</exception>
     public byte[] DecodeHmacKey()

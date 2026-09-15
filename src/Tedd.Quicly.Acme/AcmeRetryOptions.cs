@@ -63,7 +63,8 @@ public sealed class AcmeRetryOptions
             ticks *= factor;
         }
 
-        TimeSpan delay = TimeSpan.FromTicks((long)ticks);
+        // MaxDelay close to TimeSpan.MaxValue plus jitter can exceed the long range; converting such a double is undefined.
+        TimeSpan delay = ticks >= TimeSpan.MaxValue.Ticks ? TimeSpan.MaxValue : TimeSpan.FromTicks((long)ticks);
         if (retryAfter is TimeSpan ra && ra > TimeSpan.Zero)
         {
             TimeSpan clamped = ra > MaxRetryAfter ? MaxRetryAfter : ra;

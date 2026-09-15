@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Text;
 using System.Text.Json.Serialization;
 
 namespace Tedd.Quicly.Acme.Models;
@@ -56,7 +58,11 @@ internal sealed record EmptyRequest
 {
 }
 
-/// <summary>Persisted account state (see <see cref="AcmeAccountStore"/>).</summary>
+/// <summary>
+/// Persisted account state (see <see cref="AcmeAccountStore"/>). <see cref="object.ToString"/> and the debugger view
+/// redact <see cref="PrivateKeyPem"/> so logging the state never records the account key (ADR 0009).
+/// </summary>
+[DebuggerDisplay("{ToString(),nq}")]
 public sealed record AcmeAccountState
 {
     /// <summary>The directory the account was created at.</summary>
@@ -69,14 +75,30 @@ public sealed record AcmeAccountState
     [JsonConverter(typeof(JsonStringEnumConverter<AcmeKeyAlgorithm>))]
     public required AcmeKeyAlgorithm Algorithm { get; init; }
 
-    /// <summary>PKCS#8 PEM of the account private key.</summary>
+    /// <summary>PKCS#8 PEM of the account private key. Secret: never printed by <see cref="object.ToString"/>.</summary>
+    [DebuggerBrowsable(DebuggerBrowsableState.Never)]
     public required string PrivateKeyPem { get; init; }
 
     /// <summary>An order that was started but not completed (so a crashed run can resume it), or <see langword="null"/>.</summary>
     public AcmePendingOrder? PendingOrder { get; init; }
+
+    // Replaces the compiler-generated member printer used by ToString(): every member except the secret.
+    private bool PrintMembers(StringBuilder builder)
+    {
+        builder.Append("DirectoryUrl = ").Append(DirectoryUrl)
+            .Append(", AccountUrl = ").Append(AccountUrl)
+            .Append(", Algorithm = ").Append(Algorithm)
+            .Append(", PrivateKeyPem = ").Append(SecretText.Redacted)
+            .Append(", PendingOrder = ").Append(PendingOrder);
+        return true;
+    }
 }
 
-/// <summary>Persisted state of an in-flight order (see <see cref="AcmeCertificateManager"/>).</summary>
+/// <summary>
+/// Persisted state of an in-flight order (see <see cref="AcmeCertificateManager"/>). <see cref="object.ToString"/> and the
+/// debugger view redact <see cref="CertificateKeyPem"/>.
+/// </summary>
+[DebuggerDisplay("{ToString(),nq}")]
 public sealed record AcmePendingOrder
 {
     /// <summary>The order URL.</summary>
@@ -85,7 +107,8 @@ public sealed record AcmePendingOrder
     /// <summary>The identifiers the order covers.</summary>
     public required IReadOnlyList<AcmeIdentifier> Identifiers { get; init; }
 
-    /// <summary>PKCS#8 PEM of the certificate private key the CSR was (or will be) created with.</summary>
+    /// <summary>PKCS#8 PEM of the certificate private key the CSR was (or will be) created with. Secret: never printed by <see cref="object.ToString"/>.</summary>
+    [DebuggerBrowsable(DebuggerBrowsableState.Never)]
     public required string CertificateKeyPem { get; init; }
 
     /// <summary>When the order expires at the CA, if known.</summary>
@@ -93,6 +116,24 @@ public sealed record AcmePendingOrder
 
     /// <summary>When the order was created (client clock).</summary>
     public DateTimeOffset CreatedAt { get; init; }
+
+    // Replaces the compiler-generated member printer used by ToString(): every member except the secret.
+    private bool PrintMembers(StringBuilder builder)
+    {
+        builder.Append("OrderUrl = ").Append(OrderUrl)
+            .Append(", Identifiers = [").AppendJoin(", ", Identifiers).Append(']')
+            .Append(", CertificateKeyPem = ").Append(SecretText.Redacted)
+            .Append(", Expires = ").Append(Expires)
+            .Append(", CreatedAt = ").Append(CreatedAt);
+        return true;
+    }
+}
+
+/// <summary>Placeholder printed instead of secret values.</summary>
+internal static class SecretText
+{
+    /// <summary>The redaction marker.</summary>
+    public const string Redacted = "***";
 }
 
 /// <summary>On-disk envelope used by <see cref="AcmeAccountStore"/> when the document is protected with DPAPI.</summary>

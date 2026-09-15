@@ -150,7 +150,8 @@ public sealed class ReviewFindingsTests : IAsyncDisposable
 
         byte[] der = CsrBuilder.CreateCsr([AcmeIdentifier.Dns(longName)], key);
 
-        CertificateRequest parsed = CertificateRequest.LoadSigningRequest(der, HashAlgorithmName.SHA256);
+        // Requested extensions are only loaded with UnsafeLoadCertificateExtensions (the default skips them).
+        CertificateRequest parsed = CertificateRequest.LoadSigningRequest(der, HashAlgorithmName.SHA256, CertificateRequestLoadOptions.UnsafeLoadCertificateExtensions);
         foreach (X500RelativeDistinguishedName rdn in parsed.SubjectName.EnumerateRelativeDistinguishedNames())
         {
             if (rdn.GetSingleElementType().Value == "2.5.4.3")

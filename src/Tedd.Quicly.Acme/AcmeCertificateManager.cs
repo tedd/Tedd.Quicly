@@ -12,15 +12,21 @@ namespace Tedd.Quicly.Acme;
 /// its key are persisted to the <see cref="AcmeAccountStore"/> so a crash can resume; transient failures are retried
 /// with exponential back-off and jitter honouring <c>Retry-After</c> (ADR 0009).
 /// </summary>
-public sealed class AcmeCertificateManager
+/// <remarks>
+/// The manager owns the account key it loads from the store or creates; <see cref="Dispose"/> releases it, after which
+/// the client returned by <see cref="GetClientAsync"/> can no longer sign.
+/// </remarks>
+public sealed class AcmeCertificateManager : IDisposable
 {
     private readonly HttpClient _http;
     private AcmeClient? _client;
+    private bool _disposed;
 
     /// <summary>Creates a manager.</summary>
     /// <param name="httpClient">Injected HTTP client (not disposed by this class).</param>
     /// <param name="options">Configuration.</param>
     /// <exception cref="ArgumentException">No identifiers, or <see cref="AcmeCertificateManagerOptions.ReuseKey"/> without a certificate path.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">A delay option is out of range.</exception>
     public AcmeCertificateManager(HttpClient httpClient, AcmeCertificateManagerOptions options)
     {
         _http = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
@@ -35,13 +41,18 @@ public sealed class AcmeCertificateManager
             throw new ArgumentException("ReuseKey requires CertificatePath (the key is taken from the persisted certificate).", nameof(options));
         }
 
+        if (options.ChallengeCleanupTimeout <= TimeSpan.Zero || options.ChallengeCleanupTimeout > AcmeTimers.MaxDelay)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "ChallengeCleanupTimeout must be positive and at most 30 days.");
+        }
+
         options.Retry.Validate();
     }
 
     /// <summary>Configuration.</summary>
     public AcmeCertificateManagerOptions Options { get; }
 
-    /// <summary>Raised at every stage of the flow. Handlers must not throw.</summary>
+    /// <summary>Raised at every stage of the flow. Handlers should not throw; exceptions they throw are ignored.</summary>
     public event Action<AcmeProgress>? Progress;
 
     /// <summary>Loads the certificate previously persisted to <see cref="AcmeCertificateManagerOptions.CertificatePath"/>, or <see langword="null"/>.</summary>
@@ -51,34 +62,34 @@ public sealed class AcmeCertificateManager
         return path is not null && File.Exists(path) ? IssuedCertificate.LoadFile(path, Options.CertificatePassword) : null;
     }
 
-    /// <summary>Returns the client bound to the (created or reused) account.</summary>
+    /// <summary>
+    /// Returns the client bound to the (created or reused) account. A stored account is verified once (POST-as-GET of the
+    /// account URL); when the CA no longer knows it (<c>accountDoesNotExist</c>), refuses it (<c>unauthorized</c>) or
+    /// reports it as not <c>valid</c> (deactivated / revoked, or the CA was reset), a new account with a new key replaces it.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The manager was disposed.</exception>
     public async ValueTask<AcmeClient> GetClientAsync(CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (_client is { } existing)
         {
             return existing;
         }
 
         AcmeAccountState? state = Options.AccountStore.Load();
-        AcmeClient client;
+        AcmeClient? client = null;
+        string createReason = "Created account ";
         if (state is not null && state.DirectoryUrl.Equals(Options.DirectoryUrl))
         {
-            client = new AcmeClient(_http, Options.DirectoryUrl, AcmeAccountKey.Import(state.PrivateKeyPem), state.AccountUrl, Options.ClientOptions);
-            await client.GetDirectoryAsync(cancellationToken).ConfigureAwait(false);
-            Report(AcmeStage.DirectoryFetched, "Directory " + Options.DirectoryUrl);
-            Report(AcmeStage.AccountReady, "Reusing account " + state.AccountUrl);
+            client = await TryReuseAccountAsync(state, cancellationToken).ConfigureAwait(false);
+            createReason = "Stored account " + state.AccountUrl + " is no longer usable; created account ";
         }
-        else
+        else if (state is not null)
         {
-            AcmeAccountKey key = AcmeAccountKey.Create(Options.AccountKeyAlgorithm);
-            client = new AcmeClient(_http, Options.DirectoryUrl, key, null, Options.ClientOptions);
-            AcmeDirectory directory = await client.GetDirectoryAsync(cancellationToken).ConfigureAwait(false);
-            Report(AcmeStage.DirectoryFetched, "Directory " + Options.DirectoryUrl + (directory.Meta?.ExternalAccountRequired == true ? " (EAB required)" : string.Empty));
-            AcmeAccount account = await client.CreateAccountAsync(Options.Contacts, Options.AgreeTermsOfService, Options.ExternalAccountBinding, onlyReturnExisting: false, cancellationToken).ConfigureAwait(false);
-            Options.AccountStore.Save(AcmeAccountStore.CreateState(key, account.Location!, Options.DirectoryUrl));
-            Report(AcmeStage.AccountReady, (state is null ? "Created account " : "Directory changed; created new account ") + account.Location);
+            createReason = "Directory changed; created new account ";
         }
 
+        client ??= await CreateAccountAsync(createReason, cancellationToken).ConfigureAwait(false);
         _client = client;
         return client;
     }
@@ -92,7 +103,8 @@ public sealed class AcmeCertificateManager
 
     /// <summary>
     /// Orders a certificate, marking it as the replacement of an existing one (ARI <c>replaces</c>, RFC 9773 §5). When the
-    /// CA rejects the <paramref name="replaces"/> value the order is retried once without it.
+    /// CA rejects the <paramref name="replaces"/> value (<c>alreadyReplaced</c>, or <c>malformed</c> about <c>replaces</c>)
+    /// the order is retried once without it.
     /// </summary>
     /// <param name="replaces">ARI certificate identifier (<see cref="AcmeClient.GetAriCertificateId"/>) or <see langword="null"/>.</param>
     /// <param name="cancellationToken">Cancellation.</param>
@@ -117,7 +129,7 @@ public sealed class AcmeCertificateManager
                 }
 
                 TimeSpan delay = retry.GetDelay(attempt, (e as AcmeException)?.RetryAfter);
-                await Task.Delay(delay, Options.ClientOptions.TimeProvider, cancellationToken).ConfigureAwait(false);
+                await AcmeTimers.Delay(delay, Options.ClientOptions.TimeProvider, cancellationToken).ConfigureAwait(false);
             }
         }
     }
@@ -127,6 +139,81 @@ public sealed class AcmeCertificateManager
     {
         AcmeClient client = await GetClientAsync(cancellationToken).ConfigureAwait(false);
         await client.RevokeCertificateAsync(certificate, reason, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Releases the account key held by the cached client. Idempotent.</summary>
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _client?.AccountKey.Dispose();
+        _client = null;
+    }
+
+    private async Task<AcmeClient?> TryReuseAccountAsync(AcmeAccountState state, CancellationToken cancellationToken)
+    {
+        AcmeAccountKey key = AcmeAccountKey.Import(state.PrivateKeyPem);
+        try
+        {
+            AcmeClient client = new(_http, Options.DirectoryUrl, key, state.AccountUrl, Options.ClientOptions);
+            await client.GetDirectoryAsync(cancellationToken).ConfigureAwait(false);
+            Report(AcmeStage.DirectoryFetched, "Directory " + Options.DirectoryUrl);
+
+            string? unusable = null;
+            try
+            {
+                AcmeAccount account = await client.GetAccountAsync(cancellationToken).ConfigureAwait(false);
+                if (!string.Equals(account.Status, AcmeAccountStatus.Valid, StringComparison.Ordinal))
+                {
+                    unusable = "status " + account.Status;
+                }
+            }
+            catch (AcmeException e) when (e.IsType(AcmeErrorTypes.AccountDoesNotExist) || e.IsType(AcmeErrorTypes.Unauthorized))
+            {
+                unusable = e.Type;
+            }
+
+            if (unusable is not null)
+            {
+                Report(AcmeStage.AccountReady, "Stored account " + state.AccountUrl + " is not usable (" + unusable + "); creating a new account");
+                key.Dispose();
+                return null;
+            }
+
+            Report(AcmeStage.AccountReady, "Reusing account " + state.AccountUrl);
+            return client;
+        }
+        catch
+        {
+            key.Dispose();
+            throw;
+        }
+    }
+
+    private async Task<AcmeClient> CreateAccountAsync(string reason, CancellationToken cancellationToken)
+    {
+        AcmeAccountKey key = AcmeAccountKey.Create(Options.AccountKeyAlgorithm);
+        try
+        {
+            AcmeClient client = new(_http, Options.DirectoryUrl, key, null, Options.ClientOptions);
+            AcmeDirectory directory = await client.GetDirectoryAsync(cancellationToken).ConfigureAwait(false);
+            Report(AcmeStage.DirectoryFetched, "Directory " + Options.DirectoryUrl + (directory.Meta?.ExternalAccountRequired == true ? " (EAB required)" : string.Empty));
+            AcmeAccount account = await client.CreateAccountAsync(Options.Contacts, Options.AgreeTermsOfService, Options.ExternalAccountBinding, onlyReturnExisting: false, cancellationToken).ConfigureAwait(false);
+
+            // A new state has no pending order: orders belong to the account that created them.
+            Options.AccountStore.Save(AcmeAccountStore.CreateState(key, account.Location!, Options.DirectoryUrl));
+            Report(AcmeStage.AccountReady, reason + account.Location);
+            return client;
+        }
+        catch
+        {
+            key.Dispose();
+            throw;
+        }
     }
 
     private async Task<IssuedCertificate> OrderCoreAsync(string? replaces, CancellationToken cancellationToken)
@@ -234,12 +321,23 @@ public sealed class AcmeCertificateManager
         {
             return await client.NewOrderAsync(Options.Identifiers, Options.NotBefore, Options.NotAfter, replaces, cancellationToken).ConfigureAwait(false);
         }
-        catch (AcmeException e) when (replaces is not null && !AcmeRetryOptions.IsTransient(e))
+        catch (AcmeException e) when (replaces is not null && IsReplacesRejection(e))
         {
             // RFC 9773 §5: a CA may reject the replaces field (alreadyReplaced, unknown certificate); order without it.
             Report(AcmeStage.OrderCreated, "CA rejected replaces=" + replaces + " (" + e.Type + "); ordering without it");
             return await client.NewOrderAsync(Options.Identifiers, Options.NotBefore, Options.NotAfter, null, cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// True for errors that concern the <c>replaces</c> field itself: <c>alreadyReplaced</c>, or <c>malformed</c> whose
+    /// detail names <c>replaces</c>. Anything else (rejectedIdentifier, caa, unauthorized, ...) would fail the same way
+    /// without it, so it is not worth a second request.
+    /// </summary>
+    internal static bool IsReplacesRejection(AcmeException exception)
+    {
+        return exception.IsType(AcmeErrorTypes.AlreadyReplaced)
+            || (exception.IsType(AcmeErrorTypes.Malformed) && exception.Problem.Detail?.Contains("replaces", StringComparison.OrdinalIgnoreCase) == true);
     }
 
     /// <summary>Returns the persisted certificate's private key as a standalone key, or <see langword="null"/> when nothing is persisted.</summary>
@@ -261,28 +359,30 @@ public sealed class AcmeCertificateManager
         return CsrBuilder.ImportKeyPem(rsa.ExportPkcs8PrivateKeyPem());
     }
 
-    private static bool SameIdentifiers(IReadOnlyList<AcmeIdentifier> a, IReadOnlyList<AcmeIdentifier> b)
+    /// <summary>True when both lists hold the same identifiers as sets (DNS names case-insensitively), i.e. each contains the other.</summary>
+    internal static bool SameIdentifiers(IReadOnlyList<AcmeIdentifier> a, IReadOnlyList<AcmeIdentifier> b)
     {
-        if (a.Count != b.Count)
-        {
-            return false;
-        }
+        return a.Count == b.Count && ContainsAll(a, b) && ContainsAll(b, a);
 
-        for (int i = 0; i < a.Count; i++)
+        static bool ContainsAll(IReadOnlyList<AcmeIdentifier> haystack, IReadOnlyList<AcmeIdentifier> needles)
         {
-            bool found = false;
-            for (int j = 0; j < b.Count && !found; j++)
+            for (int i = 0; i < needles.Count; i++)
             {
-                found = string.Equals(a[i].Type, b[j].Type, StringComparison.Ordinal) && string.Equals(a[i].Value, b[j].Value, StringComparison.OrdinalIgnoreCase);
+                bool found = false;
+                for (int j = 0; j < haystack.Count && !found; j++)
+                {
+                    found = string.Equals(needles[i].Type, haystack[j].Type, StringComparison.Ordinal)
+                        && string.Equals(needles[i].Value, haystack[j].Value, StringComparison.OrdinalIgnoreCase);
+                }
+
+                if (!found)
+                {
+                    return false;
+                }
             }
 
-            if (!found)
-            {
-                return false;
-            }
+            return true;
         }
-
-        return true;
     }
 
     private async Task CompleteAuthorizationAsync(AcmeClient client, Uri authorizationUrl, CancellationToken cancellationToken)
@@ -340,7 +440,7 @@ public sealed class AcmeCertificateManager
             Report(AcmeStage.ChallengePublished, challenge.Type + " response published", identifier);
             if (Options.ChallengePropagationDelay > TimeSpan.Zero)
             {
-                await Task.Delay(Options.ChallengePropagationDelay, Options.ClientOptions.TimeProvider, cancellationToken).ConfigureAwait(false);
+                await AcmeTimers.Delay(Options.ChallengePropagationDelay, Options.ClientOptions.TimeProvider, cancellationToken).ConfigureAwait(false);
             }
 
             // A resumed order may find the challenge already responded to (processing); posting again is an error at
@@ -366,19 +466,21 @@ public sealed class AcmeCertificateManager
 
     private async Task CleanupAsync(string challengeType, string token, string domain, AcmeIdentifier identifier, string? txtName, string? txtValue, X509Certificate2? alpnCertificate)
     {
-        // Cleanup runs even when the caller was cancelled, so it uses no cancellation token.
+        // Cleanup runs even when the caller was cancelled, so it does not use the caller's token; a wall-clock bound
+        // (not the client TimeProvider, which tests replace) stops a hanging responder from blocking the flow forever.
+        using CancellationTokenSource timeout = new(Options.ChallengeCleanupTimeout, TimeProvider.System);
         try
         {
             switch (challengeType)
             {
                 case AcmeChallengeTypes.Http01:
-                    await Options.Http01Responder!.RemoveAsync(token, CancellationToken.None).ConfigureAwait(false);
+                    await Options.Http01Responder!.RemoveAsync(token, timeout.Token).AsTask().WaitAsync(timeout.Token).ConfigureAwait(false);
                     break;
                 case AcmeChallengeTypes.Dns01:
-                    await Options.Dns01Provider!.RemoveTxtAsync(txtName!, txtValue!, CancellationToken.None).ConfigureAwait(false);
+                    await Options.Dns01Provider!.RemoveTxtAsync(txtName!, txtValue!, timeout.Token).AsTask().WaitAsync(timeout.Token).ConfigureAwait(false);
                     break;
                 default:
-                    await Options.TlsAlpn01Responder!.RemoveAsync(identifier.Value, CancellationToken.None).ConfigureAwait(false);
+                    await Options.TlsAlpn01Responder!.RemoveAsync(identifier.Value, timeout.Token).AsTask().WaitAsync(timeout.Token).ConfigureAwait(false);
                     break;
             }
 
@@ -386,8 +488,9 @@ public sealed class AcmeCertificateManager
         }
         catch (Exception e)
         {
-            // A failed cleanup must not mask the outcome of the validation.
-            Report(AcmeStage.ChallengeCleanedUp, "Cleanup failed: " + e.Message, identifier);
+            // A failed or timed-out cleanup must not mask the outcome of the validation (Report never throws).
+            string reason = timeout.IsCancellationRequested ? "timed out after " + Options.ChallengeCleanupTimeout : e.Message;
+            Report(AcmeStage.ChallengeCleanedUp, "Cleanup failed: " + reason, identifier);
         }
         finally
         {
@@ -473,6 +576,13 @@ public sealed class AcmeCertificateManager
 
     private void Report(AcmeStage stage, string message, AcmeIdentifier? identifier = null)
     {
-        Progress?.Invoke(new AcmeProgress(stage, message, identifier));
+        try
+        {
+            Progress?.Invoke(new AcmeProgress(stage, message, identifier));
+        }
+        catch (Exception)
+        {
+            // Progress is observational: a throwing handler must not change the outcome of the flow (or of its cleanup).
+        }
     }
 }

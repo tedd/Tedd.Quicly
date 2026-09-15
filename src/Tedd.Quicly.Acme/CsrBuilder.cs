@@ -54,9 +54,14 @@ public static class CsrBuilder
         }
     }
 
+    /// <summary>Upper bound of the subject common name (RFC 5280 <c>ub-common-name</c>); Boulder rejects longer CNs as <c>badCSR</c>.</summary>
+    internal const int MaxCommonNameLength = 64;
+
     /// <summary>
-    /// Creates a DER-encoded CSR whose subject CN is the first identifier and whose subjectAltName lists every
-    /// identifier (DNS names as dNSName, IP identifiers as iPAddress). Signed with SHA-256.
+    /// Creates a DER-encoded CSR whose subjectAltName lists every identifier (DNS names as dNSName, IP identifiers as
+    /// iPAddress) and whose subject CN is the first DNS identifier of at most 64 characters (RFC 5280
+    /// <c>ub-common-name</c>). When no DNS identifier fits (only long names, or an IP-only order) the subject is empty and
+    /// the SAN extension is marked critical (RFC 5280 §4.2.1.6), as certbot and lego do. Signed with SHA-256.
     /// </summary>
     /// <exception cref="ArgumentException">No identifiers, an unsupported identifier type, an invalid IP, or an unsupported key type.</exception>
     public static byte[] CreateCsr(IReadOnlyList<AcmeIdentifier> identifiers, AsymmetricAlgorithm key)
@@ -91,9 +96,18 @@ public static class CsrBuilder
             }
         }
 
-        X500DistinguishedNameBuilder dn = new();
-        dn.AddCommonName(identifiers[0].Value);
-        X500DistinguishedName subject = dn.Build();
+        string? commonName = SelectCommonName(identifiers);
+        X500DistinguishedName subject;
+        if (commonName is null)
+        {
+            subject = new X500DistinguishedName([0x30, 0x00]); // empty RDNSequence
+        }
+        else
+        {
+            X500DistinguishedNameBuilder dn = new();
+            dn.AddCommonName(commonName);
+            subject = dn.Build();
+        }
 
         CertificateRequest request = key switch
         {
@@ -101,7 +115,23 @@ public static class CsrBuilder
             RSA rsa => new CertificateRequest(subject, rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1),
             _ => throw new ArgumentException("Only ECDsa and RSA keys are supported.", nameof(key)),
         };
-        request.CertificateExtensions.Add(san.Build(critical: false));
+
+        // RFC 5280 §4.2.1.6: with an empty subject the subjectAltName extension MUST be critical.
+        request.CertificateExtensions.Add(san.Build(critical: commonName is null));
         return request.CreateSigningRequest();
+    }
+
+    /// <summary>The first DNS identifier that fits in a CN (≤ 64 characters), or <see langword="null"/> when none does.</summary>
+    internal static string? SelectCommonName(IReadOnlyList<AcmeIdentifier> identifiers)
+    {
+        for (int i = 0; i < identifiers.Count; i++)
+        {
+            if (identifiers[i].IsDns && identifiers[i].Value.Length <= MaxCommonNameLength)
+            {
+                return identifiers[i].Value;
+            }
+        }
+
+        return null;
     }
 }

@@ -161,4 +161,10 @@ public static class AcmeErrorTypes
 
     /// <summary>The response body could not be parsed.</summary>
     public const string InvalidResponse = ClientPrefix + "invalidResponse";
+
+    /// <summary>
+    /// A URL to be requested is not HTTPS (RFC 8555 §6.1) and neither loopback nor allowed by
+    /// <see cref="AcmeClientOptions.AllowInsecureHttp"/>; the request was not sent.
+    /// </summary>
+    public const string InsecureUrl = ClientPrefix + "insecureUrl";
 }

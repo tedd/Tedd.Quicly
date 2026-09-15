@@ -24,6 +24,19 @@ public sealed class AcmeClientOptions
 
     /// <summary>Clock and timer source used for polling delays; replace in tests to avoid real waits.</summary>
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
+
+    /// <summary>
+    /// RFC 8555 §6.1 requires HTTPS, so by default the client refuses a plain <c>http://</c> directory URL, and any
+    /// <c>http://</c> URL the server hands out (directory entries, <c>Location</c>, <c>Link</c>, order / authorization /
+    /// challenge / certificate URLs), unless the host is loopback (<c>localhost</c>, <c>127.0.0.0/8</c>, <c>::1</c>).
+    /// Set this to <see langword="true"/> only for a test or mock CA on another host. Default <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// HTTPS connections are always certificate-validated by the injected <see cref="HttpClient"/>. To trust a private
+    /// or mock CA (Pebble, an in-house ACME server), build the client on <see cref="AcmeClient.CreateHttpHandler"/>
+    /// with that CA's root instead of disabling validation (ADR 0009).
+    /// </remarks>
+    public bool AllowInsecureHttp { get; set; }
 }
 
 /// <summary>Certificate revocation reason codes (RFC 5280 §5.3.1) accepted by <c>revokeCert</c>.</summary>

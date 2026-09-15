@@ -1193,6 +1193,12 @@ public sealed class FakeAcmeServer : IAsyncDisposable
                 return Fail(404, AcmeErrorTypes.Malformed, "Certificate was not issued by this CA.");
             }
 
+            // RFC 8555 §7.6: a jwk-signed revocation must be signed by the certificate's own key.
+            if (jws.Header?["jwk"] is not null && jws.Thumbprint != CertificateKeyThumbprint(der))
+            {
+                return Fail(403, AcmeErrorTypes.Unauthorized, "The jwk is not the certificate's key.");
+            }
+
             if (!_revoked.Add(key))
             {
                 return Fail(400, AcmeErrorTypes.AlreadyRevoked, "Certificate is already revoked.");
@@ -1200,6 +1206,15 @@ public sealed class FakeAcmeServer : IAsyncDisposable
 
             return (200, null, null, null, [], null, null);
         }
+    }
+
+    /// <summary>RFC 7638 thumbprint of the certificate's public key (to authorize jwk-signed revocations).</summary>
+    private static string CertificateKeyThumbprint(byte[] der)
+    {
+        using X509Certificate2 cert = X509CertificateLoader.LoadCertificate(der);
+        ECDsa? ecdsa = cert.GetECDsaPublicKey();
+        using AcmeAccountKey key = ecdsa is not null ? new AcmeAccountKey(ecdsa) : new AcmeAccountKey(cert.GetRSAPublicKey()!);
+        return key.Thumbprint;
     }
 
     private async Task RenewalInfoAsync(HttpListenerResponse res, string certId)

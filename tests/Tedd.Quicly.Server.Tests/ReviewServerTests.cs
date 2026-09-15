@@ -265,7 +265,7 @@ public class ReviewServerTests
         Thread consumer = new(() =>
         {
             uint random = 12345;
-            long deadline = Stopwatch.GetTimestamp() + (3 * Stopwatch.Frequency);
+            long deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency; // detects within ~0.2 s today; bounded cost once fixed
             for (long r = 1; r <= 5_000_000 && lost == 0 && Stopwatch.GetTimestamp() < deadline; r++)
             {
                 Volatile.Write(ref words[0], 1); // an earlier signal of slot 0 is still waiting for PollAll

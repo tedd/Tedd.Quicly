@@ -54,8 +54,8 @@ public sealed unsafe class SlabAllocator : IDisposable
 
     /// <summary>
     /// Per-shard hot metadata: the free-list head on one cache line and the counters on the next. Keeping the
-    /// counters off the head line lets the two locked operations of a rent (CAS on the head, increment of the
-    /// counter) overlap instead of serialising on one line (measured: see docs/benchmarks/memory.md).
+    /// counters off the head line means a CAS retry storm on the head does not also stall the counter
+    /// increment of a thread that already won its pop (design choice, see docs/benchmarks/memory.md).
     /// </summary>
     [StructLayout(LayoutKind.Explicit, Size = 128)]
     private struct ShardHeader

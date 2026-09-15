@@ -54,7 +54,7 @@ public enum CloseSource : byte
     /// <summary>Not closed.</summary>
     None = 0,
 
-    /// <summary>This end closed (<see cref="QuiclyPeer.Close"/>, or a local limit or protocol violation).</summary>
+    /// <summary>This end closed (<see cref="QuiclyPeer.Close(CloseReason)"/>, or a local limit or protocol violation).</summary>
     Local = 1,
 
     /// <summary>The peer sent Close or closed the QUIC connection.</summary>
@@ -67,7 +67,7 @@ public enum CloseSource : byte
 /// <summary>Why a session ended: a PROTOCOL.md §6 error code, an optional reason text and who closed it.</summary>
 /// <param name="Code">Application error code (<see cref="QuiclyErrorCode.NoError"/> for an orderly close).</param>
 /// <param name="Reason">
-/// Reason text. For <see cref="QuiclyPeer.Close"/> at most 512 bytes of UTF-8; when received from the peer it is
+/// Reason text. For <see cref="QuiclyPeer.Close(CloseReason)"/> at most 512 bytes of UTF-8; when received from the peer it is
 /// sanitised (control and format characters replaced with U+FFFD) before it is exposed.
 /// </param>
 public readonly record struct CloseReason(QuiclyErrorCode Code, string? Reason = null)
@@ -75,7 +75,7 @@ public readonly record struct CloseReason(QuiclyErrorCode Code, string? Reason =
     /// <summary>An orderly close with no reason text.</summary>
     public static CloseReason Normal => new(QuiclyErrorCode.NoError);
 
-    /// <summary>Who closed the session (<see cref="CloseSource.Local"/> for a reason passed to <see cref="QuiclyPeer.Close"/>).</summary>
+    /// <summary>Who closed the session (<see cref="CloseSource.Local"/> for a reason passed to <see cref="QuiclyPeer.Close(CloseReason)"/>).</summary>
     public CloseSource Source { get; init; }
 
     /// <summary>For <see cref="CloseSource.Transport"/>: the transport's status code (see the transport's documentation); otherwise 0.</summary>

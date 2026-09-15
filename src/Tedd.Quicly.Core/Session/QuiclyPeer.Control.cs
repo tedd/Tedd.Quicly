@@ -134,6 +134,17 @@ public sealed unsafe partial class QuiclyPeer
                 OnTransportConnected(now);
             }
 
+            // Closes first: a connection that violated the protocol or was closed by the peer is not admitted afterwards.
+            if ((signals & SignalCloseRequest) != 0 && _core.TryGetCloseRequest(out QuiclyErrorCode code))
+            {
+                BeginClose(code, DescribeLocalClose(code), CloseSource.Local, CloseMode.SendClose);
+            }
+
+            if ((signals & SignalPeerClose) != 0)
+            {
+                OnPeerCloseReceived();
+            }
+
             if ((signals & SignalHello) != 0)
             {
                 OnHelloReceived(now);
@@ -152,16 +163,6 @@ public sealed unsafe partial class QuiclyPeer
             if ((signals & SignalTableRequest) != 0)
             {
                 SendTableAnswer();
-            }
-
-            if ((signals & SignalPeerClose) != 0)
-            {
-                OnPeerCloseReceived();
-            }
-
-            if ((signals & SignalCloseRequest) != 0 && _core.TryGetCloseRequest(out QuiclyErrorCode code))
-            {
-                BeginClose(code, DescribeLocalClose(code), CloseSource.Local, CloseMode.SendClose);
             }
 
             if ((signals & SignalTransportClosed) != 0)
@@ -546,28 +547,11 @@ public sealed unsafe partial class QuiclyPeer
         _ => "closed",
     };
 
-    private static byte[]? EncodeReason(string? text)
-    {
-        if (string.IsNullOrEmpty(text))
-        {
-            return null;
-        }
-
-        byte[] bytes = Encoding.UTF8.GetBytes(text);
-        if (bytes.Length <= ControlCodec.MaxReasonLength)
-        {
-            return bytes;
-        }
-
-        // Cut before the lead byte of the first sequence that would not fit completely.
-        int length = ControlCodec.MaxReasonLength;
-        while (length > 0 && (bytes[length] & 0xC0) == 0x80)
-        {
-            length--;
-        }
-
-        return bytes.AsSpan(0, length).ToArray();
-    }
+    /// <summary>
+    /// UTF-8 of a local close reason. Every local reason is at most 512 bytes: <see cref="Close(Session.CloseReason)"/> and
+    /// <see cref="AdmissionResult.Reject"/> validate theirs, the peer's own are short constants.
+    /// </summary>
+    private static byte[]? EncodeReason(string? text) => string.IsNullOrEmpty(text) ? null : Encoding.UTF8.GetBytes(text);
 
     private static string? SanitizeReason(ReadOnlySpan<byte> utf8)
     {
@@ -712,6 +696,7 @@ public sealed unsafe partial class QuiclyPeer
             }
         }
 
+        Span<byte> frame = stackalloc byte[24];
         while (_streamPings.TryDequeue(out PongSample request))
         {
             if (_state != PeerState.Connected)
@@ -719,7 +704,6 @@ public sealed unsafe partial class QuiclyPeer
                 continue;
             }
 
-            Span<byte> frame = stackalloc byte[24];
             ControlCodec.TryWrite(frame, new Pong(request.Echo, request.RemoteReceive, _core.ToWireMicros(now)), ControlCarrier.Stream, out int written);
             if (SendControlStream(frame.Slice(0, written), out _))
             {

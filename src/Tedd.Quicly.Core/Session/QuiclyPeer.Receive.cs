@@ -714,7 +714,7 @@ public sealed unsafe partial class QuiclyPeer
                     return ReceiveResult.Consumed(total);
                 }
 
-                StreamMessageContext context = default;
+                scoped StreamMessageContext context = default;
                 context.Id = id;
                 context.Channel = record.Channel;
                 context.ChannelIndex = record.ChannelIndex;

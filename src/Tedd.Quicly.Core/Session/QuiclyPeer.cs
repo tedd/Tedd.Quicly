@@ -24,7 +24,7 @@ namespace Tedd.Quicly.Core.Session;
 /// the client sends Hello) → <see cref="PeerState.Connected"/> (HelloAck accepted) → <see cref="PeerState.Closing"/> →
 /// <see cref="PeerState.Closed"/>. Every change is reported by <see cref="StateChanged"/> from <see cref="Poll"/>; after
 /// the Closed event no handler or event runs. <see cref="Dispose"/> closes the transport if needed; native memory is freed
-/// once the transport reported its close.</para>
+/// once the transport reported its close and no <see cref="Poll"/> or <see cref="Flush"/> call is running.</para>
 /// </remarks>
 public sealed unsafe partial class QuiclyPeer : IDisposable
 {
@@ -37,8 +37,12 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     internal const int SignalTableRequest = 1 << 6;
     internal const int SignalTableInfo = 1 << 7;
 
+    // Lifetime word: native memory is freed exactly once, when the transport can no longer call back (ClosedSeen), the
+    // application disposed the peer (DisposeRequested) and no game-thread Poll/Flush is running (InCall clear). Whoever
+    // completes that condition frees; the word is only changed with Interlocked operations.
     private const int LifetimeClosedSeen = 1;
     private const int LifetimeDisposeRequested = 2;
+    private const int LifetimeInCall = 4;
 
     private readonly PeerCore _core;
     private readonly PeerRole _role;
@@ -64,6 +68,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     private IPEndPoint? _remoteEndPoint;
     private int _signals;
     private int _lifetime;
+    private int _callDepth;
     private int _freed;
     private bool _disposed;
     private Exception? _lastFault;
@@ -222,13 +227,13 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     /// <summary>The peer's address (updated on migration).</summary>
     public IPEndPoint? RemoteEndPoint => Volatile.Read(ref _remoteEndPoint);
 
-    /// <summary>What the transport can do right now.</summary>
+    /// <summary>What the transport can do right now (default once the peer is disposed).</summary>
     public TransportCapabilities Capabilities
     {
         get
         {
             ITransport? transport = _transport;
-            return transport is null || Volatile.Read(ref _freed) != 0 ? default : transport.Capabilities;
+            return transport is null || _disposed ? default : transport.Capabilities;
         }
     }
 
@@ -249,12 +254,12 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     /// <param name="bit">The signal.</param>
     internal void Signal(int bit) => Interlocked.Or(ref _signals, bit);
 
-    /// <summary>Copies the peer's statistics into <paramref name="statistics"/>. Allocation-free; game thread.</summary>
+    /// <summary>Copies the peer's statistics into <paramref name="statistics"/>. Allocation-free; game thread. Zero once disposed.</summary>
     /// <param name="statistics">Receives the snapshot.</param>
     public void GetStatistics(out PeerStatistics statistics)
     {
         statistics = default;
-        if (Volatile.Read(ref _freed) != 0)
+        if (_disposed)
         {
             return;
         }
@@ -304,12 +309,12 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     /// <summary>Copies the counters of one channel into <paramref name="statistics"/>. Allocation-free; game thread.</summary>
     /// <param name="channel">The channel id.</param>
     /// <param name="statistics">Receives the snapshot.</param>
-    /// <returns><see langword="false"/> when the table has no such channel.</returns>
+    /// <returns><see langword="false"/> when the table has no such channel or the peer is disposed.</returns>
     public bool GetChannelStatistics(ushort channel, out ChannelStatistics statistics)
     {
         statistics = default;
         int index = _core.ChannelIndexOf(channel);
-        if (index < 0 || Volatile.Read(ref _freed) != 0)
+        if (index < 0 || _disposed)
         {
             return false;
         }
@@ -369,7 +374,8 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
 
     /// <summary>
     /// Closes the transport if it is still open (error code 0, no linger) and releases the peer. Native memory is freed as
-    /// soon as the transport has reported its close (immediately when it already has). Release retained leases first.
+    /// soon as the transport has reported its close and no <see cref="Poll"/>/<see cref="Flush"/> is running (so disposing
+    /// from a handler is safe). Release retained leases first; afterwards <see cref="Release(in ReceiveLease)"/> is a no-op.
     /// </summary>
     public void Dispose()
     {
@@ -392,15 +398,44 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
             transport.Dispose();
         }
 
-        if ((Interlocked.Or(ref _lifetime, LifetimeDisposeRequested) & LifetimeClosedSeen) != 0 || transport is null)
+        // Without a transport no close callback will come, so the close counts as seen.
+        int requested = transport is null ? LifetimeDisposeRequested | LifetimeClosedSeen : LifetimeDisposeRequested;
+        int previous = Interlocked.Or(ref _lifetime, requested);
+        if (((previous | requested) & (LifetimeClosedSeen | LifetimeInCall)) == LifetimeClosedSeen)
         {
             FreeResources();
         }
     }
 
+    /// <summary>The transport reported its close (transport thread; last callback).</summary>
     private void OnClosedSeen()
     {
-        if ((Interlocked.Or(ref _lifetime, LifetimeClosedSeen) & LifetimeDisposeRequested) != 0)
+        int previous = Interlocked.Or(ref _lifetime, LifetimeClosedSeen);
+        if ((previous & (LifetimeDisposeRequested | LifetimeInCall)) == LifetimeDisposeRequested)
+        {
+            FreeResources();
+        }
+    }
+
+    /// <summary>A game-thread Poll/Flush begins (nested calls from handlers only count once).</summary>
+    private void EnterCall()
+    {
+        if (_callDepth++ == 0)
+        {
+            Interlocked.Or(ref _lifetime, LifetimeInCall);
+        }
+    }
+
+    /// <summary>A game-thread Poll/Flush ends; frees native memory if the peer was disposed and the transport closed meanwhile.</summary>
+    private void ExitCall()
+    {
+        if (--_callDepth != 0)
+        {
+            return;
+        }
+
+        int previous = Interlocked.And(ref _lifetime, ~LifetimeInCall);
+        if ((previous & (LifetimeDisposeRequested | LifetimeClosedSeen)) == (LifetimeDisposeRequested | LifetimeClosedSeen))
         {
             FreeResources();
         }

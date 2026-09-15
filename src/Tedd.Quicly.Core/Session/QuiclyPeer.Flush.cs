@@ -24,6 +24,7 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         _inFlush = true;
+        EnterCall();
         try
         {
             long now = _clock.NowMicros;
@@ -56,10 +57,7 @@ public sealed unsafe partial class QuiclyPeer
         finally
         {
             _inFlush = false;
-            if (_disposed)
-            {
-                TryFreeAfterDispose();
-            }
+            ExitCall();
         }
     }
 

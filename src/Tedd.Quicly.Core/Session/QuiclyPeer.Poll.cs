@@ -46,6 +46,7 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         _inPoll = true;
+        EnterCall();
         int dispatched = 0;
         try
         {
@@ -84,10 +85,7 @@ public sealed unsafe partial class QuiclyPeer
         finally
         {
             _inPoll = false;
-            if (_disposed)
-            {
-                TryFreeAfterDispose();
-            }
+            ExitCall();
         }
     }
 
@@ -179,7 +177,7 @@ public sealed unsafe partial class QuiclyPeer
     /// <param name="messages">Messages from <see cref="Drain"/>.</param>
     public void Release(ReadOnlySpan<ReceivedMessage> messages)
     {
-        if (Volatile.Read(ref _freed) != 0)
+        if (_disposed)
         {
             return;
         }
@@ -194,7 +192,7 @@ public sealed unsafe partial class QuiclyPeer
     /// <param name="lease">A lease from <see cref="Retain"/>.</param>
     public void Release(in ReceiveLease lease)
     {
-        if (Volatile.Read(ref _freed) == 0)
+        if (!_disposed)
         {
             _core.ReturnReceive(in lease.Lease);
         }
@@ -539,14 +537,6 @@ public sealed unsafe partial class QuiclyPeer
         for (int i = 0; i < boxes.Length; i++)
         {
             boxes[i].ReleaseAll(_core);
-        }
-    }
-
-    private void TryFreeAfterDispose()
-    {
-        if (!_inPoll && !_inFlush && (Volatile.Read(ref _lifetime) & LifetimeClosedSeen) != 0)
-        {
-            FreeResources();
         }
     }
 }

@@ -184,7 +184,7 @@ public struct StreamFrameParser
     /// <param name="input">The unconsumed bytes of the current receive segment; advanced past consumed bytes.</param>
     /// <param name="payload">For <see cref="StreamEvent.PayloadChunk"/>: the payload slice of the input; otherwise empty.</param>
     /// <returns>The event.</returns>
-    public StreamEvent Read(ChannelTable? table, ref ReadOnlySpan<byte> input, out ReadOnlySpan<byte> payload)
+    public StreamEvent Read(ChannelTable? table, scoped ref ReadOnlySpan<byte> input, out ReadOnlySpan<byte> payload)
     {
         payload = default;
         while (true)

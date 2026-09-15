@@ -8,7 +8,7 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// </summary>
 internal static class ChannelEngines
 {
-    /// <summary>Number of delivery modes (the size of <see cref="PeerCore.Engines"/>).</summary>
+    /// <summary>Number of delivery modes (the size of the per-mode engine array of a peer).</summary>
     public const int ModeCount = 6;
 
     /// <summary>Creates the engine of <paramref name="mode"/> for one peer.</summary>

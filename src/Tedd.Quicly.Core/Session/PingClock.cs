@@ -102,12 +102,16 @@ internal struct PingClock
             _filled++;
         }
 
-        int best = 0;
+        // The sample with the smallest RTT wins; on a tie the newest one (its offset is the most current, which matters
+        // when the clocks drift), so walk the window from the oldest sample to the newest and accept equal values.
+        int oldest = (_next - _filled + Window) & (Window - 1);
+        int best = oldest;
         for (int i = 1; i < _filled; i++)
         {
-            if (_rtt[i] < _rtt[best])
+            int index = (oldest + i) & (Window - 1);
+            if (_rtt[index] <= _rtt[best])
             {
-                best = i;
+                best = index;
             }
         }
 

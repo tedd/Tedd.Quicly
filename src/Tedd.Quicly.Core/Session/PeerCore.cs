@@ -716,7 +716,7 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <param name="token">A token.</param>
     public int EntryOfToken(SendToken token)
     {
-        if ((uint)token.Slot >= (uint)_entryOfToken.Length)
+        if (!token.IsValid || (uint)token.Slot >= (uint)_entryOfToken.Length)
         {
             return -1;
         }

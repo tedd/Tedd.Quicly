@@ -196,7 +196,7 @@ public sealed partial class QuiclyServer
         {
             if (Volatile.Read(ref _state) is StateStarting or StateRunning or StateStopping)
             {
-                await StopAsync().ConfigureAwait(false);
+                await StopAsync().ConfigureAwait(false); // also stops the HTTP endpoint and the certificate provisioning
             }
             else
             {
@@ -204,18 +204,35 @@ public sealed partial class QuiclyServer
                 {
                     Volatile.Write(ref _accepting, false);
                 }
-
-                ForceCloseAll();
             }
         }
         finally
         {
-            await StopSideServicesAsync().ConfigureAwait(false);
+            // Dispose the listener, then close whatever it accepted while the shutdown ran: once it is disposed no callback
+            // can add another. Both run even when the other fails.
+            Exception? listenerFailure = Capture(_listener.Dispose);
+            Exception? closeFailure = Capture(ForceCloseAll);
             _disposed = true;
-            _listener.Dispose();
             _tokens.Dispose();
             Volatile.Write(ref _allocatorReleaseRequested, 1);
             TryReleaseAllocator();
+            if ((listenerFailure ?? closeFailure) is { } failure)
+            {
+                ExceptionDispatchInfo.Throw(failure);
+            }
+        }
+    }
+
+    private static Exception? Capture(Action action)
+    {
+        try
+        {
+            action();
+            return null;
+        }
+        catch (Exception exception)
+        {
+            return exception;
         }
     }
 

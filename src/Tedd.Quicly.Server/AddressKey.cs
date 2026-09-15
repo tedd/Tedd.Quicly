@@ -27,11 +27,7 @@ internal readonly record struct AddressKey(ulong High, ulong Low)
         }
 
         Span<byte> bytes = stackalloc byte[16];
-        if (!endPoint.Address.TryWriteBytes(bytes, out int written))
-        {
-            return false;
-        }
-
+        endPoint.Address.TryWriteBytes(bytes, out int written); // 16 bytes hold any address
         if (written == 4)
         {
             key = new AddressKey(0, Ipv4MappedPrefix | BinaryPrimitives.ReadUInt32BigEndian(bytes));

@@ -45,7 +45,7 @@ internal sealed class ServerFixture : IAsyncDisposable
     private readonly SlabAllocator _clientPool = new(Pools.Small());
     private bool _disposed;
 
-    public ServerFixture(Action<ServerOptions>? configure = null, int seed = 1, bool start = true, ITransportListener? listener = null)
+    public ServerFixture(Action<ServerOptions>? configure = null, int seed = 1, bool start = true, ITransportListener? listener = null, bool observe = true)
     {
         Network = new SimulatedNetwork(Clock, seed);
         SimListener = new SimulatedListener(Network);
@@ -61,16 +61,19 @@ internal sealed class ServerFixture : IAsyncDisposable
             Step(1_000);
             return Task.CompletedTask;
         };
-        Server.PeerAdmitted += peer => Admitted.Add(new AdmittedPeer(peer, peer.Index, peer.SessionId, peer.Epoch, peer.Tag));
-        Server.PeerClosed += (peer, reason) => Closed.Add((peer, reason));
-        Server.SessionEnded += info => Ended.Add(info);
-        Server.AdmissionFailed += failure =>
+        if (observe)
         {
-            lock (Failures)
+            Server.PeerAdmitted += peer => Admitted.Add(new AdmittedPeer(peer, peer.Index, peer.SessionId, peer.Epoch, peer.Tag));
+            Server.PeerClosed += (peer, reason) => Closed.Add((peer, reason));
+            Server.SessionEnded += info => Ended.Add(info);
+            Server.AdmissionFailed += failure =>
             {
-                Failures.Add(failure);
-            }
-        };
+                lock (Failures)
+                {
+                    Failures.Add(failure);
+                }
+            };
+        }
         Connector = new SimulatedConnector(Network);
         if (start)
         {

@@ -155,6 +155,9 @@ public class PeerSetTests
         Assert.True(tracked.Add(serverTwo));
         untracked.Add(serverOne);
         untracked.Add(serverTwo);
+        Assert.True(untracked.Remove(serverTwo));
+        Assert.False(untracked.Contains(serverTwo));
+        untracked.Add(serverTwo);
         int indexOne = serverOne.Index;
 
         one.Close();

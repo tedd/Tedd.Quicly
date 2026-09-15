@@ -9,12 +9,13 @@ namespace Tedd.Quicly.Client;
 /// </summary>
 internal sealed class WorkSignal : IDisposable
 {
-    private readonly SemaphoreSlim _semaphore = new(0, 1);
+    private readonly SemaphoreSlim _semaphore = new(0);
+    private int _pending;
 
-    /// <summary>Releases a waiter (or the next one); never blocks.</summary>
+    /// <summary>Releases a waiter (or the next one) unless a release is already outstanding; never blocks.</summary>
     public void Set()
     {
-        if (_semaphore.CurrentCount != 0)
+        if (Interlocked.Exchange(ref _pending, 1) != 0)
         {
             return;
         }
@@ -23,10 +24,6 @@ internal sealed class WorkSignal : IDisposable
         {
             _semaphore.Release();
         }
-        catch (SemaphoreFullException)
-        {
-            // Another callback released it first.
-        }
         catch (ObjectDisposedException)
         {
             // A late callback after the client was disposed.
@@ -34,8 +31,15 @@ internal sealed class WorkSignal : IDisposable
     }
 
     /// <summary>Waits until <see cref="Set"/> or <paramref name="timeout"/>.</summary>
-    public async ValueTask WaitAsync(TimeSpan timeout, CancellationToken cancellationToken) =>
+    /// <remarks>
+    /// The pending flag is cleared before waiting, so a <see cref="Set"/> racing the wait releases again and is never lost;
+    /// at worst a stale release makes the next wait return at once.
+    /// </remarks>
+    public async ValueTask WaitAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        Volatile.Write(ref _pending, 0);
         await _semaphore.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+    }
 
     public void Dispose() => _semaphore.Dispose();
 }

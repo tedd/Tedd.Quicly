@@ -149,6 +149,10 @@ public sealed partial class QuiclyServer
                 generation = _generations[slot];
                 _unadmitted++;
                 _connections++;
+
+                // Counted under the gate that shutdown flips _accepting under, so the shared pool can never be disposed
+                // between this reservation and the peer's creation.
+                Interlocked.Increment(ref _alivePeers);
                 if (hasAddress)
                 {
                     CollectionsMarshal.GetValueRefOrAddDefault(_perAddress, key, out _)++;
@@ -163,7 +167,6 @@ public sealed partial class QuiclyServer
             return null;
         }
 
-        Interlocked.Increment(ref _alivePeers);
         QuiclyPeer peer;
         try
         {

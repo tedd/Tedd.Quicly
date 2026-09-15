@@ -4,5 +4,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />
+    <ProjectReference Include="..\Tedd.Quicly.Http3\Tedd.Quicly.Http3.csproj" />
   </ItemGroup>
 </Project>

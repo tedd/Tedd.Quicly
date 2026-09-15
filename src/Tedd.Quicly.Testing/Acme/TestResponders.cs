@@ -4,7 +4,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Tedd.Quicly.Acme.Challenges;
 
-namespace Tedd.Quicly.Acme.Tests.Fake;
+namespace Tedd.Quicly.Testing.Acme;
 
 /// <summary>An <see cref="IHttp01Responder"/> that really serves the key authorization over HTTP on a loopback port.</summary>
 public sealed class Http01TestResponder : IHttp01Responder, IAsyncDisposable

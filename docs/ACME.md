@@ -96,3 +96,120 @@ Schannel / MsQuic `Pfx` as a PKCS#12 credential, or `IssuedCertificate.Load(pfx,
 UserKeySet)` (`MachineKeySet` for services). The glue then disposes the previous certificate once no handshake uses
 it. Failures from the order or from the callback go to `onError` and are retried after
 `RetryDelay`.
+
+## Server integration (`Tedd.Quicly.Server.Certificates`)
+
+`CertificateProvisioner` is the glue a game server uses. It reuses the pieces above: `AcmeCertificateManager` for the
+order flow, `RenewalScheduler` for renewals, and `HttpServer` with `Http01ChallengeHandler`, `RedirectToHttpsHandler`,
+`HealthHandler` and `TlsAlpn01Responder` for the challenge endpoints. It implements `ICertificateSource`, so it serves the
+same way whether the certificate is fixed, comes from a file, or comes from ACME.
+
+### Enabling ACME
+
+```csharp
+var certificates = new CertificateProvisioner(ServerCertificateOptions.Acme(new AcmeProvisioningOptions
+{
+    DirectoryUrl = AcmeDirectories.LetsEncryptStaging,   // switch to AcmeDirectories.LetsEncrypt once it works
+    AgreeToTermsOfService = true,
+    Contacts = { "mailto:ops@example.com" },
+    DnsNames = { "play.example.com" },
+    AccountStorePath = "/var/lib/mygame/acme-account.json",
+    CertificatePath = "/var/lib/mygame/server.pfx",
+}));
+certificates.StatusChanged += s => logger.Log(s.ToString());   // Starting, Valid, Renewing, Failed(reason), Stopped
+await certificates.StartAsync(ct);
+X509Certificate2 first = await certificates.WaitForCertificateAsync(ct);
+```
+
+`StartAsync` throws only for problems that retrying cannot fix: invalid options, an endpoint that cannot be bound,
+or an unreadable PFX file. A CA that cannot issue a certificate does not make it throw. The status becomes `Failed`
+with the reason, and the provisioner keeps retrying in the background (the manager's back-off within an attempt, then
+`Renewal.RetryDelay` between attempts). `WaitForCertificateAsync` completes once a certificate exists. Background work
+never throws: every failure is reported through `Status`/`StatusChanged`. Non-fatal problems (for example an event
+handler that threw) go to `Error`, and every ACME stage goes to `Progress`, for logging.
+
+On start, a persisted certificate at `CertificatePath` is served without contacting the CA if it covers every
+configured name, has not expired, and is not due for renewal. A restart therefore costs no rate limit. A persisted
+certificate that is valid but due is served while a replacement is ordered. After that, `RenewalScheduler` renews at
+the CA's ARI window, or when one third of the lifetime remains (`Renewal.RenewBefore` overrides this). `RenewNowAsync`
+forces a renewal, for example after changing names or on key compromise.
+
+### Ports
+
+| Challenge (`ChallengeTypes`) | Needs | Endpoint option |
+| --- | --- | --- |
+| `Http01` (default, first) | TCP 80, reachable from the internet at every name's address | `HttpChallengeEndpoint` (default `0.0.0.0:80`) |
+| `TlsAlpn01` (default, second) | TCP 443 | `TlsAlpnEndpoint` (default `0.0.0.0:443`) |
+| `Dns01` | no inbound port; an `IDns01Provider` for your DNS host; the only way to get wildcards | `Dns01Provider`, `ChallengePropagationDelay` |
+
+QUIC uses UDP, so the game's QUIC listener on UDP 443 and the `tls-alpn-01` endpoint on TCP 443 do not conflict. Only
+the listed challenge types are served. List just `Dns01` for a server that must not open TCP ports. The HTTP endpoint
+answers the challenge path and, by default, redirects everything else to HTTPS (`RedirectToHttps`, ADR 0009).
+`EnableHealthEndpoint` adds `/healthz` there. Normal TLS clients on the TLS endpoint get the current certificate; add
+handlers with `TlsEndpointHandlers`. For IP identifiers (RFC 8738), the challenge certificate is also published under the
+reverse-DNS name, which is the SNI the CA sends.
+
+### Hot swap into running listeners
+
+`CertificateBinder` applies the source's current certificate to any number of `ICertificateConsumer`s. It does so
+immediately, and again on every `Changed`:
+
+```csharp
+var httpsSource = new StaticCertificateSource();                 // an HTTPS endpoint's HttpTlsOptions.CertificateSource
+await using var binder = new CertificateBinder(certificates, [
+    CertificateConsumers.FromDelegate(quicListener.UpdateCertificate),   // e.g. a new MsQuic configuration for new connections
+    CertificateConsumers.FromSource(httpsSource),
+]);
+binder.ConsumerFailed += f => logger.Log(f.Exception);
+```
+
+Each consumer switches only new handshakes to the new certificate; established connections are not affected. A
+consumer that throws is reported and does not stop the others. The replaced certificate is disposed only after
+`SupersededCertificateGracePeriod` (default 2 minutes), because handshakes that had already selected it still need its
+private key to sign. On Windows, disposing a PKCS#12-imported certificate deletes its key container. This matches
+ADR 0009: open the new configuration, swap it in, and close the old one when nothing uses it. Stop the listeners before
+disposing the binder, and dispose the binder before the provisioner.
+
+### Staging, production and EAB
+
+Test a deployment against a staging directory (`AcmeDirectories.LetsEncryptStaging`, `BuypassTest`,
+`GoogleTrustServicesTest`). Staging has much higher rate limits but issues untrusted certificates. Then switch
+`DirectoryUrl` to production. The account store records its directory, so switching creates a new account
+automatically. Delete `CertificatePath` when you switch, so that the staging certificate is not served until it is
+due.
+
+ZeroSSL, Google Trust Services and SSL.com require External Account Binding (`AcmeDirectories.KnownCas` lists which
+CAs do). Copy the key id and HMAC key from the CA's dashboard, or from `gcloud publicca external-account-keys create`
+for Google:
+
+```csharp
+DirectoryUrl = AcmeDirectories.ZeroSsl,
+ExternalAccountKeyId = "kid-from-dashboard",
+ExternalAccountHmacKey = secrets["zerossl-eab-hmac"],   // only signs account creation; never stored or logged
+```
+
+SSL.com's RSA directory needs `KeyAlgorithm = AcmeKeyAlgorithm.RS256`. A private CA (Pebble, in-house) needs
+`HttpClient = new HttpClient(AcmeClient.CreateHttpHandler(roots))` so that its root is trusted.
+
+### Static and file certificates
+
+`ServerCertificateOptions.Static(cert)` serves a certificate the application owns. The provisioner never disposes it.
+`ServerCertificateOptions.File(path, password, reloadOnChange: true)` serves a PFX and polls its modification time
+(`ReloadInterval`, default 10 s). Replace the file atomically (write a temporary file, then rename it). A replaced file
+raises `Changed`, and the binder swaps it in like a renewal. A file that cannot be read reports `Failed` and keeps the
+previous certificate.
+
+### Testing
+
+`Tedd.Quicly.Testing.Acme.FakeAcmeServer` is an in-process ACME CA for tests (never reference it from production
+code). Besides callback validation, it validates like a real CA:
+
+* `Http01ValidationHost`/`Port`: `GET /.well-known/acme-challenge/{token}` with the identifier as `Host`, with no
+  redirects followed.
+* `TlsAlpnValidationHost`/`Port`: a TLS handshake with SNI and ALPN `acme-tls/1`, checking the single SAN and the
+  critical `acmeIdentifier` hash.
+* `DnsTxtLookup`: an injected TXT table such as `InMemoryDns01Provider.Lookup`.
+
+`CertificateLifetime`, `UnavailableRequestsRemaining` and `FailValidation` drive the renewal, outage and failure paths.
+Bind every endpoint to `127.0.0.1:0` and pass the bound ports (`CertificateProvisioner.HttpChallengeEndPoint` /
+`TlsEndPoint`) to the fake.

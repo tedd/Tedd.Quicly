@@ -7,4 +7,7 @@
     <ProjectReference Include="..\Tedd.Quicly.Http\Tedd.Quicly.Http.csproj" />
     <ProjectReference Include="..\Tedd.Quicly.Acme\Tedd.Quicly.Acme.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Tedd.Quicly.Server.Tests" />
+  </ItemGroup>
 </Project>

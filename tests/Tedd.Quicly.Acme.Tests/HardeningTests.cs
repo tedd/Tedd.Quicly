@@ -3,7 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using Tedd.Quicly.Acme.Challenges;
 using Tedd.Quicly.Acme.Models;
-using Tedd.Quicly.Acme.Tests.Fake;
+using Tedd.Quicly.Testing.Acme;
 
 namespace Tedd.Quicly.Acme.Tests;
 

@@ -20,6 +20,7 @@
     <Project Path="tests/Tedd.Quicly.Http.Tests/Tedd.Quicly.Http.Tests.csproj" />
     <Project Path="tests/Tedd.Quicly.Http3.Tests/Tedd.Quicly.Http3.Tests.csproj" />
     <Project Path="tests/Tedd.Quicly.Replication.Tests/Tedd.Quicly.Replication.Tests.csproj" />
+    <Project Path="tests/Tedd.Quicly.Server.Tests/Tedd.Quicly.Server.Tests.csproj" />
     <Project Path="tests/Tedd.Quicly.Testing.Tests/Tedd.Quicly.Testing.Tests.csproj" />
     <Project Path="tests/Tedd.Quicly.Transport.MsQuic.Tests/Tedd.Quicly.Transport.MsQuic.Tests.csproj" />
   </Folder>

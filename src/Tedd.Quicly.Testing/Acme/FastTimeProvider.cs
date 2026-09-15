@@ -1,4 +1,4 @@
-namespace Tedd.Quicly.Acme.Tests.Fake;
+namespace Tedd.Quicly.Testing.Acme;
 
 /// <summary>
 /// A <see cref="TimeProvider"/> whose timers fire immediately and advance a simulated clock by the requested due time,

@@ -3,7 +3,7 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Tedd.Quicly.Acme.Models;
 
-namespace Tedd.Quicly.Acme.Tests.Fake;
+namespace Tedd.Quicly.Testing.Acme;
 
 /// <summary>A self-signed in-test root CA that issues leaf certificates from CSRs.</summary>
 public sealed class TestCa : IDisposable

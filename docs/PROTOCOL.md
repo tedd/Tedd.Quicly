@@ -244,16 +244,61 @@ expired auth token, bad or expired session token, admission policy — never dis
 4 server full; 5 reserved; 6 internal error; 7 datagrams required. The effective maximum message size is
 `min(channel.MaxMessageSize, HelloAck.maxMessageSize)`.
 
+Control-message bounds (clarifications; they apply to both endpoints, and a violation is a malformed frame:
+`ProtocolViolation` on the control stream, drop + count for a control datagram):
+
+* The HelloAck table section (present when `tableIncluded` = 1; a `tableIncluded` other than 0 or 1 is
+  malformed) is the §1 canonical table encoding followed by exactly `count` names in the same ascending-id
+  order, each `len varint (≤ 64) + utf8`. It has no length prefix: the receiver finds the `reason` that follows
+  by walking that structure. Channel ids in the section MUST be in [2, 16383].
+* The whole HelloAck, table section included, is one control message, so `Length` ≤ 16384 bounds it too. The
+  table section gets what the other fields leave: 15 756 bytes with a 69-byte session token, a 512-byte reason
+  and worst-case 8-byte varints (roughly 200 channels with 64-byte names, a few thousand with short ones).
+  *(Clarification: version 1 has no multi-frame table response. A server MUST NOT be configured with a channel
+  table whose section exceeds that budget; implementations reject such a table at configuration time.)*
+* `HelloAck.sessionToken` is bounded like Hello's tokens: ≤ 4096 bytes. `HelloAck.status` values other than
+  0–4, 6, 7 and 0xFF are malformed.
+* Hello with `version` ≠ 1: only `magic` and `version` are interpreted (a later version may lay out the rest
+  differently) and the server answers status 1. A wrong `magic` is malformed.
+* Every `channel` field of a control message (LatestAck/LatestReject entries, BulkRequest, KeyRetired) MUST be
+  in [2, 16383]; whether that channel exists and has the right mode is the session layer's check.
+* LatestAck/LatestReject: `count` MUST NOT exceed the remaining body length divided by the smallest entry
+  (6 bytes, 7 with the reason), checked before any entry is read; the whole batch is validated before any entry
+  is applied, so a malformed batch is dropped as a unit. `count` = 0 is well-formed (senders never send it).
+  `LatestReject.reason` values other than 1–4 are malformed.
+* BulkRequest: `offset + length` MUST NOT exceed 2^62−1 (range semantics such as `length > 0` belong to the bulk
+  engine). `code` fields (Close, BulkCancel, BulkReject) accept any u32.
+* Types 0x10–0x17 inside a control datagram, and undefined types (0x00, 0x06–0x0F, 0x18–0xFF) anywhere, are
+  malformed. Channel 0 written as a non-minimal varint (`0x40 0x00`) is malformed, not another channel.
+* Before logging a peer-supplied `reason` or channel name, invalid UTF-8 sequences and every character of
+  Unicode category Cc, Cf (including bidirectional overrides), Zl and Zp are replaced with U+FFFD.
+
 ## 4. Session semantics
 
 ### 4.1 Sessions, tokens, epochs
 
 * `sessionId` is a random 64-bit value chosen by the server; it is an identifier, never a secret.
-* `sessionToken` is minted only by the server: 16 random bytes ‖ HMAC-SHA256(serverKey, random ‖ sessionId ‖
-  epoch ‖ expiry) ‖ expiry u64 — at least 56 bytes. It is rotated in every HelloAck, single-use (an old
-  token is invalid once a resume succeeded or a newer token was issued), expires after `graceMicros`, and is
-  a *locator*, not a credential: a resume MUST also present an `authToken` that the admission policy accepts.
-  Token comparison is constant-time; failed auth attempts are rate-limited per remote address.
+* `sessionToken` is minted only by the server. Layout (69 bytes, integers little-endian):
+  `version u8 (= 1) ‖ sessionId u64 ‖ epoch u32 ‖ expiry i64 ‖ random (16 bytes) ‖ HMAC-SHA256(serverKey, all
+  37 preceding bytes)`. `sessionId` and `epoch` travel in clear (neither is a secret) so the server can verify a
+  token without a lookup; `expiry` is absolute microseconds on the server's clock (issue time + `graceMicros`);
+  the HMAC makes every field tamper-evident. Clients treat the token as opaque bytes. *(Clarification: the
+  earlier layout "16 random bytes ‖ HMAC ‖ expiry, ≥ 56 bytes" did not carry `sessionId`/`epoch`, so the server
+  could not recompute the MAC without already knowing the session.)* It is rotated in every HelloAck, single-use
+  (an old token is invalid once a resume succeeded or a newer token was issued), expires after `graceMicros`,
+  and is a *locator*, not a credential: a resume MUST also present an `authToken` that the admission policy
+  accepts. Token comparison is constant-time; failed auth attempts are rate-limited per remote address.
+  Implementation policy: single use is enforced by a bounded replay cache of the random parts, each entry kept
+  until its token expires; when the cache is full of unexpired entries a presented token is rejected (fail
+  closed: status 3, the client starts a fresh session) rather than an entry evicted. "A newer token was issued"
+  is enforced by the session registry comparing the token's `epoch` with the session's current epoch. Key
+  rotation keeps accepting the previous key until a deadline (typically `graceMicros` after the rotation). The
+  server inspects a presented token at admission and consumes it only when the resume commits, so a resume
+  refused for another reason (status 2, 4 or 7) leaves the token usable. The per-address failure limiter keys
+  IPv4 (and IPv4-mapped IPv6) by address and IPv6 by /64 prefix. It only ever refuses addresses it is tracking:
+  an address with no recorded failures is always admitted, so failures from other addresses never lock a client
+  out. When its bounded table has no room for a newly failing address, the tracked entry closest to fully
+  refilled is evicted (blocked addresses are evicted last).
 * `epoch` is allocated by the server, strictly increasing per `sessionId`, starting at 1; the client's
   `lastEpoch` is informational. Every sequence/version/counter is scoped to the current epoch.
 * A valid resume for a session that still has a live connection replaces that connection (the old one is
@@ -391,3 +436,46 @@ logging.
 Decompression runs on the game thread inside `Poll` (never on a transport thread); compressed messages are
 staged compressed in a pooled lease. Every limit is configurable per channel or per peer, and every violation
 is a counter in the peer's statistics.
+
+## 8. Clarifications (decided by the reference implementation)
+
+Where the sections above leave a choice open, `Tedd.Quicly.Core` (Channels/Framing) decides as follows. Every
+rule below is enforced by the receiver; a violation is a malformed frame with the consequence given in §6.
+Byte-exact examples are in [protocol-vectors.md](protocol-vectors.md).
+
+* **§1 table section.** `flags` bit 7 is reserved and MUST be 0; compression codecs 2 and 3 are rejected in a v1
+  table; `maxMessageSize` is 1 … 16 MiB; names are valid UTF-8 (a name of length 0 is allowed). `count` is at most
+  16 382 and ids are strictly ascending. A name length is a minimal varint, so a 64-byte name takes the two-byte length
+  `0x40 0x40`.
+* **§1 / §3.4 table size.** The table section travels inside the HelloAck (or the ChannelTableRequest answer), whose
+  body is at most 16 383 bytes. With the other HelloAck fields at their worst case (42 bytes of fixed fields and
+  varints, a session token of up to 4 096 bytes, a reason of up to 512 bytes) a table section of at most
+  **11 729 bytes** always fits; each channel costs 6 … 75 bytes (≈ 1 950 unnamed channels). A server whose table
+  section does not fit the frame MUST send `tableIncluded = 0` instead of an oversized frame; implementations should
+  check the section length (`ChannelTableCodec.GetLengthWithNames`) against this budget when the table is built.
+* **§1 defaults.** A channel's local `ExpiryMicros` default is 0 (none) for every mode except
+  `UnreliableSequenced` (2 × the flush interval, §4.5), including `UnreliableUnordered`. `MaxGroups` defaults to 1
+  for `ReliableOrdered` and 0 for datagram-only modes.
+* **§2.1 fragments.** Every fragment carries at least one payload byte, and the last fragment carries between 1
+  and size(fragment 0) bytes. A receiver can therefore bound the total from any single fragment: a non-last
+  fragment of size *s* implies a total ≥ *s* × (FragCount − 1) + 1, the last fragment of size *l* implies a total
+  ≥ *l* × FragCount; if that bound exceeds the effective `MaxMessageSize` (uncompressed), the fragment is dropped.
+* **§2.1 / §3.1 compression.** A compressed payload (`RawLength > 0`) is non-empty and strictly shorter than
+  `RawLength` (for fragments: the bound above is strictly below `RawLength`); anything else is malformed.
+* **§2.2 containers.** `Flags` bits 1–7 are reserved and MUST be 0; `Tick` is ≤ 2^32 − 1; a container holds at
+  least one message; an inner frame whose first byte is `0x01` is a nested container. An inner frame that encodes
+  channel 1 non-minimally is rejected by the inner parse (non-minimal varint).
+* **§3 control stream.** Both directions of the control stream begin with the preamble `0x00`. A unidirectional
+  stream whose preamble names channel 0 is rejected like channel 1 (`UnsupportedChannel`).
+* **§3.1 request ids.** `RequestId` is ≤ 2^32 − 1.
+* **§3.2 large ReliableLatest values.** The group stream's `GroupId` is the value's 32-bit version (≤ 2^32 − 1) and
+  its single message frame is `Length varint, Sequence u32 LE, Key varint, RawLength varint (when Compression ≠ 0),
+  Payload` — the §3.1 framing with the §2.1 `Sequence` field inserted after `Length`. `Sequence` MUST equal
+  `GroupId`; a second message on the stream is malformed.
+* **§3.3 bulk.** `MaxMessageSize` of a Bulk channel bounds `Length` of one transfer (the range one stream carries),
+  not `TotalLength`. `Flags` bits 4–7 MUST be 0 and the hash-algorithm bits 2–3 MUST be 0 (SHA-256; the others are
+  rejected, whether or not bit 0 is set). An unchunked body is exactly `Length` bytes. In a chunked body
+  `ChunkLength ≥ 1`; `RawLength = 0` means the chunk is stored uncompressed, otherwise `ChunkLength < RawLength`;
+  the decoded sizes of all chunks sum to exactly `Length`. Bytes after the body are malformed. The session cap
+  `HelloAck.maxMessageSize` bounds message frames only (datagram messages, ordered and group stream frames); it does
+  not apply to Bulk transfers, whose `Length` is bounded by the Bulk channel's own `MaxMessageSize` alone.

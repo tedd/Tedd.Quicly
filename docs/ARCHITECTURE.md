@@ -162,9 +162,9 @@ target selection for datagrams completes inline.
   tick (expiry deadlines, retry timestamps, dirty bits) are stored structure-of-arrays so `Vector256` scans
   and popcounts apply. Keys are hashed with linear probing over SoA `keys[]`/`slots[]` (fmix64, power-of-two
   capacity, load ≤ 0.5) or indexed directly for `KeySpace.Dense`.
-* `SendEntry` is 64 bytes and **contains** its `QUIC_BUFFER` pair (header scratch + payload pointer) so the
-  native library is handed pointers into the entry array; gather sends for one flush use contiguous
-  entries. Nothing the transport was given a pointer to moves or is reused before the matching completion.
+* `SendEntry` is 64 bytes and contains its adjacent `QUIC_BUFFER` pair (header + payload segments); the
+  header bytes live in a cold array of 32-byte blocks, and stream gathers copy the segment pairs into a
+  per-submission contiguous segment array from a native arena (ADR 0008 invariant 1). Nothing the transport was given a pointer to moves or is reused before the matching completion.
 
 ### 4.1 Send ownership
 

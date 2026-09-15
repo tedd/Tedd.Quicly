@@ -79,6 +79,10 @@ NestedContainer, BadLength, ...
   `QUIC_BUFFER[2]` given to the transport. Cold SoA arrays indexed by slot: `BufferLease[] Leases`, `ulong[] Keys`, `uint[] Sequences`,
   `ulong[] Contexts`, `long[] Deadlines`, `int[] Next` (intrusive queue links), `int[] BatchHead/Count` (container membership),
   `nint[] PinHandles`.
+  *Amended (review of the framing and state modules):* the header bytes move to a cold `NativeArray` of 32-byte
+  blocks indexed by slot (the maximum datagram header is 24 bytes, so a 16-byte in-entry scratch is too small),
+  and stream gathers use per-submission contiguous segment arrays from a native `SegmentArena` because entries
+  are not adjacent `QUIC_BUFFER`s (ADR 0008 invariant 1).
 * `ReceiveEntry` (≤ 64 B): `ushort Channel`, `ReceiveFlags Flags`, `uint Sequence`, `ulong Key`, `BufferLease Lease`, `int Length`,
   `int RawLength`, `uint ReceivedMicrosDelta`, `uint SenderTick`, `uint RequestId`.
 * `KeyTable`: open addressing, linear probing, SoA `ulong[] keys`, `int[] slots`, power-of-two capacity, load ≤ 0.5, `fmix64`,

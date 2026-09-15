@@ -5,11 +5,14 @@
 ## Invariants
 
 1. **Nothing the transport was given a pointer to moves or is reused before the matching completion.**
-   `SendEntry` (64 bytes, native memory, contains its `QUIC_BUFFER` pair and a 16-byte header scratch area)
-   stays reserved until: stream sends → `OnStreamSendCompleted`; datagrams → the *final* datagram send state
-   (`Acknowledged`, `AcknowledgedSpurious`, `LostDiscarded`, `Canceled`), even though the payload block is
-   released at `Sent`. Gather sends for one flush use contiguous entries so one `StreamSend` receives one
-   contiguous `QUIC_BUFFER[]`.
+   `SendEntry` (64 bytes, native memory) holds its adjacent `QUIC_BUFFER` pair (header segment + payload
+   segment), so a single-entry datagram passes `&entry.Header` as a two-element array. The header bytes live in
+   a cold native array of 32-byte header blocks indexed by slot (the largest datagram header is 24 bytes).
+   Entries are not adjacent `QUIC_BUFFER`s, so each stream submission copies the entries' segment pairs into a
+   per-submission contiguous `QUIC_BUFFER[]` taken from a native segment arena; that array, the header blocks and
+   the payloads stay reserved until `OnStreamSendCompleted`. Datagrams stay reserved until the *final* datagram
+   send state (`Acknowledged`, `AcknowledgedSpurious`, `LostDiscarded`, `Canceled`), even though the payload
+   block is released at `Sent`.
 2. **Contexts are generation-tagged**: `(generation << 32) | slot`. Every callback validates the generation;
    a mismatch is ignored and counted.
 3. **Publish before the call.** A completion can arrive on the transport thread before the send API

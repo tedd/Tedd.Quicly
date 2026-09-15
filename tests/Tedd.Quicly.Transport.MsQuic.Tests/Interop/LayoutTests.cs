@@ -283,7 +283,7 @@ public class LayoutTests
         Assert.Contains((16, "Buffers"), stream.Fields);
         StructEntry hash = dump.Structs.Single(s => s.Name == "QUIC_CERTIFICATE_HASH_STORE");
         Assert.Contains((24, "StoreName"), hash.Fields);
-        StructEntry addr = dump.Structs.Single(s => s.Name == "QUIC_ADDR");
+        StructEntry addr = dump.Structs.Single(s => s.Name == "QuicAddr");
         Assert.Equal(3, addr.Fields.Count);
         Assert.Contains(dump.Enums, e => e.Name == "QUIC_SEND_FLAGS" && e.Members.Contains(("FIN", 4L)));
     }

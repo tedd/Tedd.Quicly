@@ -88,24 +88,61 @@ public class CertificateHelperTests
     }
 
     [Fact]
-    public void Server_configuration_accepts_an_ephemeral_certificate_through_pkcs12()
+    public void Server_configuration_accepts_an_ephemeral_certificate_in_auto_mode()
     {
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration();
         using X509Certificate2 ephemeral = CreateEphemeral(ecdsa: true);
-        using MsQuicConfiguration config = MsQuicConfiguration.CreateServer(registration, ["x"], ephemeral);
+        using MsQuicConfiguration config = MsQuicConfiguration.CreateServer(registrationScope.Registration, ["x"], ephemeral);
         Assert.True(config.HasCredential);
-        Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12, config.CredentialType);
+        // Schannel rejects PKCS#12, so Auto re-imports the ephemeral key into a persisted container and uses a context.
+        bool schannel = MsQuicApi.Instance.TlsProvider == QUIC_TLS_PROVIDER.SCHANNEL;
+        Assert.Equal(schannel ? QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT : QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12, config.CredentialType);
+        Assert.Equal(schannel, config.OwnedCertificate is not null);
         Assert.False(config.IndicatesPortableCertificate);
     }
 
-    [Fact]
-    public void Server_configuration_persists_an_ephemeral_certificate_for_certificate_context()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Certificate_context_path_persists_an_ephemeral_key_and_close_deletes_it(bool ecdsa)
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "CERTIFICATE_CONTEXT is Windows only");
-        using var registration = new MsQuicRegistration();
-        using X509Certificate2 ephemeral = CreateEphemeral(ecdsa: true);
-        using MsQuicConfiguration config = MsQuicConfiguration.CreateServer(registration, ["x"], ephemeral, mode: MsQuicServerCredentialMode.CertificateContext);
+        using var registrationScope = new TestRegistration();
+        using X509Certificate2 ephemeral = CreateEphemeral(ecdsa);
+        MsQuicConfiguration config = MsQuicConfiguration.CreateServer(registrationScope.Registration, ["x"], ephemeral, mode: MsQuicServerCredentialMode.CertificateContext);
         Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT, config.CredentialType);
+        X509Certificate2? owned = config.OwnedCertificate;
+        Assert.NotNull(owned);
+        Assert.NotSame(ephemeral, owned);
+        Assert.False(MsQuicCertificateHelper.HasEphemeralPrivateKey(owned));
+        string container = PersistedKeyName(owned);
+        Assert.True(KeyContainerExists(container), container);
+
+        config.Close();
+        Assert.Null(config.OwnedCertificate);
+        Assert.False(KeyContainerExists(container), container);
+    }
+
+    [Fact]
+    public void Certificate_context_path_uses_an_already_persisted_key_as_is()
+    {
+        Assert.SkipUnless(OperatingSystem.IsWindows(), "CERTIFICATE_CONTEXT is Windows only");
+        using var registrationScope = new TestRegistration();
+        using X509Certificate2 cert = TestCertificates.CreateSelfSigned("CN=persisted", TimeSpan.FromHours(1));
+        using MsQuicConfiguration config = MsQuicConfiguration.CreateServer(registrationScope.Registration, ["x"], cert, mode: MsQuicServerCredentialMode.CertificateContext);
+        Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT, config.CredentialType);
+        Assert.Null(config.OwnedCertificate);
+    }
+
+    private static bool KeyContainerExists(string name) => OperatingSystem.IsWindows() && CngKey.Exists(name);
+
+    private static string PersistedKeyName(X509Certificate2 certificate)
+    {
+        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
+        using ECDsa? ecdsa = certificate.GetECDsaPrivateKey();
+        if (ecdsa is ECDsaCng ecdsaCng) return ecdsaCng.Key.KeyName!;
+        using RSA? rsa = certificate.GetRSAPrivateKey();
+        return ((RSACng)rsa!).Key.KeyName!;
     }
 
     [Fact]

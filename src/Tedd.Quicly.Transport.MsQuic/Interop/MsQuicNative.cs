@@ -24,6 +24,11 @@ public static unsafe partial class MsQuicNative
         NativeLibrary.SetDllImportResolver(typeof(MsQuicNative).Assembly, ResolveLibrary);
     }
 
+    /// <summary>Runs the static constructor (which registers the resolver); calling any static member does the same.</summary>
+    internal static void EnsureInitialized()
+    {
+    }
+
     /// <summary>Opens the API table for the requested major version (2). Returns a <c>QUIC_STATUS</c>.</summary>
     [LibraryImport(LibraryName)]
     [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -55,12 +60,15 @@ public static unsafe partial class MsQuicNative
     /// <see cref="IntPtr.Zero"/> hands the decision back to the runtime). Other names are never touched.
     /// </summary>
     internal static IntPtr ResolveLibrary(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
+        => ResolveLibrary(libraryName, assembly, searchPath, RuntimeDirectory);
+
+    /// <summary>Resolver body with the runtime directory as a parameter (null or missing file: default probing only).</summary>
+    internal static IntPtr ResolveLibrary(string libraryName, Assembly assembly, DllImportSearchPath? searchPath, string? runtimeDirectory)
     {
         if (!string.Equals(libraryName, LibraryName, StringComparison.Ordinal))
         {
             return IntPtr.Zero;
         }
-        string? runtimeDirectory = RuntimeDirectory;
         if (runtimeDirectory is not null)
         {
             string candidate = Path.Combine(runtimeDirectory, PlatformFileName);

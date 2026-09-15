@@ -17,6 +17,9 @@ namespace Tedd.Quicly.Transport.MsQuic;
 /// a failure status no completion follows. A completion may arrive before <see cref="Send"/> returns.</para>
 /// <para><b>Threading.</b> Callbacks are serialised with the owning connection's callbacks on MsQuic worker
 /// threads. <see cref="Start"/> may deliver <c>StartComplete</c> inline before it returns.</para>
+/// <para><b>Status codes.</b> Calls made off the connection's worker thread are queued and return
+/// <c>QUIC_STATUS_PENDING</c>; test acceptance with <see cref="MsQuicStatus.Succeeded"/>, never against
+/// <c>QUIC_STATUS_SUCCESS</c>.</para>
 /// <para><b>Failure.</b> An exception escaping <see cref="Events"/> is recorded in <see cref="LastCallbackException"/>
 /// and poisons the owning connection (see <see cref="MsQuicConnection.Poison"/>).</para>
 /// </remarks>
@@ -113,25 +116,34 @@ public sealed unsafe class MsQuicStream : IDisposable
 
     /// <summary>
     /// Starts a locally-opened stream. Completion is reported by <see cref="IMsQuicStreamEvents.StartComplete"/>,
-    /// possibly inline. With <see cref="QUIC_STREAM_START_FLAGS.FAIL_BLOCKED"/> a stream-limit failure is returned
-    /// as <c>QUIC_STATUS_STREAM_LIMIT_REACHED</c> (and reported in StartComplete); add
+    /// possibly inline. Returns <c>QUIC_STATUS_PENDING</c> when the start was queued (the normal case off the worker
+    /// thread) and <c>QUIC_STATUS_SUCCESS</c> when it ran inline; both mean accepted. With
+    /// <see cref="QUIC_STREAM_START_FLAGS.FAIL_BLOCKED"/> a stream-limit failure is reported by StartComplete (and returned
+    /// directly when the start runs inline) as <c>QUIC_STATUS_STREAM_LIMIT_REACHED</c>; add
     /// <see cref="QUIC_STREAM_START_FLAGS.SHUTDOWN_ON_FAIL"/> to have MsQuic shut the stream down on failure.
+    /// Flags the loaded library does not know (<see cref="MsQuicApi.SupportedStartFlags"/>) are refused with
+    /// <c>QUIC_STATUS_NOT_SUPPORTED</c> without calling MsQuic.
     /// </summary>
     public int Start(QUIC_STREAM_START_FLAGS flags)
     {
         ObjectDisposedException.ThrowIf(_handle == null, this);
+        if ((flags & ~_api.SupportedStartFlags) != 0) return MsQuicStatus.QUIC_STATUS_NOT_SUPPORTED;
         return _api.Table->StreamStart(_handle, flags);
     }
 
     /// <summary>
-    /// Queues <paramref name="bufferCount"/> gathered buffers for sending. Returns the status; no allocation.
+    /// Queues <paramref name="bufferCount"/> gathered buffers for sending. Returns <c>QUIC_STATUS_PENDING</c> (queued) or
+    /// <c>QUIC_STATUS_SUCCESS</c> (inline) on acceptance; no allocation.
     /// <see cref="QUIC_SEND_FLAGS.FIN"/> closes the send direction after this data; <see cref="QUIC_SEND_FLAGS.START"/>
-    /// starts the stream implicitly; <see cref="QUIC_SEND_FLAGS.DELAY_SEND"/> hints that more data follows.
+    /// starts the stream implicitly; <see cref="QUIC_SEND_FLAGS.DELAY_SEND"/> hints that more data follows. Flags the
+    /// loaded library does not know (<see cref="MsQuicApi.SupportedSendFlags"/>) are refused with
+    /// <c>QUIC_STATUS_NOT_SUPPORTED</c> without calling MsQuic (and without a completion).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int Send(QUIC_BUFFER* buffers, uint bufferCount, QUIC_SEND_FLAGS flags, void* clientContext)
     {
         if (_handle == null) ThrowDisposed();
+        if ((flags & ~_api.SupportedSendFlags) != 0) return MsQuicStatus.QUIC_STATUS_NOT_SUPPORTED;
         return _api.Table->StreamSend(_handle, buffers, bufferCount, flags, clientContext);
     }
 
@@ -205,6 +217,12 @@ public sealed unsafe class MsQuicStream : IDisposable
     public void Dispose() => Close();
 
     private void ThrowDisposed() => throw new ObjectDisposedException(nameof(MsQuicStream));
+
+    /// <summary>The native callback, so tests can dispatch synthetic events through the full callback path.</summary>
+    internal static delegate* unmanaged[Cdecl]<QUIC_HANDLE*, void*, QUIC_STREAM_EVENT*, int> NativeCallbackPointer => &NativeCallback;
+
+    /// <summary>The context handed to MsQuic for this object (a <see cref="GCHandle"/>).</summary>
+    internal void* NativeContext => (void*)GCHandle.ToIntPtr(_gcHandle);
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static int NativeCallback(QUIC_HANDLE* handle, void* context, QUIC_STREAM_EVENT* evt)

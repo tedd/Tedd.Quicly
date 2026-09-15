@@ -138,12 +138,16 @@ public sealed unsafe class MsQuicConnection : IDisposable
     /// Queues a datagram made of <paramref name="bufferCount"/> gathered buffers. The buffers and the buffer array
     /// must stay valid until <see cref="IMsQuicConnectionEvents.DatagramSendStateChanged"/> reports
     /// <c>SENT</c>/<c>CANCELED</c> for <paramref name="clientContext"/>; the context is reported until a final
-    /// state. On a failure status no event follows. No allocation.
+    /// state. Acceptance is <c>QUIC_STATUS_PENDING</c> (or <c>QUIC_STATUS_SUCCESS</c> inline); on a failure status no
+    /// event follows. No allocation. Flags the loaded library does not know
+    /// (<see cref="MsQuicApi.SupportedSendFlags"/>, e.g. <c>CANCEL_ON_BLOCKED</c> before 2.4) are refused with
+    /// <c>QUIC_STATUS_NOT_SUPPORTED</c> without calling MsQuic.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int SendDatagram(QUIC_BUFFER* buffers, uint bufferCount, QUIC_SEND_FLAGS flags, void* clientContext)
     {
         if (_handle == null) ThrowDisposed();
+        if ((flags & ~_api.SupportedSendFlags) != 0) return MsQuicStatus.QUIC_STATUS_NOT_SUPPORTED;
         return _api.Table->DatagramSend(_handle, buffers, bufferCount, flags, clientContext);
     }
 
@@ -206,7 +210,11 @@ public sealed unsafe class MsQuicConnection : IDisposable
         return _api.SetParam(_handle, MsQuicParam.QUIC_PARAM_CONN_SETTINGS, in settings);
     }
 
-    /// <summary>Applies a settings builder to a live connection.</summary>
+    /// <summary>
+    /// Applies a settings builder to a live connection. Start from <see cref="MsQuicSettings.Empty"/>: the default
+    /// builder carries handshake-time settings (MTU bounds, resumption level, ...) that MsQuic refuses on a live
+    /// connection with <c>QUIC_STATUS_INVALID_PARAMETER</c>.
+    /// </summary>
     public int UpdateSettings(MsQuicSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
@@ -214,18 +222,20 @@ public sealed unsafe class MsQuicConnection : IDisposable
         return UpdateSettings(in native);
     }
 
-    /// <summary>Raises (never lowers) the number of unidirectional streams the peer may open (<c>QUIC_PARAM_CONN_LOCAL_UNIDI_STREAM_COUNT</c>).</summary>
-    public int SetLocalUnidiStreamCount(ushort count)
+    /// <summary>
+    /// Changes how many bidirectional / unidirectional streams the peer may have open at once
+    /// (<c>PeerBidiStreamCount</c> / <c>PeerUnidiStreamCount</c> through <c>QUIC_PARAM_CONN_SETTINGS</c>; the
+    /// <c>QUIC_PARAM_CONN_LOCAL_*_STREAM_COUNT</c> parameters are read-only). Raising a limit sends MAX_STREAMS and
+    /// the peer sees <see cref="IMsQuicConnectionEvents.StreamsAvailable"/>; QUIC never takes stream credit back,
+    /// so a lower value only limits future credit. No allocation.
+    /// </summary>
+    public int UpdatePeerStreamLimits(ushort bidirectional, ushort unidirectional)
     {
         ObjectDisposedException.ThrowIf(_handle == null, this);
-        return _api.SetParam(_handle, MsQuicParam.QUIC_PARAM_CONN_LOCAL_UNIDI_STREAM_COUNT, in count);
-    }
-
-    /// <summary>Raises (never lowers) the number of bidirectional streams the peer may open (<c>QUIC_PARAM_CONN_LOCAL_BIDI_STREAM_COUNT</c>).</summary>
-    public int SetLocalBidiStreamCount(ushort count)
-    {
-        ObjectDisposedException.ThrowIf(_handle == null, this);
-        return _api.SetParam(_handle, MsQuicParam.QUIC_PARAM_CONN_LOCAL_BIDI_STREAM_COUNT, in count);
+        QUIC_SETTINGS settings = default;
+        settings.SetPeerBidiStreamCount(bidirectional);
+        settings.SetPeerUnidiStreamCount(unidirectional);
+        return _api.SetParam(_handle, MsQuicParam.QUIC_PARAM_CONN_SETTINGS, in settings);
     }
 
     /// <summary>
@@ -306,6 +316,12 @@ public sealed unsafe class MsQuicConnection : IDisposable
         IsPoisoned = true;
         _api.Table->ConnectionShutdown(_handle, QUIC_CONNECTION_SHUTDOWN_FLAGS.NONE, CallbackFailureErrorCode);
     }
+
+    /// <summary>The native callback, so tests can dispatch synthetic events through the full callback path.</summary>
+    internal static delegate* unmanaged[Cdecl]<QUIC_HANDLE*, void*, QUIC_CONNECTION_EVENT*, int> NativeCallbackPointer => &NativeCallback;
+
+    /// <summary>The context handed to MsQuic for this object (a <see cref="GCHandle"/>).</summary>
+    internal void* NativeContext => (void*)GCHandle.ToIntPtr(_gcHandle);
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static int NativeCallback(QUIC_HANDLE* handle, void* context, QUIC_CONNECTION_EVENT* evt)

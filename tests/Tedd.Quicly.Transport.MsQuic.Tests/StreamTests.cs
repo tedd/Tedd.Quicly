@@ -103,7 +103,7 @@ public class StreamTests
         Assert.False(clientStream.IsUnidirectional);
         Assert.Same(client, clientStream.Connection);
 
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, clientStream.Start(QUIC_STREAM_START_FLAGS.NONE));
+        TestStatus.AssertAccepted(clientStream.Start(QUIC_STREAM_START_FLAGS.NONE));
         (int startStatus, ulong id, _) = await clientStreamEvents.StartCompleteTcs.Within();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, startStatus);
         Assert.Equal(id, clientStream.Id);
@@ -121,7 +121,7 @@ public class StreamTests
         }
         try
         {
-            Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, buffers.SendOn(clientStream, QUIC_SEND_FLAGS.FIN, 42));
+            TestStatus.AssertAccepted(buffers.SendOn(clientStream, QUIC_SEND_FLAGS.FIN, 42));
 
             (nint context, bool canceled) = await clientStreamEvents.SendCompleteTcs.Within();
             Assert.Equal(42, context);
@@ -165,7 +165,7 @@ public class StreamTests
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, server.OpenStream(QUIC_STREAM_OPEN_FLAGS.UNIDIRECTIONAL, serverStreamEvents, out MsQuicStream? serverStream));
         loopback.Track(serverStream!);
         Assert.True(serverStream!.IsUnidirectional);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, serverStream.Start(QUIC_STREAM_START_FLAGS.IMMEDIATE | QUIC_STREAM_START_FLAGS.PRIORITY_WORK));
+        TestStatus.AssertAccepted(serverStream.Start(QUIC_STREAM_START_FLAGS.IMMEDIATE | QUIC_STREAM_START_FLAGS.PRIORITY_WORK));
         (int status, ulong id, _) = await serverStreamEvents.StartCompleteTcs.Within();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, status);
         Assert.Equal(3UL, id);
@@ -174,7 +174,7 @@ public class StreamTests
         using var block = new NativeBlock(hello.Length);
         block.CopyFrom(hello);
         using NativeBuffers buffer = NativeBuffers.Single(block);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, buffer.SendOn(serverStream, QUIC_SEND_FLAGS.FIN | QUIC_SEND_FLAGS.DELAY_SEND, 0));
+        TestStatus.AssertAccepted(buffer.SendOn(serverStream, QUIC_SEND_FLAGS.FIN | QUIC_SEND_FLAGS.DELAY_SEND, 0));
 
         MsQuicStream clientStream = await clientEvents.FirstPeerStreamTcs.Within();
         Assert.True(clientStream.IsPeerStarted);
@@ -203,7 +203,7 @@ public class StreamTests
         var first = new StreamRecorder();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, client.OpenStream(QUIC_STREAM_OPEN_FLAGS.UNIDIRECTIONAL, first, out MsQuicStream? firstStream));
         loopback.Track(firstStream!);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, firstStream!.Start(QUIC_STREAM_START_FLAGS.FAIL_BLOCKED | QUIC_STREAM_START_FLAGS.SHUTDOWN_ON_FAIL));
+        TestStatus.AssertAccepted(firstStream!.Start(QUIC_STREAM_START_FLAGS.FAIL_BLOCKED | QUIC_STREAM_START_FLAGS.SHUTDOWN_ON_FAIL));
         (int status, _, _) = await first.StartCompleteTcs.Within();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, status);
 
@@ -211,19 +211,20 @@ public class StreamTests
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, client.OpenStream(QUIC_STREAM_OPEN_FLAGS.UNIDIRECTIONAL, second, out MsQuicStream? secondStream));
         loopback.Track(secondStream!);
         status = secondStream!.Start(QUIC_STREAM_START_FLAGS.FAIL_BLOCKED | QUIC_STREAM_START_FLAGS.SHUTDOWN_ON_FAIL);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_STREAM_LIMIT_REACHED, status);
+        // Off the worker thread the start is queued (PENDING); inline it fails straight away. Either way StartComplete reports the limit.
+        Assert.True(status == MsQuicStatus.QUIC_STATUS_STREAM_LIMIT_REACHED || status == MsQuicStatus.QUIC_STATUS_PENDING, MsQuicStatus.GetName(status));
         (status, _, _) = await second.StartCompleteTcs.Within();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_STREAM_LIMIT_REACHED, status);
         await second.ShutdownCompleteTcs.Within();
 
         // Raise the limit on the server; the client sees STREAMS_AVAILABLE and can start another stream.
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, server.UpdateSettings(new MsQuicSettings { PeerUnidiStreamCount = 2 }));
+        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, server.UpdatePeerStreamLimits(16, 2));
         Assert.True(await TestTimeouts.WaitUntilAsync(() => clientEvents.StreamsAvailableHistory.Count >= 2, TestTimeouts.Default));
 
         var third = new StreamRecorder();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, client.OpenStream(QUIC_STREAM_OPEN_FLAGS.UNIDIRECTIONAL, third, out MsQuicStream? thirdStream));
         loopback.Track(thirdStream!);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, thirdStream!.Start(QUIC_STREAM_START_FLAGS.FAIL_BLOCKED | QUIC_STREAM_START_FLAGS.SHUTDOWN_ON_FAIL));
+        TestStatus.AssertAccepted(thirdStream!.Start(QUIC_STREAM_START_FLAGS.FAIL_BLOCKED | QUIC_STREAM_START_FLAGS.SHUTDOWN_ON_FAIL));
         (status, _, _) = await third.StartCompleteTcs.Within();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, status);
 
@@ -273,14 +274,14 @@ public class StreamTests
         b.FillPattern(ChunkSize);
         using NativeBuffers bufA = NativeBuffers.Single(a);
         using NativeBuffers bufB = NativeBuffers.Single(b);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, bufA.SendOn(clientStream!, QUIC_SEND_FLAGS.START, 1));
+        TestStatus.AssertAccepted(bufA.SendOn(clientStream!, QUIC_SEND_FLAGS.START, 1));
 
         MsQuicStream serverStream = await serverEvents.FirstPeerStreamTcs.Within();
         Assert.NotNull(serverStreamEvents);
         ulong held = await serverStreamEvents.FirstReceiveTcs.Within();
         Assert.True(held > 0);
 
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, bufB.SendOn(clientStream!, QUIC_SEND_FLAGS.FIN, 2));
+        TestStatus.AssertAccepted(bufB.SendOn(clientStream!, QUIC_SEND_FLAGS.FIN, 2));
         await Task.Delay(300);
         Assert.Equal(1, Volatile.Read(ref serverStreamEvents.Calls));
         Assert.False(serverStreamEvents.FinTcs.Task.IsCompleted);
@@ -308,18 +309,18 @@ public class StreamTests
         using var a = new NativeBlock(1000);
         a.FillPattern(0);
         using NativeBuffers buf = NativeBuffers.Single(a);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, buf.SendOn(clientStream!, QUIC_SEND_FLAGS.START, 1));
+        TestStatus.AssertAccepted(buf.SendOn(clientStream!, QUIC_SEND_FLAGS.START, 1));
 
         MsQuicStream serverStream = await serverEvents.FirstPeerStreamTcs.Within();
         var serverStreamEvents = (StreamRecorder)serverStream.Events;
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref serverStreamEvents.ReceivedBytes) == 1000, TestTimeouts.Default));
 
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, serverStream.ReceiveSetEnabled(false));
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, buf.SendOn(clientStream!, QUIC_SEND_FLAGS.FIN, 2));
+        TestStatus.AssertAccepted(serverStream.ReceiveSetEnabled(false));
+        TestStatus.AssertAccepted(buf.SendOn(clientStream!, QUIC_SEND_FLAGS.FIN, 2));
         await Task.Delay(300);
         Assert.Equal(1000, Volatile.Read(ref serverStreamEvents.ReceivedBytes));
 
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, serverStream.ReceiveSetEnabled(true));
+        TestStatus.AssertAccepted(serverStream.ReceiveSetEnabled(true));
         await serverStreamEvents.FinTcs.Within();
         Assert.Equal(2000, Volatile.Read(ref serverStreamEvents.ReceivedBytes));
         await clientStreamEvents.AllSendsCompleteTcs.Within();
@@ -339,16 +340,16 @@ public class StreamTests
         loopback.Track(clientStream1!);
         using var block = new NativeBlock(100);
         using NativeBuffers buf = NativeBuffers.Single(block);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, buf.SendOn(clientStream1!, QUIC_SEND_FLAGS.START, 0));
+        TestStatus.AssertAccepted(buf.SendOn(clientStream1!, QUIC_SEND_FLAGS.START, 0));
         MsQuicStream serverStream1 = await serverEvents.FirstPeerStreamTcs.Within();
         var serverEvents1 = (StreamRecorder)serverStream1.Events;
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref serverEvents1.ReceivedBytes) == 100, TestTimeouts.Default));
 
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, clientStream1!.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT_SEND, 0x77));
+        TestStatus.AssertAccepted(clientStream1!.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT_SEND, 0x77));
         Assert.Equal(0x77UL, await serverEvents1.PeerSendAbortedTcs.Within());
         Assert.False(await clientEvents1.SendShutdownCompleteTcs.Within());
 
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, serverStream1.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT_SEND, 0x99));
+        TestStatus.AssertAccepted(serverStream1.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT_SEND, 0x99));
         Assert.Equal(0x99UL, await clientEvents1.PeerSendAbortedTcs.Within());
         await clientEvents1.ShutdownCompleteTcs.Within();
         await serverEvents1.ShutdownCompleteTcs.Within();
@@ -356,14 +357,14 @@ public class StreamTests
         var clientEvents2 = new StreamRecorder();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, client.OpenStream(QUIC_STREAM_OPEN_FLAGS.NONE, clientEvents2, out MsQuicStream? clientStream2));
         loopback.Track(clientStream2!);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, buf.SendOn(clientStream2!, QUIC_SEND_FLAGS.START, 0));
+        TestStatus.AssertAccepted(buf.SendOn(clientStream2!, QUIC_SEND_FLAGS.START, 0));
         MsQuicStream serverStream2 = await TestTimeouts.WaitUntilAsync(() => serverEvents.PeerStreams.Count == 2, TestTimeouts.Default)
             ? serverEvents.PeerStreams.Single(s => s != serverStream1)
             : throw new TimeoutException("second peer stream");
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, serverStream2.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT_RECEIVE, 0x88));
+        TestStatus.AssertAccepted(serverStream2.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT_RECEIVE, 0x88));
         Assert.Equal(0x88UL, await clientEvents2.PeerReceiveAbortedTcs.Within());
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, clientStream2!.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT, 0x11));
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, serverStream2.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT, 0x22));
+        TestStatus.AssertAccepted(clientStream2!.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT, 0x11));
+        TestStatus.AssertAccepted(serverStream2.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT, 0x22));
         await clientEvents2.ShutdownCompleteTcs.Within();
         await ((StreamRecorder)serverStream2.Events).ShutdownCompleteTcs.Within();
     }
@@ -379,27 +380,27 @@ public class StreamTests
         loopback.Track(clientStream!);
         using var block = new NativeBlock(10);
         using NativeBuffers buf = NativeBuffers.Single(block);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, buf.SendOn(clientStream!, QUIC_SEND_FLAGS.START, 0));
+        TestStatus.AssertAccepted(buf.SendOn(clientStream!, QUIC_SEND_FLAGS.START, 0));
 
         Task aborted = Task.WhenAny(clientStreamEvents.PeerReceiveAbortedTcs.Task, clientStreamEvents.PeerSendAbortedTcs.Task);
         await aborted.WaitAsync(TestTimeouts.Default);
         Assert.Empty(serverEvents.PeerStreams);
         Assert.False(serverEvents.FirstPeerStreamTcs.Task.IsCompleted);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, clientStream!.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT, 0));
+        TestStatus.AssertAccepted(clientStream!.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT, 0));
         await clientStreamEvents.ShutdownCompleteTcs.Within();
     }
 
     [Fact]
     public async Task Peer_stream_handler_exception_rejects_the_stream_and_poisons_the_connection()
     {
-        using var loopback = new Loopback { ServerEventsFactory = _ => new ThrowingPeerStreamEvents() };
+        using var loopback = new Loopback { ServerEventsFactory = _ => new ConnectionRecorder { ThrowOnPeerStream = true } };
         (MsQuicConnection client, ConnectionRecorder clientEvents, MsQuicConnection server, _) = await loopback.ConnectPairAsync();
         var clientStreamEvents = new StreamRecorder();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, client.OpenStream(QUIC_STREAM_OPEN_FLAGS.NONE, clientStreamEvents, out MsQuicStream? clientStream));
         loopback.Track(clientStream!);
         using var block = new NativeBlock(10);
         using NativeBuffers buf = NativeBuffers.Single(block);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, buf.SendOn(clientStream!, QUIC_SEND_FLAGS.START, 0));
+        TestStatus.AssertAccepted(buf.SendOn(clientStream!, QUIC_SEND_FLAGS.START, 0));
 
         Assert.True(await TestTimeouts.WaitUntilAsync(() => server.IsPoisoned, TestTimeouts.Default));
         Assert.IsType<InvalidOperationException>(server.LastCallbackException);
@@ -408,10 +409,6 @@ public class StreamTests
         await clientStreamEvents.ShutdownCompleteTcs.Within();
     }
 
-    private sealed class ThrowingPeerStreamEvents : IMsQuicConnectionEvents
-    {
-        public bool PeerStreamStarted(MsQuicConnection connection, MsQuicStream stream, QUIC_STREAM_OPEN_FLAGS flags) => throw new InvalidOperationException("no streams for you");
-    }
 
     [Fact]
     public async Task Stream_parameters_and_lifetime_rules()
@@ -422,6 +419,7 @@ public class StreamTests
         var events = new StreamRecorder();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, client.OpenStream(QUIC_STREAM_OPEN_FLAGS.NONE, events, out MsQuicStream? stream));
         Assert.NotNull(stream);
+        loopback.Track(stream);
         Assert.Same(events, stream.Events);
         stream.Events = null!;
         Assert.NotNull(stream.Events);
@@ -439,9 +437,9 @@ public class StreamTests
         Assert.Equal(mid, priority);
         Assert.Throws<ArgumentException>(() => stream.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT | QUIC_STREAM_SHUTDOWN_FLAGS.INLINE, 0));
 
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, stream.Start(QUIC_STREAM_START_FLAGS.NONE));
+        TestStatus.AssertAccepted(stream.Start(QUIC_STREAM_START_FLAGS.NONE));
         await events.StartCompleteTcs.Within();
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, stream.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT, 1));
+        TestStatus.AssertAccepted(stream.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT, 1));
         await events.ShutdownCompleteTcs.Within();
 
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, client.OpenStream(QUIC_STREAM_OPEN_FLAGS.UNIDIRECTIONAL, null, out MsQuicStream? unstarted));
@@ -476,7 +474,7 @@ public class StreamTests
         var events = new ThrowingStreamEvents();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, client.OpenStream(QUIC_STREAM_OPEN_FLAGS.NONE, events, out MsQuicStream? stream));
         loopback.Track(stream!);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, stream!.Start(QUIC_STREAM_START_FLAGS.NONE));
+        TestStatus.AssertAccepted(stream!.Start(QUIC_STREAM_START_FLAGS.NONE));
         Assert.True(await TestTimeouts.WaitUntilAsync(() => stream.LastCallbackException is not null, TestTimeouts.Default));
         Assert.IsType<InvalidOperationException>(stream.LastCallbackException);
         Assert.Same(stream.LastCallbackException, client.LastCallbackException);
@@ -514,9 +512,9 @@ public class StreamTests
         };
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, client.OpenStream(QUIC_STREAM_OPEN_FLAGS.NONE, events, out MsQuicStream? stream));
         loopback.Track(stream!);
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, stream!.Start(QUIC_STREAM_START_FLAGS.NONE));
+        TestStatus.AssertAccepted(stream!.Start(QUIC_STREAM_START_FLAGS.NONE));
         await events.StartCompleteTcs.Within();
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, stream.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT, 0));
+        TestStatus.AssertAccepted(stream.Shutdown(QUIC_STREAM_SHUTDOWN_FLAGS.ABORT, 0));
         await events.ShutdownCompleteTcs.Within();
         Assert.IsType<InvalidOperationException>(caught);
         Assert.False(stream.IsClosed);
@@ -553,7 +551,7 @@ public class StreamTests
         for (int i = 0; i < count; i++)
         {
             int status = buffers.SendOn(stream, first + i == 0 ? QUIC_SEND_FLAGS.START : QUIC_SEND_FLAGS.NONE, first + i + 1);
-            if (status != MsQuicStatus.QUIC_STATUS_SUCCESS) throw new MsQuicException(status, "StreamSend");
+            if (MsQuicStatus.Failed(status)) throw new MsQuicException(status, "StreamSend");
         }
         return GC.GetAllocatedBytesForCurrentThread() - before;
     }

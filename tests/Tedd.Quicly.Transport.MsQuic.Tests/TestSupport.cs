@@ -88,17 +88,38 @@ internal sealed unsafe class ConnectionRecorder : IMsQuicConnectionEvents
 
     public void ShutdownComplete(MsQuicConnection connection, bool handshakeCompleted, bool peerAcknowledgedShutdown, bool appCloseInProgress)
     {
-        ShutdownCompleteTcs.TrySetResult((handshakeCompleted, peerAcknowledgedShutdown, appCloseInProgress));
+        // Run the hook first so a test awaiting the TCS observes its effects.
         OnShutdownComplete?.Invoke(connection);
+        ShutdownCompleteTcs.TrySetResult((handshakeCompleted, peerAcknowledgedShutdown, appCloseInProgress));
     }
+
+    public bool ThrowOnPeerStream;
+    private readonly Lock _streamsLock = new();
+    private bool _closing;
 
     public bool PeerStreamStarted(MsQuicConnection connection, MsQuicStream stream, QUIC_STREAM_OPEN_FLAGS flags)
     {
-        if (!AcceptPeerStreams) return false;
-        stream.Events = PeerStreamEventsFactory?.Invoke(stream) ?? new StreamRecorder();
-        PeerStreams.Add(stream);
+        if (ThrowOnPeerStream) throw new InvalidOperationException("no streams for you");
+        lock (_streamsLock)
+        {
+            // Once cleanup has begun, late peer streams (e.g. the RESET_STREAM of a stream the other side just closed)
+            // are rejected, which makes the wrapper close them; accepting one now would leak it past cleanup.
+            if (!AcceptPeerStreams || _closing) return false;
+            stream.Events = PeerStreamEventsFactory?.Invoke(stream) ?? new StreamRecorder();
+            PeerStreams.Add(stream);
+        }
         FirstPeerStreamTcs.TrySetResult(stream);
         return true;
+    }
+
+    /// <summary>Stops accepting peer streams and returns every stream accepted so far (the set is final afterwards).</summary>
+    public MsQuicStream[] BeginClosing()
+    {
+        lock (_streamsLock)
+        {
+            _closing = true;
+            return PeerStreams.ToArray();
+        }
     }
 
     public void StreamsAvailable(MsQuicConnection connection, ushort bidirectionalCount, ushort unidirectionalCount)
@@ -191,8 +212,8 @@ internal sealed unsafe class StreamRecorder : IMsQuicStreamEvents
 
     public void ShutdownComplete(MsQuicStream stream, in MsQuicStreamShutdownInfo info)
     {
-        ShutdownCompleteTcs.TrySetResult(info);
         OnShutdownComplete?.Invoke(stream);
+        ShutdownCompleteTcs.TrySetResult(info);
     }
 
     public void IdealSendBufferSize(MsQuicStream stream, ulong byteCount) => IdealSendBufferSizeTcs.TrySetResult(byteCount);
@@ -217,6 +238,10 @@ internal sealed class Loopback : IMsQuicListenerEvents, IDisposable
     public string? LastNegotiatedAlpn;
     public IPEndPoint? LastRemoteEndPoint;
     public uint LastQuicVersion;
+    public IPEndPoint? LastLocalEndPoint;
+    public int LastCryptoBufferLength;
+    public bool LastRawInfoAvailable;
+    public bool LastNegotiatedDefaultAlpn;
     public bool RejectConnections;
     public Func<MsQuicConnection, IMsQuicConnectionEvents> ServerEventsFactory = static _ => new ConnectionRecorder();
     /// <summary>Picks the configuration for a negotiated ALPN; null falls back to <see cref="ServerConfiguration"/>.</summary>
@@ -235,10 +260,25 @@ internal sealed class Loopback : IMsQuicListenerEvents, IDisposable
     {
         Registration = new MsQuicRegistration("quicly-tests");
         Certificate = TestCertificates.CreateSelfSigned("CN=localhost", TimeSpan.FromDays(1), ecdsa: true, "localhost");
-        ServerConfiguration = MsQuicConfiguration.CreateServer(Registration, [Alpn], Certificate, serverSettings ?? TestServerSettings(), credentialMode);
-        Listener = new MsQuicListener(Registration, this);
-        Listener.Start(new IPEndPoint(IPAddress.Loopback, 0), listenerAlpns ?? [Alpn]);
-        EndPoint = Listener.LocalEndPoint;
+        MsQuicConfiguration? configuration = null;
+        MsQuicListener? listener = null;
+        try
+        {
+            configuration = MsQuicConfiguration.CreateServer(Registration, [Alpn], Certificate, serverSettings ?? TestServerSettings(), credentialMode);
+            listener = new MsQuicListener(Registration, this);
+            listener.Start(new IPEndPoint(IPAddress.Loopback, 0), listenerAlpns ?? [Alpn]);
+            EndPoint = listener.LocalEndPoint;
+        }
+        catch
+        {
+            listener?.Close();
+            configuration?.Close();
+            TestRegistration.CloseWithDeadline(Registration);
+            Certificate.Dispose();
+            throw;
+        }
+        ServerConfiguration = configuration;
+        Listener = listener;
     }
 
     public MsQuicConfiguration CreateServerConfiguration(string alpn, MsQuicSettings? settings = null)
@@ -255,19 +295,23 @@ internal sealed class Loopback : IMsQuicListenerEvents, IDisposable
         return config;
     }
 
-    public MsQuicConnection Connect(IMsQuicConnectionEvents events, MsQuicConfiguration? configuration = null)
+    /// <summary>
+    /// Starts a client connection to the listener. <paramref name="serverName"/> defaults to the IP literal (no SNI
+    /// is sent for IP literals, RFC 6066); pass "localhost" to exercise SNI (INET keeps the resolution on IPv4).
+    /// </summary>
+    public MsQuicConnection Connect(IMsQuicConnectionEvents events, MsQuicConfiguration? configuration = null, string? serverName = null)
     {
         configuration ??= CreateClientConfiguration();
         var connection = new MsQuicConnection(Registration, events);
         _clientConnections.Add(connection);
-        MsQuicException.ThrowIfFailed(connection.Start(configuration, EndPoint.Address.ToString(), (ushort)EndPoint.Port, QuicAddressFamily.INET), "ConnectionStart");
+        MsQuicException.ThrowIfFailed(connection.Start(configuration, serverName ?? EndPoint.Address.ToString(), (ushort)EndPoint.Port, QuicAddressFamily.INET), "ConnectionStart");
         return connection;
     }
 
-    public async Task<(MsQuicConnection Client, ConnectionRecorder ClientEvents, MsQuicConnection Server, ConnectionRecorder ServerEvents)> ConnectPairAsync(MsQuicConfiguration? clientConfiguration = null, string expectedAlpn = Alpn)
+    public async Task<(MsQuicConnection Client, ConnectionRecorder ClientEvents, MsQuicConnection Server, ConnectionRecorder ServerEvents)> ConnectPairAsync(MsQuicConfiguration? clientConfiguration = null, string expectedAlpn = Alpn, string? serverName = null)
     {
         var clientEvents = new ConnectionRecorder();
-        MsQuicConnection client = Connect(clientEvents, clientConfiguration);
+        MsQuicConnection client = Connect(clientEvents, clientConfiguration, serverName);
         (string alpn, _) = await clientEvents.ConnectedTcs.Within();
         Assert.Equal(expectedAlpn, alpn);
         MsQuicConnection server = await FirstAcceptedTcs.Within();
@@ -283,12 +327,16 @@ internal sealed class Loopback : IMsQuicListenerEvents, IDisposable
         return stream;
     }
 
-    public MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, in MsQuicNewConnectionInfo info)
+    public unsafe MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, in MsQuicNewConnectionInfo info)
     {
         LastServerName = Encoding.UTF8.GetString(info.ServerName);
         LastNegotiatedAlpn = Encoding.ASCII.GetString(info.NegotiatedAlpn);
         LastRemoteEndPoint = info.RemoteAddress.ToIPEndPoint();
+        LastLocalEndPoint = info.LocalAddress.ToIPEndPoint();
         LastQuicVersion = info.QuicVersion;
+        LastCryptoBufferLength = info.CryptoBuffer.Length;
+        LastRawInfoAvailable = info.Raw != null;
+        LastNegotiatedDefaultAlpn = info.NegotiatedAlpnIs("quicly-test"u8);
         lock (LastClientAlpns)
         {
             LastClientAlpns.Clear();
@@ -313,29 +361,60 @@ internal sealed class Loopback : IMsQuicListenerEvents, IDisposable
 
     public void Dispose()
     {
-        foreach (MsQuicConnection c in Accepted)
+        // Freeze the peer-stream sets on every connection first, then close streams, then connections.
+        var peerStreams = new List<MsQuicStream>();
+        foreach (MsQuicConnection c in Accepted.Concat(_clientConnections))
         {
-            if (c.Events is ConnectionRecorder r)
-            {
-                foreach (MsQuicStream s in r.PeerStreams) s.Close();
-            }
+            if (c.Events is ConnectionRecorder r) peerStreams.AddRange(r.BeginClosing());
         }
-        foreach (MsQuicConnection c in _clientConnections)
-        {
-            if (c.Events is ConnectionRecorder r)
-            {
-                foreach (MsQuicStream s in r.PeerStreams) s.Close();
-            }
-        }
+        foreach (MsQuicStream s in peerStreams) s.Close();
         foreach (MsQuicStream s in _streams) s.Close();
         foreach (MsQuicConnection c in _clientConnections) c.Close();
         foreach (MsQuicConnection c in Accepted) c.Close();
         Listener.Close();
         foreach (MsQuicConfiguration c in _configurations) c.Close();
         ServerConfiguration.Close();
-        Registration.Close();
+        TestRegistration.CloseWithDeadline(Registration);
         Certificate.Dispose();
     }
+}
+
+/// <summary>
+/// A registration for a test. <c>RegistrationClose</c> blocks until every child handle is closed, so a test that
+/// fails before closing a listener or connection would otherwise hang the whole run; this closes it on a
+/// dedicated thread with a deadline and turns a leak into a test failure instead.
+/// </summary>
+internal sealed class TestRegistration : IDisposable
+{
+    public static readonly TimeSpan CloseDeadline = TimeSpan.FromSeconds(20);
+
+    public MsQuicRegistration Registration { get; }
+
+    public TestRegistration(string? appName = null, QUIC_EXECUTION_PROFILE profile = QUIC_EXECUTION_PROFILE.LOW_LATENCY) => Registration = new MsQuicRegistration(appName, profile);
+
+    public static void CloseWithDeadline(MsQuicRegistration registration)
+    {
+        if (registration.IsClosed) return;
+        var thread = new Thread(registration.Close) { IsBackground = true, Name = "RegistrationClose" };
+        thread.Start();
+        if (!thread.Join(CloseDeadline))
+        {
+            throw new TimeoutException("RegistrationClose did not return: a listener, connection, stream or configuration handle was leaked by the test. " + PerfCounterSummary());
+        }
+    }
+
+    /// <summary>Process-wide MsQuic object counters, for diagnosing which kind of handle leaked.</summary>
+    public static unsafe string PerfCounterSummary()
+    {
+        const int count = (int)QUIC_PERFORMANCE_COUNTERS.MAX;
+        long* counters = stackalloc long[count];
+        uint length = (uint)(count * sizeof(long));
+        int status = MsQuicApi.Instance.GetParam(null, MsQuicParam.QUIC_PARAM_GLOBAL_PERF_COUNTERS, &length, counters);
+        if (MsQuicStatus.Failed(status)) return "perf counters unavailable: " + MsQuicStatus.GetName(status);
+        return $"CONN_ACTIVE={counters[(int)QUIC_PERFORMANCE_COUNTERS.CONN_ACTIVE]} STRM_ACTIVE={counters[(int)QUIC_PERFORMANCE_COUNTERS.STRM_ACTIVE]} CONN_CREATED={counters[(int)QUIC_PERFORMANCE_COUNTERS.CONN_CREATED]} CONN_QUEUE_DEPTH={counters[(int)QUIC_PERFORMANCE_COUNTERS.CONN_QUEUE_DEPTH]} CONN_OPER_QUEUE_DEPTH={counters[(int)QUIC_PERFORMANCE_COUNTERS.CONN_OPER_QUEUE_DEPTH]}";
+    }
+
+    public void Dispose() => CloseWithDeadline(Registration);
 }
 
 /// <summary>Native scratch memory with a deterministic byte pattern, for gathered sends.</summary>
@@ -467,4 +546,14 @@ internal sealed class CallbackAllocationProbe
         _lastThread = thread;
         _lastAllocated = now;
     }
+}
+
+internal static class TestStatus
+{
+    /// <summary>
+    /// StreamStart, StreamSend and DatagramSend answer QUIC_STATUS_PENDING when they queue the work (the normal case
+    /// off the worker thread) and QUIC_STATUS_SUCCESS when they complete inline; both mean "accepted".
+    /// </summary>
+    public static void AssertAccepted(int status) =>
+        Assert.True(status == MsQuicStatus.QUIC_STATUS_SUCCESS || status == MsQuicStatus.QUIC_STATUS_PENDING, MsQuicStatus.GetName(status));
 }

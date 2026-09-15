@@ -30,7 +30,7 @@ public sealed unsafe class MsQuicApi
     /// The <c>QUIC_STATISTICS_V2</c> sizes the library knows (<c>QUIC_PARAM_GLOBAL_STATISTICS_V2_SIZES</c>), oldest
     /// first; empty when the library predates that parameter. The last entry is the size the library fills.
     /// </summary>
-    public uint[] StatisticsV2Sizes { get; }
+    public IReadOnlyList<uint> StatisticsV2Sizes { get; }
 
     /// <summary>
     /// The number of <see cref="QUIC_STATISTICS_V2"/> bytes the loaded library fills, capped to our struct size
@@ -51,7 +51,7 @@ public sealed unsafe class MsQuicApi
     /// </summary>
     public static bool AllowPreviewFeatures { get; set; }
 
-    private MsQuicApi(QUIC_API_TABLE* table)
+    internal MsQuicApi(QUIC_API_TABLE* table)
     {
         Table = table;
         uint* v = stackalloc uint[4];
@@ -64,8 +64,9 @@ public sealed unsafe class MsQuicApi
         status = table->GetParam(null, MsQuicParam.QUIC_PARAM_GLOBAL_TLS_PROVIDER, &length, &provider);
         TlsProvider = MsQuicStatus.Succeeded(status) ? provider : (OperatingSystem.IsWindows() ? QUIC_TLS_PROVIDER.SCHANNEL : QUIC_TLS_PROVIDER.OPENSSL);
 
-        StatisticsV2Sizes = ReadStatisticsSizes(table);
-        uint librarySize = StatisticsV2Sizes.Length == 0 ? QUIC_STATISTICS_V2.SIZE_3 : StatisticsV2Sizes[^1];
+        uint[] sizes = ReadStatisticsSizes(table);
+        StatisticsV2Sizes = Array.AsReadOnly(sizes);
+        uint librarySize = sizes.Length == 0 ? QUIC_STATISTICS_V2.SIZE_3 : sizes[^1];
         StatisticsV2Size = Math.Min(librarySize, (uint)sizeof(QUIC_STATISTICS_V2));
 
         SupportedSendFlags = MsQuicFeatureGate.SupportedSendFlags(Version);
@@ -124,12 +125,24 @@ public sealed unsafe class MsQuicApi
 
     private static int OpenOnce(out MsQuicApi? instance)
     {
+        // Touch MsQuicNative first so its static constructor registers the DllImportResolver before the first call.
+        MsQuicNative.EnsureInitialized();
+        return Open(&MsQuicNative.MsQuicOpenVersion, &MsQuicNative.MsQuicClose, out instance);
+    }
+
+    /// <summary>
+    /// Opens the v2 API table through <paramref name="openVersion"/> and validates the library version, closing the
+    /// table again through <paramref name="close"/> when the library is too old. A missing or unloadable library is
+    /// reported as <c>QUIC_STATUS_NOT_SUPPORTED</c>. The function pointers are a seam for tests.
+    /// </summary>
+    internal static int Open(delegate*<uint, void**, int> openVersion, delegate*<void*, void> close, out MsQuicApi? instance)
+    {
         instance = null;
         void* table = null;
         int status;
         try
         {
-            status = MsQuicNative.MsQuicOpenVersion(2, &table);
+            status = openVersion(2, &table);
         }
         catch (DllNotFoundException)
         {
@@ -154,7 +167,7 @@ public sealed unsafe class MsQuicApi
         var api = new MsQuicApi((QUIC_API_TABLE*)table);
         if (!MsQuicFeatureGate.IsSupported(api.Version))
         {
-            MsQuicNative.MsQuicClose(table);
+            close(table);
             return MsQuicStatus.QUIC_STATUS_VER_NEG_ERROR;
         }
         instance = api;

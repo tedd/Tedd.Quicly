@@ -26,7 +26,7 @@ public sealed class MsQuicSettings
     /// <summary>Number of bidirectional streams the peer may open (1 before admission: the control stream).</summary>
     public ushort? PeerBidiStreamCount { get; set; } = 1;
 
-    /// <summary>Number of unidirectional streams the peer may open (0 before admission; raised with <see cref="MsQuicConnection.SetLocalUnidiStreamCount"/>).</summary>
+    /// <summary>Number of unidirectional streams the peer may open (0 before admission; raised at run time with <see cref="MsQuicConnection.UpdatePeerStreamLimits"/>).</summary>
     public ushort? PeerUnidiStreamCount { get; set; } = 0;
 
     /// <summary>Per-stream receive window for peer-initiated unidirectional streams (2 MiB).</summary>

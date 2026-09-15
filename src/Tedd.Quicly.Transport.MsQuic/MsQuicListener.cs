@@ -18,8 +18,8 @@ public readonly unsafe ref struct MsQuicNewConnectionInfo
     /// <summary>The raw structure.</summary>
     public QUIC_NEW_CONNECTION_INFO* Raw => _info;
 
-    /// <summary>Negotiated QUIC version (1 for RFC 9000).</summary>
-    public uint QuicVersion => _info->QuicVersion;
+    /// <summary>Negotiated QUIC version in host byte order (1 for RFC 9000; MsQuic reports it in network order).</summary>
+    public uint QuicVersion => BitConverter.IsLittleEndian ? System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(_info->QuicVersion) : _info->QuicVersion;
 
     /// <summary>The peer's address.</summary>
     public ref readonly QUIC_ADDR RemoteAddress => ref *_info->RemoteAddress;
@@ -144,7 +144,11 @@ public sealed unsafe class MsQuicListener : IDisposable
         return _api.GetParam(_handle, MsQuicParam.QUIC_PARAM_LISTENER_LOCAL_ADDRESS, out address);
     }
 
-    /// <summary>The bound local end point (allocates); throws when not started.</summary>
+    /// <summary>
+    /// The bound local end point (allocates). Throws <see cref="InvalidOperationException"/> when the listener is
+    /// not bound (never started: MsQuic reports an <c>AF_UNSPEC</c> address) and <see cref="MsQuicException"/> when
+    /// the query itself fails.
+    /// </summary>
     public IPEndPoint LocalEndPoint
     {
         get
@@ -178,6 +182,12 @@ public sealed unsafe class MsQuicListener : IDisposable
 
     /// <inheritdoc cref="Close"/>
     public void Dispose() => Close();
+
+    /// <summary>The native callback, so tests can dispatch synthetic events through the full callback path.</summary>
+    internal static delegate* unmanaged[Cdecl]<QUIC_HANDLE*, void*, QUIC_LISTENER_EVENT*, int> NativeCallbackPointer => &NativeCallback;
+
+    /// <summary>The context handed to MsQuic for this object (a <see cref="GCHandle"/>).</summary>
+    internal void* NativeContext => (void*)GCHandle.ToIntPtr(_gcHandle);
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static int NativeCallback(QUIC_HANDLE* handle, void* context, QUIC_LISTENER_EVENT* evt)
@@ -233,19 +243,22 @@ public sealed unsafe class MsQuicListener : IDisposable
         }
         if (configuration is null || configuration.IsClosed)
         {
-            // MsQuic drops a connection whose NEW_CONNECTION callback fails and never indicates events for it.
+            // MsQuic refuses a connection whose NEW_CONNECTION callback fails, keeps ownership of the handle and
+            // never indicates events to the application for it (no handler was ever set).
             connection.Abandon();
             return MsQuicStatus.QUIC_STATUS_CONNECTION_REFUSED;
         }
-        // The handler must be in place before the configuration is applied (MsQuic starts indicating events once
-        // the handshake proceeds); the connection is owned by the app from here on.
-        connection.AttachCallback();
+        // Apply the configuration first: called from this callback it runs inline and only prepares TLS (the
+        // handshake continues after we return), so no connection event can be lost before the handler is set.
+        // On failure the connection is refused with no handler attached, so no event can reach a freed context.
         int status = connection.SetConfiguration(configuration);
         if (MsQuicStatus.Failed(status))
         {
             connection.Abandon();
             return status;
         }
+        // From here on the application owns the connection and must Close it after SHUTDOWN_COMPLETE.
+        connection.AttachCallback();
         return MsQuicStatus.QUIC_STATUS_SUCCESS;
     }
 }

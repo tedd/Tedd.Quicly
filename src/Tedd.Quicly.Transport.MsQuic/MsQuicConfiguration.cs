@@ -26,9 +26,14 @@ public enum MsQuicCertificateValidation
 /// <summary>How a server certificate is handed to MsQuic.</summary>
 public enum MsQuicServerCredentialMode
 {
-    /// <summary><see cref="Pkcs12"/> when the private key is exportable, otherwise <see cref="CertificateContext"/> (Windows).</summary>
+    /// <summary>
+    /// <see cref="Pkcs12"/> when the private key is exportable and the loaded MsQuic accepts PKCS#12; otherwise
+    /// <see cref="CertificateContext"/> (Windows). The Schannel build bundled with .NET answers PKCS#12 with
+    /// <c>QUIC_STATUS_NOT_SUPPORTED</c>, so on Windows Auto ends up on the certificate-context path (see
+    /// <see cref="MsQuicConfiguration.LoadServerCredential"/>).
+    /// </summary>
     Auto = 0,
-    /// <summary><c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c>: the certificate and key are exported to an in-memory PKCS#12 blob (all TLS providers).</summary>
+    /// <summary><c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c>: the certificate and key are exported to an in-memory PKCS#12 blob (OpenSSL builds; the Schannel build bundled with .NET rejects it with <c>QUIC_STATUS_NOT_SUPPORTED</c>, which this mode reports as an <see cref="MsQuicException"/>).</summary>
     Pkcs12 = 1,
     /// <summary><c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT</c> (Windows/Schannel only; the key is persisted first, see <see cref="MsQuicCertificateHelper"/>).</summary>
     CertificateContext = 2,
@@ -153,46 +158,90 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
     }
 
     /// <summary>
+    /// Set once the loaded library has answered <c>QUIC_STATUS_NOT_SUPPORTED</c> to a PKCS#12 credential, so
+    /// later <see cref="MsQuicServerCredentialMode.Auto"/> loads go straight to the certificate-context path.
+    /// </summary>
+    private static volatile bool s_pkcs12Unsupported;
+
+    /// <summary>
+    /// True once this process has observed that the loaded MsQuic rejects <c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c>
+    /// with <c>QUIC_STATUS_NOT_SUPPORTED</c> (the Schannel build bundled with .NET does, see
+    /// <see cref="LoadServerCredential"/>).
+    /// </summary>
+    internal static bool Pkcs12KnownUnsupported
+    {
+        get => s_pkcs12Unsupported;
+        set => s_pkcs12Unsupported = value;
+    }
+
+    /// <summary>The re-imported certificate this configuration owns (certificate-context path with an ephemeral key), else null.</summary>
+    internal X509Certificate2? OwnedCertificate => _ownedCertificate;
+
+    /// <summary>
     /// Loads a server certificate (must carry a private key). Throws <see cref="MsQuicException"/> on failure.
     /// </summary>
     /// <remarks>
-    /// <see cref="MsQuicServerCredentialMode.Auto"/> prefers PKCS#12: the certificate is exported with its key
-    /// to an in-memory blob and MsQuic imports it (no store, no persisted key container). The Schannel build
-    /// bundled with .NET accepts this path (covered by the loopback tests). When the key is not exportable the
-    /// Windows fallback is a certificate context whose key has been persisted with <c>PersistKeySet | UserKeySet</c>;
-    /// on other platforms a non-exportable key is an error. <see cref="CredentialType"/> records which path was used.
+    /// <para><see cref="MsQuicServerCredentialMode.Auto"/> prefers <c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c>
+    /// (ADR 0009): the certificate and its key are exported to an in-memory blob and MsQuic imports it itself — no
+    /// store import, no persisted key container. This is the path OpenSSL builds of MsQuic (Linux, macOS) use.</para>
+    /// <para><b>Recorded behaviour (Windows 11, msquic.dll 2.5.10 from the .NET 10 / .NET 11 preview 7 shared
+    /// framework, Schannel):</b> <c>ConfigurationLoadCredential</c> answers <c>QUIC_STATUS_NOT_SUPPORTED</c> to a
+    /// PKCS#12 credential, with or without a password. Auto mode therefore falls back to
+    /// <c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_CONTEXT</c> on Windows, which works (covered by the loopback tests). The
+    /// verdict is cached per process, so later Auto loads skip the PKCS#12 attempt.</para>
+    /// <para>Schannel can only sign with a key in a persisted, non-ephemeral container. When the certificate's key is
+    /// ephemeral (e.g. straight from <c>CertificateRequest.CreateSelfSigned</c>) it is re-imported with
+    /// <c>PersistKeySet | UserKeySet</c> — never <c>Exportable</c>, never <c>EphemeralKeySet</c> — into a certificate
+    /// owned by this configuration; <see cref="Close"/> deletes that key container again. Close the configuration
+    /// only after the connections created with it have completed their handshakes (the key is used for the
+    /// handshake signature). A certificate whose key is already persisted is used as is and never deleted.</para>
+    /// <para><see cref="MsQuicServerCredentialMode.Pkcs12"/> never falls back (it throws the library's status);
+    /// <see cref="MsQuicServerCredentialMode.CertificateContext"/> skips PKCS#12 (Windows only).
+    /// <see cref="CredentialType"/> records which path was used.</para>
     /// </remarks>
     public void LoadServerCredential(X509Certificate2 certificate, MsQuicServerCredentialMode mode = MsQuicServerCredentialMode.Auto)
     {
         ArgumentNullException.ThrowIfNull(certificate);
         ObjectDisposedException.ThrowIf(_handle == null, this);
         if (!certificate.HasPrivateKey) throw new ArgumentException("The server certificate must have a private key.", nameof(certificate));
+        if (mode is < MsQuicServerCredentialMode.Auto or > MsQuicServerCredentialMode.CertificateContext) throw new ArgumentOutOfRangeException(nameof(mode));
+        ThrowIfCredentialLoaded();
 
-        byte[]? pfx = null;
-        if (mode != MsQuicServerCredentialMode.CertificateContext && MsQuicCertificateHelper.TryExportPkcs12(certificate, out pfx))
+        bool tryPkcs12 = mode == MsQuicServerCredentialMode.Pkcs12
+            || (mode == MsQuicServerCredentialMode.Auto && !(s_pkcs12Unsupported && OperatingSystem.IsWindows()));
+        int pkcs12Status = MsQuicStatus.QUIC_STATUS_SUCCESS;
+        if (tryPkcs12)
         {
-            try
+            if (MsQuicCertificateHelper.TryExportPkcs12(certificate, out byte[]? pfx))
             {
-                LoadPkcs12Credential(pfx);
-                return;
+                try
+                {
+                    pkcs12Status = LoadPkcs12Credential(pfx);
+                }
+                finally
+                {
+                    CryptographicOperations.ZeroMemory(pfx);
+                }
+                if (MsQuicStatus.Succeeded(pkcs12Status)) return;
+                if (pkcs12Status == MsQuicStatus.QUIC_STATUS_NOT_SUPPORTED) s_pkcs12Unsupported = true;
+                if (mode == MsQuicServerCredentialMode.Pkcs12 || !OperatingSystem.IsWindows())
+                {
+                    throw new MsQuicException(pkcs12Status, "ConfigurationLoadCredential(CERTIFICATE_PKCS12)");
+                }
             }
-            finally
+            else if (mode == MsQuicServerCredentialMode.Pkcs12)
             {
-                CryptographicOperations.ZeroMemory(pfx);
+                throw new ArgumentException("The private key is not exportable, so it cannot be handed to MsQuic as PKCS#12.", nameof(certificate));
             }
-        }
-        if (mode == MsQuicServerCredentialMode.Pkcs12)
-        {
-            throw new ArgumentException("The private key is not exportable, so it cannot be handed to MsQuic as PKCS#12.", nameof(certificate));
         }
         if (!OperatingSystem.IsWindows())
         {
             throw new PlatformNotSupportedException("CERTIFICATE_CONTEXT credentials are Windows only; provide a certificate with an exportable private key.");
         }
-        LoadCertificateContextCredential(certificate);
+        LoadCertificateContextCredential(certificate, pkcs12Status);
     }
 
-    private void LoadPkcs12Credential(byte[] pfx)
+    private int LoadPkcs12Credential(byte[] pfx)
     {
         fixed (byte* p = pfx)
         {
@@ -201,32 +250,56 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
             cred.Type = QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12;
             cred.Flags = QUIC_CREDENTIAL_FLAGS.NONE;
             cred.CertificatePkcs12 = &pkcs12;
-            int status = LoadCredential(&cred);
-            MsQuicException.ThrowIfFailed(status, "ConfigurationLoadCredential(CERTIFICATE_PKCS12)");
+            return LoadCredential(&cred);
         }
     }
 
-    private void LoadCertificateContextCredential(X509Certificate2 certificate)
+    private void LoadCertificateContextCredential(X509Certificate2 certificate, int pkcs12Status)
     {
         X509Certificate2 usable = MsQuicCertificateHelper.EnsurePersistedPrivateKey(certificate);
-        if (!ReferenceEquals(usable, certificate))
-        {
-            _ownedCertificate?.Dispose();
-            _ownedCertificate = usable;
-        }
+        bool owned = !ReferenceEquals(usable, certificate);
         QUIC_CREDENTIAL_CONFIG cred = default;
         cred.Type = QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT;
         cred.Flags = QUIC_CREDENTIAL_FLAGS.NONE;
         cred.CertificateContext = (void*)usable.Handle;
         int status = LoadCredential(&cred);
         GC.KeepAlive(usable);
-        MsQuicException.ThrowIfFailed(status, "ConfigurationLoadCredential(CERTIFICATE_CONTEXT)");
+        if (MsQuicStatus.Failed(status))
+        {
+            if (owned) ReleaseOwnedCertificate(usable);
+            string operation = MsQuicStatus.Succeeded(pkcs12Status)
+                ? "ConfigurationLoadCredential(CERTIFICATE_CONTEXT)"
+                : "ConfigurationLoadCredential(CERTIFICATE_CONTEXT after CERTIFICATE_PKCS12 failed with " + MsQuicStatus.GetName(pkcs12Status) + ")";
+            throw new MsQuicException(status, operation);
+        }
+        if (owned) _ownedCertificate = usable;
+    }
+
+    /// <summary>
+    /// The helpers load exactly one credential per configuration (ADR 0009: renewal opens a new configuration).
+    /// MsQuic 2.5 itself accepts a second <c>ConfigurationLoadCredential</c> and swaps the credential under live
+    /// connections, which would also orphan a key container this configuration persisted; the raw
+    /// <see cref="LoadCredential"/> remains available for callers that knowingly want that.
+    /// </summary>
+    private void ThrowIfCredentialLoaded()
+    {
+        if (HasCredential)
+        {
+            throw new InvalidOperationException("A credential is already loaded; open a new configuration to change it (ADR 0009).");
+        }
+    }
+
+    private static void ReleaseOwnedCertificate(X509Certificate2 certificate)
+    {
+        MsQuicCertificateHelper.DeletePersistedPrivateKey(certificate);
+        certificate.Dispose();
     }
 
     /// <summary>Loads a client credential (no client certificate) with the requested validation policy.</summary>
     public void LoadClientCredential(MsQuicCertificateValidation validation = MsQuicCertificateValidation.SystemRoots)
     {
         ObjectDisposedException.ThrowIf(_handle == null, this);
+        ThrowIfCredentialLoaded();
         QUIC_CREDENTIAL_CONFIG cred = default;
         cred.Type = QUIC_CREDENTIAL_TYPE.NONE;
         cred.Flags = validation switch
@@ -240,15 +313,19 @@ public sealed unsafe class MsQuicConfiguration : IDisposable
         MsQuicException.ThrowIfFailed(status, "ConfigurationLoadCredential(client)");
     }
 
-    /// <summary>Closes the configuration. Idempotent.</summary>
+    /// <summary>
+    /// Closes the configuration. Idempotent. MsQuic keeps its own reference for connections that still use the
+    /// configuration. A key container this configuration persisted for the certificate-context path is deleted here.
+    /// </summary>
     public void Close()
     {
         QUIC_HANDLE* handle = _handle;
         if (handle == null) return;
         _handle = null;
         Registration.Api.Table->ConfigurationClose(handle);
-        _ownedCertificate?.Dispose();
+        X509Certificate2? owned = _ownedCertificate;
         _ownedCertificate = null;
+        if (owned is not null) ReleaseOwnedCertificate(owned);
     }
 
     /// <inheritdoc cref="Close"/>

@@ -77,7 +77,7 @@ public unsafe class ApiTests
         Assert.True(ext->ConnectionOpenInPartition != null);
 
         // Use the entry for real: open a connection on partition 0 and close it again.
-        using var registration = new MsQuicRegistration("ext25");
+        using var registrationScope = new TestRegistration("ext25"); MsQuicRegistration registration = registrationScope.Registration;
         QUIC_HANDLE* handle = null;
         int status = ext->ConnectionOpenInPartition(registration.Handle, 0, &NoOpConnectionCallback, null, &handle);
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, status);
@@ -181,6 +181,61 @@ public unsafe class ApiTests
             string? runtimeDirectory = MsQuicNative.RuntimeDirectory;
             Assert.NotNull(runtimeDirectory);
             Assert.True(File.Exists(Path.Combine(runtimeDirectory, "msquic.dll")), "the shared framework ships msquic.dll");
+        }
+    }
+
+    /// <summary>
+    /// Validates QUIC_SETTINGS against the LOADED library: ConfigurationOpen accepts sizeof(QUIC_SETTINGS) (144 bytes)
+    /// and QUIC_PARAM_CONFIGURATION_SETTINGS reads the same struct back with every value where we put it.
+    /// </summary>
+    [Fact]
+    public void Loaded_library_accepts_our_settings_struct_size_and_layout()
+    {
+        MsQuicApi api = MsQuicApi.Instance;
+        Assert.Equal(144, sizeof(QUIC_SETTINGS));
+        using var registrationScope = new TestRegistration("settings-size");
+        QUIC_SETTINGS settings = new MsQuicSettings { StreamRecvWindowBidiLocalDefault = 128 * 1024, StreamRecvWindowBidiRemoteDefault = 64 * 1024 }.ToNative();
+        settings.SetMaxBytesPerKey(1UL << 30);
+        settings.SetDestCidUpdateIdleTimeoutMs(12_345);
+        settings.SetHyStartEnabled(true);
+        byte* alpn = stackalloc byte[] { (byte)'x' };
+        QUIC_BUFFER alpnBuffer = new(alpn, 1);
+        QUIC_HANDLE* configuration = null;
+        int status = api.Table->ConfigurationOpen(registrationScope.Registration.Handle, &alpnBuffer, 1, &settings, (uint)sizeof(QUIC_SETTINGS), null, &configuration);
+        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, status);
+        try
+        {
+            QUIC_SETTINGS readBack = default;
+            uint length = (uint)sizeof(QUIC_SETTINGS);
+            status = api.GetParam(configuration, MsQuicParam.QUIC_PARAM_CONFIGURATION_SETTINGS, &length, &readBack);
+            Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, status);
+            Assert.Equal((uint)sizeof(QUIC_SETTINGS), length);
+            Assert.Equal(30_000UL, readBack.IdleTimeoutMs);
+            Assert.Equal(5_000UL, readBack.HandshakeIdleTimeoutMs);
+            Assert.Equal(6_000u, readBack.DisconnectTimeoutMs);
+            Assert.Equal(0u, readBack.KeepAliveIntervalMs);
+            Assert.Equal(5u, readBack.MaxAckDelayMs);
+            Assert.Equal(16u * 1024 * 1024, readBack.ConnFlowControlWindow);
+            Assert.Equal((ushort)1, readBack.PeerBidiStreamCount);
+            Assert.Equal((ushort)0, readBack.PeerUnidiStreamCount);
+            Assert.Equal((ushort)1248, readBack.MinimumMtu);
+            Assert.Equal((ushort)1500, readBack.MaximumMtu);
+            Assert.Equal(1UL << 30, readBack.MaxBytesPerKey);
+            Assert.Equal(12_345u, readBack.DestCidUpdateIdleTimeoutMs);
+            Assert.Equal(2u * 1024 * 1024, readBack.StreamRecvWindowUnidiDefault);
+            Assert.Equal(128u * 1024, readBack.StreamRecvWindowBidiLocalDefault);
+            Assert.Equal(64u * 1024, readBack.StreamRecvWindowBidiRemoteDefault);
+            Assert.True(readBack.DatagramReceiveEnabled);
+            Assert.False(readBack.SendBufferingEnabled);
+            Assert.True(readBack.PacingEnabled);
+            Assert.True(readBack.MigrationEnabled);
+            // HyStartEnabled (Flags word) is accepted by ConfigurationOpen but not reported back by this library version.
+            Assert.Equal(QUIC_SERVER_RESUMPTION_LEVEL.NO_RESUME, readBack.ServerResumptionLevel);
+            Assert.Equal((ushort)QUIC_CONGESTION_CONTROL_ALGORITHM.CUBIC, readBack.CongestionControlAlgorithm);
+        }
+        finally
+        {
+            api.Table->ConfigurationClose(configuration);
         }
     }
 }

@@ -99,7 +99,10 @@ public unsafe interface IMsQuicStreamEvents
     {
     }
 
-    /// <summary>Last event; after it the handle may be closed (calling <see cref="MsQuicStream.Close"/> inline is allowed).</summary>
+    /// <summary>
+    /// Last event of the stream. Afterwards the owner closes the handle with <see cref="MsQuicStream.Close"/> from its own
+    /// thread — never from this callback (the wrapper refuses, ADR 0008 §7).
+    /// </summary>
     void ShutdownComplete(MsQuicStream stream, in MsQuicStreamShutdownInfo info)
     {
     }

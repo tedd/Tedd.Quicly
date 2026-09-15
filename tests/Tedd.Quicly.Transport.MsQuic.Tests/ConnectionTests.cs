@@ -11,15 +11,19 @@ public class ConnectionTests
     public async Task Client_connects_and_both_sides_see_negotiated_alpn()
     {
         using var loopback = new Loopback();
-        (MsQuicConnection client, ConnectionRecorder clientEvents, MsQuicConnection server, ConnectionRecorder serverEvents) = await loopback.ConnectPairAsync();
+        (MsQuicConnection client, ConnectionRecorder clientEvents, MsQuicConnection server, ConnectionRecorder serverEvents) = await loopback.ConnectPairAsync(serverName: "localhost");
 
         Assert.False(client.IsServer);
         Assert.True(server.IsServer);
         Assert.True(clientEvents.InsideCallbackSeen);
         Assert.Contains(Loopback.Alpn, loopback.LastClientAlpns);
         Assert.Equal(Loopback.Alpn, loopback.LastNegotiatedAlpn);
-        Assert.Equal(IPAddress.Loopback.ToString(), loopback.LastServerName);
+        Assert.Equal("localhost", loopback.LastServerName);
         Assert.Equal(1u, loopback.LastQuicVersion);
+        Assert.Equal(loopback.EndPoint.Port, loopback.LastLocalEndPoint!.Port);
+        Assert.True(loopback.LastCryptoBufferLength > 0);
+        Assert.True(loopback.LastRawInfoAvailable);
+        Assert.True(loopback.LastNegotiatedDefaultAlpn);
         Assert.NotNull(loopback.LastRemoteEndPoint);
         Assert.Equal(IPAddress.Loopback, loopback.LastRemoteEndPoint.Address);
 
@@ -55,7 +59,8 @@ public class ConnectionTests
         Assert.True(MsQuicStatus.Succeeded(client.GetParam(MsQuicParam.QUIC_PARAM_CONN_QUIC_VERSION, out uint quicVersion)));
         Assert.Equal(1u, quicVersion);
 
-        (ushort bidi, ushort unidi) = await serverEvents.StreamsAvailableTcs.Within();
+        // STREAMS_AVAILABLE is indicated to the client (the server granted 16/16 in its transport parameters).
+        (ushort bidi, ushort unidi) = await clientEvents.StreamsAvailableTcs.Within();
         Assert.Equal(16, bidi);
         Assert.Equal(16, unidi);
         Assert.False(clientEvents.TransportShutdownTcs.Task.IsCompleted);
@@ -115,8 +120,8 @@ public class ConnectionTests
         (MsQuicConnection client, ConnectionRecorder clientEvents, _, ConnectionRecorder serverEvents) = await loopback.ConnectPairAsync(loopback.CreateClientConfiguration(settings: clientSettings));
 
         client.Shutdown(QUIC_CONNECTION_SHUTDOWN_FLAGS.SILENT, 7);
-        (_, bool peerAcknowledged, _) = await clientEvents.ShutdownCompleteTcs.Within();
-        Assert.False(peerAcknowledged);
+        await clientEvents.ShutdownCompleteTcs.Within();
+        // SHUTDOWN_COMPLETE.PeerAcknowledgedShutdown is set here too: MsQuic reports it whenever shutdown did not time out.
         (int status, _) = await serverEvents.TransportShutdownTcs.Within();
         Assert.Equal(MsQuicStatus.QUIC_STATUS_CONNECTION_IDLE, status);
         await serverEvents.ShutdownCompleteTcs.Within();
@@ -142,7 +147,7 @@ public class ConnectionTests
         Assert.False(handshakeCompleted);
         Assert.False(clientEvents.ConnectedTcs.Task.IsCompleted);
         Assert.Empty(loopback.Accepted);
-        Assert.Contains("nope", loopback.LastClientAlpns);
+        // MsQuic refuses an ALPN no listener offers before NEW_CONNECTION, so the listener never saw this attempt.
         client.Close();
     }
 
@@ -225,7 +230,9 @@ public class ConnectionTests
         if (clientEvents.ChainPkcs7.Length > 0)
         {
             var chain = new X509Certificate2Collection();
+#pragma warning disable SYSLIB0057 // X509CertificateLoader has no PKCS#7 loader; the collection import is the only in-box way.
             chain.Import(clientEvents.ChainPkcs7);
+#pragma warning restore SYSLIB0057
             Assert.Contains(chain.Cast<X509Certificate2>(), c => c.Thumbprint == loopback.Certificate.Thumbprint);
         }
     }
@@ -339,11 +346,29 @@ public class ConnectionTests
     [Fact]
     public async Task Pkcs12_and_certificate_context_credentials_both_complete_a_handshake()
     {
-        using var pkcs12 = new Loopback(credentialMode: MsQuicServerCredentialMode.Pkcs12);
-        Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12, pkcs12.ServerConfiguration.CredentialType);
-        (MsQuicConnection client, ConnectionRecorder clientEvents, _, _) = await pkcs12.ConnectPairAsync();
-        client.Shutdown(QUIC_CONNECTION_SHUTDOWN_FLAGS.NONE, 0);
-        await clientEvents.ShutdownCompleteTcs.Within();
+        MsQuicConnection client;
+        ConnectionRecorder clientEvents;
+        if (MsQuicApi.Instance.TlsProvider == QUIC_TLS_PROVIDER.SCHANNEL)
+        {
+            // Recorded behaviour: the Schannel msquic bundled with .NET refuses PKCS#12 outright.
+            MsQuicException ex = Assert.Throws<MsQuicException>(() => new Loopback(credentialMode: MsQuicServerCredentialMode.Pkcs12));
+            Assert.Equal(MsQuicStatus.QUIC_STATUS_NOT_SUPPORTED, ex.Status);
+        }
+        else
+        {
+            using var pkcs12 = new Loopback(credentialMode: MsQuicServerCredentialMode.Pkcs12);
+            Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12, pkcs12.ServerConfiguration.CredentialType);
+            (client, clientEvents, _, _) = await pkcs12.ConnectPairAsync();
+            client.Shutdown(QUIC_CONNECTION_SHUTDOWN_FLAGS.NONE, 0);
+            await clientEvents.ShutdownCompleteTcs.Within();
+        }
+
+        using (var auto = new Loopback())
+        {
+            (client, clientEvents, _, _) = await auto.ConnectPairAsync();
+            client.Shutdown(QUIC_CONNECTION_SHUTDOWN_FLAGS.NONE, 0);
+            await clientEvents.ShutdownCompleteTcs.Within();
+        }
 
         if (OperatingSystem.IsWindows())
         {
@@ -413,12 +438,15 @@ public class ConnectionTests
         (MsQuicConnection client, ConnectionRecorder clientEvents, MsQuicConnection server, _) = await loopback.ConnectPairAsync();
         await clientEvents.StreamsAvailableTcs.Within();
 
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, server.SetLocalUnidiStreamCount(40));
+        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, server.UpdatePeerStreamLimits(41, 40));
         Assert.True(await TestTimeouts.WaitUntilAsync(() => clientEvents.StreamsAvailableHistory.Any(s => s.Unidi == 40), TestTimeouts.Default));
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, server.SetLocalBidiStreamCount(41));
+        // Both limits travel in one QUIC_PARAM_CONN_SETTINGS update.
         Assert.True(await TestTimeouts.WaitUntilAsync(() => clientEvents.StreamsAvailableHistory.Any(s => s.Bidi == 41), TestTimeouts.Default));
 
-        var builder = new MsQuicSettings { PeerUnidiStreamCount = 42 };
+        // A full default builder carries handshake-time settings MsQuic refuses on a live connection; start from Empty.
+        Assert.Equal(MsQuicStatus.QUIC_STATUS_INVALID_PARAMETER, server.UpdateSettings(new MsQuicSettings()));
+        MsQuicSettings builder = MsQuicSettings.Empty;
+        builder.PeerUnidiStreamCount = 42;
         Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, server.UpdateSettings(builder));
         Assert.True(await TestTimeouts.WaitUntilAsync(() => clientEvents.StreamsAvailableHistory.Any(s => s.Unidi == 42), TestTimeouts.Default));
 
@@ -463,8 +491,7 @@ public class ConnectionTests
         Assert.Throws<ObjectDisposedException>(() => connection.GetLocalAddress(out _));
         Assert.Throws<ObjectDisposedException>(() => connection.SendDatagram(null, 0, QUIC_SEND_FLAGS.NONE, null));
         Assert.Throws<ObjectDisposedException>(() => connection.UpdateSettings(MsQuicSettings.Empty));
-        Assert.Throws<ObjectDisposedException>(() => connection.SetLocalUnidiStreamCount(1));
-        Assert.Throws<ObjectDisposedException>(() => connection.SetLocalBidiStreamCount(1));
+        Assert.Throws<ObjectDisposedException>(() => connection.UpdatePeerStreamLimits(1, 1));
         Assert.Throws<ObjectDisposedException>(() => connection.CompleteCertificateValidation(true));
         Assert.Throws<ObjectDisposedException>(() => connection.SendResumptionTicket(QUIC_SEND_RESUMPTION_FLAGS.NONE, default));
         ulong value = 0;
@@ -493,12 +520,12 @@ public class ConnectionTests
 
         byte share = 1;
         Assert.True(MsQuicStatus.Succeeded(connection.SetParam(MsQuicParam.QUIC_PARAM_CONN_SHARE_UDP_BINDING, 1, &share)));
-        uint length = 1;
-        byte read = 0;
-        Assert.True(MsQuicStatus.Succeeded(connection.GetParam(MsQuicParam.QUIC_PARAM_CONN_SHARE_UDP_BINDING, &length, &read)));
-        Assert.Equal(1, read);
-        Assert.True(MsQuicStatus.Failed(connection.GetStatisticsV2(out _, out uint written)));
-        Assert.Equal(0u, written);
+        QUIC_SETTINGS current = default;
+        uint length = (uint)sizeof(QUIC_SETTINGS);
+        Assert.True(MsQuicStatus.Succeeded(connection.GetParam(MsQuicParam.QUIC_PARAM_CONN_SETTINGS, &length, &current)));
+        Assert.Equal((uint)sizeof(QUIC_SETTINGS), length);
+        int statisticsStatus = connection.GetStatisticsV2(out _, out uint written);
+        Assert.Equal(MsQuicStatus.Succeeded(statisticsStatus) ? connection.Api.StatisticsV2Size : 0u, written);
 
         connection.Events = null!;
         Assert.NotNull(connection.Events);

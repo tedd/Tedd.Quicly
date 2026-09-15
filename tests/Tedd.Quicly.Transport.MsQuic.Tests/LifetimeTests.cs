@@ -36,14 +36,14 @@ public class LifetimeTests
     [Fact]
     public void Registration_without_app_name_opens()
     {
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         Assert.False(registration.IsClosed);
     }
 
     [Fact]
     public unsafe void Configuration_validates_arguments_and_closes_idempotently()
     {
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         Assert.Throws<ArgumentNullException>(() => new MsQuicConfiguration(null!, ["a"]));
         Assert.Throws<ArgumentException>(() => new MsQuicConfiguration(registration, ReadOnlySpan<string>.Empty));
         Assert.Throws<ArgumentException>(() => new MsQuicConfiguration(registration, [""]));
@@ -74,7 +74,7 @@ public class LifetimeTests
     [Fact]
     public void Client_credential_modes_map_to_the_documented_flags()
     {
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         using var systemRoots = MsQuicConfiguration.CreateClient(registration, ["a"]);
         Assert.Equal(QUIC_CREDENTIAL_FLAGS.CLIENT, systemRoots.CredentialFlags);
         using var callback = MsQuicConfiguration.CreateClient(registration, ["a"], MsQuicCertificateValidation.Callback);
@@ -87,7 +87,7 @@ public class LifetimeTests
     [Fact]
     public void Configuration_native_settings_constructor_and_invalid_validation()
     {
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         QUIC_SETTINGS settings = default;
         settings.SetIdleTimeoutMs(1000);
         using var config = new MsQuicConfiguration(registration, ["a"], in settings);
@@ -95,30 +95,54 @@ public class LifetimeTests
         Assert.False(config.HasCredential);
     }
 
+    /// <summary>
+    /// Records which server credential path the loaded library accepts. Observed on Windows with the msquic.dll
+    /// 2.5.10 bundled in the .NET shared framework (Schannel): CERTIFICATE_PKCS12 is answered with
+    /// QUIC_STATUS_NOT_SUPPORTED, so Auto falls back to CERTIFICATE_CONTEXT. OpenSSL builds take PKCS#12.
+    /// </summary>
     [Fact]
     public void Server_credential_prefers_pkcs12_and_records_the_path()
     {
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         using X509Certificate2 withKey = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
         using X509Certificate2 publicOnly = X509CertificateLoader.LoadCertificate(withKey.Export(X509ContentType.Cert));
+        bool schannel = MsQuicApi.Instance.TlsProvider == QUIC_TLS_PROVIDER.SCHANNEL;
 
         using var config = new MsQuicConfiguration(registration, ["a"]);
         Assert.Throws<ArgumentNullException>(() => config.LoadServerCredential(null!));
         Assert.Throws<ArgumentException>(() => config.LoadServerCredential(publicOnly));
+        Assert.Throws<ArgumentOutOfRangeException>(() => config.LoadServerCredential(withKey, (MsQuicServerCredentialMode)7));
+
+        // First Auto load in a "fresh" process: PKCS#12 is attempted and, on Schannel, rejected then remembered.
+        MsQuicConfiguration.Pkcs12KnownUnsupported = false;
         config.LoadServerCredential(withKey);
         Assert.True(config.HasCredential);
-        Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12, config.CredentialType);
         Assert.Equal(QUIC_CREDENTIAL_FLAGS.NONE, config.CredentialFlags);
+        Assert.Equal(schannel ? QUIC_CREDENTIAL_TYPE.CERTIFICATE_CONTEXT : QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12, config.CredentialType);
+        Assert.Equal(schannel, MsQuicConfiguration.Pkcs12KnownUnsupported);
 
-        using var explicitPkcs12 = MsQuicConfiguration.CreateServer(registration, ["a"], withKey, mode: MsQuicServerCredentialMode.Pkcs12);
-        Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12, explicitPkcs12.CredentialType);
+        // Second Auto load: the remembered verdict skips the PKCS#12 attempt.
+        using var again = MsQuicConfiguration.CreateServer(registration, ["a"], withKey);
+        Assert.Equal(config.CredentialType, again.CredentialType);
+
+        if (schannel)
+        {
+            MsQuicException ex = Assert.Throws<MsQuicException>(() => MsQuicConfiguration.CreateServer(registration, ["a"], withKey, mode: MsQuicServerCredentialMode.Pkcs12));
+            Assert.Equal(MsQuicStatus.QUIC_STATUS_NOT_SUPPORTED, ex.Status);
+            Assert.Contains("CERTIFICATE_PKCS12", ex.Operation, StringComparison.Ordinal);
+        }
+        else
+        {
+            using var explicitPkcs12 = MsQuicConfiguration.CreateServer(registration, ["a"], withKey, mode: MsQuicServerCredentialMode.Pkcs12);
+            Assert.Equal(QUIC_CREDENTIAL_TYPE.CERTIFICATE_PKCS12, explicitPkcs12.CredentialType);
+        }
     }
 
     [Fact]
     public void Non_exportable_key_falls_back_to_certificate_context_on_windows()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows(), "key containers are a Windows concept");
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         using X509Certificate2 exportable = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
         byte[] pfx = exportable.Export(X509ContentType.Pkcs12);
         using X509Certificate2 nonExportable = X509CertificateLoader.LoadPkcs12(pfx, null, X509KeyStorageFlags.UserKeySet);
@@ -137,7 +161,7 @@ public class LifetimeTests
     public void Non_exportable_key_is_an_error_off_windows()
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "the CERTIFICATE_CONTEXT fallback exists on Windows");
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         using X509Certificate2 withKey = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
         using var config = new MsQuicConfiguration(registration, ["a"]);
         Assert.Throws<PlatformNotSupportedException>(() => config.LoadServerCredential(withKey, MsQuicServerCredentialMode.CertificateContext));
@@ -146,7 +170,7 @@ public class LifetimeTests
     [Fact]
     public void Create_helpers_close_the_configuration_when_loading_fails()
     {
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         using X509Certificate2 withKey = TestCertificates.CreateSelfSigned("CN=x", TimeSpan.FromHours(1));
         using X509Certificate2 publicOnly = X509CertificateLoader.LoadCertificate(withKey.Export(X509ContentType.Cert));
         Assert.Throws<ArgumentException>(() => MsQuicConfiguration.CreateServer(registration, ["a"], publicOnly));
@@ -157,7 +181,7 @@ public class LifetimeTests
     [Fact]
     public void Raw_credential_load_reports_failure_status_without_throwing()
     {
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         using var config = new MsQuicConfiguration(registration, ["a"]);
         int status = RawCredentials.LoadInvalid(config);
         Assert.True(MsQuicStatus.Failed(status), MsQuicStatus.GetName(status));
@@ -167,14 +191,15 @@ public class LifetimeTests
     [Fact]
     public async Task Listener_lifecycle()
     {
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         var events = new RecordingListenerEvents();
-        var listener = new MsQuicListener(registration, events);
+        using var listener = new MsQuicListener(registration, events);
         Assert.Same(registration, listener.Registration);
         Assert.False(listener.IsStarted);
         Assert.Null(listener.Tag);
         Assert.Null(listener.LastCallbackException);
-        Assert.Throws<MsQuicException>(() => listener.LocalEndPoint);
+        // Not started: MsQuic reports an AF_UNSPEC address, which the wrapper turns into InvalidOperationException.
+        Assert.Throws<InvalidOperationException>(() => listener.LocalEndPoint);
         Assert.Throws<ArgumentNullException>(() => listener.Start(null!, ["a"]));
         Assert.Throws<ArgumentException>(() => listener.Start(new IPEndPoint(IPAddress.Loopback, 0), ReadOnlySpan<string>.Empty));
 
@@ -188,7 +213,7 @@ public class LifetimeTests
 
         Assert.Throws<MsQuicException>(() => listener.Start(new IPEndPoint(IPAddress.Loopback, 0), ["a"]));
 
-        var second = new MsQuicListener(registration, events);
+        using var second = new MsQuicListener(registration, events);
         MsQuicException ex = Assert.Throws<MsQuicException>(() => second.Start(ep, ["a"]));
         Assert.True(ex.Status == MsQuicStatus.QUIC_STATUS_ALPN_IN_USE || ex.Status == MsQuicStatus.QUIC_STATUS_ADDRESS_IN_USE, MsQuicStatus.GetName(ex.Status));
         second.Close();
@@ -210,7 +235,7 @@ public class LifetimeTests
     [Fact]
     public void Listener_close_without_stop_delivers_stop_complete_with_app_close()
     {
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         var events = new RecordingListenerEvents();
         var listener = new MsQuicListener(registration, events) { Tag = "t" };
         Assert.Equal("t", listener.Tag);
@@ -245,7 +270,7 @@ public class LifetimeTests
     [Fact]
     public async Task Listener_close_from_its_own_callback_is_refused()
     {
-        using var registration = new MsQuicRegistration();
+        using var registrationScope = new TestRegistration(); MsQuicRegistration registration = registrationScope.Registration;
         var events = new ClosingListenerEvents();
         var listener = new MsQuicListener(registration, events);
         events.Listener = listener;

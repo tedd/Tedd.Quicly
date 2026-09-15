@@ -29,7 +29,7 @@ public class DatagramTests
         {
             for (int i = 0; i < Count; i++)
             {
-                Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, Buffers.SendDatagramOn(sender, i, QUIC_SEND_FLAGS.NONE, i + 1));
+                TestStatus.AssertAccepted(Buffers.SendDatagramOn(sender, i, QUIC_SEND_FLAGS.NONE, i + 1));
             }
         }
 
@@ -108,7 +108,7 @@ public class DatagramTests
         using NativeBuffers buffers = NativeBuffers.Single(block);
         QUIC_SEND_FLAGS flags = QUIC_SEND_FLAGS.DGRAM_PRIORITY | QUIC_SEND_FLAGS.CANCEL_ON_BLOCKED | QUIC_SEND_FLAGS.PRIORITY_WORK;
         Assert.True(MsQuicFeatureGate.AreSendFlagsSupported(client.Api.Version, flags));
-        Assert.Equal(MsQuicStatus.QUIC_STATUS_SUCCESS, buffers.SendDatagramOn(client, flags, 0));
+        TestStatus.AssertAccepted(buffers.SendDatagramOn(client, flags, 0));
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref serverEvents.DatagramsReceived) >= 1, TestTimeouts.Default));
         Assert.True(serverEvents.Datagrams.TryDequeue(out byte[]? payload));
         Assert.Equal(block.Span.ToArray(), payload);
@@ -181,7 +181,7 @@ public class DatagramTests
         for (int i = 0; i < count; i++)
         {
             int status = buffers.SendDatagramOn(client, QUIC_SEND_FLAGS.NONE, first + i + 1);
-            if (status != MsQuicStatus.QUIC_STATUS_SUCCESS) throw new MsQuicException(status, "DatagramSend");
+            if (MsQuicStatus.Failed(status)) throw new MsQuicException(status, "DatagramSend");
         }
         return GC.GetAllocatedBytesForCurrentThread() - before;
     }

@@ -11,7 +11,8 @@ namespace Tedd.Quicly.Transport.MsQuic;
 /// <remarks>
 /// <para><b>Preferred: PKCS#12 in memory.</b> <see cref="TryExportPkcs12"/> serialises the certificate with its
 /// private key and MsQuic imports the blob itself (<c>QUIC_CREDENTIAL_TYPE_CERTIFICATE_PKCS12</c>): no store
-/// import, no persisted key container. Verified against the Schannel build bundled with .NET (see
+/// import, no persisted key container. The OpenSSL builds of MsQuic accept it; the Schannel build bundled with
+/// .NET (msquic.dll 2.5.10) answers <c>QUIC_STATUS_NOT_SUPPORTED</c>, which is why Windows falls back (see
 /// <c>MsQuicConfiguration.LoadServerCredential</c>). It needs an exportable private key; certificates whose key
 /// container forbids export make <see cref="TryExportPkcs12"/> return false.</para>
 /// <para><b>Fallback: CERTIFICATE_CONTEXT.</b> Schannel can only sign with a key that lives in a persisted, non-

@@ -111,7 +111,7 @@ public unsafe interface IMsQuicConnectionEvents
     {
     }
 
-    /// <summary>The peer wants more streams than we currently allow (raise with <see cref="MsQuicConnection.SetLocalUnidiStreamCount"/> / <see cref="MsQuicConnection.SetLocalBidiStreamCount"/>).</summary>
+    /// <summary>The peer wants more streams than we currently allow (raise the limit with <see cref="MsQuicConnection.UpdatePeerStreamLimits"/>).</summary>
     void PeerNeedsStreams(MsQuicConnection connection, bool bidirectional)
     {
     }

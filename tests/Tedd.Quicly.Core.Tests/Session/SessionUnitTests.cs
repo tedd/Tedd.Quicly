@@ -592,7 +592,11 @@ public class SessionSupportTests
             Assert.Equal(mode, engine.Mode);
         }
 
-        // Wave C2 modes stay placeholders until their engines land.
+        Assert.IsType<UnreliableUnorderedEngine>(ChannelEngines.Create(ChannelMode.UnreliableUnordered));
+        Assert.IsType<UnreliableSequencedEngine>(ChannelEngines.Create(ChannelMode.UnreliableSequenced));
+
+        // The ordered engine arrives with wave C1 step 3; wave C2 modes stay placeholders until their engines land.
+        Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.ReliableOrdered));
         Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.ReliableUnordered));
         Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.ReliableLatest));
         Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.Bulk));

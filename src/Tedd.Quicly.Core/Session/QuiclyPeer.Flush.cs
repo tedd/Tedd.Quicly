@@ -1,17 +1,28 @@
 using Tedd.Quicly.Core.Session.Engines;
+using Tedd.Quicly.Core.Transport;
 
 namespace Tedd.Quicly.Core.Session;
 
-// Game thread: Flush (docs/design/session-layer.md §4.2) and NextDeadline bookkeeping.
+// Game thread: Flush (docs/design/session-layer.md §4.2), the scheduler (§7.1) and NextDeadline bookkeeping.
 public sealed unsafe partial class QuiclyPeer
 {
+    /// <summary>Send caps at or above this many bytes per second count as unlimited (keeps the token arithmetic in range).</summary>
+    internal const long MaxSendRateBytesPerSecond = 2_000_000_000;
+
     private bool _inFlush;
+    private bool _inScheduler;
+    private uint _lastTick;
     private long _engineDeadline = long.MaxValue;
+    private TokenBucket _sendBucket;
+    private long _sendRate;
 
     /// <summary>
     /// Transmits everything buffered and runs time-driven work (game thread, clock read once): drains transport
     /// completions, runs the peer timers (pings, heartbeat, admission timeout, close linger), then — while
-    /// <see cref="PeerState.Connected"/> — every engine's <c>Tick</c> and the scheduler. Allocation-free in steady state.
+    /// <see cref="PeerState.Connected"/> — every engine's <c>Tick</c> and the scheduler: every channel in priority order
+    /// (admission order within a channel, expiry at scheduling time, the <see cref="PeerOptions.MaxSendBytesPerSecond"/>
+    /// cap), with buffered datagram messages packed into containers whenever at least two fit (PROTOCOL.md §2.2, §4.5).
+    /// Allocation-free in steady state.
     /// </summary>
     /// <param name="tick">The host's simulation tick, carried in packed containers (PROTOCOL.md §2.2); 0 = none.</param>
     /// <exception cref="ObjectDisposedException">The peer is disposed.</exception>
@@ -24,6 +35,7 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         _inFlush = true;
+        _lastTick = tick;
         EnterCall();
         try
         {
@@ -33,14 +45,7 @@ public sealed unsafe partial class QuiclyPeer
             long engineDeadline = long.MaxValue;
             if (_state == PeerState.Connected)
             {
-                FlushContext flush = new()
-                {
-                    NowMicros = now,
-                    Tick = tick,
-                    MaxDatagramPayload = _core.MaxDatagramPayload,
-                    DatagramsEnabled = _core.DatagramsEnabled,
-                    NextDeadline = long.MaxValue,
-                };
+                FlushContext flush = NewFlushContext(now, tick);
                 ReadOnlySpan<ChannelEngine> engines = _core.ActiveEngines;
                 for (int i = 0; i < engines.Length; i++)
                 {
@@ -78,20 +83,128 @@ public sealed unsafe partial class QuiclyPeer
         return ValueTask.CompletedTask;
     }
 
+    private FlushContext NewFlushContext(long now, uint tick) => new()
+    {
+        NowMicros = now,
+        Tick = tick,
+        MaxDatagramPayload = _core.MaxDatagramPayload,
+        DatagramsEnabled = _core.DatagramsEnabled,
+        NextDeadline = long.MaxValue,
+    };
+
     /// <summary>
-    /// The scheduler seam: submits the engines' queued work. This wave calls every engine once, in mode order; the datagram
-    /// wave replaces it with the priority scheduler (channel priority order precomputed, admission order within a channel,
-    /// expiry at scheduling time, token bucket) and the per-peer packer.
+    /// Sets up the send cap (constructor): a token bucket of <paramref name="maxSendBytesPerSecond"/> bytes per second whose
+    /// burst is two flush intervals' worth (the interval clamped to 10 ms … 500 ms).
     /// </summary>
-    /// <param name="flush">The flush context.</param>
+    private void InitializeScheduler(long maxSendBytesPerSecond, long now)
+    {
+        if (maxSendBytesPerSecond <= 0 || maxSendBytesPerSecond >= MaxSendRateBytesPerSecond)
+        {
+            return;
+        }
+
+        _sendRate = maxSendBytesPerSecond;
+        long window = 2 * Math.Clamp(_core.FlushIntervalMicros, 10_000, 500_000);
+        _sendBucket.Initialize(maxSendBytesPerSecond, Math.Max(1, maxSendBytesPerSecond * window / 1_000_000), now);
+    }
+
+    /// <summary>
+    /// The scheduler (docs/design/session-layer.md §7.1), one pass: the send cap is refilled; every channel is offered to
+    /// its engine in priority order (<see cref="PeerCore.ScheduleOrder"/>; within a channel admission order, expiry at
+    /// scheduling time, PROTOCOL.md §4.5); every engine's engine-level <see cref="ChannelEngine.Flush"/> follows (retries and
+    /// other traffic §4.5 schedules after fresh messages); the packer submits what it still holds. The bytes submitted are
+    /// charged to the cap. Completions the pass queued (expired, refused) are routed after it, so no continuation runs
+    /// inside a pass; a pass requested while one runs (an Immediate send from such a continuation) does nothing.
+    /// </summary>
+    /// <param name="flush">The pass.</param>
     private void FlushEngines(ref FlushContext flush)
     {
-        ReadOnlySpan<ChannelEngine> engines = _core.ActiveEngines;
-        for (int i = 0; i < engines.Length; i++)
+        if (_inScheduler)
         {
-            engines[i].Flush(ref flush);
+            return;
+        }
+
+        _inScheduler = true;
+        try
+        {
+            long now = flush.NowMicros;
+            flush.BudgetBytes = _sendRate > 0 ? _sendBucket.Available(now) : long.MaxValue;
+            flush.CancelBlockedDatagrams = TransportHonoursCancelOnBlocked();
+            DatagramPacker packer = _core.Packer;
+            packer.Begin(in flush);
+            ReadOnlySpan<int> order = _core.ScheduleOrder;
+            for (int i = 0; i < order.Length; i++)
+            {
+                int channelIndex = order[i];
+                _core.GetEngine(channelIndex).FlushChannel(channelIndex, ref flush);
+            }
+
+            ReadOnlySpan<ChannelEngine> engines = _core.ActiveEngines;
+            for (int i = 0; i < engines.Length; i++)
+            {
+                engines[i].Flush(ref flush);
+            }
+
+            packer.Finish(ref flush);
+            if (_sendRate > 0)
+            {
+                _sendBucket.Consume(flush.BytesSubmitted);
+                if (flush.BudgetExhausted)
+                {
+                    flush.NextDeadline = Math.Min(flush.NextDeadline, now + Math.Max(1, _sendBucket.MicrosUntil(1)));
+                }
+            }
+        }
+        finally
+        {
+            _inScheduler = false;
+        }
+
+        DrainLocalCompletions();
+    }
+
+    /// <summary>
+    /// One scheduler pass at the end of an <see cref="SendMode.Immediate"/> send (PROTOCOL.md §4.5: eligible now, together
+    /// with whatever is already buffered for the peer). The engines' <c>Tick</c> does not run (time-driven work belongs to
+    /// Flush and Poll); containers carry the tick last passed to <see cref="Flush"/>.
+    /// </summary>
+    private void FlushImmediate()
+    {
+        if (_inScheduler || _state != PeerState.Connected)
+        {
+            return;
+        }
+
+        EnterCall();
+        try
+        {
+            FlushContext flush = NewFlushContext(_clock.NowMicros, _lastTick);
+            FlushEngines(ref flush);
+            if (flush.NextDeadline < _engineDeadline)
+            {
+                _engineDeadline = flush.NextDeadline;
+                if (flush.NextDeadline < _nextDeadlineMicros)
+                {
+                    _nextDeadlineMicros = flush.NextDeadline;
+                }
+            }
+        }
+        finally
+        {
+            ExitCall();
         }
     }
+
+    /// <summary>
+    /// PROTOCOL.md §4.5 <c>DropWhenBlocked</c>: unreliable datagrams go out with <see cref="TransportSendFlags.CancelOnBlocked"/>
+    /// (a datagram the transport cannot send at once is dropped and completes <c>Expired</c> instead of queueing behind
+    /// congestion) only when the transport reports that it honours the flag. That report is
+    /// <c>TransportCapabilities.CancelOnBlocked</c>, added by the MsQuic transport wave (branch quicly/c3-msquic-transport)
+    /// and not on main yet, so this answers <see langword="false"/> and blocked datagrams are queued by the transport. When
+    /// the field lands: record it in <see cref="PeerCore"/> at <c>OnConnected</c> and return it here; nothing else changes.
+    /// </summary>
+    /// <returns>Whether unreliable datagrams may carry <see cref="TransportSendFlags.CancelOnBlocked"/>.</returns>
+    private bool TransportHonoursCancelOnBlocked() => false;
 
     private void UpdateNextDeadline(long timerDeadline)
     {

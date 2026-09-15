@@ -1,10 +1,15 @@
+using System.Diagnostics.CodeAnalysis;
+using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Memory;
+using Tedd.Quicly.Core.Primitives;
 using Tedd.Quicly.Core.Session.Engines;
+using Tedd.Quicly.Core.Threading;
 
 namespace Tedd.Quicly.Core.Session;
 
 // Game thread: the public send surface (ARCHITECTURE.md §4.1, §6). The peer resolves the channel and checks the session
-// state; admission itself belongs to the engine of the channel's mode (ChannelEngine.Admit).
+// state; admission itself belongs to the engine of the channel's mode (ChannelEngine.Admit). An Immediate send runs one
+// scheduler pass before it returns (QuiclyPeer.Flush.cs).
 public sealed unsafe partial class QuiclyPeer
 {
     /// <summary>Most payload pages of one <see cref="SendGather"/>.</summary>
@@ -46,6 +51,7 @@ public sealed unsafe partial class QuiclyPeer
     /// <param name="payload">The message.</param>
     /// <param name="options">Mode, tracking, expiry.</param>
     /// <returns>The admission result (and the token of a tracked send).</returns>
+    /// <exception cref="ArgumentOutOfRangeException">The channel is keyed and the key exceeds 2^62 − 1.</exception>
     public SendResult SendCopy(in SendHeader header, ReadOnlySpan<byte> payload, SendOptions options = default)
     {
         SendRequest request = default;
@@ -61,7 +67,7 @@ public sealed unsafe partial class QuiclyPeer
     /// <param name="length">Payload bytes at the start of the lease.</param>
     /// <param name="options">Mode, tracking, expiry.</param>
     /// <returns>The admission result; on a rejection the caller still owns the lease.</returns>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="length"/> is negative or exceeds the lease.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="length"/> is negative or exceeds the lease, or the channel is keyed and the key exceeds 2^62 − 1.</exception>
     public SendResult SendOwned(in SendHeader header, BufferLease lease, int length, SendOptions options = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(length);
@@ -82,7 +88,7 @@ public sealed unsafe partial class QuiclyPeer
     /// <param name="length">Bytes.</param>
     /// <param name="options">Mode, tracking, expiry.</param>
     /// <returns>The admission result.</returns>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="length"/> is negative.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="length"/> is negative, or the channel is keyed and the key exceeds 2^62 − 1.</exception>
     /// <exception cref="ArgumentNullException"><paramref name="payload"/> is null and <paramref name="length"/> is positive.</exception>
     public SendResult SendPinned(in SendHeader header, byte* payload, int length, SendOptions options = default)
     {
@@ -103,10 +109,15 @@ public sealed unsafe partial class QuiclyPeer
     /// Sends caller memory without copying; the peer pins it until the BufferReleased completion (convenience path, ADR
     /// 0008 invariant 11). The memory must not change until then.
     /// </summary>
+    /// <remarks>
+    /// Array-backed memory is pinned with a handle kept in the entry's pin side table and freed with the payload. Memory
+    /// that is not backed by an array (a <see cref="System.Buffers.MemoryManager{T}"/>) is copied at admission instead.
+    /// </remarks>
     /// <param name="header">Channel and key.</param>
     /// <param name="payload">The message.</param>
     /// <param name="options">Mode, tracking, expiry.</param>
     /// <returns>The admission result.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">The channel is keyed and the key exceeds 2^62 − 1.</exception>
     public SendResult SendBorrowed(in SendHeader header, ReadOnlyMemory<byte> payload, SendOptions options = default)
     {
         SendRequest request = default;
@@ -117,11 +128,16 @@ public sealed unsafe partial class QuiclyPeer
     }
 
     /// <summary>Sends existing payload pages as one message (at most <see cref="MaxGatherSegments"/>); ownership moves to the peer when admitted.</summary>
+    /// <remarks>
+    /// Each page contributes its whole <see cref="BufferLease.Length"/>. On datagram channels the pages are copied into one
+    /// payload buffer at admission (a datagram message fits in one datagram) and given back to the pool.
+    /// </remarks>
     /// <param name="header">Channel and key.</param>
     /// <param name="segments">The pages, in order.</param>
     /// <param name="options">Mode, tracking, expiry.</param>
     /// <returns>The admission result.</returns>
     /// <exception cref="ArgumentException">More than <see cref="MaxGatherSegments"/> pages.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The channel is keyed and the key exceeds 2^62 − 1.</exception>
     public SendResult SendGather(in SendHeader header, ReadOnlySpan<BufferLease> segments, SendOptions options = default)
     {
         if (segments.Length > MaxGatherSegments)
@@ -263,11 +279,32 @@ public sealed unsafe partial class QuiclyPeer
             return SendResult.Rejected(SendStatus.NotConnected);
         }
 
-        request.Channel = _core.GetChannel(index);
+        ChannelDefinition channel = _core.GetChannel(index);
+        if (channel.Keyed && header.Key > VarInt.MaxValue)
+        {
+            ThrowKeyOutOfRange(header.Key);
+        }
+
+        request.Channel = channel;
         request.ChannelIndex = index;
         request.Key = header.Key;
         request.Options = options;
         SendStatus status = _core.GetEngine(index).Admit(ref request);
-        return new SendResult(status, status == SendStatus.Admitted ? request.Token : default);
+        if (status != SendStatus.Admitted)
+        {
+            return SendResult.Rejected(status);
+        }
+
+        SendToken token = request.Token;
+        if (options.Mode == SendMode.Immediate)
+        {
+            FlushImmediate();
+        }
+
+        return new SendResult(SendStatus.Admitted, token);
     }
+
+    [DoesNotReturn]
+    private static void ThrowKeyOutOfRange(ulong key) =>
+        throw new ArgumentOutOfRangeException("header", key, "A message key is at most 2^62 - 1 (PROTOCOL.md §2.1).");
 }

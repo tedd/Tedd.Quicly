@@ -40,8 +40,26 @@ internal abstract class ChannelEngine : IDisposable
     /// <returns>The admission result.</returns>
     public abstract SendStatus Admit(ref SendRequest request);
 
-    /// <summary>Submits queued work to the transport (game thread, inside <see cref="QuiclyPeer.Flush"/>).</summary>
-    /// <param name="flush">Flush inputs; lower <see cref="FlushContext.NextDeadline"/> for pending work.</param>
+    /// <summary>
+    /// The scheduler's pass over one channel of this engine (game thread, inside <see cref="QuiclyPeer.Flush"/> or at the
+    /// end of a <see cref="SendMode.Immediate"/> send): hand the channel's queued messages to the transport in admission
+    /// order — datagram engines through <see cref="PeerCore.Packer"/> — dropping those whose expiry has passed
+    /// (PROTOCOL.md §4.5) and stopping when <see cref="FlushContext.BudgetBytes"/> runs out. The scheduler calls it once per
+    /// pass for every channel of the engine, highest <see cref="ChannelDefinition.Priority"/> first
+    /// (<see cref="PeerCore.ScheduleOrder"/>). Entries dropped here are finished through
+    /// <see cref="PeerCore.QueueLocalCompletion"/>, never inline, so no continuation runs inside a pass. Default: nothing.
+    /// </summary>
+    /// <param name="channelIndex">Dense index of a channel of this engine.</param>
+    /// <param name="flush">The pass: clock, tick, datagram limits, send budget.</param>
+    public virtual void FlushChannel(int channelIndex, ref FlushContext flush)
+    {
+    }
+
+    /// <summary>
+    /// Engine-level work after every channel's <see cref="FlushChannel"/> (game thread, once per scheduler pass): traffic
+    /// that PROTOCOL.md §4.5 schedules after fresh real-time messages (retries, bulk) and anything not tied to one channel.
+    /// </summary>
+    /// <param name="flush">The pass; lower <see cref="FlushContext.NextDeadline"/> for pending work.</param>
     public abstract void Flush(ref FlushContext flush);
 
     /// <summary>Time-driven work: retries, expiry, timers (game thread, <paramref name="nowMicros"/> read once by the caller).</summary>

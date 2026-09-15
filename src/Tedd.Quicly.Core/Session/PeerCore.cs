@@ -77,6 +77,11 @@ internal sealed unsafe class PeerCore : IDisposable
     private volatile bool _transportClosing;
     private volatile bool _transportClosed;
     private bool _disposed;
+    private readonly int[] _scheduleOrder;
+    private readonly CompletionEntry[] _localCompletions;
+    private int _localHead;
+    private int _localTail;
+    private int _localCount;
 
     /// <summary>Creates the shared state of <paramref name="peer"/>. Engines are created by <see cref="InitializeEngines"/>.</summary>
     /// <param name="peer">The owning peer.</param>
@@ -131,6 +136,100 @@ internal sealed unsafe class PeerCore : IDisposable
         SessionMaxMessageSize = role == PeerRole.Server ? options.MaxMessageSize : 0;
         FlushIntervalMicros = Math.Max(1, PeerOptions.ToMicros(options.FlushInterval));
         _maxDatagramPayload = 0;
+        _scheduleOrder = ComputeScheduleOrder(_channels);
+        _localCompletions = new CompletionEntry[capacity];
+        Packer = new DatagramPacker(this);
+    }
+
+    // ------------------------------------------------------------------ scheduler support (game thread)
+
+    /// <summary>The per-peer datagram packer (engines hand it entries from <see cref="ChannelEngine.FlushChannel"/>).</summary>
+    public DatagramPacker Packer { get; }
+
+    /// <summary>
+    /// Dense channel indices in scheduling order (PROTOCOL.md §4.5): highest <see cref="ChannelDefinition.Priority"/> first,
+    /// ascending id among channels of equal priority. Precomputed at construction.
+    /// </summary>
+    public ReadOnlySpan<int> ScheduleOrder => _scheduleOrder;
+
+    /// <summary>Completions queued with <see cref="QueueLocalCompletion"/> and not yet routed.</summary>
+    public int LocalCompletionsQueued => _localCount;
+
+    /// <summary>
+    /// Queues a completion the game thread decided itself: the entry was never handed to the transport, or the transport
+    /// refused it (expiry at scheduling time, a cancellation, a refused submission). It is routed like a transport
+    /// completion — to the channel's engine, the packer's fan-out or the peer's control traffic — with
+    /// <see cref="CompletionKind.Local"/> and <paramref name="status"/>, at the end of the current scheduler pass or at the
+    /// start of the next Poll or Flush; never inline, so no continuation runs inside a pass. Queue an entry at most once,
+    /// after it left every queue. Game thread.
+    /// </summary>
+    /// <param name="slot">The entry (normally <c>Filling</c>).</param>
+    /// <param name="status">How the send ends.</param>
+    public void QueueLocalCompletion(int slot, DeliveryStatus status)
+    {
+        CompletionEntry[] queue = _localCompletions;
+        Debug.Assert(_localCount < queue.Length, "an entry is queued for local completion at most once");
+        queue[_localTail] = new CompletionEntry
+        {
+            Slot = slot,
+            Generation = Entries[slot].Generation,
+            Kind = CompletionKind.Local,
+            Canceled = true,
+            Final = true,
+            Status = status,
+        };
+        _localTail = _localTail + 1 == queue.Length ? 0 : _localTail + 1;
+        _localCount++;
+    }
+
+    /// <summary>Takes the oldest completion queued with <see cref="QueueLocalCompletion"/> (game thread).</summary>
+    /// <param name="completion">The completion.</param>
+    /// <returns><see langword="false"/> when none is queued.</returns>
+    public bool TryDequeueLocalCompletion(out CompletionEntry completion)
+    {
+        if (_localCount == 0)
+        {
+            completion = default;
+            return false;
+        }
+
+        CompletionEntry[] queue = _localCompletions;
+        completion = queue[_localHead];
+        _localHead = _localHead + 1 == queue.Length ? 0 : _localHead + 1;
+        _localCount--;
+        return true;
+    }
+
+    /// <summary>
+    /// The default delivery status of a final completion: the queued status of a <see cref="CompletionKind.Local"/> one,
+    /// otherwise <see cref="MapDatagramState"/> or <see cref="MapStreamCompletion"/>.
+    /// </summary>
+    /// <param name="completion">A final completion.</param>
+    /// <returns>The status.</returns>
+    public DeliveryStatus MapCompletion(in CompletionEntry completion) => completion.Kind switch
+    {
+        CompletionKind.Local => completion.Status,
+        CompletionKind.Datagram => MapDatagramState(completion.DatagramState),
+        _ => MapStreamCompletion(completion.Canceled),
+    };
+
+    /// <summary>The delivery status of a send the transport refused synchronously (no completion follows).</summary>
+    /// <param name="status">The refusal.</param>
+    /// <returns><see cref="DeliveryStatus.Disconnected"/> while the connection is closing, otherwise <see cref="DeliveryStatus.Failed"/>.</returns>
+    public DeliveryStatus MapSubmitFailure(TransportStatus status) =>
+        _transportClosing || (status == TransportStatus.InvalidState && Transport is null) ? DeliveryStatus.Disconnected : DeliveryStatus.Failed;
+
+    private static int[] ComputeScheduleOrder(ChannelDefinition[] channels)
+    {
+        int[] order = new int[channels.Length];
+        for (int i = 0; i < order.Length; i++)
+        {
+            order[i] = i;
+        }
+
+        // Highest priority first; channels of equal priority keep the table's (ascending id) order.
+        Array.Sort(order, (a, b) => channels[a].Priority != channels[b].Priority ? channels[b].Priority.CompareTo(channels[a].Priority) : a.CompareTo(b));
+        return order;
     }
 
     /// <summary>The owning peer.</summary>
@@ -912,19 +1011,12 @@ internal sealed unsafe class PeerCore : IDisposable
     }
 
     /// <summary>
-    /// Completion routing seam for packed-container entries (channel 1). The packer (datagram engines, step 2) replaces
-    /// this with its fan-out to member entries; until then no container entry exists and a stray completion is finished
-    /// as <see cref="DeliveryStatus.Failed"/>.
+    /// Completion routing for packed-container entries (channel 1, game thread): the packer's fan-out to the member entries
+    /// (<see cref="DatagramPacker.OnContainerCompleted"/>).
     /// </summary>
     /// <param name="slot">The container entry.</param>
     /// <param name="completion">The completion.</param>
-    public void OnContainerCompleted(int slot, in CompletionEntry completion)
-    {
-        if (completion.Final)
-        {
-            CompleteEntry(slot, DeliveryStatus.Failed);
-        }
-    }
+    public void OnContainerCompleted(int slot, in CompletionEntry completion) => Packer.OnContainerCompleted(slot, in completion);
 
     /// <summary>Default delivery status of a datagram's final send state.</summary>
     /// <param name="state">A final state (or Sent when the transport does not report states).</param>

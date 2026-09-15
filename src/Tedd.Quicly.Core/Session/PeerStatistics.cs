@@ -106,6 +106,21 @@ public struct PeerStatistics
     /// <summary>Control messages (Ping, Pong, Hello, HelloAck, Close) that could not be handed to the transport.</summary>
     public long ControlSendFailures;
 
+    /// <summary>
+    /// Application datagrams handed to the transport by the scheduler: messages sent alone and packed containers (Pings
+    /// and other control datagrams are not included).
+    /// </summary>
+    public long DatagramsSent;
+
+    /// <summary>Bytes of <see cref="DatagramsSent"/> (whole datagram payloads, container overhead included).</summary>
+    public long DatagramBytesSent;
+
+    /// <summary>Packed containers among <see cref="DatagramsSent"/> (PROTOCOL.md §2.2).</summary>
+    public long ContainersSent;
+
+    /// <summary>Messages that travelled inside packed containers.</summary>
+    public long MessagesPacked;
+
     /// <summary>Send lease bytes held now.</summary>
     public long SendBytesOutstanding;
 

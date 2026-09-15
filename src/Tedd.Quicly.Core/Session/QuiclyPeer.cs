@@ -112,6 +112,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         _controlBucket.Initialize(options.ControlMessagesPerSecond, options.ControlMessagesPerSecond, now);
         _pongBucket.Initialize(options.PongsPerSecond, options.PongBurst, now);
         _decodeBucket.Initialize(options.DecodedBytesPerSecond, options.DecodedBytesPerSecond, now);
+        InitializeScheduler(options.MaxSendBytesPerSecond, now);
         _admissionDeadline = now + _admissionTimeoutMicros;
         _lastReceiveMicros = now;
         _timerDeadline = _admissionDeadline;
@@ -302,6 +303,10 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.CallbackFaults = Volatile.Read(ref c.CallbackFaults);
         statistics.DecodeFailures = c.DecodeFailures;
         statistics.ControlSendFailures = c.ControlSendFailures + Volatile.Read(ref c.PongSendFailures);
+        statistics.DatagramsSent = c.DatagramsSent;
+        statistics.DatagramBytesSent = c.DatagramBytesSent;
+        statistics.ContainersSent = c.ContainersSent;
+        statistics.MessagesPacked = c.MessagesPacked;
         statistics.SendBytesOutstanding = _core.SendBytesOutstanding;
         statistics.ReceiveBytesOutstanding = _core.ReceiveBytesOutstanding;
     }

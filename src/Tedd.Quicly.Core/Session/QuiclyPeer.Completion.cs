@@ -3,8 +3,9 @@ using Tedd.Quicly.Core.Threading;
 
 namespace Tedd.Quicly.Core.Session;
 
-// Game thread: tracked-send completion APIs and the completion-ring drain that routes transport completions to the entry's
-// owner (control traffic → the peer, containers → the packer seam, everything else → the channel's engine).
+// Game thread: tracked-send completion APIs and the completion drain that routes transport completions (and the ones the
+// game thread queued itself) to the entry's owner: control traffic → the peer, containers → the packer's fan-out,
+// everything else → the channel's engine.
 public sealed unsafe partial class QuiclyPeer
 {
     /// <summary>
@@ -48,7 +49,8 @@ public sealed unsafe partial class QuiclyPeer
 
     /// <summary>
     /// Best-effort cancellation of a tracked send that has not been handed to the transport yet (routed to its engine).
-    /// Never releases the payload by itself: the send completes <see cref="DeliveryStatus.Canceled"/> through the usual path.
+    /// Never releases the payload by itself: the send completes <see cref="DeliveryStatus.Canceled"/> through the usual
+    /// path, at the next <see cref="Poll"/> or <see cref="Flush"/>.
     /// </summary>
     /// <param name="token">The token.</param>
     /// <returns><see langword="true"/> when the send will complete canceled.</returns>
@@ -70,20 +72,42 @@ public sealed unsafe partial class QuiclyPeer
         SpscRing<CompletionEntry> ring = _core.CompletionRing;
         while (ring.TryDequeue(out CompletionEntry completion))
         {
-            int slot = completion.Slot;
-            ushort channel = _core.Entries[slot].Channel;
-            if (channel == PeerCore.ControlChannelId)
-            {
-                OnControlEntryCompleted(in completion);
-            }
-            else if (channel == PeerCore.ContainerChannelId)
-            {
-                _core.OnContainerCompleted(slot, in completion);
-            }
-            else
-            {
-                _core.GetEngine(_core.ChannelIndexOf(channel)).OnSendCompleted(slot, in completion);
-            }
+            RouteCompletion(in completion);
+        }
+
+        DrainLocalCompletions();
+    }
+
+    /// <summary>Routes the completions the game thread queued itself (<see cref="PeerCore.QueueLocalCompletion"/>).</summary>
+    private void DrainLocalCompletions()
+    {
+        while (_core.TryDequeueLocalCompletion(out CompletionEntry completion))
+        {
+            RouteCompletion(in completion);
+        }
+    }
+
+    /// <summary>
+    /// Routes one completion to the owner of its entry (game thread): channel 0 → the peer's control traffic, channel 1 →
+    /// the packer's fan-out (<see cref="PeerCore.OnContainerCompleted"/>, which routes every member back here), any other
+    /// channel → its engine's <see cref="ChannelEngine.OnSendCompleted"/>.
+    /// </summary>
+    /// <param name="completion">The completion.</param>
+    internal void RouteCompletion(in CompletionEntry completion)
+    {
+        int slot = completion.Slot;
+        ushort channel = _core.Entries[slot].Channel;
+        if (channel == PeerCore.ControlChannelId)
+        {
+            OnControlEntryCompleted(in completion);
+        }
+        else if (channel == PeerCore.ContainerChannelId)
+        {
+            _core.OnContainerCompleted(slot, in completion);
+        }
+        else
+        {
+            _core.GetEngine(_core.ChannelIndexOf(channel)).OnSendCompleted(slot, in completion);
         }
     }
 }

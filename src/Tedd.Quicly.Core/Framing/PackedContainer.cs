@@ -221,6 +221,32 @@ public ref struct PackedContainerWriter
         _count = 0;
     }
 
+    /// <summary>
+    /// Continues a container whose first <paramref name="length"/> bytes (its header and <paramref name="count"/> entries)
+    /// were written into <paramref name="buffer"/> earlier. The writer is a <c>ref struct</c> and cannot be stored, so a
+    /// packer that appends across calls keeps <see cref="Length"/> and <see cref="Count"/> and resumes with them.
+    /// </summary>
+    /// <param name="buffer">The destination the container was started in.</param>
+    /// <param name="length">Bytes written so far (the previous writer's <see cref="Length"/>).</param>
+    /// <param name="count">Messages appended so far (the previous writer's <see cref="Count"/>).</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="length"/> is shorter than a header or longer than the buffer, or <paramref name="count"/> is outside 0 … <see cref="PackedContainer.MaxMessages"/>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="buffer"/> does not start with a container header.</exception>
+    public PackedContainerWriter(Span<byte> buffer, int length, int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(length, 2);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(length, buffer.Length);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(count, PackedContainer.MaxMessages);
+        if (buffer[0] != PackedContainer.ChannelId)
+        {
+            throw new ArgumentException("The buffer does not start with a packed container header.", nameof(buffer));
+        }
+
+        _buffer = buffer;
+        _length = length;
+        _count = count;
+    }
+
     /// <summary>Bytes written so far (header + entries).</summary>
     public readonly int Length => _length;
 

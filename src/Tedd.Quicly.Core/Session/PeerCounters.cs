@@ -76,4 +76,16 @@ internal sealed class PeerCounters
 
     /// <summary>Control messages (Ping, Pong, Hello, HelloAck, Close) the game thread could not hand to the transport.</summary>
     public long ControlSendFailures;
+
+    /// <summary>Application datagrams the scheduler handed to the transport: loose messages and packed containers (control datagrams are not included).</summary>
+    public long DatagramsSent;
+
+    /// <summary>Bytes of <see cref="DatagramsSent"/> (whole datagram payloads).</summary>
+    public long DatagramBytesSent;
+
+    /// <summary>Packed containers among <see cref="DatagramsSent"/>.</summary>
+    public long ContainersSent;
+
+    /// <summary>Messages that travelled inside packed containers.</summary>
+    public long MessagesPacked;
 }

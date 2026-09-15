@@ -66,9 +66,22 @@ internal sealed class ReceiveMailbox : IDisposable
     /// <param name="entry">The complete message descriptor (its lease moves into the mailbox).</param>
     /// <param name="displaced">The displaced lease, or <see cref="BufferLease.Empty"/>.</param>
     /// <returns><see langword="false"/> only if no record is free (cannot happen with the documented sizing).</returns>
-    public bool TryPost(int keySlot, in ReceiveEntry entry, out BufferLease displaced)
+    public bool TryPost(int keySlot, in ReceiveEntry entry, out BufferLease displaced) => TryPost(keySlot, in entry, out displaced, out _);
+
+    /// <summary>
+    /// Posts <paramref name="entry"/> as the latest value of <paramref name="keySlot"/> and reports whether a value the game
+    /// thread never saw was displaced (its lease is <paramref name="displaced"/>, which is empty for an empty payload).
+    /// Transport thread.
+    /// </summary>
+    /// <param name="keySlot">Key slot.</param>
+    /// <param name="entry">The complete message descriptor (its lease moves into the mailbox).</param>
+    /// <param name="displaced">The displaced lease, or <see cref="BufferLease.Empty"/>.</param>
+    /// <param name="replaced">True when an unseen value was displaced (count a supersede).</param>
+    /// <returns><see langword="false"/> only if no record is free (cannot happen with the documented sizing).</returns>
+    public bool TryPost(int keySlot, in ReceiveEntry entry, out BufferLease displaced, out bool replaced)
     {
         displaced = BufferLease.Empty;
+        replaced = false;
         if (_freeCount == 0)
         {
             while (_returned.TryDequeue(out int returned))
@@ -88,6 +101,7 @@ internal sealed class ReceiveMailbox : IDisposable
         if (previous >= 0)
         {
             displaced = _records[previous].Lease;
+            replaced = true;
             _free[_freeCount++] = previous;
         }
 

@@ -88,11 +88,13 @@ public class SharedLeaseTableTests
         Assert.Throws<ArgumentException>(() => table.Retain(foreign));
         Assert.Throws<ArgumentException>(() => table.Release(foreign));
 
+        // Rent the whole 64-block class and pick any block outside the table's 8; which blocks come out last
+        // depends on the renting thread's free-list shard.
         BufferLease[] many = new BufferLease[64];
         for (int i = 0; i < many.Length; i++)
             Assert.True(other.TryRent(1, out many[i]));
-        BufferLease outOfRangeBlock = many[63];
-        Assert.True(outOfRangeBlock.BlockIndex >= 8);
+        BufferLease outOfRangeBlock = Array.Find(many, l => l.BlockIndex >= 8);
+        Assert.True(outOfRangeBlock.IsValid);
         Assert.Throws<ArgumentException>(() => table.GetReferenceCount(new SharedLease(outOfRangeBlock)));
         for (int i = 0; i < many.Length; i++)
             other.Return(many[i]);

@@ -86,6 +86,14 @@ public sealed class CertificatePathTests
         Assert.Equal(1, accepted.Echoes);
         Assert.Empty(bed.ConsumerFailures);
         TestContext.Current.TestOutputHelper?.WriteLine("msquic " + MsQuicApi.Instance.Version + " (" + MsQuicApi.Instance.TlsProvider + "), credential " + served.CredentialType);
+
+        // An orderly shutdown (clients, listener, binder, provisioner) leaves no key container behind (ADR 0009).
+        KeyContainer? servedKey = OperatingSystem.IsWindows() ? KeyContainer.Of(certificate) : null;
+        await bed.DisposeAsync();
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.False(servedKey!.Value.Exists(), "Disposing the provisioner should delete the served certificate's key container.");
+        }
     }
 
     [Fact(Timeout = E2eTimeouts.TestMilliseconds)]

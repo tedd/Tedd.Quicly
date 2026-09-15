@@ -39,8 +39,6 @@ internal sealed class ServedConfiguration
     /// <summary>Completes once the adapter has closed the configuration.</summary>
     public Task WhenClosed => _closed.Task;
 
-    public bool IsClosed => Volatile.Read(ref _closing) != 0;
-
     /// <summary>Adds a reference unless the configuration has already been released for good.</summary>
     public bool TryAddRef()
     {

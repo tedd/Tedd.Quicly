@@ -19,18 +19,6 @@ internal sealed class ManualTimeProvider : TimeProvider
         }
     }
 
-    /// <summary>Timers that are armed and have not fired yet.</summary>
-    public int ArmedTimers
-    {
-        get
-        {
-            lock (_lock)
-            {
-                return _timers.Count(static t => t.DueAt is not null);
-            }
-        }
-    }
-
     public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
     {
         ManualTimer timer = new(this, callback, state);

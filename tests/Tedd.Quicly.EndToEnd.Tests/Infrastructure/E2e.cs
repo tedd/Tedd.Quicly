@@ -54,21 +54,6 @@ internal static class E2eTimeouts
             throw new TimeoutException("Timed out after " + timeout + " waiting for " + what + ".", e);
         }
     }
-
-    /// <summary>Polls <paramref name="condition"/> until it holds, for at most <paramref name="timeout"/>.</summary>
-    public static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout, string what)
-    {
-        DateTime deadline = DateTime.UtcNow + timeout;
-        while (!condition())
-        {
-            if (DateTime.UtcNow > deadline)
-            {
-                throw new TimeoutException("Timed out after " + timeout + " waiting for " + what + ".");
-            }
-
-            await Task.Delay(10).ConfigureAwait(false);
-        }
-    }
 }
 
 /// <summary>

@@ -5,4 +5,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Tedd.Quicly.Client.Tests" />
+  </ItemGroup>
 </Project>

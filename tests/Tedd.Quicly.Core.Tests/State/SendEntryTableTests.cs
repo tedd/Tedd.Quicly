@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.State;
 using Tedd.Quicly.Core.Threading;
@@ -51,6 +52,15 @@ public unsafe class SendEntryTableTests
     }
 
     [Fact]
+    public void State_And_Generation_Form_One_Aligned_64_Bit_Word()
+    {
+        SendEntry e = default;
+        e.State = (int)SendEntryState.InFlight;
+        e.Generation = 0xABCD0001;
+        Assert.Equal(0xABCD0001_00000002UL, *(ulong*)&e);
+    }
+
+    [Fact]
     public void Enum_Values_Are_Fixed()
     {
         Assert.Equal(0, (int)SendEntryState.Free);
@@ -58,6 +68,7 @@ public unsafe class SendEntryTableTests
         Assert.Equal(2, (int)SendEntryState.InFlight);
         Assert.Equal(3, (int)SendEntryState.Cancelling);
         Assert.Equal(4, (int)SendEntryState.Completed);
+        Assert.Equal(0, (byte)SendEntryFlags.None);
         Assert.Equal(1, (byte)SendEntryFlags.Tracked);
         Assert.Equal(2, (byte)SendEntryFlags.Datagram);
         Assert.Equal(4, (byte)SendEntryFlags.Container);
@@ -80,6 +91,8 @@ public unsafe class SendEntryTableTests
         Assert.Equal(expected, table.Entries.Length);
         Assert.Equal(expected, table.PinHandles.Length);
         Assert.Equal(0, (nint)table.Entries.Pointer % 64);
+        for (int i = 0; i < expected; i++)
+            Assert.Equal(0, (nint)Unsafe.AsPointer(ref table[i]) % 64);
     }
 
     [Theory]
@@ -104,7 +117,6 @@ public unsafe class SendEntryTableTests
         Assert.Equal((int)SendEntryState.Filling, e.State);
         Assert.Equal(SendEntryState.Filling, table.GetState(slot));
         Assert.Equal(1u, e.Generation);
-        Assert.Equal(1u, e.Generation & 1);
         Assert.Equal(-1, table.Next[slot]);
         Assert.Equal(-1, table.BatchHead[slot]);
         Assert.Equal(0, table.BatchCount[slot]);
@@ -115,6 +127,7 @@ public unsafe class SendEntryTableTests
         e.Channel = 7;
         e.Flags = SendEntryFlags.Tracked | SendEntryFlags.Fin;
         e.HeaderLength = 9;
+        e.Header = new TransportSegment((byte*)0x20, 3);
         e.Payload = new TransportSegment((byte*)0x10, 10);
         table.Leases[slot] = new BufferLease(1, 0, 1, 2, 3, 4);
         table.Keys[slot] = 99;
@@ -128,6 +141,7 @@ public unsafe class SendEntryTableTests
         Assert.True(table.TryTransition(slot, SendEntryState.InFlight, SendEntryState.Completed));
         table.Free(slot);
         Assert.Equal(0, table.Count);
+        Assert.Equal(1u, e.Generation); // Free keeps the generation
 
         Assert.True(table.TryAllocate(out int again));
         Assert.Equal(slot, again);
@@ -135,6 +149,8 @@ public unsafe class SendEntryTableTests
         Assert.Equal(0, e.Channel);
         Assert.Equal(SendEntryFlags.None, e.Flags);
         Assert.Equal(0, e.HeaderLength);
+        Assert.Equal(0u, e.Header.Length);
+        Assert.True(e.Header.Buffer is null);
         Assert.Equal(0u, e.Payload.Length);
         Assert.True(table.Leases[slot].IsEmpty);
         Assert.Equal(0UL, table.Keys[slot]);
@@ -145,6 +161,7 @@ public unsafe class SendEntryTableTests
         Assert.Equal(0, table.BatchCount[slot]);
         Assert.Equal(0, table.PinHandles[slot]);
         Assert.Equal(table.MakeContext(slot), table.Contexts[slot]);
+        Assert.Equal((3UL << 32) | (uint)slot, table.Contexts[slot]);
     }
 
     [Fact]
@@ -160,6 +177,14 @@ public unsafe class SendEntryTableTests
         table[slot].Generation = 0xFFFFFFFE;
         Assert.True(table.TryAllocate(out slot));
         Assert.Equal(uint.MaxValue, table[slot].Generation);
+
+        for (int i = 0; i < 1000; i++)
+        {
+            table.Discard(slot);
+            Assert.True(table.TryAllocate(out slot));
+            Assert.Equal(1u, table[slot].Generation & 1);
+            Assert.NotEqual(0UL, table.Contexts[slot]);
+        }
     }
 
     [Fact]
@@ -176,27 +201,32 @@ public unsafe class SendEntryTableTests
         Assert.Equal(4, table.Count);
 
         table.Discard(slots[2]);
+        Assert.Equal(1, table.Available);
         Assert.True(table.TryAllocate(out int reused));
         Assert.Equal(2, reused);
+        Assert.False(table.TryAllocate(out _));
     }
 
     [Fact]
-    public void Publish_Requires_Filling()
+    public void Publish_Requires_Filling_And_Keeps_The_Generation()
     {
         using var table = new SendEntryTable(2);
         Assert.True(table.TryAllocate(out int slot));
+        uint generation = table[slot].Generation;
         table.Publish(slot);
         Assert.Equal(SendEntryState.InFlight, table.GetState(slot));
+        Assert.Equal(generation, table[slot].Generation);
         Assert.Throws<InvalidOperationException>(() => table.Publish(slot));
         table.Discard(slot);
         Assert.Throws<InvalidOperationException>(() => table.Publish(slot));
     }
 
     [Fact]
-    public void TryTransition_Is_A_Compare_Exchange()
+    public void TryTransition_Is_A_Compare_Exchange_On_The_State()
     {
         using var table = new SendEntryTable(2);
         Assert.True(table.TryAllocate(out int slot));
+        uint generation = table[slot].Generation;
         table.Publish(slot);
         Assert.False(table.TryTransition(slot, SendEntryState.Filling, SendEntryState.Completed));
         Assert.Equal(SendEntryState.InFlight, table.GetState(slot));
@@ -204,8 +234,48 @@ public unsafe class SendEntryTableTests
         Assert.False(table.TryTransition(slot, SendEntryState.InFlight, SendEntryState.Completed));
         Assert.True(table.TryTransition(slot, SendEntryState.Cancelling, SendEntryState.Completed));
         Assert.Equal(SendEntryState.Completed, table.GetState(slot));
+        Assert.Equal(generation, table[slot].Generation);
         table.Free(slot);
         Assert.Equal(SendEntryState.Free, table.GetState(slot));
+    }
+
+    [Fact]
+    public void TryTransitionContext_Checks_Generation_And_State_Atomically()
+    {
+        using var table = new SendEntryTable(4);
+        Assert.True(table.TryAllocate(out int slot));
+        ulong first = table.Contexts[slot];
+        table.Publish(slot);
+
+        // Wrong expected state: no change.
+        Assert.False(table.TryTransitionContext(first, SendEntryState.Cancelling, SendEntryState.Completed, out int resolved));
+        Assert.Equal(-1, resolved);
+        Assert.Equal(SendEntryState.InFlight, table.GetState(slot));
+
+        Assert.True(table.TryTransitionContext(first, SendEntryState.InFlight, SendEntryState.Completed, out resolved));
+        Assert.Equal(slot, resolved);
+        Assert.Equal(SendEntryState.Completed, table.GetState(slot));
+        table.Free(slot);
+
+        // ABA: the slot is reused and InFlight again. The old context names the same slot and the same state, but
+        // the generation differs, so it must not complete the new occupant.
+        Assert.True(table.TryAllocate(out int again));
+        Assert.Equal(slot, again);
+        ulong second = table.Contexts[again];
+        Assert.NotEqual(first, second);
+        table.Publish(again);
+        Assert.False(table.TryTransitionContext(first, SendEntryState.InFlight, SendEntryState.Completed, out resolved));
+        Assert.Equal(-1, resolved);
+        Assert.Equal(SendEntryState.InFlight, table.GetState(again));
+        Assert.True(table.TryTransitionContext(second, SendEntryState.InFlight, SendEntryState.Cancelling, out resolved));
+        Assert.True(table.TryTransitionContext(second, SendEntryState.Cancelling, SendEntryState.Completed, out resolved));
+        Assert.Equal(again, resolved);
+
+        // Malformed: slot index outside the table.
+        Assert.False(table.TryTransitionContext((second & 0xFFFF_FFFF_0000_0000UL) | 4, SendEntryState.Completed, SendEntryState.Free, out resolved));
+        Assert.False(table.TryTransitionContext(ulong.MaxValue, SendEntryState.Completed, SendEntryState.Free, out resolved));
+        Assert.Equal(-1, resolved);
+        Assert.Equal(SendEntryState.Completed, table.GetState(again));
     }
 
     [Fact]
@@ -216,12 +286,39 @@ public unsafe class SendEntryTableTests
         Assert.Throws<InvalidOperationException>(() => table.Free(slot));      // Filling
         table.Publish(slot);
         Assert.Throws<InvalidOperationException>(() => table.Free(slot));      // InFlight
-        Assert.True(table.TryTransition(slot, SendEntryState.InFlight, SendEntryState.Completed));
+        Assert.True(table.TryTransition(slot, SendEntryState.InFlight, SendEntryState.Cancelling));
+        Assert.Throws<InvalidOperationException>(() => table.Free(slot));      // Cancelling
+        Assert.Throws<InvalidOperationException>(() => table.Discard(slot));   // Cancelling
+        Assert.True(table.TryTransition(slot, SendEntryState.Cancelling, SendEntryState.Completed));
         Assert.Throws<InvalidOperationException>(() => table.Discard(slot));   // Completed
         table.Free(slot);
         Assert.Throws<InvalidOperationException>(() => table.Free(slot));      // Free
         Assert.Throws<InvalidOperationException>(() => table.Discard(slot));   // Free
         Assert.Equal(2, table.Available);
+
+        // Discard of a published entry (the transport rejected the call synchronously).
+        Assert.True(table.TryAllocate(out slot));
+        table.Publish(slot);
+        table.Discard(slot);
+        Assert.Equal(SendEntryState.Free, table.GetState(slot));
+        Assert.Equal(2, table.Available);
+    }
+
+    [Fact]
+    public void Slot_Accessors_Are_Bounds_Checked()
+    {
+        using var table = new SendEntryTable(2);
+        Assert.Throws<ArgumentOutOfRangeException>(() => table[2].Channel = 1);
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.Publish(-1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.Free(2));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.Discard(2));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.TryTransition(2, SendEntryState.InFlight, SendEntryState.Completed));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.GetState(2));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.MakeContext(2));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.SetHeader(2, [1]));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.GetHeaderScratch(-1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => { _ = table.GetSegments(2); });
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.AddToBatch(0, 2));
     }
 
     [Fact]
@@ -243,10 +340,13 @@ public unsafe class SendEntryTableTests
         Assert.False(table.TryResolveContext(((ulong)table[slot].Generation << 32) | 1000, out resolved));
         Assert.Equal(-1, resolved);
         Assert.False(table.TryResolveContext(((ulong)table[slot].Generation << 32) | 0xFFFFFFFF, out _));
+        // A slot that was never allocated (state Free, generation 0).
+        Assert.False(table.TryResolveContext(3, out _));
 
         // After free the slot is Free: even the matching generation is rejected.
         table.Publish(slot);
         Assert.True(table.TryTransition(slot, SendEntryState.InFlight, SendEntryState.Completed));
+        Assert.True(table.TryResolveContext(context, out _)); // Completed still resolves
         table.Free(slot);
         Assert.False(table.TryResolveContext(context, out _));
 
@@ -267,18 +367,19 @@ public unsafe class SendEntryTableTests
         table.SetHeader(slot, header);
 
         ref SendEntry e = ref table[slot];
+        byte* scratch = (byte*)Unsafe.AsPointer(ref e) + SendEntry.HeaderScratchOffset;
         Assert.Equal(7, e.HeaderLength);
         Assert.Equal(7u, e.Header.Length);
-        Assert.True(e.Header.Buffer == table.GetHeaderScratch(slot).GetPinnableReference() switch { _ => (table.Entries.Pointer + slot)->HeaderScratch });
-        Assert.True(e.Header.Buffer >= (byte*)table.Entries.Pointer);
-        Assert.True(e.Header.Buffer < (byte*)(table.Entries.Pointer + table.Capacity));
+        Assert.True(e.Header.Buffer == scratch);
         Assert.Equal(header, e.Header.AsSpan().ToArray());
         Assert.Equal(header, table.GetHeaderScratch(slot)[..7].ToArray());
         Assert.Equal(SendEntry.HeaderScratchSize, table.GetHeaderScratch(slot).Length);
+        Assert.True(Unsafe.AreSame(ref table.GetHeaderScratch(slot)[0], ref *scratch));
 
         table.SetHeader(slot, new byte[16]);
         Assert.Equal(16, e.HeaderLength);
         Assert.Throws<ArgumentOutOfRangeException>(() => table.SetHeader(slot, new byte[17]));
+        Assert.Equal(16, e.HeaderLength);
 
         table.SetHeader(slot, ReadOnlySpan<byte>.Empty);
         Assert.Equal(0, e.HeaderLength);
@@ -286,7 +387,7 @@ public unsafe class SendEntryTableTests
     }
 
     [Fact]
-    public void GetSegments_Covers_Consecutive_Slots_As_One_Gather()
+    public void GetSegments_Points_At_The_Entry_Header_Payload_Pair()
     {
         using var table = new SendEntryTable(4);
         Assert.True(table.TryAllocate(out int a));
@@ -298,13 +399,16 @@ public unsafe class SendEntryTableTests
         table[b].Payload = new TransportSegment((byte*)0x200, 200);
 
         TransportSegment* segments = table.GetSegments(a);
-        Assert.True(segments == &table[a].Header);
+        Assert.True(segments == (TransportSegment*)Unsafe.AsPointer(ref table[a].Header));
         Assert.Equal(1u, segments[0].Length);
         Assert.Equal(100u, segments[1].Length);
-        Assert.True(segments + 4 == table.GetSegments(b) + 2);
-        // Slot b's segments sit at +4 (after the 16-byte scratch area of slot a), not at +2.
-        Assert.Equal(2u, segments[4].Length);
-        Assert.Equal(200u, segments[5].Length);
+        Assert.Equal(0xA, segments[0].AsSpan()[0]);
+
+        // The next entry's pair starts one cache line (four segments) later, not two: consecutive entries are not
+        // one contiguous segment array, and a multi-entry gather has to copy the pairs.
+        Assert.True(table.GetSegments(b) == segments + 4);
+        Assert.Equal(2u, table.GetSegments(b)[0].Length);
+        Assert.Equal(200u, table.GetSegments(b)[1].Length);
     }
 
     [Fact]
@@ -335,19 +439,41 @@ public unsafe class SendEntryTableTests
         Assert.Equal(new[] { members[2], members[1], members[0] }, seen);
         Assert.Equal(-1, table.Next[members[0]]);
 
+        // Completion fan-out: complete every member, then the container, then free all.
+        foreach (int member in table.GetBatch(container))
+        {
+            table.Publish(member);
+            Assert.True(table.TryTransition(member, SendEntryState.InFlight, SendEntryState.Completed));
+        }
+
         table.ClearBatch(container);
         Assert.Equal(0, table.GetBatch(container).Count);
         Assert.Equal(-1, table.GetBatch(container).Head);
+        foreach (int member in members)
+            table.Free(member);
+        table.Discard(container);
+        Assert.Equal(0, table.Count);
     }
 
     [Fact]
-    public void Dispose_Is_Idempotent()
+    public void Dispose_Is_Idempotent_And_Disables_The_Table()
     {
         var table = new SendEntryTable(4);
+        Assert.True(table.TryAllocate(out int slot));
         table.Dispose();
         table.Dispose();
         Assert.True(table.Entries.IsDisposed);
         Assert.True(table.Leases.IsDisposed);
+        Assert.True(table.BatchCount.IsDisposed);
+        Assert.Equal(0, table.Capacity);
+        Assert.Equal(0, table.Available);
+        Assert.Equal(0, table.Count);
+        Assert.False(table.TryAllocate(out int none));
+        Assert.Equal(-1, none);
+        Assert.False(table.TryResolveContext(1UL << 32, out _));
+        Assert.False(table.TryTransitionContext(1UL << 32, SendEntryState.InFlight, SendEntryState.Completed, out _));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.Publish(slot));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.GetState(slot));
     }
 
     [Fact]
@@ -369,9 +495,9 @@ public unsafe class SendEntryTableTests
                 table.TryAllocate(out int slot);
                 table.SetHeader(slot, header);
                 table.Publish(slot);
-                table.TryResolveContext(table.Contexts[slot], out int resolved);
-                table.TryTransition(resolved, SendEntryState.InFlight, SendEntryState.Completed);
-                table.Free(slot);
+                table.TryResolveContext(table.Contexts[slot], out _);
+                table.TryTransitionContext(table.Contexts[slot], SendEntryState.InFlight, SendEntryState.Completed, out int resolved);
+                table.Free(resolved);
                 table.TryAllocate(out int container);
                 table.TryAllocate(out int member);
                 table.AddToBatch(container, member);
@@ -387,31 +513,47 @@ public unsafe class SendEntryTableTests
     }
 
     [Fact]
-    public void Transport_Thread_Completes_While_Owner_Allocates_And_Frees()
+    public void Transport_Thread_Completes_While_Owner_Allocates_And_Frees_And_Stale_Contexts_Never_Win()
     {
-        // Owner: allocate → publish → enqueue context on a ring. Transport: dequeue → resolve → InFlight→Completed →
-        // enqueue slot on the completion ring. Owner frees only after observing the completion (ADR 0008 §3/§4).
+        // Owner: allocate → publish → enqueue context on a ring. Transport: dequeue → InFlight→Completed through the
+        // context → enqueue slot on the completion ring, then replay the previous (now stale) context at a slot the
+        // owner is busy reusing. Owner frees only after observing the completion (ADR 0008 §3/§4). A replayed
+        // context must never change the state of the slot's next occupant.
         const int Sends = 200_000;
-        using var table = new SendEntryTable(64);
-        var submitted = new SpscRing<ulong>(64);
-        var completed = new SpscRing<int>(65);
-        int stale = 0;
+        using var table = new SendEntryTable(8);
+        var submitted = new SpscRing<ulong>(8);
+        var completed = new SpscRing<int>(9);
+        int failedCompletions = 0;
+        int staleWins = 0;
 
         var transport = new Thread(() =>
         {
             SpinWait spinner = default;
+            ulong previous = 0;
             for (int n = 0; n < Sends;)
             {
+                if (previous != 0)
+                {
+                    if (table.TryTransitionContext(previous, SendEntryState.InFlight, SendEntryState.Completed, out _)
+                        || table.TryTransitionContext(previous, SendEntryState.Filling, SendEntryState.Completed, out _))
+                        staleWins++;
+                }
+
                 if (!submitted.TryDequeue(out ulong context))
                 {
                     spinner.SpinOnce(sleep1Threshold: -1);
                     continue;
                 }
 
-                if (!table.TryResolveContext(context, out int slot) || !table.TryTransition(slot, SendEntryState.InFlight, SendEntryState.Completed))
-                    stale++;
+                if (!table.TryTransitionContext(context, SendEntryState.InFlight, SendEntryState.Completed, out int slot))
+                {
+                    failedCompletions++;
+                    slot = (int)(uint)context;
+                }
+
                 while (!completed.TryEnqueue(slot))
                     spinner.SpinOnce(sleep1Threshold: -1);
+                previous = context;
                 n++;
             }
         })
@@ -420,6 +562,7 @@ public unsafe class SendEntryTableTests
 
         SpinWait owner = default;
         int freed = 0;
+        int wrongState = 0;
         for (int sent = 0; sent < Sends;)
         {
             if (table.TryAllocate(out int slot))
@@ -434,7 +577,8 @@ public unsafe class SendEntryTableTests
 
             while (completed.TryDequeue(out int done))
             {
-                Assert.Equal(SendEntryState.Completed, table.GetState(done));
+                if (table.GetState(done) != SendEntryState.Completed)
+                    wrongState++;
                 table.Free(done);
                 freed++;
             }
@@ -448,7 +592,9 @@ public unsafe class SendEntryTableTests
         }
 
         Assert.Equal(Sends, freed);
-        Assert.Equal(0, stale);
+        Assert.Equal(0, failedCompletions);
+        Assert.Equal(0, staleWins);
+        Assert.Equal(0, wrongState);
         Assert.Equal(0, table.Count);
     }
 }

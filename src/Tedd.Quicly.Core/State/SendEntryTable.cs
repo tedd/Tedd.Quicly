@@ -9,28 +9,41 @@ namespace Tedd.Quicly.Core.State;
 
 /// <summary>
 /// Pre-allocated table of <see cref="SendEntry"/> slots (hot, one cache line each, native memory) plus the cold
-/// per-slot side tables, and the slot protocol of ADR 0008: allocate → fill → publish → transport → completion → free.
+/// per-slot side tables, implementing the slot protocol of ADR 0008: allocate → fill → publish → transport →
+/// completion → free.
 /// </summary>
 /// <remarks>
 /// <para><b>Threads.</b> <see cref="TryAllocate"/>, <see cref="Publish"/>, <see cref="Discard"/>, <see cref="Free"/>,
-/// the batch helpers and every cold array belong to the owner (game) thread. <see cref="TryTransition"/> and
-/// <see cref="TryResolveContext"/> may be called from any thread (typically the transport thread inside a
-/// completion callback). <see cref="SendEntry.State"/> is the only field written by both sides and changes only by
-/// compare-exchange once the entry is published; the free list is owned by the game thread alone, so freeing
-/// never needs an interlocked operation.</para>
-/// <para><b>Contexts.</b> <see cref="MakeContext"/> packs <c>(generation &lt;&lt; 32) | slot</c>; the generation is
-/// odd and bumped on every allocation, so a completion for a previous occupant of the slot fails
-/// <see cref="TryResolveContext"/> and is ignored (and counted) by the caller.</para>
+/// the header/batch helpers and every cold array belong to the owner (game) thread. <see cref="TryTransition"/>,
+/// <see cref="TryTransitionContext"/>, <see cref="TryResolveContext"/> and <see cref="GetState"/> may be called
+/// from any thread (typically the transport thread inside a completion callback). The free list is owned by the
+/// game thread alone, so allocating and freeing never need an interlocked operation.</para>
+/// <para><b>State word.</b> <see cref="SendEntry.State"/> (offset 0) and <see cref="SendEntry.Generation"/>
+/// (offset 4) form one naturally aligned 64-bit word, <c>(generation &lt;&lt; 32) | state</c>. It is the only
+/// memory written by both threads, and every write to it is a 64-bit volatile store (owner) or a 64-bit
+/// compare-exchange (either thread). Reading it with one 64-bit load gives a consistent (generation, state) pair,
+/// and <see cref="TryTransitionContext"/> checks the generation <em>inside</em> its compare-exchange, so a
+/// completion carrying the context of a previous occupant can never move the state of the slot's current
+/// occupant (no ABA window between "validate generation" and "change state").</para>
+/// <para><b>Contexts.</b> <see cref="MakeContext"/> packs <c>(generation &lt;&lt; 32) | slot</c>. Generations are
+/// odd and bumped on every allocation, so a context is never zero and a stale one fails validation; callers count
+/// and ignore it (ADR 0008 invariant 2).</para>
 /// <para><b>Cold side tables</b> (structure of arrays, indexed by slot, game thread): <see cref="Leases"/> (payload
 /// block to return on completion), <see cref="Keys"/>, <see cref="Sequences"/>, <see cref="Contexts"/> (the
-/// transport context, also recoverable through <see cref="MakeContext"/>), <see cref="Deadlines"/> (expiry in
-/// clock micros, scanned every flush), <see cref="Next"/> (intrusive link: channel queue while queued, then
-/// container membership once packed), <see cref="BatchHead"/>/<see cref="BatchCount"/> (members of a container
-/// entry) and <see cref="PinHandles"/> (a managed array of <see cref="nint"/> so the GC-owned
-/// <see cref="System.Buffers.MemoryHandle"/> state stays out of native memory).</para>
+/// transport context), <see cref="Deadlines"/> (expiry in clock micros, scanned every flush), <see cref="Next"/>
+/// (intrusive link: channel queue while queued, then container membership once packed),
+/// <see cref="BatchHead"/>/<see cref="BatchCount"/> (members of a container entry) and <see cref="PinHandles"/>
+/// (a managed <see cref="nint"/> array for the pin handles of the <c>SendBorrowed</c> convenience path,
+/// ADR 0008 invariant 11).</para>
+/// <para><b>Gathers.</b> One entry's <see cref="SendEntry.Header"/>/<see cref="SendEntry.Payload"/> pair is a
+/// contiguous <c>QUIC_BUFFER[2]</c> (<see cref="GetSegments"/>). Consecutive entries are <em>not</em> one contiguous
+/// segment array (each entry's 16-byte header scratch sits between its payload segment and the next entry's
+/// header segment); a multi-entry gather copies the pairs into a per-stream segment array.</para>
 /// </remarks>
 public sealed unsafe class SendEntryTable : IDisposable
 {
+    private const long GenerationMask = unchecked((long)0xFFFF_FFFF_0000_0000UL);
+
     private readonly NativeArray<SendEntry> _entries;
     private readonly NativeArray<int> _freeStack;
     private int _freeCount;
@@ -59,9 +72,10 @@ public sealed unsafe class SendEntryTable : IDisposable
 
         Next.Fill(-1);
         BatchHead.Fill(-1);
-        // Push in reverse so that slot 0 is handed out first; keeps early gathers contiguous.
+        // Push in reverse so that slot 0 is handed out first.
+        int* stack = _freeStack.Pointer;
         for (int i = capacity - 1; i >= 0; i--)
-            _freeStack[_freeCount++] = i;
+            stack[_freeCount++] = i;
     }
 
     /// <summary>Number of slots; a power of two.</summary>
@@ -73,7 +87,7 @@ public sealed unsafe class SendEntryTable : IDisposable
     /// <summary>Number of slots <see cref="TryAllocate"/> can still hand out.</summary>
     public int Available => _freeCount;
 
-    /// <summary>The hot entries. Index with a slot from <see cref="TryAllocate"/>.</summary>
+    /// <summary>The hot entries, indexed by slot.</summary>
     public NativeArray<SendEntry> Entries => _entries;
 
     /// <summary>Payload lease to return when the entry completes (<see cref="BufferLease.Empty"/> when the payload is not slab memory).</summary>
@@ -103,7 +117,7 @@ public sealed unsafe class SendEntryTable : IDisposable
     /// <summary>Opaque pin handle per slot for <see cref="SendEntryFlags.Pinned"/> entries (0 = none). Managed, cold.</summary>
     public nint[] PinHandles { get; }
 
-    /// <summary>Reference to the hot entry of <paramref name="slot"/>.</summary>
+    /// <summary>Reference to the hot entry of <paramref name="slot"/> (bounds-checked).</summary>
     /// <param name="slot">Slot index.</param>
     public ref SendEntry this[int slot]
     {
@@ -111,9 +125,15 @@ public sealed unsafe class SendEntryTable : IDisposable
         get => ref _entries[slot];
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ref long StateWord(int slot) => ref Unsafe.As<int, long>(ref _entries[slot].State);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long Word(uint generation, SendEntryState state) => (long)(((ulong)generation << 32) | (uint)state);
+
     /// <summary>
-    /// Takes a free slot, sets its state to <see cref="SendEntryState.Filling"/>, gives it a new odd generation
-    /// and resets its hot fields and cold side-table entries. Owner thread only.
+    /// Takes a free slot, gives it a new odd generation and the state <see cref="SendEntryState.Filling"/>, and
+    /// resets its hot fields and cold side-table entries. Owner thread only.
     /// </summary>
     /// <param name="slot">The allocated slot, or -1 when the table is exhausted.</param>
     /// <returns><see langword="false"/> when every slot is in use.</returns>
@@ -125,28 +145,31 @@ public sealed unsafe class SendEntryTable : IDisposable
             return false;
         }
 
-        slot = _freeStack[--_freeCount];
-        SendEntry* e = _entries.Pointer + slot;
+        int s = _freeStack.Pointer[--_freeCount];
+        slot = s;
+        SendEntry* e = _entries.Pointer + s;
         Debug.Assert(e->State == (int)SendEntryState.Free, "slot on the free list is not free");
 
         // Generations are always odd and never zero: 0 → 1 → 3 → … → 0xFFFFFFFF → 1.
-        e->Generation = (e->Generation + 1) | 1;
+        uint generation = (e->Generation + 1) | 1;
         e->Channel = 0;
         e->Flags = SendEntryFlags.None;
         e->HeaderLength = 0;
         e->Header = default;
         e->Payload = default;
-        e->State = (int)SendEntryState.Filling;
 
-        Leases[slot] = BufferLease.Empty;
-        Keys[slot] = 0;
-        Sequences[slot] = 0;
-        Contexts[slot] = MakeContext(slot);
-        Deadlines[slot] = 0;
-        Next[slot] = -1;
-        BatchHead[slot] = -1;
-        BatchCount[slot] = 0;
-        PinHandles[slot] = 0;
+        Leases.Pointer[s] = BufferLease.Empty;
+        Keys.Pointer[s] = 0;
+        Sequences.Pointer[s] = 0;
+        Contexts.Pointer[s] = ((ulong)generation << 32) | (uint)s;
+        Deadlines.Pointer[s] = 0;
+        Next.Pointer[s] = -1;
+        BatchHead.Pointer[s] = -1;
+        BatchCount.Pointer[s] = 0;
+        PinHandles[s] = 0;
+
+        // Generation and state change together, last: a reader that sees Filling sees the new generation.
+        Volatile.Write(ref *(long*)e, Word(generation, SendEntryState.Filling));
         return true;
     }
 
@@ -156,57 +179,100 @@ public sealed unsafe class SendEntryTable : IDisposable
     /// </summary>
     /// <param name="slot">Slot index.</param>
     /// <param name="header">Encoded header, at most <see cref="SendEntry.HeaderScratchSize"/> bytes.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="header"/> does not fit the scratch area.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="header"/> does not fit the scratch area, or <paramref name="slot"/> is outside the table.</exception>
     public void SetHeader(int slot, ReadOnlySpan<byte> header)
     {
         ArgumentOutOfRangeException.ThrowIfGreaterThan(header.Length, SendEntry.HeaderScratchSize);
-        SendEntry* e = _entries.Pointer + slot;
+        SendEntry* e = (SendEntry*)Unsafe.AsPointer(ref _entries[slot]);
         byte* scratch = e->HeaderScratch;
         header.CopyTo(new Span<byte>(scratch, SendEntry.HeaderScratchSize));
         e->HeaderLength = (byte)header.Length;
         e->Header = new TransportSegment(scratch, header.Length);
     }
 
-    /// <summary>The 16-byte header scratch area of <paramref name="slot"/> as a writable span.</summary>
+    /// <summary>The 16-byte header scratch area of <paramref name="slot"/> as a writable span (for encoding a header in place; then set <see cref="SendEntry.Header"/>).</summary>
     /// <param name="slot">Slot index.</param>
-    public Span<byte> GetHeaderScratch(int slot) => new((_entries.Pointer + slot)->HeaderScratch, SendEntry.HeaderScratchSize);
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="slot"/> is outside the table.</exception>
+    public Span<byte> GetHeaderScratch(int slot) =>
+        new(((SendEntry*)Unsafe.AsPointer(ref _entries[slot]))->HeaderScratch, SendEntry.HeaderScratchSize);
 
     /// <summary>
     /// Pointer to the entry's <see cref="SendEntry.Header"/>, which together with the adjacent
-    /// <see cref="SendEntry.Payload"/> is the contiguous <c>QUIC_BUFFER[2]</c> for the transport. For a gather of
-    /// consecutive slots the same pointer covers <c>2 × n</c> segments.
+    /// <see cref="SendEntry.Payload"/> is the contiguous <c>QUIC_BUFFER[2]</c> for one transport call. The pointer
+    /// covers exactly two segments; consecutive slots are not contiguous segment arrays (see the class remarks).
     /// </summary>
     /// <param name="slot">Slot index.</param>
-    public TransportSegment* GetSegments(int slot) => &(_entries.Pointer + slot)->Header;
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="slot"/> is outside the table.</exception>
+    public TransportSegment* GetSegments(int slot) => (TransportSegment*)Unsafe.AsPointer(ref _entries[slot].Header);
 
     /// <summary>
-    /// Makes the entry visible to the transport thread: <see cref="SendEntry.State"/> becomes
-    /// <see cref="SendEntryState.InFlight"/> with release semantics, so every field written before this call is
-    /// visible to a thread that observes the new state. Owner thread only; the entry must be
-    /// <see cref="SendEntryState.Filling"/>.
+    /// Makes the entry visible to the transport thread: the state becomes <see cref="SendEntryState.InFlight"/>
+    /// with release semantics, so every field written before this call is visible to a thread that observes the
+    /// new state. Owner thread only; the entry must be <see cref="SendEntryState.Filling"/>.
     /// </summary>
     /// <param name="slot">Slot index.</param>
     /// <exception cref="InvalidOperationException">The entry is not <see cref="SendEntryState.Filling"/>.</exception>
     public void Publish(int slot)
     {
-        ref SendEntry e = ref _entries[slot];
-        if (e.State != (int)SendEntryState.Filling)
-            ThrowWrongState(slot, (SendEntryState)e.State, SendEntryState.Filling);
-        Volatile.Write(ref e.State, (int)SendEntryState.InFlight);
+        ref long word = ref StateWord(slot);
+        long current = word;
+        if ((int)current != (int)SendEntryState.Filling)
+            ThrowWrongState(slot, (SendEntryState)(int)current, SendEntryState.Filling);
+        Volatile.Write(ref word, (current & GenerationMask) | (uint)SendEntryState.InFlight);
     }
 
     /// <summary>
-    /// Atomically moves the entry from <paramref name="from"/> to <paramref name="to"/>. Any thread. The transport
-    /// thread uses it for InFlight → Completed (and Cancelling → Completed); the game thread for
-    /// InFlight → Cancelling.
+    /// Atomically moves the entry of <paramref name="slot"/> from <paramref name="from"/> to <paramref name="to"/>,
+    /// whatever its generation. Any thread. Use it where the slot is known to be the right occupant (the owner's
+    /// InFlight → Cancelling); a callback holding a context should use <see cref="TryTransitionContext"/>.
     /// </summary>
     /// <param name="slot">Slot index.</param>
     /// <param name="from">Expected current state.</param>
     /// <param name="to">New state.</param>
     /// <returns><see langword="false"/> when the state was not <paramref name="from"/>; nothing changes.</returns>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool TryTransition(int slot, SendEntryState from, SendEntryState to) =>
-        Interlocked.CompareExchange(ref _entries[slot].State, (int)to, (int)from) == (int)from;
+    public bool TryTransition(int slot, SendEntryState from, SendEntryState to)
+    {
+        ref long word = ref StateWord(slot);
+        long current = Volatile.Read(ref word);
+        while ((int)current == (int)from)
+        {
+            long seen = Interlocked.CompareExchange(ref word, (current & GenerationMask) | (uint)to, current);
+            if (seen == current)
+                return true;
+            current = seen;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Atomically moves the entry named by <paramref name="context"/> from <paramref name="from"/> to
+    /// <paramref name="to"/>, provided the slot still carries the context's generation. The generation is part
+    /// of the compare-exchange, so a stale context can never change a reused slot. Any thread (typically the
+    /// transport thread: InFlight → Completed, Cancelling → Completed).
+    /// </summary>
+    /// <param name="context">Context produced by <see cref="MakeContext"/>.</param>
+    /// <param name="from">Expected current state.</param>
+    /// <param name="to">New state.</param>
+    /// <param name="slot">The slot, or -1 when the transition did not happen.</param>
+    /// <returns><see langword="false"/> when the context is malformed or stale, or the state was not <paramref name="from"/>.</returns>
+    public bool TryTransitionContext(ulong context, SendEntryState from, SendEntryState to, out int slot)
+    {
+        uint index = (uint)context;
+        if (index < (uint)_entries.Length)
+        {
+            long generationBits = (long)(context & 0xFFFF_FFFF_0000_0000UL);
+            ref long word = ref *(long*)(_entries.Pointer + index);
+            if (Interlocked.CompareExchange(ref word, generationBits | (uint)to, generationBits | (uint)from) == (generationBits | (uint)from))
+            {
+                slot = (int)index;
+                return true;
+            }
+        }
+
+        slot = -1;
+        return false;
+    }
 
     /// <summary>Current state of the entry, read with acquire semantics. Any thread.</summary>
     /// <param name="slot">Slot index.</param>
@@ -217,13 +283,14 @@ public sealed unsafe class SendEntryTable : IDisposable
     /// completion was observed through the completion ring (never by polling the state).
     /// </summary>
     /// <param name="slot">Slot index.</param>
-    /// <exception cref="InvalidOperationException">The entry is not <see cref="SendEntryState.Completed"/>.</exception>
+    /// <exception cref="InvalidOperationException">The entry is not <see cref="SendEntryState.Completed"/> (a protocol bug).</exception>
     public void Free(int slot)
     {
-        ref SendEntry e = ref _entries[slot];
-        if (e.State != (int)SendEntryState.Completed)
-            ThrowWrongState(slot, (SendEntryState)e.State, SendEntryState.Completed);
-        Release(slot, ref e);
+        ref long word = ref StateWord(slot);
+        long current = Volatile.Read(ref word);
+        if ((int)current != (int)SendEntryState.Completed)
+            ThrowWrongState(slot, (SendEntryState)(int)current, SendEntryState.Completed);
+        Release(slot, ref word, current);
     }
 
     /// <summary>
@@ -235,17 +302,20 @@ public sealed unsafe class SendEntryTable : IDisposable
     /// <exception cref="InvalidOperationException">The entry is neither <see cref="SendEntryState.Filling"/> nor <see cref="SendEntryState.InFlight"/>.</exception>
     public void Discard(int slot)
     {
-        ref SendEntry e = ref _entries[slot];
-        int state = e.State;
+        ref long word = ref StateWord(slot);
+        long current = Volatile.Read(ref word);
+        int state = (int)current;
         if (state != (int)SendEntryState.Filling && state != (int)SendEntryState.InFlight)
             ThrowWrongState(slot, (SendEntryState)state, SendEntryState.Filling);
-        Release(slot, ref e);
+        Release(slot, ref word, current);
     }
 
-    private void Release(int slot, ref SendEntry e)
+    private void Release(int slot, ref long word, long current)
     {
-        Volatile.Write(ref e.State, (int)SendEntryState.Free);
-        _freeStack[_freeCount++] = slot;
+        // Keep the generation: a late context for this occupant still fails (state Free), and the next
+        // allocation bumps it.
+        Volatile.Write(ref word, (current & GenerationMask) | (uint)SendEntryState.Free);
+        _freeStack.Pointer[_freeCount++] = slot;
     }
 
     /// <summary>Transport context for <paramref name="slot"/>: <c>(generation &lt;&lt; 32) | slot</c>.</summary>
@@ -255,29 +325,28 @@ public sealed unsafe class SendEntryTable : IDisposable
 
     /// <summary>
     /// Recovers the slot from a transport context and validates it: the slot must exist, be allocated (not
-    /// <see cref="SendEntryState.Free"/>) and carry the context's generation. Any thread.
+    /// <see cref="SendEntryState.Free"/>) and carry the context's generation, all read in one atomic snapshot.
+    /// Any thread. The answer can be outdated by the time it returns; a transport-thread caller that goes on to
+    /// change the state uses <see cref="TryTransitionContext"/>, which re-validates atomically.
     /// </summary>
     /// <param name="context">Context previously produced by <see cref="MakeContext"/>.</param>
     /// <param name="slot">The slot, or -1 when the context is stale or malformed.</param>
     /// <returns><see langword="false"/> for a stale or malformed context; the caller counts and ignores it.</returns>
     public bool TryResolveContext(ulong context, out int slot)
     {
-        int index = (int)(uint)context;
-        if ((uint)index >= (uint)_entries.Length)
+        uint index = (uint)context;
+        if (index < (uint)_entries.Length)
         {
-            slot = -1;
-            return false;
+            long word = Volatile.Read(ref *(long*)(_entries.Pointer + index));
+            if ((int)word != (int)SendEntryState.Free && (uint)((ulong)word >> 32) == (uint)(context >> 32))
+            {
+                slot = (int)index;
+                return true;
+            }
         }
 
-        ref SendEntry e = ref _entries[index];
-        if (Volatile.Read(ref e.State) == (int)SendEntryState.Free || Volatile.Read(ref e.Generation) != (uint)(context >> 32))
-        {
-            slot = -1;
-            return false;
-        }
-
-        slot = index;
-        return true;
+        slot = -1;
+        return false;
     }
 
     /// <summary>
@@ -306,12 +375,13 @@ public sealed unsafe class SendEntryTable : IDisposable
         BatchCount[containerSlot] = 0;
     }
 
-    /// <summary>Frees the native memory. Idempotent; must not race with other calls.</summary>
+    /// <summary>Frees the native memory. Idempotent; must not race with other calls. Afterwards <see cref="TryAllocate"/> fails and slot accessors throw.</summary>
     public void Dispose()
     {
         if (_disposed)
             return;
         _disposed = true;
+        _freeCount = 0;
         _entries.Dispose();
         _freeStack.Dispose();
         Leases.Dispose();
@@ -365,7 +435,7 @@ public readonly struct ContainerBatch
         }
 
         /// <summary>The current member slot.</summary>
-        public int Current => _current;
+        public readonly int Current => _current;
 
         /// <summary>Advances to the next member.</summary>
         public bool MoveNext()

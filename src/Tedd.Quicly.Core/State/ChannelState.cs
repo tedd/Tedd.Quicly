@@ -50,29 +50,29 @@ public struct ChannelSendState
     /// <summary>Size in bytes.</summary>
     public const int Size = 64;
 
-    /// <summary>Sequence number assigned to the next message.</summary>
+    /// <summary>Sequence number assigned to the next message. Owner: game thread.</summary>
     [FieldOffset(0)] public uint NextSequence;
-    /// <summary>First queued <see cref="SendEntry"/> slot (-1 = empty); entries chain through <see cref="SendEntryTable.Next"/>.</summary>
+    /// <summary>First queued <see cref="SendEntry"/> slot (-1 = empty); entries chain through <see cref="SendEntryTable.Next"/>. Owner: game thread.</summary>
     [FieldOffset(4)] public int QueueHead;
-    /// <summary>Last queued slot (-1 = empty).</summary>
+    /// <summary>Last queued slot (-1 = empty). Owner: game thread.</summary>
     [FieldOffset(8)] public int QueueTail;
-    /// <summary>Number of queued entries.</summary>
+    /// <summary>Number of queued entries. Owner: game thread.</summary>
     [FieldOffset(12)] public int QueueCount;
-    /// <summary>Payload bytes queued (checked against the channel's queue limit).</summary>
+    /// <summary>Payload bytes queued (checked against the channel's queue limit). Owner: game thread.</summary>
     [FieldOffset(16)] public long QueueBytes;
-    /// <summary>The channel's ordered stream, when open.</summary>
+    /// <summary>The channel's ordered stream, when open. Owner: game thread.</summary>
     [FieldOffset(24)] public TransportStreamId Stream;
-    /// <summary>Group being filled (group-stream channels), or -1.</summary>
+    /// <summary>Group being filled (group-stream channels), or -1. Owner: game thread.</summary>
     [FieldOffset(32)] public int CurrentGroup;
-    /// <summary>Entries published to the transport and not yet completed.</summary>
+    /// <summary>Entries published to the transport and not yet completed. Owner: game thread.</summary>
     [FieldOffset(36)] public int InFlight;
-    /// <summary>Flags.</summary>
+    /// <summary>Flags. Owner: game thread.</summary>
     [FieldOffset(40)] public ChannelSendFlags Flags;
-    /// <summary>Keys with a retry scheduled (ReliableLatest).</summary>
+    /// <summary>Keys with a retry scheduled (ReliableLatest). Owner: game thread.</summary>
     [FieldOffset(44)] public int RetryPending;
-    /// <summary>Earliest retry/expiry deadline among the channel's entries, in clock micros (0 = none).</summary>
+    /// <summary>Earliest retry/expiry deadline among the channel's entries, in clock micros (0 = none). Owner: game thread.</summary>
     [FieldOffset(48)] public long NextDeadlineMicros;
-    /// <summary>Bandwidth token-bucket balance in bytes.</summary>
+    /// <summary>Bandwidth token-bucket balance in bytes. Owner: game thread.</summary>
     [FieldOffset(56)] public long BudgetBytes;
 }
 
@@ -92,27 +92,27 @@ public struct ChannelRecvState
     /// <summary>Size in bytes.</summary>
     public const int Size = 64;
 
-    /// <summary>Last accepted sequence for unkeyed sequenced channels.</summary>
+    /// <summary>Last accepted sequence for unkeyed sequenced channels. Owner: transport thread.</summary>
     [FieldOffset(0)] public uint LastAccepted;
-    /// <summary>Highest sequence seen (statistics / reorder detection).</summary>
+    /// <summary>Highest sequence seen (statistics / reorder detection). Owner: transport thread.</summary>
     [FieldOffset(4)] public uint HighestSeen;
-    /// <summary>The peer's ordered stream for this channel, when open.</summary>
+    /// <summary>The peer's ordered stream for this channel, when open. Owner: transport thread.</summary>
     [FieldOffset(8)] public TransportStreamId Stream;
-    /// <summary>Fragment reassemblies in progress.</summary>
+    /// <summary>Fragment reassemblies in progress. Owner: transport thread.</summary>
     [FieldOffset(16)] public int Reassemblies;
-    /// <summary>Peer group streams currently open on this channel.</summary>
+    /// <summary>Peer group streams currently open on this channel. Owner: transport thread.</summary>
     [FieldOffset(20)] public int ActiveGroups;
-    /// <summary>Clock micros of the last accepted message.</summary>
+    /// <summary>Clock micros of the last accepted message. Owner: transport thread.</summary>
     [FieldOffset(24)] public long LastReceiveMicros;
-    /// <summary>Index of the channel's stream-frame parser in the stream table, or -1.</summary>
+    /// <summary>Index of the channel's stream-frame parser in the stream table, or -1. Owner: transport thread.</summary>
     [FieldOffset(32)] public int Parser;
-    /// <summary>Flags.</summary>
+    /// <summary>Flags. Owner: transport thread.</summary>
     [FieldOffset(36)] public ChannelRecvFlags Flags;
-    /// <summary>Latest-acks queued for coalesced sending.</summary>
+    /// <summary>Latest-acks queued for coalesced sending. Owner: transport thread.</summary>
     [FieldOffset(40)] public int PendingAcks;
-    /// <summary>Version of the most recent queued ack (unkeyed ReliableLatest).</summary>
+    /// <summary>Version of the most recent queued ack (unkeyed ReliableLatest). Owner: transport thread.</summary>
     [FieldOffset(44)] public uint PendingAckVersion;
-    /// <summary>Bytes held in staging leases (partial stream messages, reassembly).</summary>
+    /// <summary>Bytes held in staging leases (partial stream messages, reassembly). Owner: transport thread.</summary>
     [FieldOffset(48)] public long StagedBytes;
 }
 
@@ -127,21 +127,21 @@ public struct ChannelSendCounters
     /// <summary>Size in bytes.</summary>
     public const int Size = 64;
 
-    /// <summary>Messages handed to the transport.</summary>
+    /// <summary>Messages handed to the transport. Owner: game thread.</summary>
     [FieldOffset(0)] public long Sent;
-    /// <summary>Payload bytes handed to the transport.</summary>
+    /// <summary>Payload bytes handed to the transport. Owner: game thread.</summary>
     [FieldOffset(8)] public long Bytes;
-    /// <summary>Pending messages replaced by a newer value of the same key.</summary>
+    /// <summary>Pending messages replaced by a newer value of the same key. Owner: game thread.</summary>
     [FieldOffset(16)] public long Superseded;
-    /// <summary>Messages dropped because their expiry elapsed before sending.</summary>
+    /// <summary>Messages dropped because their expiry elapsed before sending. Owner: game thread.</summary>
     [FieldOffset(24)] public long Expired;
-    /// <summary>Sends rejected because the channel queue or the send table was full.</summary>
+    /// <summary>Sends rejected because the channel queue or the send table was full. Owner: game thread.</summary>
     [FieldOffset(32)] public long QueueFull;
-    /// <summary>Sends rejected because the message exceeded the channel's size limit.</summary>
+    /// <summary>Sends rejected because the message exceeded the channel's size limit. Owner: game thread.</summary>
     [FieldOffset(40)] public long TooLarge;
-    /// <summary>Retransmissions (ReliableLatest).</summary>
+    /// <summary>Retransmissions (ReliableLatest). Owner: game thread.</summary>
     [FieldOffset(48)] public long Retries;
-    /// <summary>Sends rejected because the key table was full.</summary>
+    /// <summary>Sends rejected because the key table was full. Owner: game thread.</summary>
     [FieldOffset(56)] public long KeyTableFull;
 }
 
@@ -155,20 +155,20 @@ public struct ChannelRecvCounters
     /// <summary>Size in bytes.</summary>
     public const int Size = 64;
 
-    /// <summary>Messages accepted.</summary>
+    /// <summary>Messages accepted. Owner: transport thread.</summary>
     [FieldOffset(0)] public long Received;
-    /// <summary>Payload bytes accepted.</summary>
+    /// <summary>Payload bytes accepted. Owner: transport thread.</summary>
     [FieldOffset(8)] public long Bytes;
-    /// <summary>Messages dropped as stale (sequence/version not newer) or malformed.</summary>
+    /// <summary>Messages dropped as stale (sequence/version not newer) or malformed. Owner: transport thread.</summary>
     [FieldOffset(16)] public long Dropped;
-    /// <summary>Mailbox values replaced before the game thread saw them.</summary>
+    /// <summary>Mailbox values replaced before the game thread saw them. Owner: transport thread.</summary>
     [FieldOffset(24)] public long Superseded;
-    /// <summary>Messages dropped because the receive ring was full.</summary>
+    /// <summary>Messages dropped because the receive ring was full. Owner: transport thread.</summary>
     [FieldOffset(32)] public long RingDrops;
-    /// <summary>Messages dropped because the key table was full.</summary>
+    /// <summary>Messages dropped because the key table was full. Owner: transport thread.</summary>
     [FieldOffset(40)] public long KeyTableFull;
-    /// <summary>Messages dropped because they exceeded a size limit.</summary>
+    /// <summary>Messages dropped because they exceeded a size limit. Owner: transport thread.</summary>
     [FieldOffset(48)] public long TooLarge;
-    /// <summary>Messages dropped because no receive buffer was available.</summary>
+    /// <summary>Messages dropped because no receive buffer was available. Owner: transport thread.</summary>
     [FieldOffset(56)] public long OutOfBuffers;
 }

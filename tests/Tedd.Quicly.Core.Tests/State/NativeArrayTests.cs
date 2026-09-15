@@ -27,7 +27,7 @@ public unsafe class NativeArrayTests
         Assert.True(array.AsSpan().IsEmpty);
         array.Clear();
         array.Fill(5);
-        Assert.Throws<ArgumentOutOfRangeException>(() => array.At(0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => array[0]);
     }
 
     [Fact]
@@ -37,14 +37,14 @@ public unsafe class NativeArrayTests
     }
 
     [Fact]
-    public void Indexer_And_At_Return_The_Same_Reference()
+    public void Indexer_Returns_References_Into_The_Block()
     {
         using var array = new NativeArray<int>(4);
         array[2] = 42;
-        Assert.Equal(42, array.At(2));
-        Assert.True(Unsafe.AreSame(ref array[2], ref array.At(2)));
+        Assert.Equal(42, array[2]);
+        Assert.True(Unsafe.AreSame(ref array[2], ref array[2]));
         Assert.True(Unsafe.AreSame(ref array[3], ref array.AsSpan()[3]));
-        Assert.True(&array[1] == array.Pointer + 1);
+        Assert.True(Unsafe.AsPointer(ref array[1]) == array.Pointer + 1);
     }
 
     [Theory]
@@ -52,10 +52,10 @@ public unsafe class NativeArrayTests
     [InlineData(4)]
     [InlineData(int.MaxValue)]
     [InlineData(int.MinValue)]
-    public void At_Rejects_Out_Of_Range(int index)
+    public void Indexer_Rejects_Out_Of_Range_In_Every_Build(int index)
     {
         using var array = new NativeArray<int>(4);
-        Assert.Throws<ArgumentOutOfRangeException>(() => array.At(index));
+        Assert.Throws<ArgumentOutOfRangeException>(() => array[index]);
     }
 
     [Fact]
@@ -97,7 +97,7 @@ public unsafe class NativeArrayTests
         Assert.Equal(0, array.Length);
         Assert.True(array.Pointer is null);
         Assert.True(array.AsSpan().IsEmpty);
-        Assert.Throws<ArgumentOutOfRangeException>(() => array.At(0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => array[0]);
 
         array.Dispose();
         Assert.True(array.IsDisposed);

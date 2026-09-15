@@ -52,25 +52,25 @@ public struct KeySendSlot
     /// <summary>Size in bytes.</summary>
     public const int Size = 64;
 
-    /// <summary>Version of the most recent value sent (or queued) for the key.</summary>
+    /// <summary>Version of the most recent value sent (or queued) for the key. Owner: game thread.</summary>
     [FieldOffset(0)] public uint CurrentVersion;
-    /// <summary>Highest version the peer acknowledged.</summary>
+    /// <summary>Highest version the peer acknowledged. Owner: game thread.</summary>
     [FieldOffset(4)] public uint AckedVersion;
-    /// <summary>Lease holding the current value (kept for retries until acked).</summary>
+    /// <summary>Lease holding the current value (kept for retries until acked). Owner: game thread.</summary>
     [FieldOffset(8)] public BufferLease CurrentLease;
-    /// <summary>Clock micros at which the current value is retransmitted unless acked (valid with <see cref="KeySendFlags.RetryArmed"/>).</summary>
+    /// <summary>Clock micros at which the current value is retransmitted unless acked (valid with <see cref="KeySendFlags.RetryArmed"/>). Owner: game thread.</summary>
     [FieldOffset(24)] public long RetryDeadline;
-    /// <summary>The <see cref="SendEntry"/> slot carrying the current value, or -1.</summary>
+    /// <summary>The <see cref="SendEntry"/> slot carrying the current value, or -1. Owner: game thread.</summary>
     [FieldOffset(32)] public int InFlightEntry;
-    /// <summary>Stream used for a large value, when <see cref="KeySendFlags.LargeValue"/>.</summary>
+    /// <summary>Stream used for a large value, when <see cref="KeySendFlags.LargeValue"/>. Owner: game thread.</summary>
     [FieldOffset(36)] public TransportStreamId LargeValueStream;
-    /// <summary>Transmissions of the current version so far (retry budget).</summary>
+    /// <summary>Transmissions of the current version so far (retry budget). Owner: game thread.</summary>
     [FieldOffset(44)] public byte Attempts;
-    /// <summary>Flags.</summary>
+    /// <summary>Flags. Owner: game thread.</summary>
     [FieldOffset(45)] public KeySendFlags Flags;
-    /// <summary>The key (reverse lookup for hashed key spaces).</summary>
+    /// <summary>The key (reverse lookup for hashed key spaces). Owner: game thread.</summary>
     [FieldOffset(48)] public ulong Key;
-    /// <summary>Clock micros of the last transmission.</summary>
+    /// <summary>Clock micros of the last transmission. Owner: game thread.</summary>
     [FieldOffset(56)] public long LastSentMicros;
 }
 
@@ -90,20 +90,20 @@ public struct KeyRecvSlot
     /// <summary>Size in bytes.</summary>
     public const int Size = 64;
 
-    /// <summary>Last accepted sequence/version for the key.</summary>
+    /// <summary>Last accepted sequence/version for the key. Owner: transport thread.</summary>
     [FieldOffset(0)] public uint LastAccepted;
-    /// <summary>Index of the key's mailbox in the channel's <see cref="Mailboxes"/> (normally the slot itself), or -1.</summary>
+    /// <summary>Index of the key's mailbox in the channel's <see cref="Mailboxes"/> (normally the slot itself), or -1. Owner: transport thread.</summary>
     [FieldOffset(4)] public int Mailbox;
-    /// <summary>Index of the reassembly in progress, or -1.</summary>
+    /// <summary>Index of the reassembly in progress, or -1. Owner: transport thread.</summary>
     [FieldOffset(8)] public int Reassembly;
-    /// <summary>Flags.</summary>
+    /// <summary>Flags. Owner: transport thread.</summary>
     [FieldOffset(12)] public KeyRecvFlags Flags;
-    /// <summary>Clock micros of the last accepted value.</summary>
+    /// <summary>Clock micros of the last accepted value. Owner: transport thread.</summary>
     [FieldOffset(16)] public long LastUpdateMicros;
-    /// <summary>The key (reverse lookup).</summary>
+    /// <summary>The key (reverse lookup). Owner: transport thread.</summary>
     [FieldOffset(24)] public ulong Key;
-    /// <summary>Version whose ack is queued (valid with <see cref="KeyRecvFlags.AckPending"/>).</summary>
+    /// <summary>Version whose ack is queued (valid with <see cref="KeyRecvFlags.AckPending"/>). Owner: transport thread.</summary>
     [FieldOffset(32)] public uint PendingAckVersion;
-    /// <summary>Values accepted for the key (statistics).</summary>
+    /// <summary>Values accepted for the key (statistics). Owner: transport thread.</summary>
     [FieldOffset(36)] public uint Updates;
 }

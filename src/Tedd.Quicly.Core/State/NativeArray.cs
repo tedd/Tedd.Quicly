@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -10,25 +9,25 @@ namespace Tedd.Quicly.Core.State;
 /// </summary>
 /// <remarks>
 /// <para>Native memory never moves, so pointers into the array (for example the <c>QUIC_BUFFER</c> pair inside a
-/// <see cref="SendEntry"/>) stay valid for the lifetime of the array and the GC never scans it. The array is
-/// allocated with <see cref="NativeMemory.AlignedAlloc(nuint, nuint)"/> at a 64-byte boundary so that an element
+/// <see cref="SendEntry"/>) stay valid for the lifetime of the array, and the GC never scans it. The block is
+/// allocated with <see cref="NativeMemory.AlignedAlloc(nuint, nuint)"/> at a 64-byte boundary, so an element
 /// whose size is a multiple of 64 bytes occupies whole cache lines.</para>
-/// <para>The indexer is bounds-checked only in debug builds (<see cref="Debug.Assert(bool)"/>); <see cref="At"/>
-/// is the always-checked accessor. <see cref="Dispose"/> frees the memory and is idempotent; a finalizer frees it
-/// if the owner forgot. After disposal <see cref="Length"/> is zero and <see cref="Pointer"/> is
-/// <see langword="null"/>.</para>
-/// <para>Thread safety: the array itself is immutable after construction; concurrent access to its elements is
-/// the caller's business (see the owning table's contract).</para>
+/// <para>The indexer is bounds-checked in every build (one unsigned compare; the hot tables that need raw speed
+/// use <see cref="Pointer"/> internally). <see cref="Dispose"/> frees the memory and is idempotent; a finalizer
+/// frees it if the owner forgot. After disposal <see cref="Length"/> is zero, <see cref="Pointer"/> is
+/// <see langword="null"/> and every indexer access throws, so a use-after-dispose is an exception rather than
+/// a wild native access.</para>
+/// <para>Thread safety: the array object is immutable after construction; concurrent access to its elements is
+/// governed by the owning table's contract. <see cref="Dispose"/> must not race with element access.</para>
 /// </remarks>
-/// <typeparam name="T">Element type; must be unmanaged so the array is a flat block of values.</typeparam>
+/// <typeparam name="T">Element type; unmanaged, so the array is a flat block of values.</typeparam>
 public sealed unsafe class NativeArray<T> : IDisposable where T : unmanaged
 {
-    /// <summary>Alignment of the first element in bytes.</summary>
+    /// <summary>Alignment of the first element in bytes (one cache line).</summary>
     public const int Alignment = 64;
 
     private T* _pointer;
     private int _length;
-    private bool _disposed;
 
     /// <summary>Allocates a zeroed array of <paramref name="length"/> elements.</summary>
     /// <param name="length">Number of elements; zero is allowed and allocates nothing.</param>
@@ -58,32 +57,21 @@ public sealed unsafe class NativeArray<T> : IDisposable where T : unmanaged
     /// <summary>Pointer to the first element (64-byte aligned), or <see langword="null"/> when empty or disposed.</summary>
     public T* Pointer => _pointer;
 
-    /// <summary>True once <see cref="Dispose"/> has run.</summary>
-    public bool IsDisposed => _disposed;
+    /// <summary>True once <see cref="Dispose"/> has run (or the finalizer freed the memory).</summary>
+    public bool IsDisposed { get; private set; }
 
-    /// <summary>
-    /// Reference to the element at <paramref name="index"/>. Bounds are asserted in debug builds only; use
-    /// <see cref="At"/> when the index comes from untrusted input.
-    /// </summary>
+    /// <summary>Reference to the element at <paramref name="index"/>, bounds-checked.</summary>
     /// <param name="index">Zero-based element index.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> is outside the array (always the case after <see cref="Dispose"/>).</exception>
     public ref T this[int index]
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get
         {
-            Debug.Assert((uint)index < (uint)_length, "NativeArray index out of range");
+            if ((uint)index >= (uint)_length)
+                ThrowIndexOutOfRange(index);
             return ref _pointer[index];
         }
-    }
-
-    /// <summary>Reference to the element at <paramref name="index"/>, bounds-checked in every build.</summary>
-    /// <param name="index">Zero-based element index.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> is outside the array.</exception>
-    public ref T At(int index)
-    {
-        if ((uint)index >= (uint)_length)
-            ThrowIndexOutOfRange(index);
-        return ref _pointer[index];
     }
 
     /// <summary>The whole array as a span. Valid until <see cref="Dispose"/>.</summary>
@@ -123,7 +111,7 @@ public sealed unsafe class NativeArray<T> : IDisposable where T : unmanaged
         T* p = _pointer;
         _pointer = null;
         _length = 0;
-        _disposed = true;
+        IsDisposed = true;
         if (p is not null)
             NativeMemory.AlignedFree(p);
     }

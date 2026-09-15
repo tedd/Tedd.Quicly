@@ -21,21 +21,24 @@ namespace Tedd.Quicly.Server.Certificates;
 /// <remarks>
 /// <para><b>ACME.</b> <see cref="StartAsync"/> starts the challenge endpoints for the allowed challenge types: a plain
 /// HTTP server answering <c>http-01</c> (optionally redirecting everything else to HTTPS and serving a health path),
-/// and a TLS server answering <c>tls-alpn-01</c> that presents the current certificate to every other client. It then
-/// serves the persisted certificate when one exists, covers every configured name and has not expired, and orders a new
-/// one (with the <see cref="AcmeCertificateManager"/>'s retry and back-off) when there is none or it is due for renewal.
-/// Afterwards a <see cref="RenewalScheduler"/> runs in the background: renewals follow ARI or the lifetime rule, failed
-/// renewals are retried after <see cref="RenewalSchedulerOptions.RetryDelay"/>, and every outcome is reported through
-/// <see cref="Status"/> and <see cref="StatusChanged"/>. Nothing thrown in the background escapes.</para>
+/// and a TLS server answering <c>tls-alpn-01</c> that presents the current certificate to every other client (and refuses
+/// their handshakes, as expected handshake failures, until a first certificate exists). It then serves the persisted
+/// certificate when one exists, covers every configured name, has not expired and was issued by the configured directory,
+/// and orders a new one (with the <see cref="AcmeCertificateManager"/>'s retry and back-off) when there is none or it is
+/// due for renewal. Afterwards a <see cref="RenewalScheduler"/> runs in the background: renewals follow ARI or the
+/// lifetime rule, failed renewals are retried after <see cref="RenewalSchedulerOptions.RetryDelay"/>, and every outcome is
+/// reported through <see cref="Status"/> and <see cref="StatusChanged"/>. Nothing thrown in the background escapes.</para>
 /// <para><b>Failures.</b> <see cref="StartAsync"/> throws for configuration and environment errors that retrying cannot
 /// fix: an endpoint that cannot be bound, a missing or unreadable PFX file, invalid options. A CA that cannot issue a
 /// certificate does not make it throw: the status becomes <see cref="CertificateState.Failed"/> with the reason and the
 /// provisioner orders again after <see cref="RenewalSchedulerOptions.RetryDelay"/> until it succeeds;
-/// <see cref="WaitForCertificateAsync"/> completes once a certificate exists.</para>
-/// <para><b>Ownership.</b> Certificates the provisioner loads or obtains are disposed by <see cref="DisposeAsync"/>; a
-/// superseded one is disposed earlier when bound through a <see cref="CertificateBinder"/> (after its grace period). A
-/// <see cref="ServerCertificateSourceKind.Static"/> certificate stays the application's. Stop the consumers before
-/// disposing the provisioner.</para>
+/// <see cref="WaitForCertificateAsync"/> completes once a certificate exists. An issued certificate that cannot be loaded
+/// is not ordered again at once (that would spend the CA's rate limits): its load is retried with the
+/// <see cref="AcmeProvisioningOptions.Retry"/> back-off and again after the retry delay, before anything new is ordered.</para>
+/// <para><b>Ownership.</b> Certificates the provisioner loads or obtains are disposed by <see cref="DisposeAsync"/>, which
+/// also zeroes the PKCS#12 bytes it kept; a superseded certificate is disposed earlier when bound through a
+/// <see cref="CertificateBinder"/> (after its grace period). A <see cref="ServerCertificateSourceKind.Static"/> certificate
+/// stays the application's. Stop the consumers before disposing the provisioner.</para>
 /// <para><b>Events</b> are raised synchronously on the thread that caused them (a start-up, timer or background thread);
 /// handlers must not block. A handler that throws is reported through <see cref="Error"/> and the other handlers still run.</para>
 /// <para>A provisioner starts once; after <see cref="StopAsync"/> create a new one.</para>
@@ -122,7 +125,9 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
 
     /// <summary>
     /// Non-fatal problems that do not change <see cref="Status"/>: an event handler threw, the challenge endpoints reported
-    /// a connection error, a persisted certificate could not be read and is being replaced.
+    /// a connection error, a persisted certificate could not be read and is being replaced, the record of the directory
+    /// that issued a certificate could not be written, a kept certificate still could not be loaded and a new one is
+    /// ordered, or stopping abandoned work that ignored cancellation.
     /// </summary>
     public event Action<Exception>? Error;
 
@@ -238,7 +243,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         {
             // Nothing started may outlive a failed start: stop whatever was bound and never become Running.
             Volatile.Write(ref _state, StateStopped);
-            _stopCts.Cancel();
+            CancelStop();
             await ReleaseResourcesAsync().ConfigureAwait(false);
             _firstCertificate.TrySetCanceled(CancellationToken.None);
             SetStatus(e is OperationCanceledException ? CertificateStatus.Stopped : CertificateStatus.Failed("Start-up failed: " + e.Message, e));
@@ -306,7 +311,10 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
 
     /// <summary>
     /// Stops the renewal loop (an order in progress is cancelled and its challenge material removed), closes the challenge
-    /// endpoints and stops watching the file. Idempotent; <paramref name="cancellationToken"/> only bounds the wait.
+    /// endpoints and stops watching the file. Idempotent; <paramref name="cancellationToken"/> only bounds the wait. Work
+    /// that ignores cancellation (a challenge responder or <see cref="IDns01Provider"/> that never returns) is waited for at
+    /// most <see cref="AcmeProvisioningOptions.ChallengeCleanupTimeout"/> plus 10 seconds, then reported through
+    /// <see cref="Error"/> and abandoned, so stopping cannot hang.
     /// </summary>
     public Task StopAsync(CancellationToken cancellationToken = default)
     {
@@ -352,7 +360,7 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         try
         {
             int previous = Interlocked.Exchange(ref _state, StateStopped);
-            _stopCts.Cancel();
+            CancelStop();
             if (previous is StateStarting or StateRunning)
             {
                 // StartAsync may still be between becoming Running and starting the loop: let it finish, so that the loop
@@ -371,6 +379,22 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         finally
         {
             _stopped.TrySetResult();
+        }
+    }
+
+    /// <summary>
+    /// Cancels the stop token. A callback that other code registered on it (a challenge responder, say) may throw: that is
+    /// reported, and stopping carries on, so the endpoints are still closed and the status still becomes Stopped.
+    /// </summary>
+    private void CancelStop()
+    {
+        try
+        {
+            _stopCts.Cancel();
+        }
+        catch (AggregateException e)
+        {
+            ReportError(e);
         }
     }
 
@@ -499,10 +523,14 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
         }
     }
 
-    /// <summary>One poll of a reloading file source; re-arms the timer unless the provisioner stopped meanwhile. Never throws.</summary>
-    private void PollFile()
+    /// <summary>
+    /// One poll of a reloading file source; re-arms the timer unless the provisioner stopped meanwhile. Never throws.
+    /// Internal so that tests can replay a timer callback that arrives after stopping.
+    /// </summary>
+    internal void PollFile()
     {
-        lock (_filePollLock)
+        _filePollLock.Enter();
+        try
         {
             FileCertificateSource? source;
             lock (_lock)
@@ -519,6 +547,10 @@ public sealed class CertificateProvisioner : ICertificateSource, IAsyncDisposabl
                     _fileTimer?.Change(_options.ReloadInterval, Timeout.InfiniteTimeSpan);
                 }
             }
+        }
+        finally
+        {
+            _filePollLock.Exit();
         }
     }
 

@@ -3,6 +3,7 @@ using System.Security.Cryptography.X509Certificates;
 using Tedd.Quicly.Acme;
 using Tedd.Quicly.Acme.Challenges;
 using Tedd.Quicly.Server.Certificates;
+using Tedd.Quicly.Testing.Acme;
 
 namespace Tedd.Quicly.Server.Tests;
 
@@ -244,6 +245,54 @@ public sealed class ProvisioningFixTests : IAsyncDisposable
         Assert.Contains(recorder.Errors, e => e is TimeoutException && e.Message.StartsWith("Start-up did not finish within ", StringComparison.Ordinal));
         dns.Release(); // the abandoned start-up winds down
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => start.WaitAsync(LongWait));
+    }
+
+    [Fact]
+    public async Task StopAsync_WhenACallbackOnTheStopTokenThrows_StillClosesTheEndpoints_AndStops()
+    {
+        CancelCallbackThrowingDns01Provider dns = new(_env.Dns);
+        AcmeProvisioningOptions options = _env.Options(AcmeChallengeKind.Dns01, AcmeChallengeKind.Http01); // http-01: an endpoint to close
+        options.Dns01Provider = dns;
+        CertificateProvisioner provisioner = _env.Create(options);
+        Recorder recorder = new(provisioner);
+        await provisioner.StartAsync();
+        Assert.NotNull(provisioner.HttpChallengeEndPoint);
+
+        Task renew = provisioner.RenewNowAsync();
+        await dns.Waiting.WaitAsync(LongWait); // the renewal order waits in CreateTxtAsync, with a throwing callback on the stop token
+        await provisioner.StopAsync().WaitAsync(LongWait);
+
+        Assert.Equal(CertificateState.Stopped, provisioner.Status.State);
+        Assert.Null(provisioner.HttpChallengeEndPoint);
+        Assert.Contains(recorder.Errors, e => e is AggregateException);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => renew);
+    }
+
+    /// <summary>
+    /// Publishes into the test DNS for the first order; for later orders it registers a callback that throws on the order's
+    /// cancellation token, and waits (honouring cancellation).
+    /// </summary>
+    private sealed class CancelCallbackThrowingDns01Provider(InMemoryDns01Provider inner) : IDns01Provider
+    {
+        private readonly TaskCompletionSource _waiting = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _calls;
+
+        public Task Waiting => _waiting.Task;
+
+        public async ValueTask CreateTxtAsync(string name, string value, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _calls) == 1)
+            {
+                await inner.CreateTxtAsync(name, value, cancellationToken);
+                return;
+            }
+
+            cancellationToken.Register(static () => throw new InvalidOperationException("a responder's cancellation callback failed"));
+            _waiting.TrySetResult();
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+
+        public ValueTask RemoveTxtAsync(string name, string value, CancellationToken cancellationToken) => inner.RemoveTxtAsync(name, value, cancellationToken);
     }
 
     /// <summary>A DNS provider whose <see cref="CreateTxtAsync"/> ignores cancellation until it is released.</summary>

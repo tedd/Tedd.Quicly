@@ -207,4 +207,38 @@ public sealed class ProvisionerSourceTests : IDisposable
         InvalidOperationException again = await Assert.ThrowsAsync<InvalidOperationException>(() => provisioner.StartAsync());
         Assert.Contains("has been stopped", again.Message, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public async Task File_UnchangedOnDisk_IsNotReloaded()
+    {
+        string path = Path.Combine(_folder, "server.pfx");
+        Certs.WriteAtomically(path, Certs.Pfx("a.example.test"), DateTime.UtcNow.AddMinutes(-10));
+        await using CertificateProvisioner provisioner = new(ServerCertificateOptions.File(path, reloadOnChange: true, reloadInterval: TimeSpan.FromMilliseconds(20)));
+        Recorder recorder = new(provisioner);
+        await provisioner.StartAsync();
+
+        await Task.Delay(300); // many polls, none of which finds a change
+
+        Assert.Single(recorder.Changed);
+        Assert.Equal(2, recorder.Statuses.Length); // Starting, then Loaded
+        Assert.StartsWith("Loaded ", provisioner.Status.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FilePoll_ThatArrivesAfterStopping_DoesNothing()
+    {
+        string path = Path.Combine(_folder, "server.pfx");
+        Certs.WriteAtomically(path, Certs.Pfx("a.example.test"), DateTime.UtcNow.AddMinutes(-10));
+        CertificateProvisioner provisioner = new(ServerCertificateOptions.File(path, reloadOnChange: true, reloadInterval: TimeSpan.FromMinutes(1)));
+        Recorder recorder = new(provisioner);
+        await provisioner.StartAsync();
+        await provisioner.DisposeAsync();
+        Certs.WriteAtomically(path, Certs.Pfx("b.example.test"), DateTime.UtcNow.AddMinutes(-5));
+
+        provisioner.PollFile(); // a timer callback that was already on its way when the provisioner stopped
+
+        Assert.Single(recorder.Changed);
+        Assert.Equal(CertificateState.Stopped, provisioner.Status.State);
+        Assert.Null(provisioner.Current);
+    }
 }

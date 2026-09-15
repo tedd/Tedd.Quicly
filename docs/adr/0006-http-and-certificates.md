@@ -12,5 +12,7 @@
   a provider interface (no DNS vendor SDKs in the library).
 * `ICertificateSource` (static file / PFX / ACME) feeds both the QUIC listener and the TLS HTTP endpoint;
   renewal swaps the certificate without restarting the listener.
-* Windows/Schannel needs a persisted private key: certificates are imported with a key container
-  (`X509KeyStorageFlags.Exportable`, not `EphemeralKeySet`) before being handed to MsQuic.
+* Windows/Schannel needs a persisted, non-ephemeral private key. The exact rule is in ADR 0009: the
+  PKCS12 credential type is preferred (no store import); otherwise import with `PersistKeySet` plus
+  `UserKeySet` (interactive) or `MachineKeySet` (services). `Exportable` and `EphemeralKeySet` are not used.
+  *(Amended by ADR 0009; the original wording recommended `Exportable`, which is irrelevant to Schannel.)*

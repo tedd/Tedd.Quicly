@@ -9,11 +9,17 @@ namespace Tedd.Quicly.Acme;
 /// External Account Binding credentials (RFC 8555 §7.3.4) issued by the CA (ZeroSSL, Google Trust Services, SSL.com, ...).
 /// </summary>
 /// <param name="KeyId">The CA-provided EAB key identifier (becomes the <c>kid</c> of the EAB JWS).</param>
-/// <param name="HmacKey">The CA-provided HMAC key, base64url encoded.</param>
+/// <param name="HmacKey">The CA-provided HMAC key, base64url encoded (standard base64 with <c>+</c>/<c>/</c>/padding is accepted too).</param>
 public sealed record ExternalAccountBinding(string KeyId, string HmacKey)
 {
     /// <summary>Decodes <see cref="HmacKey"/> to raw bytes.</summary>
-    public byte[] DecodeHmacKey() => Base64UrlCodec.Decode(HmacKey);
+    /// <exception cref="FormatException">The key is not valid base64url / base64.</exception>
+    public byte[] DecodeHmacKey()
+    {
+        ArgumentException.ThrowIfNullOrEmpty(HmacKey);
+        // RFC 8555 says base64url, but some CA dashboards hand out the standard alphabet; normalise instead of failing.
+        return Base64UrlCodec.Decode(HmacKey.Replace('+', '-').Replace('/', '_').TrimEnd('='));
+    }
 }
 
 /// <summary>Builds ACME request JWS objects (RFC 8555 §6.2) in flattened JSON serialization.</summary>

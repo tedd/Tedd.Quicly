@@ -86,6 +86,9 @@ public sealed class FakeAcmeServer : IAsyncDisposable
 
     public bool OmitLocationOnNewOrder { get; set; }
 
+    /// <summary>Finalize responses carry no Location header (RFC 8555 does not require one).</summary>
+    public bool OmitLocationOnFinalize { get; set; }
+
     public bool OmitRevokeCertFromDirectory { get; set; }
 
     public bool OmitCertificateUrlOnValidOrder { get; set; }
@@ -1135,7 +1138,7 @@ public sealed class FakeAcmeServer : IAsyncDisposable
                 order.Status = AcmeOrderStatus.Valid;
             }
 
-            return (200, OrderNode(order), order.Url.ToString(), null, null, null, null);
+            return (200, OrderNode(order), OmitLocationOnFinalize ? null : order.Url.ToString(), null, null, null, null);
         }
     }
 

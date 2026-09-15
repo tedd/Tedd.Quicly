@@ -12,6 +12,13 @@ public sealed class AcmeClientOptions
     /// <summary>Maximum number of polls before <see cref="Models.AcmeErrorTypes.PollTimeout"/> is raised. Default 60.</summary>
     public int MaxPollAttempts { get; set; } = 60;
 
+    /// <summary>
+    /// Largest response body accepted from the CA; larger responses fail with
+    /// <see cref="Models.AcmeErrorTypes.InvalidResponse"/> before being buffered (ADR 0009: a client parses hostile servers
+    /// too). Default 1 MiB, far above any directory, order or PEM chain.
+    /// </summary>
+    public int MaxResponseBytes { get; set; } = 1024 * 1024;
+
     /// <summary>The <c>User-Agent</c> sent with every request (RFC 8555 §6.1 asks clients to identify themselves).</summary>
     public string UserAgent { get; set; } = "Tedd.Quicly.Acme/1.0";
 

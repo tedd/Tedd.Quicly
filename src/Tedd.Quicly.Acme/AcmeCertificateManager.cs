@@ -106,8 +106,9 @@ public sealed class AcmeCertificateManager
             {
                 return await OrderCoreAsync(replaces, cancellationToken).ConfigureAwait(false);
             }
-            catch (Exception e) when (e is not OperationCanceledException)
+            catch (Exception e) when (!(e is OperationCanceledException && cancellationToken.IsCancellationRequested))
             {
+                // An OperationCanceledException not caused by our token is an HttpClient timeout: classified by IsTransient.
                 bool retrying = attempt < retry.MaxAttempts && AcmeRetryOptions.IsTransient(e);
                 Report(retrying ? AcmeStage.Retrying : AcmeStage.Failed, e.Message);
                 if (!retrying)
@@ -135,28 +136,30 @@ public sealed class AcmeCertificateManager
         (AcmeOrder order, AsymmetricAlgorithm certificateKey) = await ResumeOrCreateOrderAsync(client, replaces, cancellationToken).ConfigureAwait(false);
         using (certificateKey)
         {
+            // The order URL is kept here: finalize responses need not carry a Location header.
+            Uri orderUrl = order.Location!;
             for (int i = 0; i < order.Authorizations.Count; i++)
             {
                 await CompleteAuthorizationAsync(client, order.Authorizations[i], cancellationToken).ConfigureAwait(false);
             }
 
-            order = await client.WaitForOrderAsync(order.Location!, cancellationToken).ConfigureAwait(false);
+            order = await client.WaitForOrderAsync(orderUrl, cancellationToken).ConfigureAwait(false);
             Report(AcmeStage.OrderReady, "Order status " + order.Status);
 
-            if (!string.Equals(order.Status, AcmeOrderStatus.Valid, StringComparison.Ordinal))
+            if (string.Equals(order.Status, AcmeOrderStatus.Ready, StringComparison.Ordinal))
             {
                 byte[] csr = CsrBuilder.CreateCsr(Options.Identifiers, certificateKey);
                 order = await client.FinalizeOrderAsync(order.Finalize, csr, cancellationToken).ConfigureAwait(false);
                 Report(AcmeStage.OrderFinalized, "Finalized; status " + order.Status);
                 if (!string.Equals(order.Status, AcmeOrderStatus.Valid, StringComparison.Ordinal))
                 {
-                    order = await client.WaitForOrderAsync(order.Location!, cancellationToken).ConfigureAwait(false);
+                    order = await client.WaitForOrderAsync(orderUrl, cancellationToken).ConfigureAwait(false);
                 }
             }
 
             Uri certificateUrl = order.Certificate
                 ?? throw AcmeException.Client(AcmeErrorTypes.InvalidResponse, "The order is " + order.Status + " but carries no certificate URL.");
-            AcmeCertificateChain chain = await SelectChainAsync(client, certificateUrl, cancellationToken).ConfigureAwait(false);
+            using AcmeCertificateChain chain = await SelectChainAsync(client, certificateUrl, cancellationToken).ConfigureAwait(false);
             Report(AcmeStage.CertificateDownloaded, chain.Certificates.Count + " certificate(s); leaf " + chain.Leaf.Subject + " expires " + chain.Leaf.NotAfter.ToUniversalTime().ToString("u", System.Globalization.CultureInfo.InvariantCulture));
 
             IssuedCertificate issued = IssuedCertificate.Create(chain.Certificates, certificateKey, Options.CertificatePassword);
@@ -340,8 +343,18 @@ public sealed class AcmeCertificateManager
                 await Task.Delay(Options.ChallengePropagationDelay, Options.ClientOptions.TimeProvider, cancellationToken).ConfigureAwait(false);
             }
 
-            await client.RespondToChallengeAsync(challenge.Url, cancellationToken).ConfigureAwait(false);
-            Report(AcmeStage.ChallengeResponded, challenge.Url.ToString(), identifier);
+            // A resumed order may find the challenge already responded to (processing); posting again is an error at
+            // some CAs, so only wait for it then. The response material is still (re)published above.
+            if (string.Equals(challenge.Status, AcmeChallengeStatus.Pending, StringComparison.Ordinal))
+            {
+                await client.RespondToChallengeAsync(challenge.Url, cancellationToken).ConfigureAwait(false);
+                Report(AcmeStage.ChallengeResponded, challenge.Url.ToString(), identifier);
+            }
+            else
+            {
+                Report(AcmeStage.ChallengeResponded, challenge.Url + " already " + challenge.Status + "; waiting", identifier);
+            }
+
             await client.WaitForAuthorizationAsync(authorizationUrl, cancellationToken).ConfigureAwait(false);
             Report(AcmeStage.AuthorizationValid, "Validated via " + challenge.Type, identifier);
         }
@@ -429,13 +442,24 @@ public sealed class AcmeCertificateManager
             return chain;
         }
 
-        for (int i = 0; i < chain.AlternateChainUrls.Count; i++)
+        try
         {
-            AcmeCertificateChain alternate = await client.DownloadCertificateAsync(chain.AlternateChainUrls[i], cancellationToken).ConfigureAwait(false);
-            if (ChainMatches(alternate, preferred))
+            for (int i = 0; i < chain.AlternateChainUrls.Count; i++)
             {
-                return alternate;
+                AcmeCertificateChain alternate = await client.DownloadCertificateAsync(chain.AlternateChainUrls[i], cancellationToken).ConfigureAwait(false);
+                if (ChainMatches(alternate, preferred))
+                {
+                    chain.Dispose();
+                    return alternate;
+                }
+
+                alternate.Dispose();
             }
+        }
+        catch
+        {
+            chain.Dispose();
+            throw;
         }
 
         return chain;

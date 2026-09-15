@@ -8,8 +8,7 @@ namespace Tedd.Quicly.Benchmarks.Acme;
 /// Base64url encode/decode: V0 (Convert.ToBase64String + Replace/TrimEnd) vs V1 (System.Buffers.Text.Base64Url).
 /// Sizes: 32 B (a SHA-256 thumbprint / DNS TXT value), 256 B (an RSA-2048 modulus or signature), 1 KiB (a CSR).
 /// </summary>
-[MemoryDiagnoser]
-[ShortRunJob]
+[Config(typeof(InProcessShortRunConfig))]
 public class Base64UrlBench
 {
     private byte[] _data = [];

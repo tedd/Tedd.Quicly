@@ -18,6 +18,13 @@ public sealed class AcmeClient
     private const string JoseContentType = "application/jose+json";
     private const string ProblemContentType = "application/problem+json";
     private const string PemChainContentType = "application/pem-certificate-chain";
+
+    /// <summary>Upper bound of the nonce pool; nonces beyond it are dropped (each request needs only one).</summary>
+    internal const int MaxPooledNonces = 32;
+
+    /// <summary>Longest accepted <c>Replay-Nonce</c> value.</summary>
+    internal const int MaxNonceLength = 512;
+
     private static readonly byte[] EmptyObjectPayload = JsonSerializer.SerializeToUtf8Bytes(new EmptyRequest(), AcmeJsonContext.Default.EmptyRequest);
 
     private readonly HttpClient _http;
@@ -284,15 +291,18 @@ public sealed class AcmeClient
         throw AcmeException.Client(AcmeErrorTypes.PollTimeout, "Order " + orderUrl + " is still pending after " + Options.MaxPollAttempts + " polls.");
     }
 
-    /// <summary>Submits the CSR (DER) to the order's <c>finalize</c> URL (RFC 8555 §7.4).</summary>
+    /// <summary>
+    /// Submits the CSR (DER) to the order's <c>finalize</c> URL (RFC 8555 §7.4). The returned order's
+    /// <see cref="AcmeOrder.Location"/> is the <c>Location</c> header when the CA sends one and <see langword="null"/>
+    /// otherwise (the header is optional on finalize), so keep the order URL from <see cref="NewOrderAsync"/>.
+    /// </summary>
     public async ValueTask<AcmeOrder> FinalizeOrderAsync(Uri finalizeUrl, byte[] csrDer, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(finalizeUrl);
         ArgumentNullException.ThrowIfNull(csrDer);
         byte[] body = JsonSerializer.SerializeToUtf8Bytes(new FinalizeRequest { Csr = Base64UrlCodec.Encode(csrDer) }, AcmeJsonContext.Default.FinalizeRequest);
         AcmeResponse response = await SendSignedAsync(finalizeUrl, body, embedJwk: false, accept: null, cancellationToken).ConfigureAwait(false);
-        AcmeOrder order = Parse(response, AcmeJsonContext.Default.AcmeOrder);
-        return order with { Location = response.Location ?? order.Location };
+        return Parse(response, AcmeJsonContext.Default.AcmeOrder) with { Location = response.Location };
     }
 
     /// <summary>Downloads the certificate chain (RFC 8555 §7.4.2) as <c>application/pem-certificate-chain</c>.</summary>
@@ -455,14 +465,16 @@ public sealed class AcmeClient
     private async Task<AcmeResponse> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         request.Headers.UserAgent.ParseAdd(Options.UserAgent);
-        using HttpResponseMessage response = await _http.SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken).ConfigureAwait(false);
-        byte[] body = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+        using HttpResponseMessage response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        byte[] body = await ReadBoundedAsync(response.Content, Options.MaxResponseBytes, cancellationToken).ConfigureAwait(false);
 
         if (response.Headers.TryGetValues("Replay-Nonce", out IEnumerable<string>? nonces))
         {
             foreach (string nonce in nonces)
             {
-                if (!string.IsNullOrEmpty(nonce))
+                // RFC 8555 §6.5.1: the value is base64url; clients MUST ignore invalid values. The pool is bounded so a
+                // hostile server cannot grow it without limit (ADR 0009).
+                if (IsValidNonce(nonce) && _nonces.Count < MaxPooledNonces)
                 {
                     _nonces.Enqueue(nonce);
                 }
@@ -484,7 +496,69 @@ public sealed class AcmeClient
             retryAfter = ra.Delta ?? (ra.Date is { } date ? date - Options.TimeProvider.GetUtcNow() : null);
         }
 
-        return new AcmeResponse(response.StatusCode, body, response.Content.Headers.ContentType?.MediaType, response.Headers.Location, links, retryAfter);
+        // Location may be relative (RFC 9110 §10.2.2); resolve it against the request URL.
+        Uri? location = response.Headers.Location;
+        if (location is not null && !location.IsAbsoluteUri)
+        {
+            location = new Uri(request.RequestUri!, location);
+        }
+
+        return new AcmeResponse(response.StatusCode, body, response.Content.Headers.ContentType?.MediaType, location, links, retryAfter);
+    }
+
+    /// <summary>Reads the body, refusing (before buffering it) anything larger than <paramref name="maxBytes"/>.</summary>
+    private static async Task<byte[]> ReadBoundedAsync(HttpContent content, int maxBytes, CancellationToken cancellationToken)
+    {
+        if (content.Headers.ContentLength is long declared && declared > maxBytes)
+        {
+            throw TooLarge(maxBytes);
+        }
+
+        Stream stream = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        await using (stream.ConfigureAwait(false))
+        {
+            using MemoryStream buffer = new();
+            byte[] chunk = new byte[16 * 1024];
+            while (true)
+            {
+                int read = await stream.ReadAsync(chunk, cancellationToken).ConfigureAwait(false);
+                if (read == 0)
+                {
+                    return buffer.ToArray();
+                }
+
+                if (buffer.Length + read > maxBytes)
+                {
+                    throw TooLarge(maxBytes);
+                }
+
+                buffer.Write(chunk, 0, read);
+            }
+        }
+
+        static AcmeException TooLarge(int max) => AcmeException.Client(
+            AcmeErrorTypes.InvalidResponse,
+            "The server response exceeds MaxResponseBytes (" + max.ToString(System.Globalization.CultureInfo.InvariantCulture) + ").");
+    }
+
+    /// <summary>True for a non-empty base64url nonce of sane length (RFC 8555 §6.5.1).</summary>
+    internal static bool IsValidNonce(string? nonce)
+    {
+        if (string.IsNullOrEmpty(nonce) || nonce.Length > MaxNonceLength)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < nonce.Length; i++)
+        {
+            char c = nonce[i];
+            if (!(char.IsAsciiLetterOrDigit(c) || c == '-' || c == '_'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static void ParseLinkHeader(string value, List<(Uri Url, string Rel)> links)

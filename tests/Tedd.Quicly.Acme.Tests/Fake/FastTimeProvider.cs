@@ -24,6 +24,13 @@ public sealed class FastTimeProvider : TimeProvider
 
     public override DateTimeOffset GetUtcNow() => Now;
 
+    // The timestamp must follow the simulated clock too: .NET 11's Task.Delay measures elapsed time with
+    // GetTimestamp and re-arms the timer when the real stopwatch says the delay has not elapsed yet, which with
+    // synchronously-firing timers would spin forever.
+    public override long GetTimestamp() => Now.UtcTicks;
+
+    public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
     public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
     {
         lock (_lock)

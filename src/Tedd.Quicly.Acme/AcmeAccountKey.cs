@@ -115,16 +115,18 @@ public sealed class AcmeAccountKey : IDisposable
             throw new ArgumentException("Unsupported PEM label '" + label.ToString() + "'.", nameof(pem));
         }
 
-        if (isEc)
+        AsymmetricAlgorithm key = isEc ? ECDsa.Create() : RSA.Create();
+        try
         {
-            ECDsa ecdsa = ECDsa.Create();
-            ecdsa.ImportFromPem(pem);
-            return new AcmeAccountKey(ecdsa);
+            key.ImportFromPem(pem);
+            return key is ECDsa ecdsa ? new AcmeAccountKey(ecdsa) : new AcmeAccountKey((RSA)key);
         }
-
-        RSA rsa = RSA.Create();
-        rsa.ImportFromPem(pem);
-        return new AcmeAccountKey(rsa);
+        catch
+        {
+            // Wrong curve / too-short RSA key / corrupt PEM: do not leak the native key handle.
+            key.Dispose();
+            throw;
+        }
     }
 
     /// <summary>Creates a verification-only key from a public JWK (as sent in a JWS <c>jwk</c> header).</summary>

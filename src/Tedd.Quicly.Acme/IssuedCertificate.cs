@@ -102,15 +102,14 @@ public sealed class IssuedCertificate : IDisposable
     /// <summary>Loads a PKCS#12 file.</summary>
     public static IssuedCertificate LoadFile(string path, string? password = null) => Load(File.ReadAllBytes(path), password);
 
-    /// <summary>Writes <see cref="Pfx"/> to <paramref name="path"/> (atomically: temp file + rename).</summary>
+    /// <summary>
+    /// Writes <see cref="Pfx"/> to <paramref name="path"/> atomically (temp file + rename). The file holds the private key,
+    /// so on Unix it is created with mode <c>0600</c> (ADR 0009).
+    /// </summary>
     public void Save(string path)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
-        path = Path.GetFullPath(path);
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        string temp = path + ".tmp";
-        File.WriteAllBytes(temp, Pfx);
-        File.Move(temp, path, overwrite: true);
+        SecureFile.WriteAllBytesAtomic(path, Pfx);
     }
 
     /// <summary>Exports the chain as PEM (leaf first).</summary>

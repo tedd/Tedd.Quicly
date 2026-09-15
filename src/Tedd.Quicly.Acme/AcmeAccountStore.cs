@@ -105,17 +105,13 @@ public sealed class AcmeAccountStore
     public void Save(AcmeAccountState state)
     {
         ArgumentNullException.ThrowIfNull(state);
-        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path)!);
-        string temp = Path + ".tmp";
         byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(state, AcmeJsonContext.Default.AcmeAccountState);
         if (Protection != AcmeStoreProtection.None)
         {
             bytes = ProtectDocument(bytes);
         }
 
-        File.WriteAllBytes(temp, bytes);
-        RestrictPermissions(temp);
-        File.Move(temp, Path, overwrite: true);
+        SecureFile.WriteAllBytesAtomic(Path, bytes);
     }
 
     /// <summary>Records (or with <see langword="null"/> clears) the in-flight order on the stored state.</summary>
@@ -155,27 +151,6 @@ public sealed class AcmeAccountStore
         catch (Exception e) when (e is CryptographicException or FormatException)
         {
             throw new InvalidDataException("Account store '" + Path + "' cannot be decrypted with DPAPI (different user / machine, or corrupt).", e);
-        }
-    }
-
-    private static void RestrictPermissions(string path)
-    {
-        if (OperatingSystem.IsWindows())
-        {
-            return; // NTFS: inherits the parent directory ACL; the user profile is already owner-only by default.
-        }
-
-        try
-        {
-            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        }
-        catch (IOException)
-        {
-            // Best effort (e.g. FAT / SMB mounts without mode support).
-        }
-        catch (UnauthorizedAccessException)
-        {
-            // Best effort.
         }
     }
 }

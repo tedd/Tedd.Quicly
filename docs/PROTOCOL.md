@@ -391,3 +391,37 @@ logging.
 Decompression runs on the game thread inside `Poll` (never on a transport thread); compressed messages are
 staged compressed in a pooled lease. Every limit is configurable per channel or per peer, and every violation
 is a counter in the peer's statistics.
+
+## 8. Clarifications (decided by the reference implementation)
+
+Where the sections above leave a choice open, `Tedd.Quicly.Core` (Channels/Framing) decides as follows. Every
+rule below is enforced by the receiver; a violation is a malformed frame with the consequence given in §6.
+Byte-exact examples are in [protocol-vectors.md](protocol-vectors.md).
+
+* **§1 table section.** `flags` bit 7 is reserved and MUST be 0; compression codecs 2 and 3 are rejected in a v1
+  table; `maxMessageSize` is 1 … 16 MiB; names are valid UTF-8 (a name of length 0 is allowed). `count` is at most
+  16 382 and ids are strictly ascending.
+* **§1 defaults.** A channel's local `ExpiryMicros` default is 0 (none) for every mode except
+  `UnreliableSequenced` (2 × the flush interval, §4.5), including `UnreliableUnordered`. `MaxGroups` defaults to 1
+  for `ReliableOrdered` and 0 for datagram-only modes.
+* **§2.1 fragments.** Every fragment carries at least one payload byte, and the last fragment carries between 1
+  and size(fragment 0) bytes. A receiver can therefore bound the total from any single fragment: a non-last
+  fragment of size *s* implies a total ≥ *s* × (FragCount − 1) + 1, the last fragment of size *l* implies a total
+  ≥ *l* × FragCount; if that bound exceeds the effective `MaxMessageSize` (uncompressed), the fragment is dropped.
+* **§2.1 / §3.1 compression.** A compressed payload (`RawLength > 0`) is non-empty and strictly shorter than
+  `RawLength` (for fragments: the bound above is strictly below `RawLength`); anything else is malformed.
+* **§2.2 containers.** `Flags` bits 1–7 are reserved and MUST be 0; `Tick` is ≤ 2^32 − 1; a container holds at
+  least one message; an inner frame whose first byte is `0x01` is a nested container. An inner frame that encodes
+  channel 1 non-minimally is rejected by the inner parse (non-minimal varint).
+* **§3 control stream.** Both directions of the control stream begin with the preamble `0x00`. A unidirectional
+  stream whose preamble names channel 0 is rejected like channel 1 (`UnsupportedChannel`).
+* **§3.1 request ids.** `RequestId` is ≤ 2^32 − 1.
+* **§3.2 large ReliableLatest values.** The group stream's `GroupId` is the value's 32-bit version (≤ 2^32 − 1) and
+  its single message frame is `Length varint, Sequence u32 LE, Key varint, RawLength varint (when Compression ≠ 0),
+  Payload` — the §3.1 framing with the §2.1 `Sequence` field inserted after `Length`. `Sequence` MUST equal
+  `GroupId`; a second message on the stream is malformed.
+* **§3.3 bulk.** `MaxMessageSize` of a Bulk channel bounds `Length` of one transfer (the range one stream carries),
+  not `TotalLength`. `Flags` bits 4–7 MUST be 0 and the hash-algorithm bits 2–3 MUST be 0 (SHA-256; the others are
+  rejected, whether or not bit 0 is set). An unchunked body is exactly `Length` bytes. In a chunked body
+  `ChunkLength ≥ 1`; `RawLength = 0` means the chunk is stored uncompressed, otherwise `ChunkLength < RawLength`;
+  the decoded sizes of all chunks sum to exactly `Length`. Bytes after the body are malformed.

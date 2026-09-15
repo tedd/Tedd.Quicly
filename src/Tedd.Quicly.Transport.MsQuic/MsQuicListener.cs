@@ -54,10 +54,18 @@ public interface IMsQuicListenerEvents
     /// drops the connection and the wrapper is released; the app must not use it afterwards.
     /// </summary>
     /// <remarks>
-    /// Do not call any MsQuic API on <paramref name="connection"/> (streams, datagrams, parameters, Shutdown, ...)
+    /// <para>Do not call any MsQuic API on <paramref name="connection"/> (streams, datagrams, parameters, Shutdown, ...)
     /// from inside this callback: the wrapper sets the returned configuration and attaches the connection's
     /// callback handler only after the handler returns, and MsQuic silently drops any event it would indicate
-    /// inline before then (and a rejected connection must never have been used).
+    /// inline before then (and a rejected connection must never have been used).</para>
+    /// <para><b>Configuration lifetime.</b> The wrapper applies the returned configuration (<c>ConnectionSetConfiguration</c>)
+    /// right after this handler returns, still inside MsQuic's NEW_CONNECTION callback, and holds no reference on it in
+    /// between; MsQuic takes its own reference only when the configuration is applied. The configuration must therefore
+    /// stay open until then: a handler whose configuration can be closed concurrently (a certificate swap on another
+    /// thread, for example) must take a reference of its own before returning and give it up once the connection's
+    /// handshake has ended (its first event) or the configuration was refused (<see cref="ConnectionConfigurationFailed"/>).
+    /// Closed earlier, the connection is refused, or the listener uses a freed configuration when no other connection
+    /// holds it. <see cref="MsQuicTransportListener"/> keeps one reference per connection until its handshake has ended.</para>
     /// </remarks>
     MsQuicConfiguration? NewConnection(MsQuicListener listener, MsQuicConnection connection, in MsQuicNewConnectionInfo info);
 
@@ -70,13 +78,25 @@ public interface IMsQuicListenerEvents
     void DosModeChanged(MsQuicListener listener, bool enabled)
     {
     }
+
+    /// <summary>
+    /// <see cref="NewConnection"/> returned a configuration but applying it to <paramref name="connection"/> failed with
+    /// <paramref name="status"/>: MsQuic refuses the connection and no event will ever reach it. Release whatever the
+    /// handler set up for it. Called on the worker thread, inside the NEW_CONNECTION callback. Default: nothing.
+    /// </summary>
+    void ConnectionConfigurationFailed(MsQuicListener listener, MsQuicConnection connection, int status)
+    {
+    }
 }
 
 /// <summary>A QUIC listener bound to a local UDP end point and a set of ALPNs.</summary>
 /// <remarks>
-/// Lifetime: <see cref="Close"/> stops the listener (waiting for STOP_COMPLETE) and frees the handle; call it
+/// <para>Lifetime: <see cref="Close"/> stops the listener (waiting for STOP_COMPLETE) and frees the handle; call it
 /// once, never from inside the listener callback. Connections accepted through it outlive it and must be
-/// closed separately. The native context is one <see cref="GCHandle"/> per listener.
+/// closed separately. The native context is one <see cref="GCHandle"/> per listener.</para>
+/// <para>Configurations: the configuration a <see cref="IMsQuicListenerEvents.NewConnection"/> handler returns is applied
+/// after the handler returns, without the listener holding a reference on it in between; keep it open until then (see
+/// <see cref="IMsQuicListenerEvents.NewConnection"/>), for example by reference counting it across certificate swaps.</para>
 /// </remarks>
 public sealed unsafe class MsQuicListener : IDisposable
 {
@@ -272,6 +292,15 @@ public sealed unsafe class MsQuicListener : IDisposable
         if (MsQuicStatus.Failed(status))
         {
             connection.Abandon();
+            try
+            {
+                _events.ConnectionConfigurationFailed(this, connection, status);
+            }
+            catch (Exception ex)
+            {
+                LastCallbackException = ex;
+                MsQuicCallbackScope.OnEscapedException(ex);
+            }
             return status;
         }
         // From here on the application owns the connection and must Close it after SHUTDOWN_COMPLETE.

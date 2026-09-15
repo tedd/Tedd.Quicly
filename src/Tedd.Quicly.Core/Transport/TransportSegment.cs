@@ -4,8 +4,10 @@ namespace Tedd.Quicly.Core.Transport;
 
 /// <summary>
 /// One contiguous native memory segment handed to or received from a transport.
-/// The layout is bit-identical to MsQuic's <c>QUIC_BUFFER</c> (<c>uint32_t Length; uint8_t* Buffer;</c>,
-/// 16 bytes on 64-bit) so arrays of segments can be passed to the native library without translation.
+/// In a 64-bit process the layout is bit-identical to MsQuic's <c>QUIC_BUFFER</c> (<c>uint32_t Length; uint8_t* Buffer;</c>,
+/// 16 bytes) so arrays of segments can be passed to the native library without translation. In a 32-bit process
+/// <c>QUIC_BUFFER</c> is 8 bytes while this struct stays 16, so a transport that reinterprets segment arrays (the MsQuic
+/// transport) refuses to run there.
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Size = 16)]
 public unsafe struct TransportSegment

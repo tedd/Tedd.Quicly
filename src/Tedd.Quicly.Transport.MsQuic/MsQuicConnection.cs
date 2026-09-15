@@ -226,13 +226,15 @@ public sealed unsafe class MsQuicConnection : IDisposable
     /// <summary>Reads <c>QUIC_PARAM_CONN_STATISTICS_V2</c>; <paramref name="bytesWritten"/> says up to which field the struct is valid (compare with <see cref="QUIC_STATISTICS_V2.SIZE_4"/> etc.).</summary>
     public int GetStatisticsV2(out QUIC_STATISTICS_V2 statistics, out uint bytesWritten)
     {
-        ObjectDisposedException.ThrowIf(_handle == null, this);
+        // Read the handle once: Close on another thread clears the field, so a second read could hand MsQuic a null handle.
+        QUIC_HANDLE* handle = _handle;
+        ObjectDisposedException.ThrowIf(handle == null, this);
         statistics = default;
         uint length = (uint)sizeof(QUIC_STATISTICS_V2);
         int status;
         fixed (QUIC_STATISTICS_V2* p = &statistics)
         {
-            status = _api.Table->GetParam(_handle, MsQuicParam.QUIC_PARAM_CONN_STATISTICS_V2, &length, p);
+            status = _api.Table->GetParam(handle, MsQuicParam.QUIC_PARAM_CONN_STATISTICS_V2, &length, p);
         }
         bytesWritten = MsQuicStatus.Succeeded(status) ? Math.Min(length, (uint)sizeof(QUIC_STATISTICS_V2)) : 0;
         return status;

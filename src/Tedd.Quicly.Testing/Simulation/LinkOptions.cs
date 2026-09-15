@@ -77,6 +77,15 @@ public sealed class LinkOptions
     public long? DisconnectAtMicros { get; set; }
 
     /// <summary>
+    /// When true, the handshake of a connection made through <see cref="SimulatedConnector"/> fails after the listener
+    /// accepted it (as when the client rejects the server's certificate): neither end connects; the client raises
+    /// <see cref="Core.Transport.ITransportSink.OnClosed"/> with <see cref="Core.Transport.TransportCloseReason.Transport"/> and
+    /// <see cref="SimulatedTransport.StatusHandshakeFailed"/> one round trip after <c>Connect</c>, the accepted server end
+    /// half a round trip later. Default false.
+    /// </summary>
+    public bool FailHandshake { get; set; }
+
+    /// <summary>
     /// Time from <see cref="SimulatedNetwork.CreatePair"/> until both ends are connected; <c>null</c> (default) means one
     /// round trip (2 × <see cref="DelayMicros"/>). Connections made through <see cref="SimulatedConnector"/> ignore it:
     /// the client connects after one round trip, the server half a round trip later.

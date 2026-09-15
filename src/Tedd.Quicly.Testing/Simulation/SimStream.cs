@@ -24,6 +24,9 @@ internal sealed class SimStream
     public bool ShutdownDelivered;
     public bool CountsTowardLimit;
 
+    /// <summary>The start was refused for the peer's stream limit: the stream never starts (it is dead until closed).</summary>
+    public bool StartRefused;
+
     // Send direction.
     public bool CanSend;
     public bool FinQueued;
@@ -68,6 +71,7 @@ internal sealed class SimStream
         ShutdownScheduled = false;
         ShutdownDelivered = false;
         CountsTowardLimit = false;
+        StartRefused = false;
         CanSend = false;
         FinQueued = false;
         SendDone = false;

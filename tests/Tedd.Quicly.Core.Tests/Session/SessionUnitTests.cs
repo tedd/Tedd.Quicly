@@ -600,8 +600,9 @@ public class SessionSupportTests
 
         Assert.IsType<ReliableOrderedEngine>(ChannelEngines.Create(ChannelMode.ReliableOrdered));
 
-        // Wave C2 modes stay placeholders until their engines land.
-        Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.ReliableUnordered));
+        Assert.IsType<GroupStreamEngine>(ChannelEngines.Create(ChannelMode.ReliableUnordered));
+
+        // The remaining wave C2 modes stay placeholders until their engines land.
         Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.ReliableLatest));
         Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.Bulk));
         Assert.Throws<ArgumentOutOfRangeException>(() => ChannelEngines.Create((ChannelMode)6));

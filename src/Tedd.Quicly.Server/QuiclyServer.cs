@@ -235,6 +235,10 @@ public sealed partial class QuiclyServer : IAsyncDisposable
     /// When a resume replaces a connection that was still open, <see cref="PeerAdmitted"/> of the new peer can come first: the
     /// replaced peer's <see cref="PeerClosed"/> (with <see cref="QuiclyErrorCode.SessionReplaced"/>) follows once its close
     /// completed, so key per-session state by <see cref="QuiclyPeer.SessionId"/> and check the <see cref="QuiclyPeer.Epoch"/>.
+    /// A server cannot resume a connection in place — its accept callback has to hand out a sink before the Hello names the
+    /// session — so the resumed connection is a new peer that inherits the session's <see cref="QuiclyPeer.Tag"/> (and
+    /// whatever else the admission policy copies onto it) but starts its <see cref="QuiclyPeer.GetStatistics"/> counters from
+    /// zero: those belong to the peer object, so a host that reports per session aggregates them itself.
     /// </summary>
     public event Action<QuiclyPeer, CloseReason>? PeerClosed;
 

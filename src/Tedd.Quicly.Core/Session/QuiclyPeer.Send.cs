@@ -702,7 +702,7 @@ public sealed unsafe partial class QuiclyPeer
             }
 
             _core.ReturnSend(in item.Lease);
-            _core.Counters.ThreadSafeSendDrops++;
+            Interlocked.Increment(ref _core.Counters.ThreadSafeSendDrops);
         }
 
         return immediate;
@@ -753,13 +753,13 @@ public sealed unsafe partial class QuiclyPeer
         {
             _hasHeldForeign = false;
             _core.ReturnSend(in _heldForeign.Lease);
-            _core.Counters.ThreadSafeSendDrops++;
+            Interlocked.Increment(ref _core.Counters.ThreadSafeSendDrops);
         }
 
         while (front.TryDequeue(out ForeignSend item))
         {
             _core.ReturnSend(in item.Lease);
-            _core.Counters.ThreadSafeSendDrops++;
+            Interlocked.Increment(ref _core.Counters.ThreadSafeSendDrops);
         }
     }
 

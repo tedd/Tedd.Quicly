@@ -23,7 +23,8 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// <c>Expired</c>, completing <see cref="DeliveryStatus.Expired"/>). Sequence numbers come from a per-channel counter of the
 /// channel's width, assigned at admission.</para>
 /// <para><b>Completions (game thread).</b> The early Sent notice returns the payload and completes the BufferReleased
-/// stage; the final completion maps to Delivered (acknowledged, or sent when the transport reports no states), Lost,
+/// stage; the final completion maps to Delivered (acknowledged), Sent (handed to a carrier that reports no per-datagram
+/// states, so delivery can never be known — PROTOCOL.md §4.3), Lost,
 /// Expired (canceled by the transport, or expired here), Canceled (<see cref="TryCancel"/>), Failed or Disconnected, and
 /// frees the slot. Entry scratch: <c>Aux0</c> holds the admitted length (queue accounting), <c>Aux1</c> where the entry is
 /// (queued, handed to the packer, finished).</para>
@@ -236,7 +237,8 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
         long expiry = request.Options.ExpiryMicros > 0 ? request.Options.ExpiryMicros : _expiryMicros[local];
         if (expiry > 0)
         {
-            long now = _core.Clock.NowMicros;
+            // The pass's clock stamp, not a QPC per message (ADR 0008 invariant 9).
+            long now = _core.CurrentPassMicros;
             entries.Deadlines[slot] = expiry >= long.MaxValue - now ? long.MaxValue : now + expiry;
         }
 

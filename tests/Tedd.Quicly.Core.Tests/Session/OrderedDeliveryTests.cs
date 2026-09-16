@@ -1,7 +1,9 @@
 using Tedd.Quicly.Core.Channels;
+using Tedd.Quicly.Core.Framing;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.State;
+using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Testing.Simulation;
 
 namespace Tedd.Quicly.Core.Tests.Session;
@@ -176,6 +178,50 @@ public class OrderedDeliveryTests
 
         // The compressible payload travelled as a short LZ4 block.
         Assert.True(OrderedKit.Stats(h.Client, 6).BytesSent < 2_000 + 2_000 + 3);
+    }
+
+    [Fact]
+    public void Request_And_Response_Ids_Reach_The_Handler_On_A_RequestResponse_Channel()
+    {
+        // The receive side of PROTOCOL.md §3.1 RequestId: 0 = plain, odd = request, even ≥ 2 = response to RequestId − 1.
+        // The send side is a wave C2 hook (SendRequestAsync / Respond), so the frames are written by hand here.
+        using ServerHarness h = new(table: OrderedTables.Main);
+        Assert.True(h.Admit(), "The raw client was not admitted.");
+        ChannelDefinition rpc = h.Table[10]!;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(10, Handlers.Collect(got));
+
+        byte[] frames = new byte[64];
+        int written = StreamFraming.WritePreamble(frames, rpc.Id);
+        written += WriteMessage(frames.AsSpan(written), rpc, 1, 0xA1);
+        written += WriteMessage(frames.AsSpan(written), rpc, 2, 0xB2);
+        written += WriteMessage(frames.AsSpan(written), rpc, 0, 0xC3);
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(frames.AsSpan(0, written), out TransportStreamId _));
+        Assert.True(h.RunUntil(() => got.Count == 3), $"{got.Count} of 3 frames were delivered.");
+
+        Assert.Equal(1u, got[0].Header.RequestId);
+        Assert.True(got[0].Header.Flags.HasFlag(ReceiveFlags.IsRequest));
+        Assert.False(got[0].Header.Flags.HasFlag(ReceiveFlags.IsResponse));
+        Assert.Equal(new byte[] { 0xA1 }, got[0].Payload);
+
+        Assert.Equal(2u, got[1].Header.RequestId);
+        Assert.True(got[1].Header.Flags.HasFlag(ReceiveFlags.IsResponse));
+        Assert.False(got[1].Header.Flags.HasFlag(ReceiveFlags.IsRequest));
+        Assert.Equal(new byte[] { 0xB2 }, got[1].Payload);
+
+        Assert.Equal(0u, got[2].Header.RequestId);
+        Assert.Equal(ReceiveFlags.None, got[2].Header.Flags);
+        Assert.Equal(new byte[] { 0xC3 }, got[2].Payload);
+
+        static int WriteMessage(Span<byte> destination, ChannelDefinition channel, uint requestId, byte payload)
+        {
+            StreamMessageHeader header = default;
+            header.Length = 1;
+            header.RequestId = requestId;
+            int written = StreamFraming.WriteFrameHeader(destination, channel, in header);
+            destination[written] = payload;
+            return written + 1;
+        }
     }
 
     [Fact]

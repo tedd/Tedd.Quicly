@@ -111,46 +111,58 @@ public sealed unsafe partial class QuiclyPeer
         PeerCounters counters = _core.Counters;
         counters.DatagramsReceived++;
         counters.DatagramBytesReceived += datagram.Length;
-        Volatile.Write(ref _lastReceiveMicros, now);
         ParseStatus status = DatagramFraming.TryParse(datagram, _core.Table, _core.SessionMaxMessageSize, out MessageHeader header, out int offset);
+        bool accepted;
         switch (status)
         {
             case ParseStatus.Ok:
-                DeliverDatagram(in header, datagram.Slice(offset), now);
+                accepted = DeliverDatagram(in header, datagram.Slice(offset), now);
                 break;
             case ParseStatus.ControlChannel:
-                HandleControlDatagram(datagram, now);
+                accepted = HandleControlDatagram(datagram, now);
                 break;
             case ParseStatus.ContainerChannel:
-                HandleContainer(datagram, now);
+                accepted = HandleContainer(datagram, now);
                 break;
             default:
                 counters.MalformedDatagrams++;
                 _core.CountDatagramDropped(header.Channel);
+                accepted = false;
                 break;
+        }
+
+        if (accepted)
+        {
+            // Only valid, accepted traffic (control frames included) satisfies the heartbeat: garbage, frames for
+            // unknown channels and traffic before admission must not keep a dead session alive (PROTOCOL.md §7).
+            Volatile.Write(ref _lastReceiveMicros, now);
         }
     }
 
-    private void DeliverDatagram(in MessageHeader header, ReadOnlySpan<byte> payload, long now)
+    /// <summary>Hands a parsed application datagram to its engine; <see langword="false"/> when it was not accepted.</summary>
+    private bool DeliverDatagram(in MessageHeader header, ReadOnlySpan<byte> payload, long now)
     {
         if (!_core.IsAdmitted)
         {
             _core.Counters.DroppedBeforeAdmission++;
-            return;
+            return false;
         }
 
         _core.GetEngine(_core.ChannelIndexOf(header.Channel)).OnDatagram(in header, payload, now);
+        return true;
     }
 
-    private void HandleContainer(ReadOnlySpan<byte> datagram, long now)
+    /// <summary>Dispatches a packed container's messages; <see langword="true"/> when at least one was accepted.</summary>
+    private bool HandleContainer(ReadOnlySpan<byte> datagram, long now)
     {
         if (PackedContainer.TryParse(datagram, out PackedContainerReader reader) != ParseStatus.Ok)
         {
             _core.Counters.MalformedDatagrams++;
-            return;
+            return false;
         }
 
         _core.CurrentSenderTick = reader.HasTick ? reader.Tick : 0;
+        bool accepted = false;
         foreach (ReadOnlySpan<byte> message in reader)
         {
             if (_ignoreIncoming)
@@ -161,11 +173,11 @@ public sealed unsafe partial class QuiclyPeer
             ParseStatus status = DatagramFraming.TryParse(message, _core.Table, _core.SessionMaxMessageSize, out MessageHeader header, out int offset);
             if (status == ParseStatus.Ok)
             {
-                DeliverDatagram(in header, message.Slice(offset), now);
+                accepted |= DeliverDatagram(in header, message.Slice(offset), now);
             }
             else if (status == ParseStatus.ControlChannel)
             {
-                HandleControlDatagram(message, now);
+                accepted |= HandleControlDatagram(message, now);
             }
             else
             {
@@ -175,27 +187,29 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         _core.CurrentSenderTick = 0;
+        return accepted;
     }
 
-    private void HandleControlDatagram(ReadOnlySpan<byte> frame, long now)
+    /// <summary>Handles one control datagram; <see langword="false"/> when it was malformed, rate-limited or too early.</summary>
+    private bool HandleControlDatagram(ReadOnlySpan<byte> frame, long now)
     {
         PeerCounters counters = _core.Counters;
         if (ControlCodec.TryReadDatagram(frame, out ControlType type, out ReadOnlySpan<byte> body, out _) != ControlParseStatus.Ok)
         {
             counters.MalformedDatagrams++;
-            return;
+            return false;
         }
 
         counters.ControlMessagesReceived++;
         if (!TakeControlToken(now))
         {
-            return;
+            return false;
         }
 
         if (!_core.IsAdmitted)
         {
             counters.DroppedBeforeAdmission++;
-            return;
+            return false;
         }
 
         bool valid;
@@ -230,6 +244,8 @@ public sealed unsafe partial class QuiclyPeer
         {
             counters.MalformedDatagrams++;
         }
+
+        return valid;
     }
 
     private bool TakeControlToken(long now)
@@ -367,7 +383,6 @@ public sealed unsafe partial class QuiclyPeer
         int total = TotalLength(segments);
         long now = _clock.NowMicros;
         _core.Counters.StreamBytesReceived += total;
-        Volatile.Write(ref _lastReceiveMicros, now);
         if (_ignoreIncoming)
         {
             return ReceiveResult.Consumed(total);
@@ -389,10 +404,14 @@ public sealed unsafe partial class QuiclyPeer
         switch (record.Tag)
         {
             case StreamTag.Control:
+                // Data on a live control or engine stream is accepted traffic; data on a discarded or reset stream is not
+                // (PROTOCOL.md §7: the heartbeat must not be satisfied by what we throw away).
+                Volatile.Write(ref _lastReceiveMicros, now);
                 ReceiveControl(ref record, segments, fin, now);
                 return ReceiveResult.Consumed(total);
             case StreamTag.Preamble:
             case StreamTag.Engine:
+                Volatile.Write(ref _lastReceiveMicros, now);
                 return ReceiveEngineStream(ref record, id, segments, total, fin, now);
             default:
                 return ReceiveResult.Consumed(total);
@@ -774,6 +793,11 @@ public sealed unsafe partial class QuiclyPeer
                         RequestLocalClose(result.Code);
                         return ReceiveResult.Consumed(total);
                 }
+
+                // PROTOCOL.md §7 "stream idle mid-message": watch the stream while a message is only half received (its
+                // staging lease and ring reservation are held), and stop watching when the message is complete. Refreshed
+                // by every accepted event, so only a peer that really stopped sending times out.
+                StreamTable.NoteProgress(ref record, context.Phase == StreamMessagePhase.End ? 0 : now);
             }
 
             consumed += segment.Length;
@@ -852,6 +876,8 @@ public sealed unsafe partial class QuiclyPeer
 
     private void NotifyEngineClosed(ref StreamRecord record, TransportStreamId id, bool aborted, ulong code)
     {
+        // The engine releases whatever the half-received message held, so the idle watch stops here either way.
+        StreamTable.NoteProgress(ref record, 0);
         if (record.Tag == StreamTag.Engine)
         {
             record.Tag = StreamTag.Discard;

@@ -130,6 +130,12 @@ public struct PeerStatistics
     /// <summary>Stream receives held back by back-pressure (receive ring full or receive budget used up) and resumed from Poll.</summary>
     public long StreamReceivePends;
 
+    /// <summary>
+    /// Peer streams reset with <c>Timeout</c> because they stopped in the middle of a message (PROTOCOL.md §7,
+    /// <see cref="PeerOptions.StreamIdleTimeout"/>); their staging leases and ring reservations were released.
+    /// </summary>
+    public long StreamIdleTimeouts;
+
     /// <summary>Sends queued from other threads (<see cref="PeerOptions.ThreadSafeSend"/>).</summary>
     public long ThreadSafeSends;
 

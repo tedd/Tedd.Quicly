@@ -40,7 +40,7 @@ namespace Tedd.Quicly.Core.Threading;
 /// or its result read); an unconsumed one keeps its slot alive.
 /// </para>
 /// </remarks>
-public sealed class CompletionTable
+public sealed class CompletionTable : IDisposable
 {
     private readonly Slot[] _slots;
     private readonly MpscRing<int> _free;
@@ -180,6 +180,9 @@ public sealed class CompletionTable
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="token"/> names a slot outside the table.</exception>
     public void Release(SendToken token)
         => GetSlot(token).Release(token.Generation);
+
+    /// <summary>Frees the native memory of the free list. Call it once, after no thread can complete a send any more.</summary>
+    public void Dispose() => _free.Dispose();
 
     private Slot GetSlot(SendToken token)
     {

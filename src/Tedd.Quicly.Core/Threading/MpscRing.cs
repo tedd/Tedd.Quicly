@@ -1,9 +1,10 @@
 using System.Runtime.CompilerServices;
+using Tedd.Quicly.Core.State;
 
 namespace Tedd.Quicly.Core.Threading;
 
 /// <summary>
-/// Bounded lock-free multi-producer / single-consumer ring buffer (Vyukov's bounded queue).
+/// Bounded lock-free multi-producer / single-consumer ring buffer (Vyukov's bounded queue) over native memory.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -13,10 +14,15 @@ namespace Tedd.Quicly.Core.Threading;
 /// and the consumer never touches the enqueue position at all. Elements are dequeued in the order in which
 /// producers claimed their slots.
 /// </para>
-/// <para>The ring never allocates after construction.</para>
+/// <para>
+/// The slots live in a <see cref="NativeArray{T}"/>, so the block is 64-byte aligned (ADR 0008 invariant 12) and
+/// a slot whose sequence word plus value is 64 bytes — the peer's <c>ForeignSend</c> front — occupies exactly one
+/// cache line. The ring never allocates after construction. <see cref="Dispose"/> frees the native memory and must
+/// not race with element access; a finalizer frees it if the owner forgot.
+/// </para>
 /// </remarks>
-/// <typeparam name="T">Element type; must be unmanaged so that the buffer is a flat array of values.</typeparam>
-public sealed class MpscRing<T> where T : unmanaged
+/// <typeparam name="T">Element type; must be unmanaged so that the buffer is a flat block of values.</typeparam>
+public sealed unsafe class MpscRing<T> : IDisposable where T : unmanaged
 {
     private struct Slot
     {
@@ -24,7 +30,8 @@ public sealed class MpscRing<T> where T : unmanaged
         public T Value;
     }
 
-    private readonly Slot[] _slots;
+    private readonly NativeArray<Slot> _buffer;
+    private readonly Slot* _slots;
     private readonly int _mask;
     private MpscPositions _pos;
 
@@ -34,7 +41,8 @@ public sealed class MpscRing<T> where T : unmanaged
     public MpscRing(int minimumCapacity)
     {
         int capacity = SpscRing<T>.RoundUpCapacity(minimumCapacity);
-        _slots = new Slot[capacity];
+        _buffer = new NativeArray<Slot>(capacity);
+        _slots = _buffer.Pointer;
         _mask = capacity - 1;
         for (int i = 0; i < capacity; i++)
             _slots[i].Sequence = i;
@@ -42,6 +50,12 @@ public sealed class MpscRing<T> where T : unmanaged
 
     /// <summary>Number of elements the ring can hold. Always a power of two.</summary>
     public int Capacity => _mask + 1;
+
+    /// <summary>Size of one slot in bytes (the sequence word plus the element).</summary>
+    public static int SlotSize => sizeof(Slot);
+
+    /// <summary>Address of the first slot (64-byte aligned); for layout assertions.</summary>
+    internal nint Address => (nint)_slots;
 
     /// <summary>
     /// Approximate number of queued elements (claimed slots, including ones a producer has not yet finished
@@ -65,7 +79,7 @@ public sealed class MpscRing<T> where T : unmanaged
     /// <returns><see langword="false"/> when the ring is full; the element is not stored.</returns>
     public bool TryEnqueue(in T item)
     {
-        Slot[] slots = _slots;
+        Slot* slots = _slots;
         long pos = Volatile.Read(ref _pos.Enqueue);
         while (true)
         {
@@ -124,7 +138,7 @@ public sealed class MpscRing<T> where T : unmanaged
     /// <returns>Number of elements written to <paramref name="destination"/>.</returns>
     public int TryDequeueBatch(Span<T> destination)
     {
-        Slot[] slots = _slots;
+        Slot* slots = _slots;
         long pos = _pos.Dequeue;
         int count = 0;
         while (count < destination.Length)
@@ -142,4 +156,7 @@ public sealed class MpscRing<T> where T : unmanaged
             Volatile.Write(ref _pos.Dequeue, pos);
         return count;
     }
+
+    /// <summary>Frees the native slot block. Safe to call more than once; must not race with element access.</summary>
+    public void Dispose() => _buffer.Dispose();
 }

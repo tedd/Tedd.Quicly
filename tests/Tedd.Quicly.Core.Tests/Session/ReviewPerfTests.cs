@@ -14,24 +14,29 @@ namespace Tedd.Quicly.Core.Tests.Session;
 public class ReviewPerfTests
 {
     /// <summary>
-    /// ARCHITECTURE.md §9 publishes the per-peer receive ring as "4 096 × 32 B" — one of the numbers
-    /// <c>ServerOptions.ExpectedPeers</c> scales. <see cref="ReceiveEntry"/> is 64 bytes, so the ring is twice the
-    /// published size, and it is a GC-heap <c>ReceiveEntry[]</c> (256 KiB, large-object heap) rather than the native
-    /// memory ADR 0008 invariant 12 and ARCHITECTURE.md §4 require for hot struct arrays.
+    /// ARCHITECTURE.md §9 used to publish the per-peer receive ring as "4 096 × 32 B" — one of the numbers
+    /// <c>ServerOptions.ExpectedPeers</c> scales — while <see cref="ReceiveEntry"/> is 64 bytes and 52 of those bytes are
+    /// in use, so the struct cannot shrink: the review's decision was to correct the document to 64 B and to move the
+    /// ring off the GC heap, which is what this test pins. (The finding's original assertion, <c>ReceiveEntry == 32</c>,
+    /// contradicted its own decision and could never hold.) The ring must therefore be exactly
+    /// <c>capacity × ReceiveEntry.Size</c> bytes of 64-byte-aligned native memory — not a managed
+    /// <c>ReceiveEntry[4096]</c> on the large-object heap (ADR 0008 invariant 12, ARCHITECTURE.md §4).
     /// </summary>
     [Fact]
-    public void Receive_Ring_Matches_The_Published_32_Byte_Entry_Sizing()
+    public void Receive_Ring_Matches_The_Published_Entry_Sizing_In_Native_Memory()
     {
         using SessionHarness h = new(table: OrderedTables.Main);
         PeerCore core = h.Client.Core;
         int receiveEntry = Unsafe.SizeOf<ReceiveEntry>();
-        long actual = (long)core.ReceiveRing.Capacity * receiveEntry;
 
-        Assert.True(
-            receiveEntry == 32,
-            $"ARCHITECTURE.md §9 sizes the receive ring at 32 B per entry; ReceiveEntry is {receiveEntry} B, so the ring "
-            + $"is {actual / 1024} KiB instead of the published {core.ReceiveRing.Capacity * 32 / 1024} KiB "
-            + "(and it is a GC-heap array, not native memory: ADR 0008 invariant 12).");
+        Assert.Equal(ReceiveEntry.Size, receiveEntry);
+        Assert.Equal(64, receiveEntry);
+        Assert.Equal((long)core.ReceiveRing.Capacity * receiveEntry, core.ReceiveRing.ByteLength);
+        Assert.Equal(256 * 1024, core.ReceiveRing.ByteLength);
+
+        nint address = core.ReceiveRing.Address;
+        Assert.True(address != 0, "the receive ring has no native buffer");
+        Assert.True(address % 64 == 0, $"the receive ring's buffer is not 64-byte aligned (0x{address:X}).");
     }
 
     /// <summary>

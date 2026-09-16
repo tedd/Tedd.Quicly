@@ -13,10 +13,17 @@ public class OrderedZeroAllocationTests
 {
     private static readonly ChannelTable Table = OrderedTables.Main;
 
+    /// <summary>
+    /// Measured on a clean link (delay only), where the simulator itself allocates nothing at all: on a lossy or jittery
+    /// link its buffer pool rents a pinned array whenever more sends are in flight than ever before, at ticks that depend
+    /// on the seed, so a window could straddle one of those events and fail for a reason outside the session layer
+    /// (review of wave C1, non-blocking performance finding 1). Loss, jitter and retransmission are covered by
+    /// <see cref="Steady_Ordered_Traffic_Under_Loss_And_Jitter_Delivers_Every_Message_In_Order"/>.
+    /// </summary>
     [Fact]
     public void Steady_Ordered_Traffic_Of_64_Byte_Messages_Does_Not_Allocate()
     {
-        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 10_000, JitterMicros = 2_000, StreamLossPercent = 2 }, table: Table);
+        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 10_000 }, table: Table);
         SimulatedNetwork network = h.Network;
         QuiclyPeer client = h.Client;
         QuiclyPeer server = h.Server!;
@@ -47,10 +54,8 @@ public class OrderedZeroAllocationTests
             client.Poll();
         }
 
-        // Warm up past the harness's own growth: on this lossy link the simulator's buffer pool allocates a pinned buffer (on
-        // this thread) whenever more sends are in flight at once than ever before. With seed 1 that happens at ticks 1 382 and
-        // 1 428, then not before tick 5 422.
-        for (int i = 0; i < 3_000; i++)
+        // Warm-up: tiered compilation, the peer's tables and the simulator's pool all reach their steady state.
+        for (int i = 0; i < 1_200; i++)
         {
             Tick();
         }
@@ -63,6 +68,52 @@ public class OrderedZeroAllocationTests
             }
         });
         Assert.True(received > 1_200 * 20, $"{received} messages");
+        Assert.Equal(PeerState.Connected, client.State);
+    }
+
+    [Fact]
+    public void Steady_Ordered_Traffic_Under_Loss_And_Jitter_Delivers_Every_Message_In_Order()
+    {
+        // The workload of the allocation test above on a lossy, jittery link: every admitted message arrives, in order and
+        // byte-exact, and the session stays connected. Allocation is not measured here (the simulator's buffer pool grows
+        // at seed-dependent ticks); it is measured on the clean link above.
+        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 10_000, JitterMicros = 2_000, StreamLossPercent = 2 }, table: Table);
+        SimulatedNetwork network = h.Network;
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        int received = 0;
+        string? failure = null;
+        server.RegisterHandler(4, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) =>
+        {
+            if (failure is null && !OrderedKit.Matches(payload, received, 64))
+            {
+                failure = $"message {received} arrived out of order or damaged";
+            }
+
+            received++;
+        });
+
+        int sent = 0;
+        for (uint tick = 0; tick < 600; tick++)
+        {
+            for (int i = 0; i < 16; i++)
+            {
+                if (client.SendCopy(new SendHeader(4), OrderedKit.Payload(sent, 64)).IsAdmitted)
+                {
+                    sent++;
+                }
+            }
+
+            client.Flush(tick);
+            network.Advance(16_667);
+            server.Poll();
+            server.Flush();
+            client.Poll();
+        }
+
+        Assert.True(h.RunUntil(() => received == sent), $"{received} of {sent} messages arrived");
+        Assert.Null(failure);
+        Assert.True(sent > 9_000, $"{sent} messages admitted");
         Assert.Equal(PeerState.Connected, client.State);
     }
 

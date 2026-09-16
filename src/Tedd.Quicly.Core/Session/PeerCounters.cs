@@ -68,6 +68,13 @@ internal sealed class PeerCounters
     /// <summary>Sends queued from other threads (<see cref="PeerOptions.ThreadSafeSend"/>).</summary>
     public long ThreadSafeSends;
 
+    /// <summary>
+    /// Sends from other threads refused when they were admitted, or dropped when the session ended (their leases went
+    /// back to the pool). Incremented by the game thread and, on teardown, by the transport thread, so both use
+    /// <see cref="Interlocked"/>.
+    /// </summary>
+    public long ThreadSafeSendDrops;
+
     // ---- game thread
 
     /// <summary>Pings sent (datagram and stream).</summary>
@@ -103,6 +110,6 @@ internal sealed class PeerCounters
     /// <summary>Bytes of <see cref="StreamSends"/> (preambles, frame headers and payloads).</summary>
     public long StreamBytesSent;
 
-    /// <summary>Sends from other threads refused when the game thread admitted them (their leases went back to the pool).</summary>
-    public long ThreadSafeSendDrops;
+    /// <summary>Peer streams reset because they stopped mid-message (PROTOCOL.md §7, <see cref="PeerOptions.StreamIdleTimeout"/>).</summary>
+    public long StreamIdleTimeouts;
 }

@@ -53,6 +53,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     private readonly IClock _clock;
     private readonly long _admissionTimeoutMicros;
     private readonly long _heartbeatMicros;
+    private readonly long _streamIdleMicros;
     private readonly long _pingIntervalMicros;
     private readonly long _fastPingIntervalMicros;
     private readonly long _fastLockMicros;
@@ -90,6 +91,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         _clock = options.Clock;
         _admissionTimeoutMicros = PeerOptions.ToMicros(options.AdmissionTimeout);
         _heartbeatMicros = PeerOptions.ToMicros(options.HeartbeatTimeout);
+        _streamIdleMicros = PeerOptions.ToMicros(options.StreamIdleTimeout);
         _pingIntervalMicros = PeerOptions.ToMicros(options.PingInterval);
         _fastPingIntervalMicros = PeerOptions.ToMicros(options.FastPingInterval);
         _fastLockMicros = PeerOptions.ToMicros(options.FastLockDuration);
@@ -108,6 +110,8 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         _sink = new Sink(this);
         _core = new PeerCore(this, role, table, options);
         _handlers = new MessageHandler?[_core.ChannelCount];
+        // Built here, never inside Poll: the drain queues are native memory sized once (ARCHITECTURE.md §3).
+        _queues = new ReceiveQueues(ReceiveQueues.NodesFor(options.ReceiveRingCapacity), _core.ChannelCount);
         InitializeSendSide(options);
         long now = _clock.NowMicros;
         _controlBucket.Initialize(options.ControlMessagesPerSecond, options.ControlMessagesPerSecond, now);
@@ -311,8 +315,9 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.StreamSends = c.StreamSends;
         statistics.StreamBytesSent = c.StreamBytesSent;
         statistics.StreamReceivePends = Volatile.Read(ref c.StreamReceivePends);
+        statistics.StreamIdleTimeouts = c.StreamIdleTimeouts;
         statistics.ThreadSafeSends = Volatile.Read(ref c.ThreadSafeSends);
-        statistics.ThreadSafeSendDrops = c.ThreadSafeSendDrops;
+        statistics.ThreadSafeSendDrops = Volatile.Read(ref c.ThreadSafeSendDrops);
         statistics.SendBytesOutstanding = _core.SendBytesOutstanding;
         statistics.ReceiveBytesOutstanding = _core.ReceiveBytesOutstanding;
     }
@@ -461,7 +466,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
             return;
         }
 
-        _queues?.ReleaseAll(_core);
+        _queues.ReleaseAll(_core);
         if (_hasHeld)
         {
             _hasHeld = false;
@@ -471,6 +476,10 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         ReleaseForeignSends();
         _core.Dispose();
         _controlPool.Dispose();
+        _queues.Dispose();
+        _pongs.Dispose();
+        _streamPings.Dispose();
+        _front?.Dispose();
     }
 
     private void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);

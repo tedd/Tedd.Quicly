@@ -32,7 +32,7 @@ public enum DeliveryStatus : byte
     /// <summary>The outcome is not known yet.</summary>
     Pending = 0,
 
-    /// <summary>The message reached the remote peer (or, for unreliable sends, left the local transport).</summary>
+    /// <summary>The message reached the remote peer's transport (an acknowledgement, or a LatestAck for ReliableLatest).</summary>
     Delivered,
 
     /// <summary>A newer version of the same key replaced this message before it was sent.</summary>
@@ -52,4 +52,11 @@ public enum DeliveryStatus : byte
 
     /// <summary>The transport declared the datagram lost (unreliable sends whose transport reports datagram send state).</summary>
     Lost,
+
+    /// <summary>
+    /// The datagram was handed to the network and this carrier cannot report acknowledgement (PROTOCOL.md §4.3:
+    /// <c>Delivered</c> requires per-datagram send state, <see cref="Transport.TransportCapabilities.DatagramSendState"/>).
+    /// A terminal outcome: nothing further will be reported for the send, and it is <em>not</em> a delivery claim.
+    /// </summary>
+    Sent,
 }

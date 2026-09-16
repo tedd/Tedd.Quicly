@@ -44,6 +44,7 @@ public sealed unsafe partial class QuiclyPeer
         try
         {
             long now = _clock.NowMicros;
+            _core.NotePass(now);
             DrainCompletions();
             DrainForeignSends();
             RetrySendWaiters();
@@ -286,7 +287,9 @@ public sealed unsafe partial class QuiclyPeer
         EnterCall();
         try
         {
-            FlushContext flush = NewFlushContext(_clock.NowMicros, _lastTick);
+            long now = _clock.NowMicros;
+            _core.NotePass(now);
+            FlushContext flush = NewFlushContext(now, _lastTick);
             FlushEngines(ref flush);
             if (flush.NextDeadline < _engineDeadline)
             {

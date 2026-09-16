@@ -227,7 +227,8 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
         long expiry = request.Options.ExpiryMicros > 0 ? request.Options.ExpiryMicros : _expiryMicros[local];
         if (expiry > 0)
         {
-            long now = _core.Clock.NowMicros;
+            // The pass's clock stamp, not a QPC per message (ADR 0008 invariant 9).
+            long now = _core.CurrentPassMicros;
             entries.Deadlines[slot] = expiry >= long.MaxValue - now ? long.MaxValue : now + expiry;
         }
 
@@ -1107,6 +1108,7 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
         }
 
         _send?.Dispose();
+        _notices?.Dispose();
     }
 
     /// <summary>A transport-thread event of one of this engine's send streams, handed to the game thread.</summary>

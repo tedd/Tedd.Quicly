@@ -149,5 +149,6 @@ internal sealed class ReceiveMailbox : IDisposable
     {
         Boxes.Dispose();
         _records.Dispose();
+        _returned.Dispose();
     }
 }

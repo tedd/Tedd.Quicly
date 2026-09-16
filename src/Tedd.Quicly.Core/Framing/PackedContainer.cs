@@ -11,7 +11,11 @@ public static class PackedContainer
     /// <summary>Channel id of a packed container.</summary>
     public const byte ChannelId = 1;
 
-    /// <summary>Most messages one container may hold.</summary>
+    /// <summary>
+    /// Most messages <em>this implementation packs</em> into one container (PROTOCOL.md §2.2/§8). It is a sender-side
+    /// limit only: <see cref="TryParse"/> accepts as many messages as a datagram holds, because a conformant peer may
+    /// pack more (about 599 two-byte messages fit 1 200 bytes).
+    /// </summary>
     public const int MaxMessages = 64;
 
     /// <summary>Flags bit: a tick varint follows the flags byte.</summary>
@@ -54,15 +58,17 @@ public static class PackedContainer
     /// <summary>
     /// Validates a whole container and returns an iterator over its messages. Validation is complete before the
     /// first message is yielded: channel byte 0x01, no reserved flag bits, tick ≤ 2^32−1, every length ≥ 1 and within
-    /// the remaining bytes, no inner channel 1, at most 64 messages, at least one message, no trailing bytes.
+    /// the remaining bytes, no inner channel 1, at least one message, no trailing bytes. The number of messages is
+    /// bounded only by the datagram's length (PROTOCOL.md §2.2): <see cref="MaxMessages"/> is what this implementation
+    /// packs, not what it accepts.
     /// </summary>
     /// <param name="datagram">The whole datagram, starting with the channel id 0x01.</param>
     /// <param name="reader">The iterator (default on failure).</param>
     /// <returns>
     /// <see cref="ParseStatus.Ok"/>, <see cref="ParseStatus.NotContainer"/>, <see cref="ParseStatus.Truncated"/>,
     /// <see cref="ParseStatus.NonMinimalVarint"/>, <see cref="ParseStatus.BadFlags"/>, <see cref="ParseStatus.ValueOutOfRange"/>,
-    /// <see cref="ParseStatus.BadLength"/>, <see cref="ParseStatus.NestedContainer"/>, <see cref="ParseStatus.TooManyMessages"/>
-    /// or <see cref="ParseStatus.ContainerEmpty"/>.
+    /// <see cref="ParseStatus.BadLength"/>, <see cref="ParseStatus.NestedContainer"/> or
+    /// <see cref="ParseStatus.ContainerEmpty"/>.
     /// </returns>
     public static ParseStatus TryParse(ReadOnlySpan<byte> datagram, out PackedContainerReader reader)
     {
@@ -126,11 +132,9 @@ public static class PackedContainer
                 return ParseStatus.NestedContainer;
             }
 
-            if (++count > MaxMessages)
-            {
-                return ParseStatus.TooManyMessages;
-            }
-
+            // PROTOCOL.md §2.2: the receiver accepts as many messages as the datagram actually holds (its length is the
+            // implicit bound); only the sender keeps to MaxMessages per container.
+            count++;
             pos += (int)length;
         }
 

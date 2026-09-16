@@ -85,6 +85,14 @@ public sealed class PeerOptions
     public TimeSpan HeartbeatTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>
+    /// A stream of the peer that stops making progress in the middle of a message for this long is reset with
+    /// <see cref="QuiclyErrorCode.Timeout"/> (PROTOCOL.md §7 "stream idle mid-message"), which releases the staging
+    /// lease and the receive-ring reservation the half-received message holds; the connection survives.
+    /// <see cref="TimeSpan.Zero"/> disables the check. Default 30 s.
+    /// </summary>
+    public TimeSpan StreamIdleTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// After Close is sent, how long the peer waits for the control stream to deliver it before closing the transport
     /// anyway. Default 1 s.
     /// </summary>
@@ -182,6 +190,7 @@ public sealed class PeerOptions
         CheckNonNegative(AckDelay, nameof(AckDelay));
         CheckNonNegative(FastLockDuration, nameof(FastLockDuration));
         CheckNonNegative(HeartbeatTimeout, nameof(HeartbeatTimeout));
+        CheckNonNegative(StreamIdleTimeout, nameof(StreamIdleTimeout));
         CheckNonNegative(CloseLinger, nameof(CloseLinger));
         CheckNonNegative(SessionGrace, nameof(SessionGrace));
         if (MaxSendBytesPerSecond < 0 || BulkMaxBytesPerSecond < 0)

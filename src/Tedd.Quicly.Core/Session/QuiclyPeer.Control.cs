@@ -638,6 +638,7 @@ public sealed unsafe partial class QuiclyPeer
                     }
                 }
 
+                next = SweepIdleStreams(now, next);
                 break;
             case PeerState.Closing:
                 if (_lingerDeadline != 0 && now >= _lingerDeadline)
@@ -654,6 +655,41 @@ public sealed unsafe partial class QuiclyPeer
     }
 
     private long LingerDeadline(long next) => _lingerDeadline != 0 && _lingerDeadline < next ? _lingerDeadline : next;
+
+    /// <summary>
+    /// PROTOCOL.md §7 "stream idle mid-message | 30 s | stream reset Timeout": resets every peer stream that has made no
+    /// progress on a half-received message for <see cref="PeerOptions.StreamIdleTimeout"/>, so a peer that starts a
+    /// message and stops cannot pin the receive budget (its staging lease) and a receive-ring slot for the life of the
+    /// connection. The reset is stream-level — the connection survives — and the transport reports the stream closed,
+    /// where the owning engine releases the lease and cancels the reservation (the same path as a peer-initiated reset).
+    /// Game thread, <paramref name="now"/> read once by <see cref="RunTimers"/>; returns the next deadline.
+    /// </summary>
+    /// <param name="now">Clock micros of this pass.</param>
+    /// <param name="next">The deadline so far.</param>
+    /// <returns>The deadline, lowered to the oldest watched stream's expiry.</returns>
+    private long SweepIdleStreams(long now, long next)
+    {
+        if (_streamIdleMicros <= 0)
+        {
+            return next;
+        }
+
+        long cutoff = now - _streamIdleMicros;
+        while (_core.Streams.TryTakeIdle(cutoff, out TransportStreamId stalled))
+        {
+            _core.Counters.StreamIdleTimeouts++;
+            _transport?.AbortStream(stalled, (ulong)QuiclyErrorCode.Timeout, StreamAbortDirection.Both);
+        }
+
+        long earliest = _core.Streams.EarliestMidMessage();
+        if (earliest == long.MaxValue)
+        {
+            return next;
+        }
+
+        long due = earliest + _streamIdleMicros;
+        return due < next ? due : next;
+    }
 
     // ------------------------------------------------------------------ ping / pong (PROTOCOL.md §2.3, §4.6)
 

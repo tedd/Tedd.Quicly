@@ -13,7 +13,7 @@ namespace Tedd.Quicly.Core.Session;
 public sealed unsafe partial class QuiclyPeer
 {
     private readonly MessageHandler?[] _handlers;
-    private ReceiveQueues? _queues;
+    private readonly ReceiveQueues _queues;
     private int _queuedWithHandler;
     private ReceiveEntry _held;
     private bool _hasHeld;
@@ -52,6 +52,7 @@ public sealed unsafe partial class QuiclyPeer
         try
         {
             long now = _clock.NowMicros;
+            _core.NotePass(now);
             DrainCompletions();
             bool immediate = DrainForeignSends();
             RetrySendWaiters();
@@ -120,18 +121,15 @@ public sealed unsafe partial class QuiclyPeer
 
         long now = _clock.NowMicros;
         int written = 0;
-        ReceiveQueues? queues = _queues;
-        if (queues is not null)
+        ReceiveQueues queues = _queues;
+        while (written < into.Length && queues.TryTake(index, out ReceiveEntry entry))
         {
-            while (written < into.Length && queues.TryTake(index, out ReceiveEntry entry))
+            if (_handlers[index] is not null)
             {
-                if (_handlers[index] is not null)
-                {
-                    _queuedWithHandler--;
-                }
-
-                Emit(ref entry, now, into, ref written);
+                _queuedWithHandler--;
             }
+
+            Emit(ref entry, now, into, ref written);
         }
 
         if (_hasHeld && written < into.Length)
@@ -251,10 +249,7 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         _handlers[index] = handler;
-        if (_queues is not null)
-        {
-            _queuedWithHandler += _queues.Count(index);
-        }
+        _queuedWithHandler += _queues.Count(index);
     }
 
     /// <summary>Removes the handler of a channel; its messages then wait for <see cref="Drain"/> (game thread).</summary>
@@ -271,11 +266,7 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         _handlers[index] = null;
-        if (_queues is not null)
-        {
-            _queuedWithHandler -= _queues.Count(index);
-        }
-
+        _queuedWithHandler -= _queues.Count(index);
         return true;
     }
 
@@ -352,7 +343,7 @@ public sealed unsafe partial class QuiclyPeer
     private bool TryQueue(in ReceiveEntry entry)
     {
         int index = _core.ChannelIndexOf(entry.Channel);
-        ReceiveQueues queues = _queues ??= new ReceiveQueues(_core.ReceiveRing.Capacity, _core.ChannelCount);
+        ReceiveQueues queues = _queues;
         if (!queues.TryAppend(index, in entry))
         {
             return false;
@@ -369,7 +360,7 @@ public sealed unsafe partial class QuiclyPeer
     private int DispatchQueued(int maxItems, long now)
     {
         int dispatched = 0;
-        ReceiveQueues queues = _queues!;
+        ReceiveQueues queues = _queues;
         for (int index = 0; index < _handlers.Length && _queuedWithHandler > 0 && dispatched < maxItems && !_disposed; index++)
         {
             MessageHandler? handler = _handlers[index];
@@ -543,7 +534,7 @@ public sealed unsafe partial class QuiclyPeer
             _core.ReturnReceive(in _held.Lease);
         }
 
-        _queues?.ReleaseAll(_core);
+        _queues.ReleaseAll(_core);
         _queuedWithHandler = 0;
         ReadOnlySpan<ReceiveMailbox> boxes = _core.Mailboxes;
         for (int i = 0; i < boxes.Length; i++)

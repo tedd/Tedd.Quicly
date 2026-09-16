@@ -92,6 +92,7 @@ internal sealed unsafe class PeerCore : IDisposable
     private readonly CompletionEntry[] _localCompletions;
     private readonly NativeArray<long> _stamps;
     private readonly bool _atomicSendBudget;
+    private long _passMicros;
     private long _stamp;
     private int _localHead;
     private int _localTail;
@@ -142,7 +143,9 @@ internal sealed unsafe class PeerCore : IDisposable
         _entryOfToken = new int[capacity];
         Array.Fill(_entryOfToken, -1);
         Completions = new CompletionTable(capacity, _signalFromTransport);
-        CompletionRing = new SpscRing<CompletionEntry>((2 * capacity) + 1);
+        // Two completions per entry at most (one early Sent notice plus one final completion), and capacity is already
+        // a power of two, so this is exactly the bound: asking for one more would double the ring (ADR 0008 §5).
+        CompletionRing = new SpscRing<CompletionEntry>(2 * capacity);
         ReceiveRing = new SpscRing<ReceiveEntry>(options.ReceiveRingCapacity);
         _sendCounters = new NativeArray<ChannelSendCounters>(Math.Max(1, _channels.Length));
         _recvCounters = new NativeArray<ChannelRecvCounters>(Math.Max(1, _channels.Length));
@@ -154,6 +157,7 @@ internal sealed unsafe class PeerCore : IDisposable
         _maxDatagramPayload = 0;
         _scheduleOrder = ComputeScheduleOrder(_channels);
         _localCompletions = new CompletionEntry[capacity];
+        _passMicros = Clock.NowMicros;
         Packer = new DatagramPacker(this);
     }
 
@@ -170,6 +174,17 @@ internal sealed unsafe class PeerCore : IDisposable
 
     /// <summary>The admission stamp of the most recently admitted message (0 before the first; game thread).</summary>
     public long LastAdmissionStamp => _stamp;
+
+    /// <summary>
+    /// Clock micros of the current game-thread pass: read once at the start of every <see cref="QuiclyPeer.Poll"/>,
+    /// <see cref="QuiclyPeer.Flush"/> and <see cref="SendMode.Immediate"/> pass (ADR 0008 invariant 9), and at
+    /// construction. Engines stamp expiry deadlines from it instead of reading the clock per admitted message.
+    /// </summary>
+    public long CurrentPassMicros => _passMicros;
+
+    /// <summary>Records the clock stamp of a game-thread pass (game thread; <paramref name="nowMicros"/> read once by the caller).</summary>
+    /// <param name="nowMicros">Clock micros.</param>
+    public void NotePass(long nowMicros) => _passMicros = nowMicros;
 
     /// <summary>
     /// Gives an admitted entry the next peer-wide admission number (game thread, at commit). Engines keep every channel
@@ -328,7 +343,7 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>Tracked-send completion slots.</summary>
     public CompletionTable Completions { get; }
 
-    /// <summary>Transport completions, transport thread → game thread (capacity 2 × send table + 1).</summary>
+    /// <summary>Transport completions, transport thread → game thread (capacity 2 × the send table: two per entry).</summary>
     public SpscRing<CompletionEntry> CompletionRing { get; }
 
     /// <summary>Complete received messages, transport thread → game thread.</summary>
@@ -753,14 +768,13 @@ internal sealed unsafe class PeerCore : IDisposable
     public bool TryEnqueueReceive(in ReceiveEntry entry)
     {
         SpscRing<ReceiveEntry> ring = ReceiveRing;
-        int used = ring.Count + _receiveReserved;
-        if (used >= ring.Capacity || !ring.TryEnqueue(in entry))
+        if (!ring.TryEnqueueReserving(in entry, _receiveReserved))
         {
             Counters.ReceiveRingDrops++;
             return false;
         }
 
-        NoteRingUse(used + 1);
+        NoteRingUse(ring.CachedCount + _receiveReserved);
         return true;
     }
 
@@ -772,14 +786,13 @@ internal sealed unsafe class PeerCore : IDisposable
     public bool TryReserveReceive()
     {
         SpscRing<ReceiveEntry> ring = ReceiveRing;
-        int used = ring.Count + _receiveReserved;
-        if (used >= ring.Capacity)
+        if (!ring.HasRoomFor(_receiveReserved))
         {
             return false;
         }
 
         _receiveReserved++;
-        NoteRingUse(used + 1);
+        NoteRingUse(ring.CachedCount + _receiveReserved);
         return true;
     }
 
@@ -800,11 +813,25 @@ internal sealed unsafe class PeerCore : IDisposable
         _receiveReserved--;
     }
 
+    /// <summary>
+    /// Updates the ring's occupancy high-water mark from the producer's own view (transport thread). The consumer's
+    /// index is read, and the shared counter written, only when this call suspects a new maximum — which can happen at
+    /// most <c>Capacity</c> times in the peer's life — so a received message costs no coherence traffic
+    /// (ADR 0008 invariant 5).
+    /// </summary>
+    /// <param name="used">Queued entries plus reservations as the producer's cached view sees them (an upper bound).</param>
     private void NoteRingUse(int used)
     {
-        if (used > Counters.ReceiveRingHighWater)
+        PeerCounters counters = Counters;
+        if (used <= counters.ReceiveRingHighWater)
         {
-            Counters.ReceiveRingHighWater = used;
+            return;
+        }
+
+        int exact = ReceiveRing.RefreshedCount() + _receiveReserved;
+        if (exact > counters.ReceiveRingHighWater)
+        {
+            counters.ReceiveRingHighWater = exact;
         }
     }
 
@@ -1122,12 +1149,19 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <param name="completion">The completion.</param>
     public void OnContainerCompleted(int slot, in CompletionEntry completion) => Packer.OnContainerCompleted(slot, in completion);
 
-    /// <summary>Default delivery status of a datagram's final send state.</summary>
+    /// <summary>
+    /// Default delivery status of a datagram's final send state (PROTOCOL.md §4.3). An acknowledgement is
+    /// <see cref="DeliveryStatus.Delivered"/>; <see cref="DatagramSendState.Sent"/> is final only on a carrier that
+    /// reports no per-datagram states (<see cref="DatagramStatesReported"/> false: WebTransport/browser, MsQuic without
+    /// the capability), and such a send completes <see cref="DeliveryStatus.Sent"/> — the datagram reached the network
+    /// and nothing more will ever be known about it, so it is never reported as delivered.
+    /// </summary>
     /// <param name="state">A final state (or Sent when the transport does not report states).</param>
     /// <returns>The status (<see cref="DeliveryStatus.Disconnected"/> for a cancellation caused by the connection closing).</returns>
     public DeliveryStatus MapDatagramState(DatagramSendState state) => state switch
     {
-        DatagramSendState.Acknowledged or DatagramSendState.AcknowledgedSpurious or DatagramSendState.Sent => DeliveryStatus.Delivered,
+        DatagramSendState.Acknowledged or DatagramSendState.AcknowledgedSpurious => DeliveryStatus.Delivered,
+        DatagramSendState.Sent => DeliveryStatus.Sent,
         DatagramSendState.LostDiscarded => DeliveryStatus.Lost,
         _ => _transportClosing ? DeliveryStatus.Disconnected : DeliveryStatus.Expired,
     };
@@ -1164,12 +1198,9 @@ internal sealed unsafe class PeerCore : IDisposable
                 return;
             }
 
+            // Every datagram entry gets the notice: the payload block is released at Sent (ADR 0008 invariant 1,
+            // ARCHITECTURE.md §2.1), tracked or not, and the ring holds two items per entry.
             SendEntryFlags flags = Entries[sentSlot].Flags;
-            if ((flags & (SendEntryFlags.Tracked | SendEntryFlags.Container)) == 0)
-            {
-                return;
-            }
-
             if (_signalFromTransport && (flags & (SendEntryFlags.Tracked | SendEntryFlags.Container | SendEntryFlags.EngineCompletes)) == SendEntryFlags.Tracked)
             {
                 Completions.Complete(_tokens[sentSlot], CompletionStage.BufferReleased, DeliveryStatus.Pending);
@@ -1257,7 +1288,8 @@ internal sealed unsafe class PeerCore : IDisposable
     {
         if (!CompletionRing.TryEnqueue(in completion))
         {
-            // Cannot happen: at most two items per entry and the ring holds 2 × capacity + 1.
+            // Cannot happen: at most two items per entry (one Sent notice, one final completion) and the ring holds
+            // two per entry.
             Counters.CallbackFaults++;
         }
     }
@@ -1302,6 +1334,10 @@ internal sealed unsafe class PeerCore : IDisposable
 
         Entries.Dispose();
         Segments.Dispose();
+        ReceiveRing.Dispose();
+        CompletionRing.Dispose();
+        PendedStreams.Dispose();
+        Completions.Dispose();
         _tokens.Dispose();
         _stamps.Dispose();
         _userContexts.Dispose();

@@ -284,23 +284,37 @@ public class ConnectTests
         Assert.Equal(PeerState.Connected, client.State);
     }
 
+    /// <summary>
+    /// Dispose cancels the wait a connect is sitting in (its own token, linked into the wait), and the connect then ends with
+    /// <see cref="ObjectDisposedException"/> and disposes the peer it drove. The wait is stubbed out here so the test never
+    /// depends on real timers or on a free thread-pool thread; the work signal's own wait is covered by
+    /// <see cref="Connect_Without_A_Wait_Override_Waits_For_Transport_Callbacks"/>.
+    /// </summary>
     [Fact]
-    public async Task Disposing_The_Client_While_The_Connect_Sleeps_In_The_Work_Signal_Ends_It()
+    public async Task Disposing_The_Client_Cancels_The_Wait_A_Connect_Sits_In()
     {
         await using ClientFixture f = new();
-        QuiclyClient client = new(f.Unreachable()); // the network is never advanced, so no callback wakes the connect
-        try
+        QuiclyClient client = f.CreateClient(f.Unreachable());
+        TaskCompletionSource waiting = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.WaitOverride = async (_, token) =>
         {
-            Task<QuiclyPeer> connecting = client.ConnectAsync(f.EndPoint, f.Options(), TestContext.Current.CancellationToken).AsTask();
-            Assert.False(connecting.IsCompleted);
-            client.Dispose(); // cancels the wait at once instead of letting it sleep out its timeout
-            await Assert.ThrowsAsync<ObjectDisposedException>(() => connecting);
-            Assert.Equal(PeerState.Closed, client.State);
-            Assert.Null(client.Peer);
-        }
-        finally
+            waiting.TrySetResult(); // the connect is in its wait now
+            await Task.Delay(Timeout.InfiniteTimeSpan, token); // only Dispose (or the caller's token) ends it
+        };
+
+        Task<QuiclyPeer> connecting = client.ConnectAsync(f.EndPoint, f.Options(), TestContext.Current.CancellationToken).AsTask();
+        await waiting.Task;
+        Assert.False(connecting.IsCompleted);
+        client.Dispose();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => connecting);
+        Assert.Equal(PeerState.Closed, client.State);
+        Assert.Null(client.Peer);
+        for (int i = 0; i < 200 && f.Server.PeerCount != 0; i++)
         {
-            client.Dispose();
+            f.Step(1_000); // the peer the connect drove was disposed: the server sees its connection close
         }
+
+        Assert.Equal(0, f.Server.PeerCount);
     }
 }

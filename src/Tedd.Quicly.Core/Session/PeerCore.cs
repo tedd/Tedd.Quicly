@@ -71,6 +71,9 @@ internal sealed unsafe class PeerCore : IDisposable
     private readonly int[] _entryOfToken;
     private readonly ReceiveMailbox?[] _mailboxByIndex;
     private ReceiveMailbox[] _mailboxes = [];
+    // Cold, by slot: the shared payload an entry holds one reference on (SendShared), released in ReleasePayload.
+    private readonly SharedLeaseTable?[] _sharedTables;
+    private readonly SharedLease[] _sharedLeases;
     private readonly long _sendBudget;
     private readonly long _receiveBudget;
     private readonly bool _signalFromTransport;
@@ -142,6 +145,8 @@ internal sealed unsafe class PeerCore : IDisposable
         _userContexts = new NativeArray<ulong>(capacity);
         _entryOfToken = new int[capacity];
         Array.Fill(_entryOfToken, -1);
+        _sharedTables = new SharedLeaseTable?[capacity];
+        _sharedLeases = new SharedLease[capacity];
         Completions = new CompletionTable(capacity, _signalFromTransport);
         // Two completions per entry at most (one early Sent notice plus one final completion), and capacity is already
         // a power of two, so this is exactly the bound: asking for one more would double the ring (ADR 0008 §5).
@@ -261,6 +266,7 @@ internal sealed unsafe class PeerCore : IDisposable
         };
         _localTail = _localTail + 1 == queue.Length ? 0 : _localTail + 1;
         _localCount++;
+        NoteWork();
     }
 
     /// <summary>Takes the oldest completion queued with <see cref="QueueLocalCompletion"/> (game thread).</summary>
@@ -775,8 +781,15 @@ internal sealed unsafe class PeerCore : IDisposable
         }
 
         NoteRingUse(ring.CachedCount + _receiveReserved);
+        NoteWork();
         return true;
     }
+
+    /// <summary>
+    /// Tells the host that game-thread work was published (<see cref="PeerOptions.WorkSignal"/>): any thread,
+    /// non-blocking, and at most once between two <see cref="QuiclyPeer.Poll"/> calls, so a burst costs one call.
+    /// </summary>
+    public void NoteWork() => Peer.NoteWork();
 
     /// <summary>
     /// Reserves one receive-ring slot for a message that is still arriving (a stream message), so that publishing it at its
@@ -804,6 +817,7 @@ internal sealed unsafe class PeerCore : IDisposable
         _receiveReserved--;
         bool enqueued = ReceiveRing.TryEnqueue(in entry);
         Debug.Assert(enqueued, "a reserved receive slot must be free");
+        NoteWork();
     }
 
     /// <summary>Gives back a reservation that will not be published (transport thread).</summary>
@@ -868,6 +882,8 @@ internal sealed unsafe class PeerCore : IDisposable
             // Sized to the peer's stream allowance + 2: a stream can pend only once until resumed.
             Counters.CallbackFaults++;
         }
+
+        NoteWork();
     }
 
     // ------------------------------------------------------------------ streams (game thread)
@@ -970,6 +986,23 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <param name="data">The payload.</param>
     /// <param name="length">Payload bytes.</param>
     public void SetPayload(int slot, byte* data, int length) => Entries[slot].Payload = new TransportSegment(data, length);
+
+    /// <summary>
+    /// Takes one reference on a shared payload for the entry (<see cref="QuiclyPeer.SendShared"/>; game thread, while
+    /// <c>Filling</c>): <see cref="SharedLeaseTable.Retain"/> now, and exactly one
+    /// <see cref="SharedLeaseTable.Release"/> in <see cref="ReleasePayload"/> — when the transport released the payload,
+    /// when the entry is discarded, when the session closes, or when the peer is disposed with the send in flight. The
+    /// payload segment itself is set by <see cref="SetPayload"/>.
+    /// </summary>
+    /// <param name="slot">The entry.</param>
+    /// <param name="table">The table that counts the lease's references.</param>
+    /// <param name="lease">The shared payload.</param>
+    public void AttachShared(int slot, SharedLeaseTable table, in SharedLease lease)
+    {
+        table.Retain(in lease);
+        _sharedTables[slot] = table;
+        _sharedLeases[slot] = lease;
+    }
 
     /// <summary>
     /// Publishes the entry and hands it to the transport as one datagram: header segment (when <c>HeaderLength</c> &gt; 0)
@@ -1100,7 +1133,11 @@ internal sealed unsafe class PeerCore : IDisposable
         RetireEntry(slot);
     }
 
-    /// <summary>Returns the entry's payload lease and frees its pin handle, if any (game thread). Idempotent.</summary>
+    /// <summary>
+    /// Returns the entry's payload lease, frees its pin handle and drops its shared reference, if any (game thread).
+    /// Idempotent: each of the three is cleared as it is released, so a <c>Sent</c> notice followed by the final completion
+    /// releases the shared payload exactly once.
+    /// </summary>
     /// <param name="slot">The entry.</param>
     public void ReleasePayload(int slot)
     {
@@ -1116,6 +1153,15 @@ internal sealed unsafe class PeerCore : IDisposable
         {
             Entries.PinHandles[slot] = 0;
             GCHandle.FromIntPtr(pin).Free();
+        }
+
+        SharedLeaseTable? shared = _sharedTables[slot];
+        if (shared is not null)
+        {
+            SharedLease sharedLease = _sharedLeases[slot];
+            _sharedTables[slot] = null;
+            _sharedLeases[slot] = default;
+            shared.Release(in sharedLease);
         }
     }
 
@@ -1291,6 +1337,77 @@ internal sealed unsafe class PeerCore : IDisposable
             // Cannot happen: at most two items per entry (one Sent notice, one final completion) and the ring holds
             // two per entry.
             Counters.CallbackFaults++;
+        }
+
+        NoteWork();
+    }
+
+    // ------------------------------------------------------------------ reconnect (game thread)
+
+    /// <summary>
+    /// Clears everything bound to the transport that was lost, before <see cref="QuiclyPeer.Reconnect"/> attaches a new one
+    /// (game thread, while no transport callback can arrive: the old transport reported its close and the new one is not
+    /// attached yet). The engines forget their streams (<see cref="ChannelEngine.OnReconnecting"/>), any send entry still
+    /// allocated completes <see cref="DeliveryStatus.Disconnected"/> and frees its slot, the hand-off rings, the container
+    /// packer and the segment arena are emptied, and admission, the datagram capabilities and a client's session message cap
+    /// go back to their pre-handshake values. Kept: the channel table, the engines themselves, every counter, the send and
+    /// receive budgets and <see cref="Epoch"/> — the epoch is what the resumed Hello presents as <c>LastEpoch</c>
+    /// (PROTOCOL.md §4.1).
+    /// </summary>
+    public void ResetForReconnect()
+    {
+        foreach (ChannelEngine engine in _activeEngines)
+        {
+            engine.OnReconnecting();
+        }
+
+        AbandonEntries();
+        while (CompletionRing.TryDequeue(out _))
+        {
+        }
+
+        while (PendedStreams.TryDequeue(out _))
+        {
+        }
+
+        _localHead = 0;
+        _localTail = 0;
+        _localCount = 0;
+        Transport = null;
+        _transportClosing = false;
+        _transportClosed = false;
+        _admitted = false;
+        _datagramsEnabled = false;
+        _datagramStatesReported = false;
+        _cancelOnBlocked = false;
+        _maxDatagramPayload = 0;
+        _closeRequest = 0;
+        _receiveReserved = 0;
+        CurrentSenderTick = 0;
+        if (Role == PeerRole.Client)
+        {
+            // Learned again from the resumed HelloAck; a server keeps the cap from its own options.
+            SessionMaxMessageSize = 0;
+        }
+
+        Streams.Clear();
+        Packer.Reset();
+        Segments.Reset();
+    }
+
+    /// <summary>
+    /// Completes every send entry still allocated <see cref="DeliveryStatus.Disconnected"/> and frees its slot: what the
+    /// lost connection left behind after its engines finished their own queues (a Close frame whose completion never came,
+    /// a container of a refused pass). Game thread.
+    /// </summary>
+    private void AbandonEntries()
+    {
+        for (int slot = 0; slot < Entries.Capacity; slot++)
+        {
+            if (Entries.GetState(slot) != SendEntryState.Free)
+            {
+                CompleteEntry(slot, DeliveryStatus.Disconnected);
+            }
         }
     }
 

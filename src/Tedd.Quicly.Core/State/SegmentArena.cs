@@ -158,6 +158,20 @@ public sealed unsafe class SegmentArena : IDisposable
         }
     }
 
+    /// <summary>
+    /// Drops every run and starts the arena over (<see cref="Session.QuiclyPeer.Reconnect"/>: the runs of the lost
+    /// connection's stream sends will never be freed one by one, because their completions are gone). Owner thread, only
+    /// once every entry that owned a run has been completed.
+    /// </summary>
+    public void Reset()
+    {
+        _runLength.Fill(0);
+        _freed.Fill(0);
+        _head = 0;
+        _tail = 0;
+        _used = 0;
+    }
+
     /// <summary>Frees the native memory. Idempotent.</summary>
     public void Dispose()
     {

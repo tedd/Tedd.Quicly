@@ -24,6 +24,13 @@ internal enum SendPayloadKind : byte
 
     /// <summary><see cref="SendRequest.Gather"/> lists existing payload pages.</summary>
     Gather = 4,
+
+    /// <summary>
+    /// <see cref="SendRequest.Shared"/> is a reference-counted lease of <see cref="SendRequest.SharedTable"/>: the entry
+    /// takes one reference when admission commits and releases it when its payload is released (zero copy, never
+    /// compressed; <see cref="QuiclyPeer.SendShared"/>).
+    /// </summary>
+    Shared = 5,
 }
 
 /// <summary>
@@ -67,6 +74,12 @@ internal unsafe ref struct SendRequest
 
     /// <summary><see cref="SendPayloadKind.Gather"/>: the pages (at most <see cref="QuiclyPeer.MaxGatherSegments"/>).</summary>
     public ReadOnlySpan<BufferLease> Gather;
+
+    /// <summary><see cref="SendPayloadKind.Shared"/>: the table that counts the lease's references.</summary>
+    public SharedLeaseTable? SharedTable;
+
+    /// <summary><see cref="SendPayloadKind.Shared"/>: the shared payload.</summary>
+    public SharedLease Shared;
 
     /// <summary>Request id for request/response channels (0 = plain message).</summary>
     public uint RequestId;

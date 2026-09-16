@@ -214,6 +214,17 @@ internal sealed class StreamTable
         return earliest;
     }
 
+    /// <summary>
+    /// Drops every record (<see cref="QuiclyPeer.Reconnect"/>): the lost transport's stream slots are about to be handed out
+    /// again by a new transport, so a stale record must not be mistaken for one of the resumed connection's streams. Game
+    /// thread, while no transport callback can arrive.
+    /// </summary>
+    public void Clear()
+    {
+        Array.Clear(_records);
+        Count = 0;
+    }
+
     /// <summary>Removes the record of <paramref name="id"/> if it is live.</summary>
     /// <param name="id">The stream.</param>
     public void Remove(TransportStreamId id)

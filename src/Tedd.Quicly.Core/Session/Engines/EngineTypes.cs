@@ -135,9 +135,9 @@ internal enum CompletionKind : byte
 /// A completion of one send entry, drained on the game thread and routed to the entry's owner
 /// (<see cref="ChannelEngine.OnSendCompleted"/>, the packer's fan-out, or the peer's control traffic). Transport
 /// completions come through the completion ring: per entry at most one non-final <see cref="DatagramSendState.Sent"/>
-/// notice (only for <see cref="State.SendEntryFlags.Tracked"/> or <see cref="State.SendEntryFlags.Container"/> datagram
-/// entries, so the payload can be released early) and exactly one final completion; the ring holds
-/// <c>2 × send table + 1</c> items, so it cannot overflow. <see cref="CompletionKind.Local"/> completions are queued by the
+/// notice (for every datagram entry, tracked or not, so its payload block is released at <c>Sent</c> — ADR 0008
+/// invariant 1) and exactly one final completion; the ring holds <c>2 × send table</c> items — two per entry — so it
+/// cannot overflow. <see cref="CompletionKind.Local"/> completions are queued by the
 /// game thread itself (<see cref="PeerCore.QueueLocalCompletion"/>) and are always final. A member of a packed container
 /// receives a copy of its container's completion.
 /// </summary>

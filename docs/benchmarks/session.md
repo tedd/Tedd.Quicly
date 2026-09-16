@@ -37,6 +37,14 @@ pings, heartbeat and the fast lock off, so a measured cycle is only the traffic 
 synchronously. The simulator's own cost is in [simulation.md](simulation.md) (1.5 µs per round of two 600-byte datagrams over
 a 1 ms link, about 12 µs per 64 KiB stream send).
 
+**Caveat: every figure here is single-core.** Both peers and the simulator run on the one thread, so the transport-thread →
+game-thread hand-offs (receive ring, completion ring, mailboxes) are produced and consumed by the same core with warm cache
+lines and no cross-thread coherence traffic whatsoever. These benchmarks therefore *cannot* show what it costs when a producer
+touches the consumer's cache line — the defect behind ADR 0008 invariant 5's cached-index rule, which the wave C1 performance
+review found in `TryEnqueueReceive`/`TryReserveReceive` (they read `SpscRing.Count`, i.e. both indices, per received message) —
+and they show no lock or contention cost either. Read them as "what one core does with the whole session", not as a model of a
+real client or server where the transport worker and the game thread are different cores.
+
 | Benchmark | Workload | Reported per |
 |---|---|---|
 | `SessionEndToEndBench.Unreliable64Packed` | 100 × `SendCopy` of 64 B on the unordered channel, then one cycle: client `Flush` (the scheduler packs containers), `Advance(0)`, server `Poll` (dispatch to a counting handler), `Advance(0)`, client `Poll` (completions) | message |
@@ -144,7 +152,10 @@ both versions, and the setup checks that both loops produce the same sum. Per me
 | V0_CopyParserPerEvent | .NET 11.0 preview 7, InProcessEmitToolchain | 35.15 ns | 9.083 ns | 0.498 ns | 1.00 |      - |
 | V1_MarkPerEvent       | .NET 11.0 preview 7, InProcessEmitToolchain | 19.79 ns | 8.464 ns | 0.464 ns | 0.56 |      - |
 
-An earlier run of the same pair on .NET 10 gave 33.30 → 20.19 ns out of process and 35.44 → 19.65 ns in process.
+An earlier run of the same pair on .NET 10 gave 33.30 → 20.19 ns out of process and 35.44 → 19.65 ns in process, and the wave C1
+review's independent re-run measured V0 at 32.65 ns against V1 at 20.24 ns out of process (ratio 0.62) and 21.41 ns in process.
+Across every run V0 sits at 32.6–35.4 ns except the 41.57 ns sample in the table above, so **~33 → ~20 ns, a 38–40 % reduction,
+is the honest headline**; the 0.50 ratio of that one row is a high V0 sample, not a halving of the loop.
 
 The **first V1 was refuted**: a `readonly struct Mark` returned by value from `GetMark()` through its constructor measured
 41.64 ns against V0's 32.95 ns out of process (ratio 1.26) and 42.64 ns against 36.30 ns in process (1.17). Saving less state
@@ -152,7 +163,8 @@ did not pay once taking the mark became a call plus a copy of the returned struc
 (`GetMark(out Mark mark)`, a mutable struct with internal fields), with `GetMark` and `Rewind` aggressively inlined.
 
 **Decision.** Keep V1: `StreamFrameParser.Mark`, `GetMark(out Mark)`, `Rewind(in Mark)`; the peer's loop takes a mark per
-event and a whole copy only on bulk streams. The loop costs half as much per message on both runtimes. V0 stays runnable in
+event and a whole copy only on bulk streams. The loop costs **38–40 % less per message** on both runtimes (about 33 ns down to about 20 ns; the 0.57 and 0.56 ratios are the
+representative ones, not the 0.50 of the row whose V0 sample ran high). V0 stays runnable in
 the archive as `StreamReceiveLoopBench`'s baseline. The `Pend` path is covered by `Framing/StreamFrameParserMarkTests`
 (rewinding every message event replays the same messages in any segmentation, a header straddling segments is restored) and
 by the ordered engine's ring-full and receive-budget tests.

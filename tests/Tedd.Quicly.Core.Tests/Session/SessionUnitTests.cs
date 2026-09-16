@@ -363,7 +363,10 @@ public class SessionSupportTests
         PeerCore core = h.Client.Core;
         Assert.Equal(DeliveryStatus.Delivered, core.MapDatagramState(DatagramSendState.Acknowledged));
         Assert.Equal(DeliveryStatus.Delivered, core.MapDatagramState(DatagramSendState.AcknowledgedSpurious));
-        Assert.Equal(DeliveryStatus.Delivered, core.MapDatagramState(DatagramSendState.Sent));
+
+        // PROTOCOL.md §4.3: Sent is final only on a carrier that reports no per-datagram state, and it is not a delivery
+        // claim — the session knows the datagram left the host and nothing more.
+        Assert.Equal(DeliveryStatus.Sent, core.MapDatagramState(DatagramSendState.Sent));
         Assert.Equal(DeliveryStatus.Lost, core.MapDatagramState(DatagramSendState.LostDiscarded));
         Assert.Equal(DeliveryStatus.Expired, core.MapDatagramState(DatagramSendState.Canceled));
         Assert.Equal(DeliveryStatus.Delivered, core.MapStreamCompletion(false));

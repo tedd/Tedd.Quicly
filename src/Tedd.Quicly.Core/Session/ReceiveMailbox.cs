@@ -111,6 +111,15 @@ internal sealed class ReceiveMailbox : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Whether the mailbox of <paramref name="keySlot"/> still holds a value the game thread has not claimed. Transport
+    /// thread: an engine uses it to see whether a message it posted earlier (a key retirement) has been delivered before it
+    /// lets a newer value displace it.
+    /// </summary>
+    /// <param name="keySlot">Key slot.</param>
+    /// <returns><see langword="true"/> while a posted value is still waiting.</returns>
+    public bool HasPending(int keySlot) => Boxes.Peek(keySlot) != Mailboxes.Empty;
+
     /// <summary>Collects dirty key slots (game thread). Every returned key must be passed to <see cref="TryTake"/>.</summary>
     /// <param name="keySlots">Receives key slots.</param>
     /// <returns>Keys written.</returns>

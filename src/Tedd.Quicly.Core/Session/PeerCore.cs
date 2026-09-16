@@ -166,6 +166,7 @@ internal sealed unsafe class PeerCore : IDisposable
         AckDelayMicros = Math.Max(0, PeerOptions.ToMicros(options.AckDelay));
         RetryShareOfEstimatedBandwidth = options.RetryShareOfEstimatedBandwidth;
         MaxRetryBytesPerSecond = options.MaxRetryBytesPerSecond;
+        MaxSendBytesPerSecond = options.MaxSendBytesPerSecond;
         Packer = new DatagramPacker(this);
     }
 
@@ -266,6 +267,12 @@ internal sealed unsafe class PeerCore : IDisposable
 
     /// <summary>Absolute cap on ReliableLatest retransmission bytes per second (<see cref="PeerOptions.MaxRetryBytesPerSecond"/>; 0 = derive).</summary>
     public long MaxRetryBytesPerSecond { get; }
+
+    /// <summary>
+    /// The peer's send cap in bytes per second (<see cref="PeerOptions.MaxSendBytesPerSecond"/>; 0 = none), which is the
+    /// bandwidth estimate the ReliableLatest retry budget falls back to when the transport reports no congestion window.
+    /// </summary>
+    public long MaxSendBytesPerSecond { get; }
 
     /// <summary>Completions queued with <see cref="QueueLocalCompletion"/> and not yet routed.</summary>
     public int LocalCompletionsQueued => _localCount;

@@ -20,9 +20,11 @@ public sealed unsafe partial class QuiclyPeer
     /// shared lease is that the bytes are serialised (and, if wanted, compressed) once by the caller instead of once per
     /// peer — so <c>RawLength</c> on the wire is 0 and the message must fit the channel's limits as it is.</para>
     /// <para>Works on every channel mode the peer implements today: the unreliable datagram modes (alone or packed into a
-    /// container, where the reference is released as soon as the bytes were copied into the container) and
+    /// container, where the reference is released as soon as the bytes were copied into the container),
     /// <see cref="Channels.ChannelMode.ReliableOrdered"/> (the lease travels in a carrier's segment run and the reference is
-    /// released when the carrier is acknowledged).</para>
+    /// released when the carrier is acknowledged) and <see cref="Channels.ChannelMode.ReliableLatest"/> (the key's live
+    /// value holds the reference for as long as that version may be retransmitted — up to 30 s — and releases it when the
+    /// value is acknowledged, superseded or fails).</para>
     /// <para>With <see cref="PeerOptions.ThreadSafeSend"/> a call from a thread other than the game thread copies the bytes
     /// into a send lease at the call and takes no reference, exactly as <see cref="SendPinned"/> does there.</para>
     /// </remarks>

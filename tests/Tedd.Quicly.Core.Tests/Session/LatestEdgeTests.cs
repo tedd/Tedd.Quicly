@@ -564,4 +564,221 @@ public class LatestEdgeTests
         Assert.Equal(ReceiveFlags.KeyRetired, received[0].Flags);
         Assert.Equal(1, DatagramKit.ChannelStats(h.Server, 2).ReceiveSuperseded);
     }
+
+    [Fact]
+    public void A_Shared_Value_Holds_One_Reference_Until_It_Is_Superseded_Or_Retired()
+    {
+        // ARCHITECTURE.md §4.1: the entry takes one reference on admission and releases it exactly once, on every path the
+        // value can end on — here a supersede and a key retirement rather than an ack.
+        using SharedPool pool = new();
+        using SessionHarness h = Harness(client: o => o.Allocator = pool.Allocator);
+        SharedLease stale = pool.Share(64, seed: 3);
+        SharedLease newest = pool.Share(64, seed: 4);
+
+        SendResult first = h.Client.SendShared(new SendHeader(2, 71), pool.Table, in stale, 64, SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, first.Status);
+        Assert.Equal(2, pool.Count(in stale));
+        SendResult second = h.Client.SendShared(new SendHeader(2, 71), pool.Table, in newest, 64, SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, second.Status);
+        Assert.Equal(2, pool.Count(in newest));
+
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(first.Token) == DeliveryStatus.Superseded, 5_000_000),
+            $"status {h.Client.GetDeliveryStatus(first.Token)}");
+        Assert.Equal(1, pool.Count(in stale));
+
+        Assert.Equal(SendStatus.Admitted, h.Client.RetireKey(2, 71));
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(second.Token) is not DeliveryStatus.Pending, 5_000_000),
+            "the live value never finished");
+        Assert.Equal(1, pool.Count(in newest));
+
+        // The host still owns its own reference on both blocks, so it releases the last one itself.
+        Assert.True(pool.Table.Release(in stale));
+        Assert.True(pool.Table.Release(in newest));
+    }
+
+    [Fact]
+    public void A_Shared_Value_That_Needs_A_Group_Stream_Is_Retained_Until_It_Is_Acknowledged()
+    {
+        // The same contract on the large-value path: the stream reads the shared block directly, so the reference must last
+        // until the LatestAck, not until the stream send completes (PROTOCOL.md §3.2, §4.3).
+        using SharedPool pool = new();
+        using SessionHarness h = Harness(client: o => o.Allocator = pool.Allocator);
+        List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
+        h.Server!.RegisterHandler(2, LatestKit.Collect(received));
+        SharedLease shared = pool.Share(1_400, seed: 5);
+
+        SendResult result = h.Client.SendShared(new SendHeader(2, 72), pool.Table, in shared, 1_400, SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, result.Status);
+        Assert.Equal(2, pool.Count(in shared));
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(result.Token) == DeliveryStatus.Delivered, 10_000_000),
+            $"status {h.Client.GetDeliveryStatus(result.Token)}");
+        Assert.Single(received);
+        Assert.Equal(1_400, received[0].Payload.Length);
+        Assert.True(DatagramKit.Statistics(h.Client).StreamSends >= 1, "the shared value did not go out on a group stream");
+        Assert.Equal(1, pool.Count(in shared));
+        Assert.True(pool.Table.Release(in shared));
+    }
+
+    [Fact]
+    public void A_Shared_Value_A_Full_Key_Table_Refuses_Takes_No_Reference()
+    {
+        using SharedPool pool = new();
+        using SessionHarness h = Harness(client: o => o.Allocator = pool.Allocator);
+        SharedLease shared = pool.Share(64, seed: 6);
+
+        // Channel 6 holds four keys and never evicts, so the fifth key is refused — and a refused admission must leave the
+        // caller's own reference count untouched.
+        for (ulong key = 0; key < 4; key++)
+        {
+            Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(6, key), LatestKit.Payload(1, 16)).Status);
+        }
+
+        Assert.Equal(SendStatus.KeyTableFull, h.Client.SendShared(new SendHeader(6, 99), pool.Table, in shared, 64).Status);
+        Assert.Equal(1, pool.Count(in shared));
+        Assert.True(pool.Table.Release(in shared));
+    }
+
+    [Fact]
+    public void An_Ack_For_A_Version_That_Never_Left_This_Host_Completes_Nothing()
+    {
+        // PROTOCOL.md §4.3: Delivered means a LatestAck covering the version. Nothing is flushed here, so no version of this
+        // key has ever been transmitted and an ack naming one cannot be evidence of anything — whatever version it claims.
+        using SessionHarness h = Harness();
+        SendResult result = h.Client.SendCopy(new SendHeader(2, 81), LatestKit.Payload(1, 64), SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, result.Status);
+        ReliableLatestEngine engine = LatestKit.Engine(h.Client);
+        Assert.True(engine.OnControl(ControlType.LatestAck, AckBody(2, 81, 1), onStream: false, 0));
+        Assert.True(engine.OnControl(ControlType.LatestAck, AckBody(2, 81, 99), onStream: false, 0));
+
+        // Admission drains the notices the transport thread handed over, so they have been applied by the time it returns.
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2, 82), LatestKit.Payload(2, 64)).Status);
+        Assert.Equal(DeliveryStatus.Pending, h.Client.GetDeliveryStatus(result.Token));
+        Assert.Equal(0u, LatestKit.AckedVersion(h.Client, 2, 81));
+        Assert.Equal(2, LatestKit.LiveKeys(h.Client, 2));
+
+        // The guard is not over-strict: the peer's own ack of the version that really goes out still completes it.
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(result.Token) == DeliveryStatus.Delivered, 5_000_000),
+            $"status {h.Client.GetDeliveryStatus(result.Token)}");
+    }
+
+    [Fact]
+    public void A_Value_That_Never_Got_A_Transmission_Fails_On_Its_Version_Budget()
+    {
+        // Every stream start is refused synchronously and no credit ever arrives, so this large value is admitted and then
+        // waits without a single transmission: only its own 30-second budget can end it (PROTOCOL.md §4.4).
+        AsyncRefusalConnector connector = null!;
+        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 2_000 }, table: Table,
+            client: o =>
+            {
+                LatestKit.Quiet(o);
+                LatestKit.Roomy(o);
+            },
+            server: o =>
+            {
+                LatestKit.Quiet(o);
+                LatestKit.Roomy(o);
+            },
+            connector: inner => connector = new AsyncRefusalConnector(inner));
+        h.Run(50_000);
+        AsyncRefusalTransport transport = connector.Transport!;
+        transport.Synchronous = true;
+        transport.RefuseStarts = int.MaxValue;
+
+        SendResult result = h.Client.SendCopy(new SendHeader(2, 91), LatestKit.Payload(9, 8_000), SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, result.Status);
+        h.Run(1_000_000, step: 50_000);
+        Assert.Equal(0, DatagramKit.ChannelStats(h.Client, 2).Sent);
+        Assert.Equal(1, LatestKit.LiveKeys(h.Client, 2));
+
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(result.Token) is not DeliveryStatus.Pending, 45_000_000, step: 25_000),
+            "the value that was never transmitted never finished, so it pinned its entry and its lease");
+        Assert.Equal(DeliveryStatus.Failed, h.Client.GetDeliveryStatus(result.Token));
+        Assert.Equal(0, LatestKit.LiveKeys(h.Client, 2));
+    }
+
+    [Fact]
+    public void A_Retirement_Waiting_In_The_Mailbox_Is_Not_Displaced_By_A_New_Holder_Of_The_Key()
+    {
+        // PROTOCOL.md §3.4 type 0x17: the application must see the retirement. The new value of the same key id arrives while
+        // the notice is still unclaimed (no Poll in between), so it must wait rather than replace it in the mailbox.
+        using SessionHarness h = Harness();
+        SendResult first = h.Client.SendCopy(new SendHeader(2, 101), LatestKit.Payload(1, 32), SendOptions.Tracked);
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(first.Token) == DeliveryStatus.Delivered), "the value was not delivered");
+
+        Assert.Equal(SendStatus.Admitted, h.Client.RetireKey(2, 101));
+        h.Client.Flush();
+        h.Network.Advance(10_000);
+
+        // Only the transport thread ran, so the retirement is in the mailbox; now a new holder of the same key sends.
+        SendResult again = h.Client.SendCopy(new SendHeader(2, 101), LatestKit.Payload(2, 32), SendOptions.Tracked);
+        h.Client.Flush();
+        h.Network.Advance(10_000);
+
+        List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
+        h.Server!.RegisterHandler(2, LatestKit.Collect(received));
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(again.Token) == DeliveryStatus.Delivered, 10_000_000),
+            $"status {h.Client.GetDeliveryStatus(again.Token)}");
+        Assert.Contains(received, value => value.Flags == ReceiveFlags.KeyRetired);
+        Assert.Contains(received, value => LatestKit.Matches(value.Payload, 2, 32));
+    }
+
+    [Fact]
+    public void A_Large_Value_Of_A_New_Epoch_Is_Accepted_On_A_Group_Stream()
+    {
+        // PROTOCOL.md §4.1: the epoch restarts the sender's version counter, so the receive side must forget its per-key
+        // versions before the next value whichever way that value arrives — a group stream included.
+        using ServerHarness h = new(table: Table, server: o =>
+        {
+            LatestKit.Quiet(o);
+            LatestKit.Roomy(o);
+        });
+        Assert.True(h.Admit(), "the raw client was not admitted");
+        List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
+        h.Server!.RegisterHandler(2, LatestKit.Collect(received));
+
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(LatestKit.GroupStream(Table, 2, 7, 3, new byte[1_500]), out _, fin: true));
+        h.Run(50_000);
+        Assert.Single(received);
+        Assert.Equal(7u, received[0].Version);
+
+        // A new epoch, and its first value of this key is large too: version 1 must be accepted, not dropped as "not newer"
+        // against the epoch that ended (which would re-ack version 7 and tell the sender a value it never got had arrived).
+        LatestKit.Engine(h.Server).OnEpochReset(resumed: true);
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(LatestKit.GroupStream(Table, 2, 1, 3, new byte[1_500]), out _, fin: true));
+        h.Run(50_000);
+        Assert.Equal(2, received.Count);
+        Assert.Equal(1u, received[1].Version);
+        Assert.Equal(PeerState.Connected, h.Server.State);
+    }
+
+    [Fact]
+    public void A_Reported_Start_That_Took_No_Stream_Slot_Does_Not_Release_One()
+    {
+        // The per-channel slot is paired with the stream id it was counted for, so a transport that reports OnStreamStarted
+        // for a start its own SubmitStream refused cannot hand back a slot the live stream still holds — which would let the
+        // sender open more streams than the channel's MaxGroups and make the receiver reset a live stream of ours (§7).
+        using SessionHarness h = Harness(client: LatestKit.Roomy, server: LatestKit.Roomy,
+            link: new LinkOptions { DelayMicros = 2_000, BandwidthBitsPerSecond = 8_000_000 });
+        List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
+        h.Server!.RegisterHandler(8, LatestKit.Collect(received));
+
+        // Channel 8 opens one group stream at a time; this value holds that one slot.
+        SendToken first = h.Client.SendCopy(new SendHeader(8, 1), LatestKit.Payload(1, 20_000), SendOptions.Tracked).Token;
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+
+        ReliableLatestEngine engine = LatestKit.Engine(h.Client);
+        int dense = h.Client.Core.ChannelIndexOf(8);
+        ulong context = PeerCore.MakeEngineStreamContext(ChannelMode.ReliableLatest, dense, 99);
+        TransportStreamId phantom = new(4_000, 1);
+        engine.OnStreamStarted(phantom, context, TransportStatus.StreamLimitReached);
+        engine.OnStreamClosed(phantom, aborted: true, 0);
+
+        SendToken second = h.Client.SendCopy(new SendHeader(8, 2), LatestKit.Payload(2, 20_000), SendOptions.Tracked).Token;
+        Assert.True(h.RunUntil(
+            () => h.Client.GetDeliveryStatus(first) == DeliveryStatus.Delivered && h.Client.GetDeliveryStatus(second) == DeliveryStatus.Delivered,
+            30_000_000), $"first {h.Client.GetDeliveryStatus(first)}, second {h.Client.GetDeliveryStatus(second)}");
+        Assert.Equal(0, DatagramKit.Statistics(h.Server).StreamsReset);
+        Assert.Equal(2, received.Count(value => value.Payload.Length == 20_000));
+    }
 }

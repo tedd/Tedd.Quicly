@@ -66,8 +66,11 @@ internal sealed unsafe partial class ReliableLatestEngine
 
         _streamCapacity = Math.Max(streams, 1);
         _streams = new NativeArray<LatestRecvStream>(_streamCapacity);
-        _txStreams = new TransportStreamId[_streamCapacity];
-        _txLocals = new int[_streamCapacity];
+
+        // One entry per stream this engine may hold open plus one per channel: a start the peer refused is recorded here too
+        // until its shutdown arrives, and it must never crowd out the record of a stream that is really carrying a value.
+        _txStreams = new TransportStreamId[_streamCapacity + count];
+        _txLocals = new int[_streamCapacity + count];
         _streamFree = new int[_streamCapacity];
         for (int i = 0; i < _streamCapacity; i++)
         {
@@ -85,8 +88,52 @@ internal sealed unsafe partial class ReliableLatestEngine
         _maxStage = Math.Min(core.ReceiveBudgetBytes, core.Allocator.MaxBlockSize);
     }
 
-    /// <summary>Asks the transport thread to forget its per-key receive state before the next value (a new epoch, PROTOCOL.md §4.1).</summary>
-    private void ResetReceiveState() => Volatile.Write(ref _resetReceive, 1);
+    /// <summary>
+    /// Asks the transport thread to forget its per-key receive state before the next value, whichever way that value arrives
+    /// (a new epoch, PROTOCOL.md §4.1), and drops the acks this end still owed: their versions belong to the counter that
+    /// just ended, so sending one could tell the peer a value of the new epoch had arrived. Game thread.
+    /// </summary>
+    private void ResetReceiveState()
+    {
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            LatestRecvKeys keys = _recvKeys[local];
+            int used = keys.SlotsUsed;
+            for (int slot = 0; slot < used; slot++)
+            {
+                Interlocked.Exchange(ref keys.VersionRef(slot), 0);
+            }
+        }
+
+        while (_ackQueue.TryDequeue(out _))
+        {
+        }
+
+        while (_rejectQueue.TryDequeue(out _))
+        {
+        }
+
+        Array.Clear(_ackSweep);
+        _heldAck.Local = -1;
+        _heldReject = default;
+        _sweepLocal = -1;
+        _sweepSlot = 0;
+        Volatile.Write(ref _resetReceive, 1);
+    }
+
+    /// <summary>
+    /// Forgets the per-key receive state once, if a new epoch asked for it (<see cref="ResetReceiveState"/>). Every receive
+    /// entry point calls this before it looks at a key: the epoch restarts the sender's version counter, so a value that
+    /// arrives on a group stream must not be measured against the previous epoch's versions any more than a datagram must
+    /// (PROTOCOL.md §4.1, §4.3). Transport thread.
+    /// </summary>
+    private void ConsumeEpochReset()
+    {
+        if (Volatile.Read(ref _resetReceive) != 0 && Interlocked.Exchange(ref _resetReceive, 0) != 0)
+        {
+            ClearReceiveKeys();
+        }
+    }
 
     private void DisposeReceive()
     {
@@ -217,16 +264,12 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// <inheritdoc/>
     public override void OnDatagram(in MessageHeader header, ReadOnlySpan<byte> payload, long nowMicros)
     {
-        if (Volatile.Read(ref _resetReceive) != 0 && Interlocked.Exchange(ref _resetReceive, 0) != 0)
-        {
-            ClearReceiveKeys();
-        }
-
+        ConsumeEpochReset();
         int dense = _core.ChannelIndexOf(header.Channel);
         int local = _localOf[dense];
         ref ChannelRecvCounters counters = ref _core.RecvCounters(dense);
         LatestRecvKeys keys = _recvKeys[local];
-        if (!keys.TryGetOrAdd(header.Key, out int keySlot))
+        if (!TryGetRecvSlot(local, header.Key, out int keySlot))
         {
             // PROTOCOL.md §7: a full ReliableLatest key table rejects with reason 4 and never evicts.
             counters.KeyTableFull++;
@@ -235,6 +278,14 @@ internal sealed unsafe partial class ReliableLatestEngine
         }
 
         ref KeyRecvSlot key = ref keys[keySlot];
+        if ((key.Flags & KeyRecvFlags.Retired) != 0 && !TryReuseRetiredSlot(local, keySlot, ref key))
+        {
+            // The application has not taken the key's retirement yet: a value posted now would displace it (§3.4 type 0x17).
+            counters.RingDrops++;
+            QueueReject(local, header.Key, header.Sequence, LatestRejectReason.RingFull);
+            return;
+        }
+
         if ((key.Flags & KeyRecvFlags.HasAccepted) != 0 && !SerialNumber.IsNewer(header.Sequence, key.LastAccepted))
         {
             // An older or duplicate version: re-ack the current one so a lost ack cannot stall the sender (§4.4).
@@ -349,7 +400,7 @@ internal sealed unsafe partial class ReliableLatestEngine
         LatestRecvKeys keys = _recvKeys[local];
         int dense = _denseOf[local];
         ref ChannelRecvCounters counters = ref _core.RecvCounters(dense);
-        if (!keys.TryGetOrAdd(key, out int keySlot))
+        if (!TryGetRecvSlot(local, key, out int keySlot))
         {
             counters.KeyTableFull++;
             return;
@@ -367,10 +418,75 @@ internal sealed unsafe partial class ReliableLatestEngine
             counters.Superseded++;
         }
 
-        // The slot is free for a new holder of the same key id; its first value is then newer than anything remembered.
+        // The slot is kept until the application has taken the notice: freeing it here would let a new holder of the same key
+        // id post into the mailbox and displace the retirement, and the application would never hear that the key was
+        // retired. The next value for the key takes the slot over once the notice is gone (TryReuseRetiredSlot), and a key
+        // retired and never reused is reclaimed when the table is full (ReclaimRetiredSlots).
         Interlocked.Exchange(ref keys.VersionRef(keySlot), 0);
-        keys[keySlot] = default;
-        keys.Remove(key);
+        keys[keySlot].Flags |= KeyRecvFlags.Retired;
+    }
+
+    /// <summary>
+    /// The receive slot of <paramref name="key"/>. A full table first gives up the slots of keys whose retirement the
+    /// application has already taken, because those are free in every sense; a live key is never evicted (PROTOCOL.md §7).
+    /// Transport thread.
+    /// </summary>
+    /// <param name="local">The channel.</param>
+    /// <param name="key">The key.</param>
+    /// <param name="keySlot">The slot, when one was found.</param>
+    /// <returns><see langword="false"/> when the key can get no slot.</returns>
+    private bool TryGetRecvSlot(int local, ulong key, out int keySlot)
+    {
+        LatestRecvKeys keys = _recvKeys[local];
+        return keys.TryGetOrAdd(key, out keySlot) || (ReclaimRetiredSlots(local) && keys.TryGetOrAdd(key, out keySlot));
+    }
+
+    /// <summary>Gives up the slot of every retired key of a channel whose notice has been delivered (transport thread).</summary>
+    /// <param name="local">The channel.</param>
+    /// <returns>Whether at least one slot was freed.</returns>
+    private bool ReclaimRetiredSlots(int local)
+    {
+        LatestRecvKeys keys = _recvKeys[local];
+        ReceiveMailbox box = _mailboxes[local];
+        bool freed = false;
+        int used = keys.SlotsUsed;
+        for (int slot = 0; slot < used; slot++)
+        {
+            ref KeyRecvSlot candidate = ref keys[slot];
+            if ((candidate.Flags & KeyRecvFlags.Retired) == 0 || box.HasPending(slot))
+            {
+                continue;
+            }
+
+            ulong retired = candidate.Key;
+            candidate = default;
+            keys.Remove(retired);
+            freed = true;
+        }
+
+        return freed;
+    }
+
+    /// <summary>
+    /// Lets a new holder of a retired key take the slot over, once the application has taken the retirement out of the
+    /// mailbox: the slot forgets its versions, so the new holder's first value is newer than anything remembered.
+    /// Transport thread.
+    /// </summary>
+    /// <param name="local">The channel.</param>
+    /// <param name="keySlot">The slot.</param>
+    /// <param name="key">The slot's state.</param>
+    /// <returns><see langword="false"/> while the retirement is still waiting to be delivered.</returns>
+    private bool TryReuseRetiredSlot(int local, int keySlot, ref KeyRecvSlot key)
+    {
+        if (_mailboxes[local].HasPending(keySlot))
+        {
+            return false;
+        }
+
+        ulong id = key.Key;
+        key = default;
+        key.Key = id;
+        return true;
     }
 
     private void ClearReceiveKeys()
@@ -391,6 +507,7 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// </remarks>
     public override StreamAccept OnStreamOpened(TransportStreamId id, ushort channel, ulong groupId)
     {
+        ConsumeEpochReset();
         int local = LocalOf(channel);
         if (local < 0)
         {
@@ -424,6 +541,10 @@ internal sealed unsafe partial class ReliableLatestEngine
         {
             case StreamMessagePhase.Start:
             {
+                // A stream opened in the epoch that just ended can still deliver its first message here, so the reset is
+                // consumed on this path too (PROTOCOL.md §4.1).
+                ConsumeEpochReset();
+
                 // The parser has checked that Sequence equals the stream's GroupId (PROTOCOL.md §8 item 8).
                 uint version = message.Header.Sequence;
                 ulong key = message.Header.Key;
@@ -447,7 +568,7 @@ internal sealed unsafe partial class ReliableLatestEngine
                 }
 
                 LatestRecvKeys keys = _recvKeys[local];
-                if (!keys.TryGetOrAdd(key, out int keySlot))
+                if (!TryGetRecvSlot(local, key, out int keySlot))
                 {
                     counters.KeyTableFull++;
                     QueueReject(local, key, version, LatestRejectReason.KeyTableFull);
@@ -455,6 +576,14 @@ internal sealed unsafe partial class ReliableLatestEngine
                 }
 
                 stream.KeySlot = keySlot;
+                if ((keys[keySlot].Flags & KeyRecvFlags.Retired) != 0 && !TryReuseRetiredSlot(local, keySlot, ref keys[keySlot]))
+                {
+                    // The key's retirement is still waiting to be delivered, so this value has nowhere to go yet (§3.4).
+                    counters.RingDrops++;
+                    QueueReject(local, key, version, LatestRejectReason.RingFull);
+                    return StreamConsume.ResetStream(QuiclyErrorCode.LimitExceeded);
+                }
+
                 if ((keys[keySlot].Flags & KeyRecvFlags.HasAccepted) != 0 && !SerialNumber.IsNewer(version, keys[keySlot].LastAccepted))
                 {
                     // Stale: consume the stream and re-ack the current version at its end.
@@ -554,7 +683,7 @@ internal sealed unsafe partial class ReliableLatestEngine
             if (_txStreams[index] == id)
             {
                 _txStreams[index] = default;
-                Post(new LatestNotice { Local = _txLocals[index], Kind = NoticeKind.StreamClosed });
+                Post(new LatestNotice { Local = _txLocals[index], Kind = NoticeKind.StreamClosed, Stream = id });
                 return;
             }
         }
@@ -604,10 +733,10 @@ internal sealed unsafe partial class ReliableLatestEngine
             }
 
             stream = default;
-            _txStreams[index] = default;
             _streamFree[index] = _streamCapacity - 1 - index;
         }
 
+        Array.Clear(_txStreams);
         _streamFreeCount = _streamCapacity;
         Array.Clear(_activeGroups);
         Array.Clear(_ackSweep);
@@ -644,6 +773,22 @@ internal sealed unsafe partial class ReliableLatestEngine
 
     // ------------------------------------------------------------------ acks the peer sent us (game thread)
 
+    /// <summary>
+    /// Drops the acks and rejects the peer sent in the epoch that just ended — their versions belong to a counter that no
+    /// longer exists — while still applying the stream shutdowns among them, which release per-channel stream slots that
+    /// nothing else would give back (game thread, <see cref="OnEpochReset"/>).
+    /// </summary>
+    private void DropNoticesOfClosedEpoch()
+    {
+        while (_notices.TryDequeue(out LatestNotice notice))
+        {
+            if (notice.Kind == NoticeKind.StreamClosed)
+            {
+                ReleaseCountedStream(notice.Stream);
+            }
+        }
+    }
+
     /// <summary>Applies the LatestAck and LatestReject entries the transport thread handed over (game thread).</summary>
     private void DrainNotices()
     {
@@ -654,13 +799,9 @@ internal sealed unsafe partial class ReliableLatestEngine
             if (notice.Kind == NoticeKind.StreamClosed)
             {
                 // A large-value stream of ours shut down, so its per-channel slot is free again (the receiver freed its own
-                // at the same point) and a value waiting for credit may go out.
-                if (_openStreams[local] > 0)
-                {
-                    _openStreams[local]--;
-                }
-
-                _streamBlocked[local] = false;
+                // at the same point) and a value waiting for credit may go out. The slot is looked up by the stream's own id,
+                // so a start that was reported and then refused — one this engine never counted — releases nothing.
+                ReleaseCountedStream(notice.Stream);
                 continue;
             }
 
@@ -679,6 +820,15 @@ internal sealed unsafe partial class ReliableLatestEngine
                     ArmRetry(local, ref _send[local], ref key, _core.CurrentPassMicros);
                 }
 
+                continue;
+            }
+
+            // PROTOCOL.md §4.3: an ack is evidence only for a version that really left this host. A version above the
+            // highest one ever transmitted for this key was never on the wire, so it proves nothing and completes nothing
+            // (it is what an ack of a closed epoch looks like after the counter restarted).
+            uint highestSent = keys.SentVersion(keySlot);
+            if (highestSent == 0 || SerialNumber.IsNewer(notice.Version, highestSent))
+            {
                 continue;
             }
 
@@ -738,7 +888,6 @@ internal sealed unsafe partial class ReliableLatestEngine
             return;
         }
 
-        _nextAckMicros = now + _ackDelayMicros;
         // The carrier is chosen before the batch is written, because the two carriers frame a control message differently: a
         // datagram the transport refused makes the next transmission take the control stream instead (PROTOCOL.md §2.3).
         bool datagrams = _core.DatagramsEnabled && !_ackDatagramsRefused;
@@ -750,6 +899,7 @@ internal sealed unsafe partial class ReliableLatestEngine
         }
 
         Span<byte> buffer = stackalloc byte[AckFrameBytes];
+        bool transmitted = false;
         for (int frame = 0; frame < MaxAckDatagramsPerPass; frame++)
         {
             LatestAckBatchWriter writer = new(buffer.Slice(0, limit), carrier);
@@ -772,6 +922,7 @@ internal sealed unsafe partial class ReliableLatestEngine
             }
 
             Send(buffer, writer.Finish(), carrier);
+            transmitted = true;
         }
 
         for (int frame = 0; frame < MaxAckDatagramsPerPass; frame++)
@@ -796,6 +947,15 @@ internal sealed unsafe partial class ReliableLatestEngine
             }
 
             Send(buffer, writer.Finish(), carrier);
+            transmitted = true;
+        }
+
+        if (transmitted)
+        {
+            // The AckDelay window starts when a transmission really went out. Advancing it for a pass that could send
+            // nothing (no carrier, a datagram limit too small for any batch) would skip that window's acks silently, and
+            // with AckDelay 0 it would also pin the flush deadline at the current time (LowerDeadline).
+            _nextAckMicros = now + _ackDelayMicros;
         }
     }
 
@@ -932,6 +1092,9 @@ internal sealed unsafe partial class ReliableLatestEngine
         public uint Version;
         public NoticeKind Kind;
         public LatestRejectReason Reason;
+
+        /// <summary><see cref="NoticeKind.StreamClosed"/>: the stream that shut down (the game thread resolves its slot).</summary>
+        public TransportStreamId Stream;
     }
 
     /// <summary>Staging state of one peer group stream carrying a large value (transport thread).</summary>

@@ -189,7 +189,13 @@ public sealed unsafe class Mailboxes : IDisposable
         }
     }
 
-    /// <summary>Current mailbox value without taking it. Diagnostics; any thread.</summary>
+    /// <summary>
+    /// Current mailbox value without taking it (<see cref="Empty"/> when there is nothing); any thread. Diagnostics, and the
+    /// producer's way of seeing whether the game thread has taken what it posted earlier
+    /// (<see cref="Session.ReceiveMailbox.HasPending"/>).
+    /// </summary>
+    /// <param name="keySlot">Key slot.</param>
+    /// <returns>The lease index waiting there, or <see cref="Empty"/>.</returns>
     internal int Peek(int keySlot) => Volatile.Read(ref _mailbox[keySlot]);
 
     /// <summary>Whether <paramref name="keySlot"/>'s dirty bit is set right now. Diagnostics; any thread.</summary>

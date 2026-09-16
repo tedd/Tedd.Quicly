@@ -146,8 +146,14 @@ public sealed class PeerOptions
     /// <summary>Largest datagram payload this end will process, announced in Hello/HelloAck (0 = no cap beyond the transport's).</summary>
     public ushort MaxReceiveDatagram { get; set; }
 
-    /// <summary>Control messages (datagram and stream) accepted per second before the connection is closed with <see cref="QuiclyErrorCode.LimitExceeded"/>. Default 200.</summary>
-    public int ControlMessagesPerSecond { get; set; } = 200;
+    /// <summary>
+    /// Control messages (datagram and stream) accepted per second before the connection is closed with
+    /// <see cref="QuiclyErrorCode.LimitExceeded"/>. Default 2 000 (PROTOCOL.md §7). Size it from the channel table: the
+    /// coalesced LatestAck traffic of keyed <see cref="Channels.ChannelMode.ReliableLatest"/> channels dominates it, and one
+    /// ack datagram carries about 170 keys, so a channel of <i>N</i> keys updated at <i>F</i> Hz makes the peer receive
+    /// roughly <c>N·F / 170</c> control messages per second (about 360/s for 1 000 keys at 60 Hz).
+    /// </summary>
+    public int ControlMessagesPerSecond { get; set; } = 2_000;
 
     /// <summary>Sustained Pong rate (PROTOCOL.md §2.3); excess Pings are ignored and counted. Default 4 per second.</summary>
     public int PongsPerSecond { get; set; } = 4;

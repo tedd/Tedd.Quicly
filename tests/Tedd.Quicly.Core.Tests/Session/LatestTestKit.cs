@@ -48,17 +48,16 @@ internal static class LatestKit
     }
 
     /// <summary>
-    /// Budgets and a pool with room for many large values in flight, and a control-message allowance that matches the ack
-    /// traffic of a many-key channel: one coalesced LatestAck datagram carries about 170 keys, so 1 000 keys at 60 Hz need
-    /// roughly 360 control messages per second in each direction — well above the 200/s default of PROTOCOL.md §7, which the
-    /// receiving peer would otherwise answer with <c>LimitExceeded</c> (every §7 limit is configurable per peer).
+    /// Budgets and a pool with room for many large values in flight. The control-message rate is left at its default: one
+    /// coalesced LatestAck datagram carries about 170 keys, so even the 1 000-key 60 Hz workload needs only some 360 control
+    /// messages per second in each direction, well inside the 2 000/s default of PROTOCOL.md §7 (which is what that default
+    /// was sized for).
     /// </summary>
     public static void Roomy(PeerOptions options)
     {
         options.SendBudgetBytes = 4 * 1024 * 1024;
         options.ReceiveBudgetBytes = 4 * 1024 * 1024;
         options.SendTableCapacity = 4096;
-        options.ControlMessagesPerSecond = 8000;
         options.AllocatorOptions = new SlabAllocatorOptions
         {
             FreeListShards = 2,

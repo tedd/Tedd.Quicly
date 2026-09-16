@@ -94,6 +94,10 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     private double _retryShare;
     private long _retryCap;
 
+    // The streams whose per-channel slot this engine has counted, and the channel each was counted against (game thread).
+    private TransportStreamId[] _countedStreams = [];
+    private int[] _countedLocals = [];
+
     /// <summary>Where a value entry is and what it still owes.</summary>
     [Flags]
     private enum ValueFlags : byte
@@ -133,6 +137,12 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         _sendKeys = new LatestSendKeys[count];
         _send = new NativeArray<LatestSendState>(Math.Max(count, 1));
         InitializeReceive(core, count);
+
+        // One slot per stream this engine may hold open (the sum of the channels' MaxGroups), so the per-channel stream
+        // accounting is exact: a slot is taken when the stream id is recorded here and given back only by that same id's
+        // shutdown notice.
+        _countedStreams = new TransportStreamId[_streamCapacity];
+        _countedLocals = new int[_streamCapacity];
         for (int local = 0; local < count; local++)
         {
             ChannelDefinition channel = _channels[local];
@@ -257,7 +267,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             return SendStatus.QueueFull;
         }
 
-        if (!TryTakeValue(_core, ref request, channel, length, out BufferLease lease, out byte* payload, out int wireLength, out int rawLength))
+        if (!TryPrepareValue(_core, ref request, channel, length, out SendPayloadKind committed, out PreparedPayload prepared))
         {
             _core.DiscardEntry(value);
             return SendStatus.OutOfBuffers;
@@ -265,7 +275,9 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
         if (request.Options.Track && !_core.TryTrack(value, request.Options.Context, out request.Token))
         {
-            _core.ReturnSend(in lease);
+            // Only what was rented here goes back; a refused admission leaves the caller's own lease, pages and shared
+            // references untouched (EnginePayload.Release).
+            EnginePayload.Release(_core, in prepared);
             _core.DiscardEntry(value);
             counters.QueueFull++;
             return SendStatus.QueueFull;
@@ -279,14 +291,22 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         header.Sequence = version;
         header.Key = request.Key;
         header.FragCount = 1;
-        header.RawLength = rawLength;
+        header.RawLength = prepared.RawLength;
         SendEntryTable entries = _core.Entries;
         entries.SetHeaderLength(value, DatagramFraming.WriteHeader(entries.GetHeaderBlock(value), channel, in header));
-        entries.Leases[value] = lease;
-        _core.SetPayload(value, payload, wireLength);
+
+        // The value takes its payload through the shared commit, so every kind is handled the same way the other modes
+        // handle it: a shared block is retained for as long as this version may be retransmitted (one reference released in
+        // ReleasePayload), a pin handle is recorded, and a payload kind added later cannot be dropped here silently
+        // (ARCHITECTURE.md §4.1, ADR 0008 invariant 1).
+        SendRequest commit = default;
+        commit.Kind = committed;
+        commit.Lease = request.Lease;
+        commit.Gather = request.Gather;
+        EnginePayload.Commit(_core, value, ref commit, in prepared);
         entries.Keys[value] = request.Key;
         entries.Sequences[value] = version;
-        entries.BatchCount[value] = rawLength;
+        entries.BatchCount[value] = prepared.RawLength;
         long now = _core.CurrentPassMicros;
         entries.Deadlines[value] = now + VersionBudgetMicros;
         _core.StampAdmission(value);
@@ -310,63 +330,51 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         keys.Arm(keySlot);
         send.LiveKeys++;
         EnqueueFresh(ref send, value, length);
+
+        // A value that never gets a first transmission (an occupied stream slot, no datagrams, a starved send cap) has no
+        // retry timer, so the channel's timer is armed for its 30-second budget instead — otherwise the budget would never
+        // be checked and the value would pin its entry and its lease for the life of the session (PROTOCOL.md §4.4).
+        long budgetDue = entries.Deadlines[value] + 1;
+        if (budgetDue < send.NextRetryMicros)
+        {
+            send.NextRetryMicros = budgetDue;
+        }
+
         return SendStatus.Admitted;
     }
 
     /// <summary>
-    /// Takes the value's bytes into memory this engine owns for as long as the version may be retransmitted: a copy (or its
-    /// LZ4 block) in a send lease, or the caller's owned lease. Pinned, borrowed and gathered payloads are copied, because
-    /// caller memory is only promised until the BufferReleased completion while a version lives for up to 30 s.
+    /// Prepares the value's bytes in memory the value may be retransmitted from for up to 30 s: a copy (or its LZ4 block) in
+    /// a send lease, the caller's owned lease, or a reference-counted shared block. Pinned, borrowed and gathered payloads
+    /// are copied, because caller memory is only promised until the BufferReleased completion; a shared block needs no copy
+    /// because the entry holds one reference on it until its payload is released
+    /// (<see cref="EnginePayload.Commit"/> → <see cref="PeerCore.AttachShared"/>).
     /// </summary>
-    private static bool TryTakeValue(PeerCore core, ref SendRequest request, ChannelDefinition channel, int length,
-        out BufferLease lease, out byte* payload, out int wireLength, out int rawLength)
+    /// <param name="core">The peer's shared state.</param>
+    /// <param name="request">The request (unchanged).</param>
+    /// <param name="channel">Its channel.</param>
+    /// <param name="length">Raw payload bytes.</param>
+    /// <param name="committed">The kind <see cref="EnginePayload.Commit"/> must be told (a copy for pinned and borrowed).</param>
+    /// <param name="prepared">The prepared payload; hand it to <c>Commit</c> or <c>Release</c>.</param>
+    /// <returns><see langword="false"/> when no send lease was available; nothing was taken.</returns>
+    private static bool TryPrepareValue(PeerCore core, ref SendRequest request, ChannelDefinition channel, int length,
+        out SendPayloadKind committed, out PreparedPayload prepared)
     {
-        SendPayloadKind kind = request.Kind;
         SendRequest copy = request;
-        if (kind == SendPayloadKind.Pinned)
+        if (copy.Kind == SendPayloadKind.Pinned)
         {
             copy.Kind = SendPayloadKind.Copy;
             copy.Source = new ReadOnlySpan<byte>(request.Pointer, length);
         }
-        else if (kind == SendPayloadKind.Borrowed)
+        else if (copy.Kind == SendPayloadKind.Borrowed)
         {
             copy.Kind = SendPayloadKind.Copy;
             copy.Source = request.Borrowed.Span;
         }
 
-        PreparedPayload prepared = default;
-        if (!EnginePayload.TryPrepare(core, ref copy, channel, length, takeSinglePage: false, ref prepared))
-        {
-            lease = BufferLease.Empty;
-            payload = null;
-            wireLength = 0;
-            rawLength = 0;
-            return false;
-        }
-
-        // Either the engine rented the lease (a copy, a compressed block or a gather) or the caller handed one over.
-        lease = prepared.Lease;
-        payload = prepared.Pointer;
-        wireLength = prepared.Length;
-        rawLength = prepared.RawLength;
-        if (kind == SendPayloadKind.Owned && !prepared.Rented)
-        {
-            lease = request.Lease;
-        }
-        else if (kind == SendPayloadKind.Owned)
-        {
-            // The caller's lease was compressed into a new one and goes back to the pool now.
-            core.ReturnSend(in request.Lease);
-        }
-        else if (kind == SendPayloadKind.Gather)
-        {
-            foreach (BufferLease page in request.Gather)
-            {
-                core.ReturnSend(in page);
-            }
-        }
-
-        return true;
+        committed = copy.Kind;
+        prepared = default;
+        return EnginePayload.TryPrepare(core, ref copy, channel, length, takeSinglePage: false, ref prepared);
     }
 
     /// <summary>Replaces the key's live value (PROTOCOL.md §4.3 <see cref="DeliveryStatus.Superseded"/>).</summary>
@@ -580,7 +588,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         }
 
         SendPendingAcks(ref flush);
-        LowerDeadline(ref flush.NextDeadline);
+        LowerDeadline(flush.NowMicros, ref flush.NextDeadline);
     }
 
     /// <inheritdoc/>
@@ -600,6 +608,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             }
 
             LatestSendKeys keys = _sendKeys[local];
+            NativeArray<long> deadlines = _core.Entries.Deadlines;
             long earliest = long.MaxValue;
             int keySlot = keys.ArmedHead;
             while (keySlot >= 0)
@@ -607,24 +616,39 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
                 int next = keys.ArmedNext(keySlot);
                 ref KeySendSlot key = ref keys[keySlot];
                 int value = key.InFlightEntry;
-                if (value >= 0 && (key.Flags & KeySendFlags.RetryArmed) != 0 && nowMicros >= key.RetryDeadline)
+                if (value < 0)
                 {
-                    if (!TryFailExpiredVersion(local, keys, keySlot, ref key, value, nowMicros))
-                    {
-                        // The value goes back into the retry queue and its timer is re-armed rather than cleared: a retry the
-                        // per-peer byte budget holds back must stay visible here, or its 30-second version budget would never
-                        // be checked again (PROTOCOL.md §4.4).
-                        EnqueueRetry(local, ref send, value);
-                        ArmRetry(local, ref send, ref key, nowMicros);
-                        if (key.RetryDeadline < earliest)
-                        {
-                            earliest = key.RetryDeadline;
-                        }
-                    }
+                    keySlot = next;
+                    continue;
                 }
-                else if (value >= 0 && (key.Flags & KeySendFlags.RetryArmed) != 0 && key.RetryDeadline < earliest)
+
+                // A value still waiting for its first transmission has no retry timer; its own 30-second budget is what this
+                // pass watches for it (one past the deadline, so reaching the due time really fails it instead of
+                // re-publishing a deadline that has already passed).
+                bool armed = (key.Flags & KeySendFlags.RetryArmed) != 0;
+                long due = armed ? key.RetryDeadline : deadlines[value] + 1;
+                if (nowMicros < due)
                 {
-                    earliest = key.RetryDeadline;
+                    if (due < earliest)
+                    {
+                        earliest = due;
+                    }
+
+                    keySlot = next;
+                    continue;
+                }
+
+                if (!TryFailExpiredVersion(local, keys, keySlot, ref key, value, nowMicros))
+                {
+                    // The value goes back into the retry queue and its timer is re-armed rather than cleared: a retry the
+                    // per-peer byte budget holds back must stay visible here, or its 30-second version budget would never
+                    // be checked again (PROTOCOL.md §4.4).
+                    EnqueueRetry(local, ref send, value);
+                    ArmRetry(local, ref send, ref key, nowMicros);
+                    if (key.RetryDeadline < earliest)
+                    {
+                        earliest = key.RetryDeadline;
+                    }
                 }
 
                 keySlot = next;
@@ -633,7 +657,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             send.NextRetryMicros = earliest;
         }
 
-        LowerDeadline(ref nextDeadline);
+        LowerDeadline(nowMicros, ref nextDeadline);
     }
 
     /// <summary>Completes a version that used up its 30-second budget (PROTOCOL.md §4.4).</summary>
@@ -653,7 +677,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         return true;
     }
 
-    private void LowerDeadline(ref long nextDeadline)
+    private void LowerDeadline(long now, ref long nextDeadline)
     {
         for (int local = 0; local < _channels.Length; local++)
         {
@@ -664,7 +688,10 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             }
         }
 
-        if (HasPendingAcks() && _nextAckMicros < nextDeadline)
+        // Only a *future* ack time is a deadline. With AckDelay 0 there is nothing to wait for (the acks go out in every
+        // pass), and a time already past — a pass that could not send its batch at all — must not be published either: a
+        // host that sleeps until the deadline would spin on it.
+        if (_ackDelayMicros > 0 && _nextAckMicros > now && _nextAckMicros < nextDeadline && HasPendingAcks())
         {
             nextDeadline = _nextAckMicros;
         }
@@ -771,6 +798,16 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         }
 
         valueEntry.Aux1 = WithOutstanding(aux, OutstandingOf(aux) + 1);
+
+        // PROTOCOL.md §4.3: only a version that really left this host can be acknowledged, so the highest version ever
+        // transmitted for the key is what an incoming ack is measured against (DrainNotices).
+        uint transmitted = entries.Sequences[value];
+        ref uint highestSent = ref keys.SentVersion(keySlot);
+        if (highestSent == 0 || SerialNumber.IsNewer(transmitted, highestSent))
+        {
+            highestSent = transmitted;
+        }
+
         key.Attempts++;
         key.LastSentMicros = now;
         ArmRetry(local, ref send, ref key, now);
@@ -836,6 +873,16 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             return false;
         }
 
+        // The slot is counted against this stream's id, so only that id's own shutdown can give it back: a transport that
+        // reports a start it then refused cannot release a slot the refused stream never took, and the sender can never
+        // exceed the channel's cap because of one.
+        int counted = FreeCountedStream();
+        if (counted < 0)
+        {
+            _core.DiscardEntry(transmission);
+            return false;
+        }
+
         uint version = entries.Sequences[value];
         uint serial = (send.StreamSerial + 1) & PeerCore.EngineStreamSerialMask;
         ulong context = PeerCore.MakeEngineStreamContext(ChannelMode.ReliableLatest, _denseOf[local], serial);
@@ -888,6 +935,8 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
         // The slot is held until the stream shuts down, not until this send completes: the receiver frees its own slot at
         // shutdown, so counting the send would let us open one more stream than it still holds.
+        _countedStreams[counted] = stream;
+        _countedLocals[counted] = local;
         _openStreams[local]++;
         long bytes = written + header.Length;
         flush.BudgetBytes -= bytes;
@@ -896,6 +945,50 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         counters.StreamSends++;
         counters.StreamBytesSent += bytes;
         return true;
+    }
+
+    /// <summary>A free slot of the counted-stream table, or -1 when every stream this engine may open is already counted.</summary>
+    private int FreeCountedStream()
+    {
+        for (int index = 0; index < _countedStreams.Length; index++)
+        {
+            if (!_countedStreams[index].IsValid)
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    /// <summary>
+    /// Gives back the per-channel stream slot of <paramref name="stream"/>, if this engine counted one for it (game thread,
+    /// from the shutdown notice). A stream that was never counted — a start the transport reported and then refused, or
+    /// another engine's stream broadcast to us — changes nothing.
+    /// </summary>
+    /// <param name="stream">The stream that shut down.</param>
+    private void ReleaseCountedStream(TransportStreamId stream)
+    {
+        if (!stream.IsValid)
+        {
+            return;
+        }
+
+        for (int index = 0; index < _countedStreams.Length; index++)
+        {
+            if (_countedStreams[index] == stream)
+            {
+                int local = _countedLocals[index];
+                _countedStreams[index] = default;
+                if (_openStreams[local] > 0)
+                {
+                    _openStreams[local]--;
+                }
+
+                _streamBlocked[local] = false;
+                return;
+            }
+        }
     }
 
     private void AbortLargeStream(ref KeySendSlot key)
@@ -971,7 +1064,10 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             _retryRate = rate;
             if (rate > 0)
             {
-                _retryBucket.Initialize(rate, Math.Max(1, rate / 10), now);
+                // The level is carried across the change, not refilled: a rate derived from the congestion window moves on
+                // every pass, and re-initialising the bucket would hand out a full burst each time — the aggregate cap of
+                // PROTOCOL.md §4.4 would never bind.
+                _retryBucket.SetRate(rate, Math.Max(1, rate / 10), now);
             }
         }
     }
@@ -992,7 +1088,15 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
         if (estimate <= 0)
         {
-            return 0; // no estimate and no configured cap: retries are bounded by the per-version budget alone
+            // PeerOptions.RetryShareOfEstimatedBandwidth: "the congestion window divided by the RTT, or
+            // MaxSendBytesPerSecond when the transport reports none" — so the aggregate retry budget still exists on a
+            // transport that publishes no window.
+            estimate = _core.MaxSendBytesPerSecond;
+        }
+
+        if (estimate <= 0)
+        {
+            return 0; // neither an estimate nor a send cap: retries are bounded by the per-version budget alone
         }
 
         return Math.Max(MinRetryBytesPerSecond, (long)(estimate * _retryShare));
@@ -1020,8 +1124,15 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         {
             // DatagramSendState.Sent: the transmission's bytes left the host. The value keeps its payload for retries, so
             // there is nothing to release; the BufferReleased stage of the value's token completes with its first Sent.
+            // The owner slot and the version are checked exactly as on the final path: a value's slot is reused as soon as
+            // its completion is routed, so a late Sent notice must not complete a stage of whatever took the slot.
             int owner = (int)entries[entrySlot].Aux0;
-            _core.CompleteStage(owner, CompletionStage.BufferReleased, DeliveryStatus.Pending);
+            uint sent = (uint)entries[entrySlot].Aux1;
+            if (entries.GetState(owner) != SendEntryState.Free && IsValueEntry(entries[owner].Aux1) && entries.Sequences[owner] == sent)
+            {
+                _core.CompleteStage(owner, CompletionStage.BufferReleased, DeliveryStatus.Pending);
+            }
+
             return;
         }
 
@@ -1169,12 +1280,16 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             return;
         }
 
+        // The acks and rejects the peer sent in the epoch that just ended name versions of a counter that no longer exists,
+        // so they are dropped here rather than measured against the new one (the stream shutdowns among them still apply).
+        DropNoticesOfClosedEpoch();
         for (int local = 0; local < _channels.Length; local++)
         {
             LatestSendKeys keys = _sendKeys[local];
             ref LatestSendState send = ref _send[local];
             send.NextVersion = 1;
             send.NextRetryMicros = long.MaxValue;
+            keys.ResetSentVersions();
             int keySlot = keys.ArmedHead;
             while (keySlot >= 0)
             {
@@ -1238,8 +1353,11 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
                 keys.Disarm(keySlot);
                 keySlot = next;
             }
+
+            keys.ResetSentVersions();
         }
 
+        Array.Clear(_countedStreams);
         ResetReceiveForReconnect();
     }
 
@@ -1392,6 +1510,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         private NativeArray<KeySendSlot> _slots;
         private NativeArray<int> _next;
         private NativeArray<int> _previous;
+        private NativeArray<uint> _sent;
 
         public LatestSendKeys(ChannelDefinition channel)
         {
@@ -1401,6 +1520,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             _slots = new NativeArray<KeySendSlot>(initial);
             _next = new NativeArray<int>(initial);
             _previous = new NativeArray<int>(initial);
+            _sent = new NativeArray<uint>(initial);
         }
 
         /// <summary>First key with a live value, or -1.</summary>
@@ -1411,6 +1531,16 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         /// <summary>The next key of the live list after <paramref name="slot"/>, or -1.</summary>
         /// <param name="slot">A key slot.</param>
         public int ArmedNext(int slot) => _next[slot];
+
+        /// <summary>
+        /// The highest version of the key that really left this host (0 = none): an ack above it names a version that was
+        /// never transmitted, so it cannot complete anything (PROTOCOL.md §4.3).
+        /// </summary>
+        /// <param name="slot">A key slot.</param>
+        public ref uint SentVersion(int slot) => ref _sent[slot];
+
+        /// <summary>Forgets every key's highest transmitted version (a new epoch restarts the channel's counter).</summary>
+        public void ResetSentVersions() => _sent.AsSpan().Clear();
 
         public bool TryGet(ulong key, out int slot) => _table.TryGetSlot(key, out slot);
 
@@ -1435,6 +1565,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             _slots[slot].InFlightEntry = -1;
             _next[slot] = -1;
             _previous[slot] = -1;
+            _sent[slot] = 0;
             return true;
         }
 
@@ -1494,6 +1625,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             _slots.Dispose();
             _next.Dispose();
             _previous.Dispose();
+            _sent.Dispose();
         }
 
         private void EnsureSlot(int slot)
@@ -1507,6 +1639,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             _slots = Grow(_slots, length);
             _next = Grow(_next, length);
             _previous = Grow(_previous, length);
+            _sent = Grow(_sent, length);
         }
 
         private static NativeArray<T> Grow<T>(NativeArray<T> array, int length)

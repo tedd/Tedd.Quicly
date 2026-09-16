@@ -27,6 +27,7 @@ public class LatestBench
     private QuiclyPeer _server = null!;
     private SimulatedNetwork _network = null!;
     private long _received;
+    private long _sent;
     private uint _tick;
 
     [GlobalSetup]
@@ -54,11 +55,22 @@ public class LatestBench
     }
 
     /// <summary>
-    /// A closed session would make every cycle trivially cheap, so the measurement is only valid while both peers are
-    /// connected and no value had to be retransmitted.
+    /// A closed session — or one that started refusing admission — would make every cycle trivially cheap, so the
+    /// measurement is only valid while both peers are connected, no value had to be retransmitted and every value the cycle
+    /// sent actually reached the peer's handler.
     /// </summary>
     private void Check()
     {
+        // The cycle is one tick deep, so let what is still in flight arrive before the counts are compared.
+        for (int i = 0; i < 4; i++)
+        {
+            _client.Flush(++_tick);
+            _network.Advance(16_667);
+            _server.Poll();
+            _server.Flush();
+            _client.Poll();
+        }
+
         if (_client.State != PeerState.Connected || _server.State != PeerState.Connected)
         {
             throw new InvalidOperationException($"The benchmark session closed ({_client.State}/{_server.State}, {_client.CloseReason}).");
@@ -67,6 +79,13 @@ public class LatestBench
         if (_client.GetChannelStatistics(2, out ChannelStatistics statistics) && statistics.Retries > 0)
         {
             throw new InvalidOperationException($"{statistics.Retries} retransmissions: the cycle is not a steady state.");
+        }
+
+        if (_received < _sent)
+        {
+            throw new InvalidOperationException(
+                $"{_received} of {_sent} values reached the peer: the cycle stopped delivering (refused admission, a full "
+                + "key table or a coalesced value), so the numbers would not measure a value that gets through.");
         }
     }
 
@@ -82,6 +101,8 @@ public class LatestBench
         {
             _client.SendCopy(new SendHeader(2, key), _value);
         }
+
+        _sent += keys;
 
         // One 60 Hz tick of virtual time per cycle, so the peer's acks arrive within the next cycle and no retry timer fires.
         _client.Flush(++_tick);
@@ -108,10 +129,8 @@ public class LatestBench
             PeerOptions serverOptions = SessionFixture.Options(Clock, compact: false);
             PeerOptions clientOptions = SessionFixture.Options(Clock, compact: false);
 
-            // One coalesced LatestAck datagram carries about 170 keys, so 1 000 keys at 60 Hz need roughly 360 control
-            // messages per second — above the 200/s default of PROTOCOL.md §7 (a per-peer limit, so hosts raise it).
-            serverOptions.ControlMessagesPerSecond = 8000;
-            clientOptions.ControlMessagesPerSecond = 8000;
+            // The control-message rate stays at its default: one coalesced LatestAck datagram carries about 170 keys, so
+            // 1 000 keys at 60 Hz need roughly 360 control messages per second, inside the 2 000/s default of §7.
             QuiclyPeer? accepted = null;
             Listener.Start(static (in NewConnectionInfo _) => PreHandshakeDecision.Accept, (ITransport transport, in NewConnectionInfo info) =>
             {

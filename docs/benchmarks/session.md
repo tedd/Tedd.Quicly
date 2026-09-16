@@ -212,8 +212,8 @@ after the session hooks were merged). One
 operation is one *value*: the key's slot lookup, the version from the channel's counter, the value entry with its payload
 lease, one transmission handed to the packer (packed with the other keys' values into containers), the transport, the
 receiving side's per-key acceptance and mailbox post, dispatch to the handler, the peer's coalesced `LatestAck` batch and the
-completion it produces. Channel 2 is a `ReliableLatest` channel with a dense key space; both peers raise
-`ControlMessagesPerSecond` to 8 000 (see the caveat below).
+completion it produces. Channel 2 is a `ReliableLatest` channel with a dense key space; both peers leave
+`ControlMessagesPerSecond` at its 2 000/s default, which covers this workload's ack traffic (see the caveat below).
 
 | Method         | Toolchain              | Mean     | Error     | StdDev   | Values/s (derived) | Allocated |
 |--------------- |----------------------- |---------:|----------:|---------:|-------------------:|----------:|
@@ -245,11 +245,14 @@ three digits. What both runs agree on is the shape of the cost, below.
   (the 20 ms `MinRetry` backstop is longer than the 16.7 ms tick). The benchmark asserts both in its setup and cleanup, so a
   cycle that stopped delivering could not produce numbers.
 * **Caveat: the control-message limit is part of this workload.** One `LatestAck` datagram carries about 170 keys, so 1 000
-  keys at 60 Hz make the peer receive ~360 control messages per second — above the 200/s default of PROTOCOL.md §7. The
-  first run of this benchmark was **discarded** for exactly that reason: the peers closed with `LimitExceeded` part-way
-  through, and the remaining cycles measured a closed session (they reported 413.6 / 388.9 ns, i.e. ~13 % too fast). The
-  kept run raises `ControlMessagesPerSecond` on both ends and fails the benchmark if either peer is not connected or any
-  value was retransmitted. Hosts running many-key latest channels must raise the same limit (session-layer.md §7.5).
+  keys at 60 Hz make the peer receive ~360 control messages per second. Against the **200/s** default this benchmark
+  originally ran with, that closed the session: the first run was **discarded** because the peers closed with
+  `LimitExceeded` part-way through and the remaining cycles measured a closed session (413.6 / 388.9 ns, i.e. ~13 % too
+  fast); the kept run raised the limit to 8 000/s on both ends. That measurement is exactly what made PROTOCOL.md §7 raise
+  the default to **2 000/s with a sizing rule**, so the benchmark now runs at the default and raises nothing. Its `Check()`
+  fails the run if either peer is not connected, if any value was retransmitted, or if fewer values reached the peer's
+  handler than the cycles sent — so a run that started refusing admission or closing the session cannot produce numbers.
+  Hosts running channels with more keys or a higher rate than this still size the limit themselves (session-layer.md §7.5).
 * The single-core caveat of the tables above applies unchanged: both peers and the simulator run on one thread, so the
   transport-thread → game-thread hand-offs (mailboxes, the ack ring, the completion ring) cost no cross-core coherence here.
   Another agent was building and testing on the machine during the run.

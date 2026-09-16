@@ -16,10 +16,9 @@ internal static class ChannelEngines
     /// <returns>A new, uninitialised engine.</returns>
     public static ChannelEngine Create(ChannelMode mode) => mode switch
     {
-        // Wave C1 (next step): UnreliableUnordered, UnreliableSequenced and ReliableOrdered engines.
-        ChannelMode.UnreliableUnordered => new PlaceholderEngine(mode),
-        ChannelMode.UnreliableSequenced => new PlaceholderEngine(mode),
-        ChannelMode.ReliableOrdered => new PlaceholderEngine(mode),
+        ChannelMode.UnreliableUnordered => new UnreliableUnorderedEngine(),
+        ChannelMode.UnreliableSequenced => new UnreliableSequencedEngine(),
+        ChannelMode.ReliableOrdered => new ReliableOrderedEngine(),
         // Wave C2: GroupStreamEngine, ReliableLatestEngine, BulkEngine.
         ChannelMode.ReliableUnordered => new PlaceholderEngine(mode),
         ChannelMode.ReliableLatest => new PlaceholderEngine(mode),

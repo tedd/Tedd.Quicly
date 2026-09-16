@@ -57,8 +57,23 @@ internal sealed class PeerCounters
     /// <summary>Pong samples dropped because the hand-off ring to the game thread was full.</summary>
     public long PongSamplesDropped;
 
+    /// <summary>Stream receives held back (<see cref="Engines.StreamConsume.Pend"/>): ring full or receive budget used up.</summary>
+    public long StreamReceivePends;
+
     /// <summary>Highest receive ring occupancy seen (including reservations).</summary>
     public int ReceiveRingHighWater;
+
+    // ---- any thread (Interlocked)
+
+    /// <summary>Sends queued from other threads (<see cref="PeerOptions.ThreadSafeSend"/>).</summary>
+    public long ThreadSafeSends;
+
+    /// <summary>
+    /// Sends from other threads refused when they were admitted, or dropped when the session ended (their leases went
+    /// back to the pool). Incremented by the game thread and, on teardown, by the transport thread, so both use
+    /// <see cref="Interlocked"/>.
+    /// </summary>
+    public long ThreadSafeSendDrops;
 
     // ---- game thread
 
@@ -76,4 +91,25 @@ internal sealed class PeerCounters
 
     /// <summary>Control messages (Ping, Pong, Hello, HelloAck, Close) the game thread could not hand to the transport.</summary>
     public long ControlSendFailures;
+
+    /// <summary>Application datagrams the scheduler handed to the transport: loose messages and packed containers (control datagrams are not included).</summary>
+    public long DatagramsSent;
+
+    /// <summary>Bytes of <see cref="DatagramsSent"/> (whole datagram payloads).</summary>
+    public long DatagramBytesSent;
+
+    /// <summary>Packed containers among <see cref="DatagramsSent"/>.</summary>
+    public long ContainersSent;
+
+    /// <summary>Messages that travelled inside packed containers.</summary>
+    public long MessagesPacked;
+
+    /// <summary>Stream sends handed to the transport by the engines (one per gathered submission).</summary>
+    public long StreamSends;
+
+    /// <summary>Bytes of <see cref="StreamSends"/> (preambles, frame headers and payloads).</summary>
+    public long StreamBytesSent;
+
+    /// <summary>Peer streams reset because they stopped mid-message (PROTOCOL.md §7, <see cref="PeerOptions.StreamIdleTimeout"/>).</summary>
+    public long StreamIdleTimeouts;
 }

@@ -153,7 +153,8 @@ internal sealed class SessionHarness : SimFixture
     private bool _serverDisposed;
 
     public SessionHarness(LinkOptions? link = null, ChannelTable? table = null, ChannelTable? serverTable = null,
-        Action<PeerOptions>? client = null, Action<PeerOptions>? server = null, byte[]? authToken = null, int seed = 1, bool connect = true)
+        Action<PeerOptions>? client = null, Action<PeerOptions>? server = null, byte[]? authToken = null, int seed = 1, bool connect = true,
+        Func<ITransportConnector, ITransportConnector>? connector = null)
         : base(seed)
     {
         Table = table ?? TestTables.Default;
@@ -170,7 +171,7 @@ internal sealed class SessionHarness : SimFixture
         ClientOptions = new PeerOptions { Clock = Clock };
         client?.Invoke(ClientOptions);
         Connector = new SimulatedConnector(Network, link);
-        Client = QuiclyPeer.Connect(Connector, Listener.LocalEndPoint, "test", Table, ClientOptions, authToken);
+        Client = QuiclyPeer.Connect(connector?.Invoke(Connector) ?? Connector, Listener.LocalEndPoint, "test", Table, ClientOptions, authToken);
         Client.StateChanged += (_, from, to) => ClientEvents.Add((from, to));
         if (connect)
         {

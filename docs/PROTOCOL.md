@@ -105,6 +105,11 @@ bytes. Control frames inside a container count against the same control-rate lim
 scheduler packs buffered datagram messages for the same peer into one container whenever at least two fit;
 the cost is 2 bytes plus one length varint per message.
 
+There is no limit on the number of messages in a container other than the datagram's own length (about 599
+two-byte messages fit 1 200 bytes): a receiver MUST accept as many messages as the datagram actually holds and
+MUST NOT reject a container for its message count. A sender MAY pack fewer — the reference implementation packs
+at most 64 messages per container (`PackedContainer.MaxMessages`), a send-side choice only.
+
 ### 2.3 Control datagram (channel 0)
 
 ```
@@ -123,8 +128,9 @@ Body
 | 0x06–0x0F | reserved | (former Receipt/GroupReceipt/Applied ids; reserved for later versions) |
 
 Control datagrams are sent with the transport's high-priority datagram flag so they never queue behind
-application datagrams. Pong is sent for at most 4 Pings per second per peer; excess Pings are ignored and
-counted. Acks are coalesced: at most one LatestAck/LatestReject datagram per peer per `AckDelay` (default 5 ms) or per Poll,
+application datagrams. Pong is sent for at most 4 Pings per second per peer, with a burst allowance of 32
+(`PeerOptions.PongsPerSecond` / `PongBurst`) so that the peer's 10 Hz fast lock over the first 3 s of a session
+(§4.6) is answered in full; excess Pings are ignored and counted. Acks are coalesced: at most one LatestAck/LatestReject datagram per peer per `AckDelay` (default 5 ms) or per Poll,
 de-duplicated by (channel, key) keeping the highest version. BulkProgress is sent at most every 64 KiB or
 100 ms per transfer, and on completion. Every control datagram type MAY also be carried as a control-stream
 message (§3.4) when a datagram cannot be sent.
@@ -328,7 +334,7 @@ data is never used for authentication. Reconnect = new TLS handshake + QUICLY se
 
 | Mode | `BufferReleased` | `Delivered` | Other terminal states |
 |---|---|---|---|
-| Unreliable* | datagram handed to the network (transport SENT) | transport ack when the transport reports datagram send state (caps bit1); otherwise never | `Lost`, `Expired`, `Canceled` (dropped when blocked) |
+| Unreliable* | datagram handed to the network (transport SENT) | transport ack when the transport reports datagram send state (caps bit1); otherwise **never** (the send completes `Sent`) | `Sent`, `Lost`, `Expired`, `Canceled` (dropped when blocked) |
 | ReliableOrdered / ReliableUnordered | stream bytes acknowledged by the peer's QUIC stack | same event | `Disconnected`, `Failed` |
 | ReliableLatest | as above per transmission | `LatestAck` covering the version (cumulative) | `Superseded`, `Failed`, `Disconnected` |
 | Bulk | per chunk | transfer complete (`BulkProgress` = Length) | `Canceled`, `Failed` |
@@ -336,6 +342,12 @@ data is never used for authentication. Reconnect = new TLS handshake + QUICLY se
 A QUIC acknowledgement proves delivery to the peer's transport, not that the peer application processed
 the message; the only application-level acknowledgement in v1 is the response of a `RequestResponse`
 channel (an empty response is an "applied" ack).
+
+`Sent` is the terminal outcome of an unreliable send on a carrier that reports no per-datagram send state — a
+WebTransport/browser carrier, or MsQuic without the capability (§3.4 `caps` bit1). Such a carrier tells the
+session only that the datagram left the host, which proves nothing about delivery, so the send completes `Sent`
+and an implementation MUST NOT report `Delivered` for it. `Sent` is final: the payload is released and the send
+slot is freed at the same event, because no further state will ever be reported.
 
 ### 4.4 ReliableLatest retransmission
 
@@ -360,6 +372,10 @@ channel (an empty response is an "applied" ack).
   cancel-on-blocked semantics (`DropWhenBlocked`, default on): a datagram that cannot be sent immediately
   because of congestion is dropped and counted as `Expired`. Default `Expiry` is 0 (none) for reliable
   channels and 2× the flush interval for `UnreliableSequenced`.
+* Buffered datagrams are **not** handed over with a delay-send hint (MsQuic's `DELAY_SEND`). Measured on
+  loopback, setting it made a tick's burst 16–19 % slower per datagram, and a later re-run found no measurable
+  effect in either direction; batching is achieved by packing (§2.2), so the flag is never set
+  (`docs/benchmarks/msquic-transport.md`, `docs/benchmarks/session.md`).
 * Order: by channel `Priority` (high first), then admission order. Retries and Bulk are scheduled after fresh
   real-time traffic; Bulk is capped by `BulkMaxBytesPerSecond` / `BulkShareOfEstimatedBandwidth` (default
   50 %) and by `IdealSendBufferSize` from the transport.
@@ -441,6 +457,15 @@ logging.
 | bulk transfers per direction per peer | 2 (+ 1 pending request) | `BulkReject` |
 | receive ring depth per peer | 4 096 entries | see byte budget row; latest/coalescing channels use per-key mailboxes instead of ring entries |
 
+The **stream idle mid-message** rule is per receiving stream and applies to every stream mode: a stream that has
+delivered a message's frame header but not the rest of its payload for 30 s (`PeerOptions.StreamIdleTimeout`) is
+reset with `Timeout` (RESET_STREAM / STOP_SENDING), which releases that message's staging lease and its
+receive-ring slot; the connection survives, and other streams of the same channel are unaffected. Without it a
+peer that starts one message and stops can pin the whole per-peer receive byte budget for the life of the
+connection, and the connection-level heartbeat does not notice because the peer stays live on other channels.
+Progress on the stream (any accepted frame event) restarts the 30 s, and a stream between messages is never
+watched.
+
 Decompression runs on the game thread inside `Poll` (never on a transport thread); compressed messages are
 staged compressed in a pooled lease. Every limit is configurable per channel or per peer, and every violation
 is a counter in the peer's statistics.
@@ -472,7 +497,9 @@ Byte-exact examples are in [protocol-vectors.md](protocol-vectors.md).
   `RawLength` (for fragments: the bound above is strictly below `RawLength`); anything else is malformed.
 * **§2.2 containers.** `Flags` bits 1–7 are reserved and MUST be 0; `Tick` is ≤ 2^32 − 1; a container holds at
   least one message; an inner frame whose first byte is `0x01` is a nested container. An inner frame that encodes
-  channel 1 non-minimally is rejected by the inner parse (non-minimal varint).
+  channel 1 non-minimally is rejected by the inner parse (non-minimal varint). The message count is bounded only
+  by the datagram's length: the parser accepts every message that fits, while the packer writes at most
+  `PackedContainer.MaxMessages` = 64 per container.
 * **§3 control stream.** Both directions of the control stream begin with the preamble `0x00`. A unidirectional
   stream whose preamble names channel 0 is rejected like channel 1 (`UnsupportedChannel`).
 * **§3.1 request ids.** `RequestId` is ≤ 2^32 − 1.

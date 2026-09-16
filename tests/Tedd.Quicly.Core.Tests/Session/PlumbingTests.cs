@@ -501,7 +501,13 @@ public class SendPlumbingTests
     {
         using SessionHarness h = new(table: TestTables.AllModes);
         byte[] data = [1];
-        for (ushort channel = 2; channel <= 7; channel++)
+
+        // Channels 2 … 4 (the unreliable modes and ReliableOrdered) have their engines; 5 … 7 are placeholders until wave C2.
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2, 1), data).Status);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(3, 1), data).Status);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(4, 1), data).Status);
+        Assert.Equal(SendStatus.Admitted, (await h.Client.SendAsync(new SendHeader(4, 1), data)).Status);
+        for (ushort channel = 5; channel <= 7; channel++)
         {
             Assert.Equal(SendStatus.NotSupported, h.Client.SendCopy(new SendHeader(channel, 1), data).Status);
             Assert.Equal(SendStatus.NotSupported, h.Client.SendBorrowed(new SendHeader(channel, 1), data).Status);
@@ -510,7 +516,7 @@ public class SendPlumbingTests
         }
 
         BufferLease lease = h.Client.RentBuffer(8);
-        Assert.Equal(SendStatus.NotSupported, h.Client.SendOwned(new SendHeader(2), lease, 1).Status);
+        Assert.Equal(SendStatus.NotSupported, h.Client.SendOwned(new SendHeader(5), lease, 1).Status);
         h.Client.ReturnBuffer(in lease);
         Assert.Equal(SendStatus.NotSupported, SendPinned(h.Client));
         Assert.Equal(SendStatus.NotSupported, h.Client.RetireKey(6, 1));
@@ -525,7 +531,7 @@ public class SendPlumbingTests
     private static unsafe SendStatus SendPinned(QuiclyPeer peer)
     {
         byte value = 1;
-        return peer.SendPinned(new SendHeader(2), &value, 1).Status;
+        return peer.SendPinned(new SendHeader(5), &value, 1).Status;
     }
 
     [Fact]
@@ -771,7 +777,6 @@ public class StreamPlumbingTests
     }
 
     [Theory]
-    [InlineData((byte)4)]
     [InlineData((byte)5)]
     public void Streams_Of_Modes_Without_An_Engine_Are_Reset(byte channel)
     {

@@ -176,7 +176,8 @@ public sealed unsafe partial class QuiclyPeer
 
     private void OnTransportConnected(long now)
     {
-        if (_state != PeerState.Connecting)
+        // Reconnecting is the resumed session's Connecting (PROTOCOL.md §4.1): the same peer, a new transport.
+        if (_state is not (PeerState.Connecting or PeerState.Reconnecting))
         {
             return;
         }
@@ -598,6 +599,7 @@ public sealed unsafe partial class QuiclyPeer
         switch (_state)
         {
             case PeerState.Connecting:
+            case PeerState.Reconnecting:
             case PeerState.Handshaking:
                 if (now >= _admissionDeadline)
                 {
@@ -638,6 +640,7 @@ public sealed unsafe partial class QuiclyPeer
                     }
                 }
 
+                next = SweepIdleStreams(now, next);
                 break;
             case PeerState.Closing:
                 if (_lingerDeadline != 0 && now >= _lingerDeadline)
@@ -654,6 +657,41 @@ public sealed unsafe partial class QuiclyPeer
     }
 
     private long LingerDeadline(long next) => _lingerDeadline != 0 && _lingerDeadline < next ? _lingerDeadline : next;
+
+    /// <summary>
+    /// PROTOCOL.md §7 "stream idle mid-message | 30 s | stream reset Timeout": resets every peer stream that has made no
+    /// progress on a half-received message for <see cref="PeerOptions.StreamIdleTimeout"/>, so a peer that starts a
+    /// message and stops cannot pin the receive budget (its staging lease) and a receive-ring slot for the life of the
+    /// connection. The reset is stream-level — the connection survives — and the transport reports the stream closed,
+    /// where the owning engine releases the lease and cancels the reservation (the same path as a peer-initiated reset).
+    /// Game thread, <paramref name="now"/> read once by <see cref="RunTimers"/>; returns the next deadline.
+    /// </summary>
+    /// <param name="now">Clock micros of this pass.</param>
+    /// <param name="next">The deadline so far.</param>
+    /// <returns>The deadline, lowered to the oldest watched stream's expiry.</returns>
+    private long SweepIdleStreams(long now, long next)
+    {
+        if (_streamIdleMicros <= 0)
+        {
+            return next;
+        }
+
+        long cutoff = now - _streamIdleMicros;
+        while (_core.Streams.TryTakeIdle(cutoff, out TransportStreamId stalled))
+        {
+            _core.Counters.StreamIdleTimeouts++;
+            _transport?.AbortStream(stalled, (ulong)QuiclyErrorCode.Timeout, StreamAbortDirection.Both);
+        }
+
+        long earliest = _core.Streams.EarliestMidMessage();
+        if (earliest == long.MaxValue)
+        {
+            return next;
+        }
+
+        long due = earliest + _streamIdleMicros;
+        return due < next ? due : next;
+    }
 
     // ------------------------------------------------------------------ ping / pong (PROTOCOL.md §2.3, §4.6)
 
@@ -863,28 +901,56 @@ public sealed unsafe partial class QuiclyPeer
             // Unreachable (at most five changes per connection); keep the newest.
             _transitions[_transitions.Length - 1] = new StateTransition(previous, next);
         }
+
+        // A queued transition is game-thread work: Poll must run to raise it, even when nothing arrived from the network.
+        NoteWork();
     }
 
-    /// <summary>Raises queued <see cref="StateChanged"/> events in order (game thread). With <paramref name="holdClosed"/> the change to Closed stays queued.</summary>
+    /// <summary>
+    /// Raises queued <see cref="StateChanged"/> events in order (game thread). With <paramref name="holdClosed"/> the change
+    /// to Closed stays queued. A transition leaves the queue <em>before</em> its handlers run, so a handler that throws can
+    /// never have the same transition raised again by the next <see cref="Poll"/> (the peer would otherwise report the same
+    /// change for ever); the exception is recorded like a callback fault and the remaining transitions still go out.
+    /// </summary>
     private void RaiseTransitions(bool holdClosed)
     {
-        int raised = 0;
-        while (raised < _transitionCount)
+        while (_transitionCount > 0)
         {
-            StateTransition transition = _transitions[raised];
+            StateTransition transition = _transitions[0];
             if (holdClosed && transition.To == PeerState.Closed)
             {
-                break;
+                return;
             }
 
-            raised++;
-            StateChanged?.Invoke(this, transition.From, transition.To);
-        }
+            // Delivered before the handler runs; a handler may itself queue further transitions (Close, Dispose).
+            _transitionCount--;
+            Array.Copy(_transitions, 1, _transitions, 0, _transitionCount);
+            Action<QuiclyPeer, PeerState, PeerState>? handler = StateChanged;
+            if (handler is null)
+            {
+                continue;
+            }
 
-        if (raised > 0)
-        {
-            Array.Copy(_transitions, raised, _transitions, 0, _transitionCount - raised);
-            _transitionCount -= raised;
+            try
+            {
+                handler(this, transition.From, transition.To);
+            }
+            catch (Exception exception)
+            {
+                NoteHandlerFault(exception);
+            }
         }
+    }
+
+    /// <summary>
+    /// Records an exception from application code the peer called on the game thread (a <see cref="StateChanged"/> handler):
+    /// counted as <see cref="PeerStatistics.CallbackFaults"/> and kept in <see cref="LastCallbackFault"/>, never rethrown, so
+    /// one broken handler cannot stall the peer's own state machine or hide the transitions that follow it.
+    /// </summary>
+    /// <param name="exception">What the handler threw.</param>
+    private void NoteHandlerFault(Exception exception)
+    {
+        Interlocked.Increment(ref _core.Counters.CallbackFaults);
+        Interlocked.CompareExchange(ref _lastFault, exception, null);
     }
 }

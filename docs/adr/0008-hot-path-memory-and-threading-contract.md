@@ -26,10 +26,16 @@
    Free → Submitted → [Cancelling] → Completed → Free. The game thread reuses a slot only after observing the
    completion through the `CompletionRing`; it never polls `State`.
 5. **Rings are SPSC** per peer (`ReceiveRing`, `CompletionRing`, slab return ring): cached remote index,
-   `Volatile.Read/Write` acquire/release, 128-byte padding between head, tail and entries. Genuinely
-   multi-producer paths (`ThreadSafeSend`, the server's "peers with work" queue) use the Vyukov bounded MPMC
-   algorithm so a stalled producer never blocks the consumer. `CompletionRing` capacity = send table + 1, so
-   it cannot overflow.
+   `Volatile.Read/Write` acquire/release, 128-byte padding between head, tail and entries, elements in a
+   `NativeArray<T>` like every other hot struct array (invariant 12). Genuinely multi-producer paths
+   (`ThreadSafeSend`, the server's "peers with work" queue) use the Vyukov bounded MPMC algorithm so a stalled
+   producer never blocks the consumer. `CompletionRing` capacity = **two per send entry** (one early `Sent`
+   notice plus one final completion, so `2 × send table`; capacity is already a power of two, and asking for one
+   more slot would double the ring), so it cannot overflow.
+   The cached remote index is the *contract*, not an optimisation: a producer that also holds ring reservations
+   checks room with `SpscRing.HasRoomFor`/`TryEnqueueReserving`, which read the consumer's index only when the
+   producer's private snapshot says the ring is full, and occupancy high-water marks are refreshed only when a
+   new maximum is suspected — so a received message costs no coherence traffic.
 6. **Keyed coalescing channels use mailboxes, not ring entries**: the transport thread writes into a fresh
    lease and `Interlocked.Exchange`s it into the key's mailbox; a non-negative previous value is a lease the
    game thread never saw and is freed immediately by the transport thread; the game thread claims with

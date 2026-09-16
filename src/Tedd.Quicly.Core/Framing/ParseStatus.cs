@@ -53,7 +53,7 @@ public enum ParseStatus : byte
     /// <summary>A packed container holds no message.</summary>
     ContainerEmpty,
 
-    /// <summary>More than 64 messages in a container, or a second message in a ReliableLatest group stream.</summary>
+    /// <summary>A second message in a ReliableLatest group stream (a container's message count is bounded only by its length).</summary>
     TooManyMessages,
 
     /// <summary>Reserved flag bits are set (container flags, bulk flags, unsupported bulk hash algorithm).</summary>

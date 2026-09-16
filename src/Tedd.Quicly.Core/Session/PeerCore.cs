@@ -47,6 +47,16 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary><see cref="ITransport.OpenStream"/> context of the control stream; engines must use other values.</summary>
     public const ulong ControlStreamContext = 1UL << 63;
 
+    /// <summary>
+    /// Tag bit of the <see cref="ITransport.OpenStream"/> context of a stream an engine opened
+    /// (<see cref="MakeEngineStreamContext"/>): the peer routes its <see cref="ITransportSink.OnStreamStarted"/> to the
+    /// engine of the encoded mode (<see cref="ChannelEngine.OnStreamStarted"/>).
+    /// </summary>
+    public const ulong EngineStreamContextTag = 1UL << 62;
+
+    /// <summary>Mask of the stream serial carried in an engine stream context (24 bits; it wraps).</summary>
+    public const uint EngineStreamSerialMask = 0xFF_FFFF;
+
     private readonly SlabAllocator _allocator;
     private readonly bool _ownsAllocator;
     private readonly int[] _indexById;
@@ -61,6 +71,9 @@ internal sealed unsafe class PeerCore : IDisposable
     private readonly int[] _entryOfToken;
     private readonly ReceiveMailbox?[] _mailboxByIndex;
     private ReceiveMailbox[] _mailboxes = [];
+    // Cold, by slot: the shared payload an entry holds one reference on (SendShared), released in ReleasePayload.
+    private readonly SharedLeaseTable?[] _sharedTables;
+    private readonly SharedLease[] _sharedLeases;
     private readonly long _sendBudget;
     private readonly long _receiveBudget;
     private readonly bool _signalFromTransport;
@@ -73,10 +86,20 @@ internal sealed unsafe class PeerCore : IDisposable
     private volatile int _maxDatagramPayload;
     private volatile bool _datagramsEnabled;
     private volatile bool _datagramStatesReported;
+    private volatile bool _cancelOnBlocked;
     private volatile bool _admitted;
     private volatile bool _transportClosing;
     private volatile bool _transportClosed;
     private bool _disposed;
+    private readonly int[] _scheduleOrder;
+    private readonly CompletionEntry[] _localCompletions;
+    private readonly NativeArray<long> _stamps;
+    private readonly bool _atomicSendBudget;
+    private long _passMicros;
+    private long _stamp;
+    private int _localHead;
+    private int _localTail;
+    private int _localCount;
 
     /// <summary>Creates the shared state of <paramref name="peer"/>. Engines are created by <see cref="InitializeEngines"/>.</summary>
     /// <param name="peer">The owning peer.</param>
@@ -117,11 +140,17 @@ internal sealed unsafe class PeerCore : IDisposable
         int capacity = Entries.Capacity;
         Segments = new SegmentArena(options.SegmentArenaCapacity);
         _tokens = new NativeArray<SendToken>(capacity);
+        _stamps = new NativeArray<long>(capacity);
+        _atomicSendBudget = options.ThreadSafeSend;
         _userContexts = new NativeArray<ulong>(capacity);
         _entryOfToken = new int[capacity];
         Array.Fill(_entryOfToken, -1);
+        _sharedTables = new SharedLeaseTable?[capacity];
+        _sharedLeases = new SharedLease[capacity];
         Completions = new CompletionTable(capacity, _signalFromTransport);
-        CompletionRing = new SpscRing<CompletionEntry>((2 * capacity) + 1);
+        // Two completions per entry at most (one early Sent notice plus one final completion), and capacity is already
+        // a power of two, so this is exactly the bound: asking for one more would double the ring (ADR 0008 §5).
+        CompletionRing = new SpscRing<CompletionEntry>(2 * capacity);
         ReceiveRing = new SpscRing<ReceiveEntry>(options.ReceiveRingCapacity);
         _sendCounters = new NativeArray<ChannelSendCounters>(Math.Max(1, _channels.Length));
         _recvCounters = new NativeArray<ChannelRecvCounters>(Math.Max(1, _channels.Length));
@@ -131,6 +160,163 @@ internal sealed unsafe class PeerCore : IDisposable
         SessionMaxMessageSize = role == PeerRole.Server ? options.MaxMessageSize : 0;
         FlushIntervalMicros = Math.Max(1, PeerOptions.ToMicros(options.FlushInterval));
         _maxDatagramPayload = 0;
+        _scheduleOrder = ComputeScheduleOrder(_channels);
+        _localCompletions = new CompletionEntry[capacity];
+        _passMicros = Clock.NowMicros;
+        Packer = new DatagramPacker(this);
+    }
+
+    // ------------------------------------------------------------------ scheduler support (game thread)
+
+    /// <summary>The per-peer datagram packer (engines hand it entries from <see cref="ChannelEngine.FlushChannel"/>).</summary>
+    public DatagramPacker Packer { get; }
+
+    /// <summary>
+    /// Dense channel indices in scheduling order (PROTOCOL.md §4.5): highest <see cref="ChannelDefinition.Priority"/> first,
+    /// ascending id among channels of equal priority. Precomputed at construction.
+    /// </summary>
+    public ReadOnlySpan<int> ScheduleOrder => _scheduleOrder;
+
+    /// <summary>The admission stamp of the most recently admitted message (0 before the first; game thread).</summary>
+    public long LastAdmissionStamp => _stamp;
+
+    /// <summary>
+    /// Clock micros of the current game-thread pass: read once at the start of every <see cref="QuiclyPeer.Poll"/>,
+    /// <see cref="QuiclyPeer.Flush"/> and <see cref="SendMode.Immediate"/> pass (ADR 0008 invariant 9), and at
+    /// construction. Engines stamp expiry deadlines from it instead of reading the clock per admitted message.
+    /// </summary>
+    public long CurrentPassMicros => _passMicros;
+
+    /// <summary>Records the clock stamp of a game-thread pass (game thread; <paramref name="nowMicros"/> read once by the caller).</summary>
+    /// <param name="nowMicros">Clock micros.</param>
+    public void NotePass(long nowMicros) => _passMicros = nowMicros;
+
+    /// <summary>
+    /// Gives an admitted entry the next peer-wide admission number (game thread, at commit). Engines keep every channel
+    /// queue in admission order, so the stamp of a queue's head is the oldest of the queue; <see cref="QuiclyPeer.FlushAsync"/>
+    /// waits until no queue holds a stamp at or below its mark (<see cref="ChannelEngine.OldestQueuedStamp"/>).
+    /// </summary>
+    /// <param name="slot">The entry.</param>
+    public void StampAdmission(int slot) => _stamps[slot] = ++_stamp;
+
+    /// <summary>The admission stamp of an entry (<see cref="StampAdmission"/>; game thread).</summary>
+    /// <param name="slot">The entry.</param>
+    /// <returns>The stamp.</returns>
+    public long GetAdmissionStamp(int slot) => _stamps[slot];
+
+    /// <summary>
+    /// The <see cref="ITransport.OpenStream"/> context of a stream an engine opens: <see cref="EngineStreamContextTag"/>, the
+    /// mode (bits 56-61), the stream serial (bits 32-55) and the dense channel index (bits 0-31). Never equal to
+    /// <see cref="ControlStreamContext"/>.
+    /// </summary>
+    /// <param name="mode">The engine's mode.</param>
+    /// <param name="channelIndex">Dense channel index.</param>
+    /// <param name="serial">The engine's serial of the stream (masked to <see cref="EngineStreamSerialMask"/>).</param>
+    /// <returns>The context.</returns>
+    public static ulong MakeEngineStreamContext(ChannelMode mode, int channelIndex, uint serial) =>
+        EngineStreamContextTag | ((ulong)((byte)mode & 0x3F) << 56) | ((ulong)(serial & EngineStreamSerialMask) << 32) | (uint)channelIndex;
+
+    /// <summary>Decodes a context made by <see cref="MakeEngineStreamContext"/> (any thread).</summary>
+    /// <param name="context">A stream context.</param>
+    /// <param name="mode">The engine's mode.</param>
+    /// <param name="channelIndex">Dense channel index.</param>
+    /// <param name="serial">The stream serial.</param>
+    /// <returns><see langword="false"/> for any other context (the control stream, a test engine's own values).</returns>
+    public static bool TryDecodeEngineStreamContext(ulong context, out ChannelMode mode, out int channelIndex, out uint serial)
+    {
+        if ((context & (ControlStreamContext | EngineStreamContextTag)) != EngineStreamContextTag)
+        {
+            mode = default;
+            channelIndex = -1;
+            serial = 0;
+            return false;
+        }
+
+        mode = (ChannelMode)(byte)((context >> 56) & 0x3F);
+        channelIndex = (int)(uint)context;
+        serial = (uint)(context >> 32) & EngineStreamSerialMask;
+        return true;
+    }
+
+    /// <summary>Completions queued with <see cref="QueueLocalCompletion"/> and not yet routed.</summary>
+    public int LocalCompletionsQueued => _localCount;
+
+    /// <summary>
+    /// Queues a completion the game thread decided itself: the entry was never handed to the transport, or the transport
+    /// refused it (expiry at scheduling time, a cancellation, a refused submission). It is routed like a transport
+    /// completion — to the channel's engine, the packer's fan-out or the peer's control traffic — with
+    /// <see cref="CompletionKind.Local"/> and <paramref name="status"/>, at the end of the current scheduler pass or at the
+    /// start of the next Poll or Flush; never inline, so no continuation runs inside a pass. Queue an entry at most once,
+    /// after it left every queue. Game thread.
+    /// </summary>
+    /// <param name="slot">The entry (normally <c>Filling</c>).</param>
+    /// <param name="status">How the send ends.</param>
+    public void QueueLocalCompletion(int slot, DeliveryStatus status)
+    {
+        CompletionEntry[] queue = _localCompletions;
+        Debug.Assert(_localCount < queue.Length, "an entry is queued for local completion at most once");
+        queue[_localTail] = new CompletionEntry
+        {
+            Slot = slot,
+            Generation = Entries[slot].Generation,
+            Kind = CompletionKind.Local,
+            Canceled = true,
+            Final = true,
+            Status = status,
+        };
+        _localTail = _localTail + 1 == queue.Length ? 0 : _localTail + 1;
+        _localCount++;
+        NoteWork();
+    }
+
+    /// <summary>Takes the oldest completion queued with <see cref="QueueLocalCompletion"/> (game thread).</summary>
+    /// <param name="completion">The completion.</param>
+    /// <returns><see langword="false"/> when none is queued.</returns>
+    public bool TryDequeueLocalCompletion(out CompletionEntry completion)
+    {
+        if (_localCount == 0)
+        {
+            completion = default;
+            return false;
+        }
+
+        CompletionEntry[] queue = _localCompletions;
+        completion = queue[_localHead];
+        _localHead = _localHead + 1 == queue.Length ? 0 : _localHead + 1;
+        _localCount--;
+        return true;
+    }
+
+    /// <summary>
+    /// The default delivery status of a final completion: the queued status of a <see cref="CompletionKind.Local"/> one,
+    /// otherwise <see cref="MapDatagramState"/> or <see cref="MapStreamCompletion"/>.
+    /// </summary>
+    /// <param name="completion">A final completion.</param>
+    /// <returns>The status.</returns>
+    public DeliveryStatus MapCompletion(in CompletionEntry completion) => completion.Kind switch
+    {
+        CompletionKind.Local => completion.Status,
+        CompletionKind.Datagram => MapDatagramState(completion.DatagramState),
+        _ => MapStreamCompletion(completion.Canceled),
+    };
+
+    /// <summary>The delivery status of a send the transport refused synchronously (no completion follows).</summary>
+    /// <param name="status">The refusal.</param>
+    /// <returns><see cref="DeliveryStatus.Disconnected"/> while the connection is closing, otherwise <see cref="DeliveryStatus.Failed"/>.</returns>
+    public DeliveryStatus MapSubmitFailure(TransportStatus status) =>
+        _transportClosing || (status == TransportStatus.InvalidState && Transport is null) ? DeliveryStatus.Disconnected : DeliveryStatus.Failed;
+
+    private static int[] ComputeScheduleOrder(ChannelDefinition[] channels)
+    {
+        int[] order = new int[channels.Length];
+        for (int i = 0; i < order.Length; i++)
+        {
+            order[i] = i;
+        }
+
+        // Highest priority first; channels of equal priority keep the table's (ascending id) order.
+        Array.Sort(order, (a, b) => channels[a].Priority != channels[b].Priority ? channels[b].Priority.CompareTo(channels[a].Priority) : a.CompareTo(b));
+        return order;
     }
 
     /// <summary>The owning peer.</summary>
@@ -163,7 +349,7 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>Tracked-send completion slots.</summary>
     public CompletionTable Completions { get; }
 
-    /// <summary>Transport completions, transport thread → game thread (capacity 2 × send table + 1).</summary>
+    /// <summary>Transport completions, transport thread → game thread (capacity 2 × the send table: two per entry).</summary>
     public SpscRing<CompletionEntry> CompletionRing { get; }
 
     /// <summary>Complete received messages, transport thread → game thread.</summary>
@@ -240,11 +426,14 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>The transport reported <c>OnClosed</c>; no further callback arrives.</summary>
     public bool IsTransportClosed => _transportClosed;
 
-    /// <summary>Send lease bytes held now (game thread).</summary>
-    public long SendBytesOutstanding => _sendBytes;
+    /// <summary>Send lease bytes held now (game thread; any thread with <see cref="PeerOptions.ThreadSafeSend"/>).</summary>
+    public long SendBytesOutstanding => Volatile.Read(ref _sendBytes);
 
     /// <summary>Receive lease bytes held now (any thread).</summary>
     public long ReceiveBytesOutstanding => Volatile.Read(ref _receiveBytes);
+
+    /// <summary>The receive budget (<see cref="PeerOptions.ReceiveBudgetBytes"/>).</summary>
+    public long ReceiveBudgetBytes => _receiveBudget;
 
     // ------------------------------------------------------------------ construction
 
@@ -404,6 +593,16 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <param name="reported">The capability.</param>
     public void SetDatagramStatesReported(bool reported) => _datagramStatesReported = reported;
 
+    /// <summary>
+    /// Records whether the transport honours <see cref="TransportSendFlags.CancelOnBlocked"/> (transport thread: at connect and
+    /// whenever the datagram capability changes).
+    /// </summary>
+    /// <param name="honoured">The capability (<see cref="TransportCapabilities.CancelOnBlocked"/>).</param>
+    public void SetCancelOnBlocked(bool honoured) => _cancelOnBlocked = honoured;
+
+    /// <summary>The transport honours <see cref="TransportSendFlags.CancelOnBlocked"/> (any thread).</summary>
+    public bool CancelOnBlockedHonoured => _cancelOnBlocked;
+
     /// <summary>The peer raised our stream limits (transport thread).</summary>
     public void NoteStreamCredit() => Interlocked.Increment(ref _streamCredit);
 
@@ -458,7 +657,10 @@ internal sealed unsafe class PeerCore : IDisposable
 
     // ------------------------------------------------------------------ leases
 
-    /// <summary>Rents a send lease of at least <paramref name="length"/> bytes within the send budget (game thread).</summary>
+    /// <summary>
+    /// Rents a send lease of at least <paramref name="length"/> bytes within the send budget (game thread; any thread when
+    /// <see cref="PeerOptions.ThreadSafeSend"/> is on, which makes the budget accounting atomic).
+    /// </summary>
     /// <param name="length">Bytes needed.</param>
     /// <param name="lease">The lease, or empty.</param>
     /// <returns><see langword="false"/> when the budget or the pool is exhausted.</returns>
@@ -467,6 +669,19 @@ internal sealed unsafe class PeerCore : IDisposable
         if (!_allocator.TryRent(length, out lease))
         {
             return false;
+        }
+
+        if (_atomicSendBudget)
+        {
+            if (Interlocked.Add(ref _sendBytes, lease.Length) > _sendBudget)
+            {
+                Interlocked.Add(ref _sendBytes, -lease.Length);
+                _allocator.Return(in lease);
+                lease = BufferLease.Empty;
+                return false;
+            }
+
+            return true;
         }
 
         if (_sendBytes + lease.Length > _sendBudget)
@@ -480,7 +695,7 @@ internal sealed unsafe class PeerCore : IDisposable
         return true;
     }
 
-    /// <summary>Returns a send lease (game thread). Empty leases are ignored.</summary>
+    /// <summary>Returns a send lease (the threads of <see cref="TryRentSend"/>). Empty leases are ignored.</summary>
     /// <param name="lease">The lease.</param>
     public void ReturnSend(in BufferLease lease)
     {
@@ -489,7 +704,15 @@ internal sealed unsafe class PeerCore : IDisposable
             return;
         }
 
-        _sendBytes -= lease.Length;
+        if (_atomicSendBudget)
+        {
+            Interlocked.Add(ref _sendBytes, -lease.Length);
+        }
+        else
+        {
+            _sendBytes -= lease.Length;
+        }
+
         _allocator.Return(in lease);
     }
 
@@ -551,16 +774,22 @@ internal sealed unsafe class PeerCore : IDisposable
     public bool TryEnqueueReceive(in ReceiveEntry entry)
     {
         SpscRing<ReceiveEntry> ring = ReceiveRing;
-        int used = ring.Count + _receiveReserved;
-        if (used >= ring.Capacity || !ring.TryEnqueue(in entry))
+        if (!ring.TryEnqueueReserving(in entry, _receiveReserved))
         {
             Counters.ReceiveRingDrops++;
             return false;
         }
 
-        NoteRingUse(used + 1);
+        NoteRingUse(ring.CachedCount + _receiveReserved);
+        NoteWork();
         return true;
     }
+
+    /// <summary>
+    /// Tells the host that game-thread work was published (<see cref="PeerOptions.WorkSignal"/>): any thread,
+    /// non-blocking, and at most once between two <see cref="QuiclyPeer.Poll"/> calls, so a burst costs one call.
+    /// </summary>
+    public void NoteWork() => Peer.NoteWork();
 
     /// <summary>
     /// Reserves one receive-ring slot for a message that is still arriving (a stream message), so that publishing it at its
@@ -570,14 +799,13 @@ internal sealed unsafe class PeerCore : IDisposable
     public bool TryReserveReceive()
     {
         SpscRing<ReceiveEntry> ring = ReceiveRing;
-        int used = ring.Count + _receiveReserved;
-        if (used >= ring.Capacity)
+        if (!ring.HasRoomFor(_receiveReserved))
         {
             return false;
         }
 
         _receiveReserved++;
-        NoteRingUse(used + 1);
+        NoteRingUse(ring.CachedCount + _receiveReserved);
         return true;
     }
 
@@ -589,6 +817,7 @@ internal sealed unsafe class PeerCore : IDisposable
         _receiveReserved--;
         bool enqueued = ReceiveRing.TryEnqueue(in entry);
         Debug.Assert(enqueued, "a reserved receive slot must be free");
+        NoteWork();
     }
 
     /// <summary>Gives back a reservation that will not be published (transport thread).</summary>
@@ -598,11 +827,25 @@ internal sealed unsafe class PeerCore : IDisposable
         _receiveReserved--;
     }
 
+    /// <summary>
+    /// Updates the ring's occupancy high-water mark from the producer's own view (transport thread). The consumer's
+    /// index is read, and the shared counter written, only when this call suspects a new maximum — which can happen at
+    /// most <c>Capacity</c> times in the peer's life — so a received message costs no coherence traffic
+    /// (ADR 0008 invariant 5).
+    /// </summary>
+    /// <param name="used">Queued entries plus reservations as the producer's cached view sees them (an upper bound).</param>
     private void NoteRingUse(int used)
     {
-        if (used > Counters.ReceiveRingHighWater)
+        PeerCounters counters = Counters;
+        if (used <= counters.ReceiveRingHighWater)
         {
-            Counters.ReceiveRingHighWater = used;
+            return;
+        }
+
+        int exact = ReceiveRing.RefreshedCount() + _receiveReserved;
+        if (exact > counters.ReceiveRingHighWater)
+        {
+            counters.ReceiveRingHighWater = exact;
         }
     }
 
@@ -633,11 +876,14 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <param name="id">The stream.</param>
     public void NotePendedStream(TransportStreamId id)
     {
+        Counters.StreamReceivePends++;
         if (!PendedStreams.TryEnqueue(in id))
         {
             // Sized to the peer's stream allowance + 2: a stream can pend only once until resumed.
             Counters.CallbackFaults++;
         }
+
+        NoteWork();
     }
 
     // ------------------------------------------------------------------ streams (game thread)
@@ -740,6 +986,23 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <param name="data">The payload.</param>
     /// <param name="length">Payload bytes.</param>
     public void SetPayload(int slot, byte* data, int length) => Entries[slot].Payload = new TransportSegment(data, length);
+
+    /// <summary>
+    /// Takes one reference on a shared payload for the entry (<see cref="QuiclyPeer.SendShared"/>; game thread, while
+    /// <c>Filling</c>): <see cref="SharedLeaseTable.Retain"/> now, and exactly one
+    /// <see cref="SharedLeaseTable.Release"/> in <see cref="ReleasePayload"/> — when the transport released the payload,
+    /// when the entry is discarded, when the session closes, or when the peer is disposed with the send in flight. The
+    /// payload segment itself is set by <see cref="SetPayload"/>.
+    /// </summary>
+    /// <param name="slot">The entry.</param>
+    /// <param name="table">The table that counts the lease's references.</param>
+    /// <param name="lease">The shared payload.</param>
+    public void AttachShared(int slot, SharedLeaseTable table, in SharedLease lease)
+    {
+        table.Retain(in lease);
+        _sharedTables[slot] = table;
+        _sharedLeases[slot] = lease;
+    }
 
     /// <summary>
     /// Publishes the entry and hands it to the transport as one datagram: header segment (when <c>HeaderLength</c> &gt; 0)
@@ -870,7 +1133,11 @@ internal sealed unsafe class PeerCore : IDisposable
         RetireEntry(slot);
     }
 
-    /// <summary>Returns the entry's payload lease and frees its pin handle, if any (game thread). Idempotent.</summary>
+    /// <summary>
+    /// Returns the entry's payload lease, frees its pin handle and drops its shared reference, if any (game thread).
+    /// Idempotent: each of the three is cleared as it is released, so a <c>Sent</c> notice followed by the final completion
+    /// releases the shared payload exactly once.
+    /// </summary>
     /// <param name="slot">The entry.</param>
     public void ReleasePayload(int slot)
     {
@@ -886,6 +1153,15 @@ internal sealed unsafe class PeerCore : IDisposable
         {
             Entries.PinHandles[slot] = 0;
             GCHandle.FromIntPtr(pin).Free();
+        }
+
+        SharedLeaseTable? shared = _sharedTables[slot];
+        if (shared is not null)
+        {
+            SharedLease sharedLease = _sharedLeases[slot];
+            _sharedTables[slot] = null;
+            _sharedLeases[slot] = default;
+            shared.Release(in sharedLease);
         }
     }
 
@@ -912,26 +1188,26 @@ internal sealed unsafe class PeerCore : IDisposable
     }
 
     /// <summary>
-    /// Completion routing seam for packed-container entries (channel 1). The packer (datagram engines, step 2) replaces
-    /// this with its fan-out to member entries; until then no container entry exists and a stray completion is finished
-    /// as <see cref="DeliveryStatus.Failed"/>.
+    /// Completion routing for packed-container entries (channel 1, game thread): the packer's fan-out to the member entries
+    /// (<see cref="DatagramPacker.OnContainerCompleted"/>).
     /// </summary>
     /// <param name="slot">The container entry.</param>
     /// <param name="completion">The completion.</param>
-    public void OnContainerCompleted(int slot, in CompletionEntry completion)
-    {
-        if (completion.Final)
-        {
-            CompleteEntry(slot, DeliveryStatus.Failed);
-        }
-    }
+    public void OnContainerCompleted(int slot, in CompletionEntry completion) => Packer.OnContainerCompleted(slot, in completion);
 
-    /// <summary>Default delivery status of a datagram's final send state.</summary>
+    /// <summary>
+    /// Default delivery status of a datagram's final send state (PROTOCOL.md §4.3). An acknowledgement is
+    /// <see cref="DeliveryStatus.Delivered"/>; <see cref="DatagramSendState.Sent"/> is final only on a carrier that
+    /// reports no per-datagram states (<see cref="DatagramStatesReported"/> false: WebTransport/browser, MsQuic without
+    /// the capability), and such a send completes <see cref="DeliveryStatus.Sent"/> — the datagram reached the network
+    /// and nothing more will ever be known about it, so it is never reported as delivered.
+    /// </summary>
     /// <param name="state">A final state (or Sent when the transport does not report states).</param>
     /// <returns>The status (<see cref="DeliveryStatus.Disconnected"/> for a cancellation caused by the connection closing).</returns>
     public DeliveryStatus MapDatagramState(DatagramSendState state) => state switch
     {
-        DatagramSendState.Acknowledged or DatagramSendState.AcknowledgedSpurious or DatagramSendState.Sent => DeliveryStatus.Delivered,
+        DatagramSendState.Acknowledged or DatagramSendState.AcknowledgedSpurious => DeliveryStatus.Delivered,
+        DatagramSendState.Sent => DeliveryStatus.Sent,
         DatagramSendState.LostDiscarded => DeliveryStatus.Lost,
         _ => _transportClosing ? DeliveryStatus.Disconnected : DeliveryStatus.Expired,
     };
@@ -968,12 +1244,9 @@ internal sealed unsafe class PeerCore : IDisposable
                 return;
             }
 
+            // Every datagram entry gets the notice: the payload block is released at Sent (ADR 0008 invariant 1,
+            // ARCHITECTURE.md §2.1), tracked or not, and the ring holds two items per entry.
             SendEntryFlags flags = Entries[sentSlot].Flags;
-            if ((flags & (SendEntryFlags.Tracked | SendEntryFlags.Container)) == 0)
-            {
-                return;
-            }
-
             if (_signalFromTransport && (flags & (SendEntryFlags.Tracked | SendEntryFlags.Container | SendEntryFlags.EngineCompletes)) == SendEntryFlags.Tracked)
             {
                 Completions.Complete(_tokens[sentSlot], CompletionStage.BufferReleased, DeliveryStatus.Pending);
@@ -1061,8 +1334,80 @@ internal sealed unsafe class PeerCore : IDisposable
     {
         if (!CompletionRing.TryEnqueue(in completion))
         {
-            // Cannot happen: at most two items per entry and the ring holds 2 × capacity + 1.
+            // Cannot happen: at most two items per entry (one Sent notice, one final completion) and the ring holds
+            // two per entry.
             Counters.CallbackFaults++;
+        }
+
+        NoteWork();
+    }
+
+    // ------------------------------------------------------------------ reconnect (game thread)
+
+    /// <summary>
+    /// Clears everything bound to the transport that was lost, before <see cref="QuiclyPeer.Reconnect"/> attaches a new one
+    /// (game thread, while no transport callback can arrive: the old transport reported its close and the new one is not
+    /// attached yet). The engines forget their streams (<see cref="ChannelEngine.OnReconnecting"/>), any send entry still
+    /// allocated completes <see cref="DeliveryStatus.Disconnected"/> and frees its slot, the hand-off rings, the container
+    /// packer and the segment arena are emptied, and admission, the datagram capabilities and a client's session message cap
+    /// go back to their pre-handshake values. Kept: the channel table, the engines themselves, every counter, the send and
+    /// receive budgets and <see cref="Epoch"/> — the epoch is what the resumed Hello presents as <c>LastEpoch</c>
+    /// (PROTOCOL.md §4.1).
+    /// </summary>
+    public void ResetForReconnect()
+    {
+        foreach (ChannelEngine engine in _activeEngines)
+        {
+            engine.OnReconnecting();
+        }
+
+        AbandonEntries();
+        while (CompletionRing.TryDequeue(out _))
+        {
+        }
+
+        while (PendedStreams.TryDequeue(out _))
+        {
+        }
+
+        _localHead = 0;
+        _localTail = 0;
+        _localCount = 0;
+        Transport = null;
+        _transportClosing = false;
+        _transportClosed = false;
+        _admitted = false;
+        _datagramsEnabled = false;
+        _datagramStatesReported = false;
+        _cancelOnBlocked = false;
+        _maxDatagramPayload = 0;
+        _closeRequest = 0;
+        _receiveReserved = 0;
+        CurrentSenderTick = 0;
+        if (Role == PeerRole.Client)
+        {
+            // Learned again from the resumed HelloAck; a server keeps the cap from its own options.
+            SessionMaxMessageSize = 0;
+        }
+
+        Streams.Clear();
+        Packer.Reset();
+        Segments.Reset();
+    }
+
+    /// <summary>
+    /// Completes every send entry still allocated <see cref="DeliveryStatus.Disconnected"/> and frees its slot: what the
+    /// lost connection left behind after its engines finished their own queues (a Close frame whose completion never came,
+    /// a container of a refused pass). Game thread.
+    /// </summary>
+    private void AbandonEntries()
+    {
+        for (int slot = 0; slot < Entries.Capacity; slot++)
+        {
+            if (Entries.GetState(slot) != SendEntryState.Free)
+            {
+                CompleteEntry(slot, DeliveryStatus.Disconnected);
+            }
         }
     }
 
@@ -1106,7 +1451,12 @@ internal sealed unsafe class PeerCore : IDisposable
 
         Entries.Dispose();
         Segments.Dispose();
+        ReceiveRing.Dispose();
+        CompletionRing.Dispose();
+        PendedStreams.Dispose();
+        Completions.Dispose();
         _tokens.Dispose();
+        _stamps.Dispose();
         _userContexts.Dispose();
         _sendCounters.Dispose();
         _recvCounters.Dispose();

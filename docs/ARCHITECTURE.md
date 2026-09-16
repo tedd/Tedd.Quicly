@@ -126,9 +126,10 @@ target selection for datagrams completes inline.
   request table, completion slots) is owned by the game thread. All time-driven work (retries, expiry,
   pings, heartbeat, group flush) runs inside `Flush`/`Poll`; there are no timers. `NextDeadline` tells a host
   how long it may sleep. `now` is read once per `Flush`/`Poll`.
-* **Hand-off**: per peer, pre-allocated single-producer/single-consumer rings (the transport side has one
-  producer by construction): `ReceiveRing` (descriptors of complete messages, 32 bytes each) and
-  `CompletionRing` (sized to the send table + 1, so it can never overflow). Keyed channels with
+* **Hand-off**: per peer, pre-allocated single-producer/single-consumer rings in native memory (the transport
+  side has one producer by construction): `ReceiveRing` (descriptors of complete messages, 64 bytes each) and
+  `CompletionRing` (sized to two per send entry — one early `Sent` notice plus one final completion — so it can
+  never overflow). Keyed channels with
   `CoalesceOnReceive` bypass the ring: each key has a **mailbox** slot exchanged atomically (the transport
   thread frees the lease the game thread never saw) and a per-channel dirty bitset the game thread scans.
 * **Send entries** cross threads: the game thread submits, the transport thread completes. The entry's
@@ -174,7 +175,7 @@ target selection for datagrams completes inline.
 | `RentBuffer(size)` + `SendOwned(header, lease, length)` | none | after the transport is done (datagram: sent; stream: acknowledged) | serialise directly into library memory — the true zero-copy path |
 | `SendPinned(header, byte* ptr, int length)` / `SendPinned(header, PinnedMemory)` | none, no handle | `BufferReleased` completion | native memory or `GC.AllocateArray(pinned: true)` |
 | `SendBorrowed(header, ReadOnlyMemory<byte>)` | none, but pins (`MemoryHandle` stored as `nint` in a side table) | `BufferReleased` completion | convenience path for ordinary arrays |
-| `SendShared(peerSet, header, sharedLease)` | none | when every peer's send completed | broadcast one serialisation to many peers |
+| `SendShared(header, table, sharedLease, length)` | none | this peer's reference is dropped when its own send completed (or was discarded); the block returns to the pool when the last peer released it | broadcast one serialisation to many peers — never compressed, so the caller compresses once instead of once per peer |
 | `SendGather(header, ReadOnlySpan<BufferLease>)` / `(header, TransportSegment*, count)` | none | `BufferReleased` | header + existing payload pages (≤ 8 segments) |
 
 The library never promises "no copy anywhere": it promises **at most one application-level copy**. MsQuic
@@ -251,6 +252,11 @@ public sealed class QuiclyPeer : IDisposable
     public void GetStatistics(out PeerStatistics stats);          // fixed-layout struct: RTT (smoothed/min/max/variance, transport + application), one-way jitter, datagram loss %, bytes/packets per second each way, cwnd, bytes in flight, max datagram payload, ring occupancy high-water marks, per-channel counters (sent, received, dropped, superseded, expired, out-of-buffers, queue-full, too-large, ring-drops, retries, key-table-full)
     public long EstimatedRemoteMicros();
     public TimeSpan NextDeadline { get; }
+    public long NextDeadlineMicros { get; }            // = min(poll, flush), for a host with one loop
+    public long NextPollDeadlineMicros { get; }         // the peer's own timers: ping, heartbeat, admission, close linger, stream idle
+    public long NextFlushDeadlineMicros { get; }        // engine work only a Flush can serve (retries, expiry, send-cap refill)
+    public bool HasPendingWork { get; }                 // anything waiting for Poll: rings, mailboxes, transitions, a due timer
+    public bool IsDisposed { get; }
 
     public BufferLease RentBuffer(int size);
     public SendResult SendCopy(in SendHeader h, ReadOnlySpan<byte> payload, SendOptions o = default);
@@ -258,6 +264,7 @@ public sealed class QuiclyPeer : IDisposable
     public unsafe SendResult SendPinned(in SendHeader h, byte* payload, int length, SendOptions o = default);
     public SendResult SendBorrowed(in SendHeader h, ReadOnlyMemory<byte> payload, SendOptions o = default);
     public SendResult SendGather(in SendHeader h, ReadOnlySpan<BufferLease> segments, SendOptions o = default);
+    public SendResult SendShared(in SendHeader h, SharedLeaseTable table, in SharedLease lease, int length, SendOptions o = default); // fan-out: retains on admission, releases exactly once
     public ValueTask<SendResult> SendAsync(in SendHeader h, ReadOnlyMemory<byte> payload, SendOptions o, CancellationToken ct); // waits for admission when a reliable queue is full
     public ValueTask<ReceiveLease> SendRequestAsync(in SendHeader h, ReadOnlyMemory<byte> payload, TimeSpan timeout, CancellationToken ct);
     public SendResult Respond(in ReceiveHeader request, ReadOnlySpan<byte> payload);
@@ -277,14 +284,22 @@ public sealed class QuiclyPeer : IDisposable
     public bool TryCancel(SendToken t);              // best effort; never releases the payload by itself
 
     public void Close(CloseReason reason);           // graceful; completes through Poll with PeerState.Closed
-    public event Action<QuiclyPeer, PeerState, PeerState>? StateChanged;   // raised from Poll
+    public void Reconnect(ITransportConnector connector, EndPoint endpoint, string? serverName, ReadOnlySpan<byte> authToken); // client: resume this session over a new transport (PROTOCOL §4.1)
+    public event Action<QuiclyPeer, PeerState, PeerState>? StateChanged;   // raised from Poll; a throwing handler never sees the same transition twice
 }
 
 public readonly record struct SendHeader(ushort Channel, ulong Key = 0);
 public readonly struct SendOptions { public SendMode Mode; /* Buffered | Immediate */ public bool Track; public ulong Context; public long ExpiryMicros; }
 public readonly record struct SendResult(SendStatus Status, SendToken Token);
 public enum SendStatus { Admitted, QueueFull, TooLarge, OutOfBuffers, ChannelClosed, NotConnected, KeyTableFull, InvalidChannel, NotSupported }
-public enum DeliveryStatus { Pending, Delivered, Superseded, Failed, Canceled, Expired, Lost, Disconnected }
+public enum DeliveryStatus { Pending, Delivered, Superseded, Failed, Canceled, Expired, Lost, Disconnected, Sent }
+
+// PeerOptions.WorkSignal: told once per Poll that the peer has game-thread work, so a host wakes instead of polling idle peers.
+// Non-blocking, allocation-free, must not re-enter the peer; HasPendingWork is the level behind this edge.
+public interface IPeerWorkSignal { void OnWork(QuiclyPeer peer); }
+
+// PeerOptions also exposes Clone() (an independent copy sharing the clock, pool and signal) and Validate() (the same checks the
+// peer constructors run), so hosts neither copy options by reflection nor build a throw-away peer to check them.
 ```
 
 ### 6.1 Server and client
@@ -338,7 +353,7 @@ public sealed class QuiclyClient
 | `CongestionControlAlgorithm` | CUBIC (BBR option) | |
 | `StreamSchedulingScheme` | ROUND_ROBIN | Bulk must not starve ordered channels |
 | execution profile | LOW_LATENCY (REAL_TIME option) | |
-| datagram flags | Buffered → `DELAY_SEND`; Immediate/high priority → `DGRAM_PRIORITY`; unreliable → `CANCEL_ON_BLOCKED` | packing and stale-data control |
+| datagram flags | Immediate/high priority → `DGRAM_PRIORITY`; unreliable → `CANCEL_ON_BLOCKED`. `DELAY_SEND` is **not** used: measured on MsQuic loopback it made a tick's burst 16–19 % slower per datagram, and a later re-run found no measurable effect either way, so the session layer never sets it — batching comes from packing (PROTOCOL §2.2) instead | packing and stale-data control |
 
 Bulk sends are windowed on the transport's `IdealSendBufferSize` and additionally capped to a fraction of
 the congestion window (`BulkShareOfCongestionWindow`, default 50 %, re-evaluated per completion) — stream
@@ -372,12 +387,19 @@ logs a warning per connection). Session/auth token rules, admission timeouts, re
 | receive byte budget | peer | 256 KiB | pooled leases + reassembly + stream staging |
 | send byte budget | peer | 256 KiB | blocks in flight; reliable throughput ≤ budget / RTT |
 | send table | peer | 1 024 entries × 64 B | tracked and untracked sends in flight |
-| rings | peer | 4 096 × 32 B receive, (send table + 1) × 16 B completion | |
+| rings | peer | 4 096 × 64 B receive (256 KiB), 2 048 × 16 B completion (32 KiB) | native memory; `ReceiveEntry` is 64 B (52 of them in use) and a send entry produces at most two completions |
+| drain queues | peer | min(receive ring, 1 024) × 68 B (68 KiB) | per-channel queues for `Drain` consumers: a 64 B node plus its link, native, built with the peer |
+| segment arena | peer | 1 024 × 16 B | per-submission gather arrays for stream sends |
 | channel state | peer × channel | 2 × 64 B | send + receive halves |
 | key slots | peer × keyed channel | `MaxKeys` × 64 B (+ mailbox) | dense or hashed |
 
-`ServerOptions.ExpectedPeers` scales the defaults; the numbers are published from the benchmark in
-`docs/benchmarks/memory.md`.
+With the defaults a peer's fixed native tables are therefore about **560 KiB**: 256 KiB receive ring, 32 KiB
+completion ring, 64 KiB send entries plus ~120 KiB of their header blocks and cold side arrays, 68 KiB drain
+queues and 16 KiB segment arena. The 256 KiB receive and 256 KiB send figures above are *payload* budgets drawn
+from the shared slab reserve, not additional per-peer allocations. `ServerOptions.ExpectedPeers` scales all of
+it — 1 000 peers at the defaults would be ~550 MiB of tables alone, so a server with many peers lowers
+`ReceiveRingCapacity`, `SendTableCapacity` and the byte budgets (the defaults target tens to a few hundred peers
+per process). The numbers are published from the benchmark in `docs/benchmarks/memory.md`.
 
 ## 10. Testing & measurement
 

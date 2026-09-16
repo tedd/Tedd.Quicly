@@ -48,6 +48,16 @@ internal sealed class SimStream
     public long FinalSize = -1;
     public bool Pending;
     public bool FinIndicated;
+
+    // Flow control (LinkOptions.StreamReceiveWindowBytes > 0).
+    /// <summary>Sender: the highest stream offset the peer lets this end send up to.</summary>
+    public long SendLimit = long.MaxValue;
+    /// <summary>Receiver: the limit this end last advertised to the sender.</summary>
+    public long AdvertisedLimit;
+    private TxPacket[] _blocked = new TxPacket[8];
+    private int _blockedHead;
+    /// <summary>Sender: packets held back by the peer's limit, in stream order.</summary>
+    public int BlockedCount;
     private long[] _boundaries = new long[16];
     private int _boundaryHead;
     private int _boundaryCount;
@@ -91,6 +101,11 @@ internal sealed class SimStream
         _boundaryHead = 0;
         _boundaryCount = 0;
         _held.Clear();
+        SendLimit = long.MaxValue;
+        AdvertisedLimit = 0;
+        Array.Clear(_blocked);
+        _blockedHead = 0;
+        BlockedCount = 0;
     }
 
     // ---- pending send FIFO ----
@@ -129,6 +144,31 @@ internal sealed class SimStream
         _pendingHead = (_pendingHead + 1) & (_pending.Length - 1);
         PendingCount--;
         return record;
+    }
+
+    // ---- flow-control hold queue (sender) ----
+
+    public void Block(in TxPacket packet)
+    {
+        if (BlockedCount == _blocked.Length)
+        {
+            TxPacket[] grown = new TxPacket[_blocked.Length * 2];
+            for (int i = 0; i < BlockedCount; i++)
+                grown[i] = _blocked[(_blockedHead + i) & (_blocked.Length - 1)];
+            _blocked = grown;
+            _blockedHead = 0;
+        }
+        _blocked[(_blockedHead + BlockedCount) & (_blocked.Length - 1)] = packet;
+        BlockedCount++;
+    }
+
+    public ref TxPacket PeekBlocked() => ref _blocked[_blockedHead];
+
+    public void DropBlocked()
+    {
+        _blocked[_blockedHead] = default;
+        _blockedHead = (_blockedHead + 1) & (_blocked.Length - 1);
+        BlockedCount--;
     }
 
     // ---- receive reassembly ----

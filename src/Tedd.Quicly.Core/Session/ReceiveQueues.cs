@@ -5,16 +5,27 @@ namespace Tedd.Quicly.Core.Session;
 /// <summary>
 /// Per-channel FIFO queues of complete received messages waiting for <see cref="QuiclyPeer.Drain"/> (game thread only).
 /// <see cref="QuiclyPeer.Poll"/> moves messages of channels without a handler here from the receive ring, so one
-/// Drain-style channel never blocks the ring for the others. A fixed node pool (the receive ring's capacity) bounds it:
-/// when the pool is full, Poll stops taking from the ring and the ring's own overflow policy applies.
+/// Drain-style channel never blocks the ring for the others. A fixed node pool bounds it: when the pool is full, Poll
+/// stops taking from the ring and the ring's own overflow policy applies.
 /// </summary>
-internal sealed class ReceiveQueues
+/// <remarks>
+/// Built with the peer (never lazily in <see cref="QuiclyPeer.Poll"/>: ARCHITECTURE.md §3, nothing in the hot path
+/// allocates after warm-up) and backed by native memory (ADR 0008 invariant 12), so a first message on a channel
+/// without a handler costs nothing on the GC heap. The pool holds <see cref="NodesFor"/> messages: the receive ring's
+/// capacity, capped at <see cref="MaxNodes"/> — a Drain-style consumer that falls further behind than that leaves the
+/// rest in the ring, which is where back-pressure belongs.
+/// </remarks>
+internal sealed class ReceiveQueues : IDisposable
 {
-    private readonly ReceiveEntry[] _nodes;
-    private readonly int[] _next;
-    private readonly int[] _head;
-    private readonly int[] _tail;
-    private readonly int[] _count;
+    /// <summary>Largest node pool built for a peer (messages held across all handler-less channels at once).</summary>
+    public const int MaxNodes = 1024;
+
+    private readonly NativeArray<ReceiveEntry> _nodes;
+    private readonly NativeArray<int> _next;
+    private readonly NativeArray<int> _head;
+    private readonly NativeArray<int> _tail;
+    private readonly NativeArray<int> _count;
+    private readonly int _channels;
     private int _free;
 
     /// <summary>Creates queues for <paramref name="channels"/> channels over a pool of <paramref name="capacity"/> nodes.</summary>
@@ -22,20 +33,26 @@ internal sealed class ReceiveQueues
     /// <param name="channels">Number of channels (dense indices).</param>
     public ReceiveQueues(int capacity, int channels)
     {
-        _nodes = new ReceiveEntry[capacity];
-        _next = new int[capacity];
+        _channels = channels;
+        _nodes = new NativeArray<ReceiveEntry>(capacity);
+        _next = new NativeArray<int>(capacity);
         for (int i = 0; i < capacity; i++)
         {
             _next[i] = i + 1 < capacity ? i + 1 : -1;
         }
 
         _free = capacity > 0 ? 0 : -1;
-        _head = new int[channels];
-        _tail = new int[channels];
-        _count = new int[channels];
-        Array.Fill(_head, -1);
-        Array.Fill(_tail, -1);
+        _head = new NativeArray<int>(Math.Max(channels, 1));
+        _tail = new NativeArray<int>(Math.Max(channels, 1));
+        _count = new NativeArray<int>(Math.Max(channels, 1));
+        _head.Fill(-1);
+        _tail.Fill(-1);
     }
+
+    /// <summary>Node pool size for a peer whose receive ring holds <paramref name="ringCapacity"/> messages.</summary>
+    /// <param name="ringCapacity">The receive ring's capacity.</param>
+    /// <returns>The pool size, at most <see cref="MaxNodes"/>.</returns>
+    public static int NodesFor(int ringCapacity) => Math.Clamp(ringCapacity, 1, MaxNodes);
 
     /// <summary>Pool size.</summary>
     public int Capacity => _nodes.Length;
@@ -111,12 +128,22 @@ internal sealed class ReceiveQueues
     /// <param name="core">Owner of the receive budget.</param>
     public void ReleaseAll(PeerCore core)
     {
-        for (int ci = 0; ci < _head.Length; ci++)
+        for (int ci = 0; ci < _channels; ci++)
         {
             while (TryTake(ci, out ReceiveEntry entry))
             {
                 core.ReturnReceive(entry.Lease);
             }
         }
+    }
+
+    /// <summary>Frees the native memory (after <see cref="ReleaseAll"/>).</summary>
+    public void Dispose()
+    {
+        _nodes.Dispose();
+        _next.Dispose();
+        _head.Dispose();
+        _tail.Dispose();
+        _count.Dispose();
     }
 }

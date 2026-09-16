@@ -24,6 +24,13 @@ internal enum SendPayloadKind : byte
 
     /// <summary><see cref="SendRequest.Gather"/> lists existing payload pages.</summary>
     Gather = 4,
+
+    /// <summary>
+    /// <see cref="SendRequest.Shared"/> is a reference-counted lease of <see cref="SendRequest.SharedTable"/>: the entry
+    /// takes one reference when admission commits and releases it when its payload is released (zero copy, never
+    /// compressed; <see cref="QuiclyPeer.SendShared"/>).
+    /// </summary>
+    Shared = 5,
 }
 
 /// <summary>
@@ -68,6 +75,12 @@ internal unsafe ref struct SendRequest
     /// <summary><see cref="SendPayloadKind.Gather"/>: the pages (at most <see cref="QuiclyPeer.MaxGatherSegments"/>).</summary>
     public ReadOnlySpan<BufferLease> Gather;
 
+    /// <summary><see cref="SendPayloadKind.Shared"/>: the table that counts the lease's references.</summary>
+    public SharedLeaseTable? SharedTable;
+
+    /// <summary><see cref="SendPayloadKind.Shared"/>: the shared payload.</summary>
+    public SharedLease Shared;
+
     /// <summary>Request id for request/response channels (0 = plain message).</summary>
     public uint RequestId;
 
@@ -92,9 +105,29 @@ internal struct FlushContext
 
     /// <summary>Earliest time-driven deadline so far (clock micros, <see cref="long.MaxValue"/> = none); engines lower it.</summary>
     public long NextDeadline;
+
+    /// <summary>
+    /// Bytes the send cap (<see cref="PeerOptions.MaxSendBytesPerSecond"/>, a token bucket) still allows in this pass;
+    /// <see cref="long.MaxValue"/> without a cap. Whoever hands bytes to the transport checks that it is positive first
+    /// and subtracts what it takes: the last message of a pass may overdraw, and later refills repay the debt. The packer
+    /// does this for datagrams; a stream engine does it for its stream sends.
+    /// </summary>
+    public long BudgetBytes;
+
+    /// <summary>Set by whoever held work back because <see cref="BudgetBytes"/> ran out; the scheduler then lowers <see cref="NextDeadline"/> to the refill time.</summary>
+    public bool BudgetExhausted;
+
+    /// <summary>Bytes handed to the transport in this pass (datagrams and stream data); charged to the send cap when the pass ends.</summary>
+    public long BytesSubmitted;
+
+    /// <summary>
+    /// Unreliable datagrams may carry <see cref="TransportSendFlags.CancelOnBlocked"/> in this pass (PROTOCOL.md §4.5
+    /// <c>DropWhenBlocked</c>): true only when the transport reports that it honours the flag.
+    /// </summary>
+    public bool CancelBlockedDatagrams;
 }
 
-/// <summary>Kind of transport completion carried by a <see cref="CompletionEntry"/>.</summary>
+/// <summary>Kind of completion carried by a <see cref="CompletionEntry"/>.</summary>
 internal enum CompletionKind : byte
 {
     /// <summary><c>OnStreamSendCompleted</c>.</summary>
@@ -102,14 +135,24 @@ internal enum CompletionKind : byte
 
     /// <summary><c>OnDatagramSendStateChanged</c>.</summary>
     Datagram = 1,
+
+    /// <summary>
+    /// Queued by the game thread itself (<see cref="PeerCore.QueueLocalCompletion"/>): the entry was never handed to the
+    /// transport, or the transport refused it (expiry at scheduling time, a cancellation, a refused submission).
+    /// <see cref="CompletionEntry.Status"/> says how it ends.
+    /// </summary>
+    Local = 2,
 }
 
 /// <summary>
-/// A transport completion of one send entry, pushed by the transport thread into the completion ring and drained on the
-/// game thread (<see cref="ChannelEngine.OnSendCompleted"/>). Per entry the ring carries at most one non-final
-/// <see cref="DatagramSendState.Sent"/> notice (only for <see cref="State.SendEntryFlags.Tracked"/> or
-/// <see cref="State.SendEntryFlags.Container"/> datagram entries, so the payload can be released early) and exactly one
-/// final completion; the ring holds <c>2 × send table + 1</c> items, so it cannot overflow.
+/// A completion of one send entry, drained on the game thread and routed to the entry's owner
+/// (<see cref="ChannelEngine.OnSendCompleted"/>, the packer's fan-out, or the peer's control traffic). Transport
+/// completions come through the completion ring: per entry at most one non-final <see cref="DatagramSendState.Sent"/>
+/// notice (for every datagram entry, tracked or not, so its payload block is released at <c>Sent</c> — ADR 0008
+/// invariant 1) and exactly one final completion; the ring holds <c>2 × send table</c> items — two per entry — so it
+/// cannot overflow. <see cref="CompletionKind.Local"/> completions are queued by the
+/// game thread itself (<see cref="PeerCore.QueueLocalCompletion"/>) and are always final. A member of a packed container
+/// receives a copy of its container's completion.
 /// </summary>
 internal struct CompletionEntry
 {
@@ -134,6 +177,12 @@ internal struct CompletionEntry
     /// stays in flight; the payload may be released with <see cref="PeerCore.ReleasePayload"/>).
     /// </summary>
     public bool Final;
+
+    /// <summary>
+    /// <see cref="CompletionKind.Local"/>: the delivery status the entry ends with (<see cref="DeliveryStatus.Pending"/> on
+    /// transport completions). <see cref="PeerCore.MapCompletion"/> reads it.
+    /// </summary>
+    public DeliveryStatus Status;
 }
 
 /// <summary>What the peer does with a peer-opened stream after <see cref="ChannelEngine.OnStreamOpened"/>.</summary>

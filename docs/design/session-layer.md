@@ -15,13 +15,14 @@ Time/           IClock, MonotonicClock, VirtualClock                            
 Channels/       ChannelMode, ChannelDefinition, ChannelTable(+Builder), ChannelTableCodec (canonical encoding + hash)
 Framing/        MessageHeader, DatagramFraming, StreamFraming, StreamFrameParser, PackedContainer, ControlCodec, ControlMessages
 State/          NativeArray<T>, SendEntry (+cold SoA), SegmentArena, ReceiveEntry, KeyTable, DenseKeyTable, Mailboxes, ChannelSendState, ChannelRecvState
-Session/        QuiclyPeer (partial: .cs .Send .Flush .Poll .Receive .Control .Completion), PeerCore (engine façade), PeerOptions,
+Session/        QuiclyPeer (partial: .cs .Send .Flush .Poll .Receive .Control .Completion .Work .Shared .Reconnect), PeerCore (engine façade), PeerOptions,
                 SendHeader/SendOptions/SendResult/SendStatus, ReceiveHeader/ReceivedMessage/ReceiveLease/MessageHandler,
                 PeerStatistics/ChannelStatistics, IPeerAdmission/AdmissionResult/HelloInfo, PeerRole/PeerState/CloseReason/
                 CompletionMode, BulkDescriptor/IBulkSource/BulkTransfer/BulkRangeRequest (C2 shapes), PingClock, TokenBucket,
-                TransportControlPool, StreamTable, ReceiveQueues, ReceiveMailbox, PeerCounters
+                TransportControlPool, StreamTable, ReceiveQueues, ReceiveMailbox, PeerCounters, IPeerWorkSignal
 Session/Engines/ ChannelEngine (the boundary), ChannelEngines (per-mode registry), EngineTypes (SendRequest, FlushContext,
-                CompletionEntry, StreamAccept, StreamConsume, StreamMessageContext), PlaceholderEngine; the mode engines
+                CompletionEntry, StreamAccept, StreamConsume, StreamMessageContext), EnginePayload (the shared send paths),
+                PlaceholderEngine; the mode engines (DatagramEngine with UnreliableUnordered/UnreliableSequenced, ReliableOrderedEngine)
 ```
 
 ## 1. Channels
@@ -66,6 +67,7 @@ static class StreamFraming   // PROTOCOL §3.1/3.2 message framing (Length, Key,
 public struct StreamFrameParser   // incremental, resumable; holds at most 32 bytes of partial header; never copies payload
 {
     void Reset(in ChannelDefinition ch, StreamRole role /*Ordered|Group|Bulk|Control*/);
+    void GetMark(out Mark mark); void Rewind(in Mark mark);   // un-reads the last message event cheaply (the Pend of the session layer)
     // Feed(segment) returns events: NeedMore, PreambleParsed, MessageHeader(h, payloadLength) then PayloadBytes(span) ... MessageComplete, Error(code)
     // A message's payload is delivered as zero or more PayloadBytes callbacks straight from the transport's segments.
 }
@@ -105,7 +107,7 @@ NestedContainer, BadLength, ...
 * `ChannelSendState` / `ChannelRecvState` (64 B each, per channel): counters, next sequence, queue head/tail/bytes, stream id,
   group state, statistics fields (sent/received/dropped/superseded/expired/queueFull/tooLarge/ringDrops/retries/keyTableFull).
 
-## 4. QuiclyPeer (as built: wave C1, step 1 — peer core)
+## 4. QuiclyPeer (as built: wave C1, steps 1–3)
 
 `public sealed partial class QuiclyPeer : IDisposable`. Transport callbacks are **not** public API: a private nested
 `Sink : ITransportSink` forwards them and is exposed as `peer.TransportSink` (a server's `AcceptCallback` returns it; a client
@@ -114,21 +116,25 @@ options, authToken)` (client) and `QuiclyPeer.CreateServerPeer(transport, in inf
 
 | File | Owns |
 |---|---|
-| `QuiclyPeer.cs` | construction, immutable option values, public properties (`Index`, `Tag`, `Role`, `State`, `Epoch`, `SessionId`, `SessionToken`, `HandshakeStatus`, `CloseReason`, `RemoteEndPoint`, `Capabilities`, `Channels`, `RemoteChannelTable`, `LastCallbackFault`), `GetStatistics`, `GetChannelStatistics`, `EstimatedRemoteMicros`, `NextDeadline`/`NextDeadlineMicros`, `Dispose` with deferred native free, the transport→game signal word |
-| `QuiclyPeer.Send.cs` | `RentBuffer`/`GetBufferSpan`/`ReturnBuffer`, `SendCopy/SendOwned/SendPinned/SendBorrowed/SendGather/SendAsync`, `SendRequestAsync`, `Respond`, `RetireKey`, `BeginBulkSendAsync`, `RequestBulk`: resolve the channel, require `Connected`, build a `SendRequest`, call the channel's engine |
-| `QuiclyPeer.Flush.cs` | `Flush(tick)`, `FlushAsync`, the scheduler seam `FlushEngines`, `NextDeadline` bookkeeping |
+| `QuiclyPeer.cs` | construction, immutable option values, public properties (`Index`, `Tag`, `Role`, `State`, `IsDisposed`, `Epoch`, `SessionId`, `SessionToken`, `HandshakeStatus`, `CloseReason`, `RemoteEndPoint`, `Capabilities`, `Channels`, `RemoteChannelTable`, `LastCallbackFault`), `GetStatistics`, `GetChannelStatistics`, `EstimatedRemoteMicros`, `NextDeadline`/`NextDeadlineMicros` and the split `NextPollDeadlineMicros`/`NextFlushDeadlineMicros` (§4.7), `Dispose` with deferred native free, the transport→game signal word |
+| `QuiclyPeer.Send.cs` | `RentBuffer`/`GetBufferSpan`/`ReturnBuffer`, `SendCopy/SendOwned/SendPinned/SendBorrowed/SendGather/SendAsync`, `SendRequestAsync`, `Respond`, `RetireKey`, `BeginBulkSendAsync`, `RequestBulk`: resolve the channel, require `Connected`, build a `SendRequest`, call the channel's engine; the `SendAsync` waiters and the `ThreadSafeSend` front (§7.3) |
+| `QuiclyPeer.Flush.cs` | `Flush(tick)`, `FlushAsync` and its watermark (§7.3), the scheduler seam `FlushEngines`, `NextDeadline` bookkeeping |
 | `QuiclyPeer.Poll.cs` | `Poll(maxItems)`, `Drain`, `Release`, `Retain`, `RegisterHandler`/`UnregisterHandler`, per-channel drain queues (`ReceiveQueues`), mailbox dispatch, LZ4 decode in Poll, pended-stream resume, the final Closed step |
 | `QuiclyPeer.Control.cs` | game thread: handshake (client Hello, server checks + `IPeerAdmission` + HelloAck, `CompleteAdmission`, channel-table answer), `Close`, close linger, ping schedule + `PingClock`, heartbeat, admission timeout, the `StateChanged` queue |
 | `QuiclyPeer.Receive.cs` | transport thread: the `Sink`, datagram / container / control-datagram receive, the stream table driver (control stream parsing, preamble → engine, parser events → engine, back-pressure un-read), stream error rules, Pong from the transport thread |
 | `QuiclyPeer.Completion.cs` | `WaitAsync`/`Wait`/`GetDeliveryStatus`/`TryCancel`, completion-ring drain and routing |
+| `QuiclyPeer.Work.cs` | `HasPendingWork` and the `PeerOptions.WorkSignal` edge (`NoteWork`, re-armed by `Poll`; §4.7) |
+| `QuiclyPeer.Shared.cs` | `SendShared` over a reference-counted `SharedLease` (§4.1) |
+| `QuiclyPeer.Reconnect.cs` | `Reconnect` and the two resets it drives (§4.8) |
 | `PeerCore.cs` | the engine-facing façade (§7) |
 | `Engines/*.cs` | the engine boundary, the registry, the placeholder, the mode engines |
 
 **Hand-offs** (ADR 0008). Transport → game thread: a signal word (`Interlocked.Or` / `Exchange`) with the bits Connected, Hello,
 HelloAck, PeerClose, TransportClosed, CloseRequest, TableRequest, TableInfo — the data of a bit is written before it is set
 (Hello/HelloAck/Close bodies are copied to arrays: handshake and close only); SPSC rings `CompletionRing` (`CompletionEntry`,
-capacity 2 × send table + 1), `ReceiveRing` (`ReceiveEntry`), `PendedStreams` (capacity = the peer's unidirectional allowance + 2),
-pong samples (16) and stream-ping requests (8); per-key mailboxes; `PeerCore.RequestClose(code)` (first request wins), executed by
+capacity 2 × send table: two per entry), `ReceiveRing` (`ReceiveEntry`, 64 B each), `PendedStreams` (capacity = the peer's
+unidirectional allowance + 2), pong samples (16) and stream-ping requests (8) — every ring's elements live in a `NativeArray`
+(ADR 0008 invariants 5 and 12) and the peer disposes them with its other native tables; per-key mailboxes; `PeerCore.RequestClose(code)` (first request wins), executed by
 the game thread in Poll/Flush. Game → transport thread: `PeerCore.IsAdmitted` (volatile), the control stream id (volatile word) and
 `PeerCore.SessionMaxMessageSize` (server: its option; client: set by the transport thread from an accepted HelloAck before it
 publishes admission). Transport-thread code calls only `AbortStream`, `CloseStream` (after shutdown complete) and `SendDatagram`
@@ -146,28 +152,54 @@ statistics and `Capabilities` read as default, and callbacks that still arrive a
 ### 4.1 Send path (game thread)
 
 1. The peer: channel lookup (`InvalidChannel`), `State == Connected` (`NotConnected`), argument checks (length vs lease, pinned
-   null, ≤ 8 gather pages), then `engine.Admit(ref SendRequest)` (placeholders answer `NotSupported`).
-2. The engine (steps 2/3): size against `PeerCore.EffectiveMaxMessageSize(channel)`, key, queue limits;
+   null, ≤ 8 gather pages, a key above 2^62 − 1 on a keyed channel ⇒ `ArgumentOutOfRangeException`), then
+   `engine.Admit(ref SendRequest)` (placeholders answer `NotSupported`). An admitted `Immediate` send then runs one scheduler pass
+   (`FlushImmediate`, §4.2) before the call returns (PROTOCOL.md §4.5: eligible now, together with what is buffered).
+2. The engine: size against `PeerCore.EffectiveMaxMessageSize(channel)`, key, queue limits;
    `PeerCore.TryAllocateEntry(channel, flags, out slot)` (`QueueFull`); header bytes into the slot's 32-byte block
    (`Entries.GetHeaderBlock(slot)` + `Entries.SetHeaderLength`); payload with `TryRentSend` + `AttachLease` (copy / owned), `SetPayload`
-   (pinned) or a pin handle in `Entries.PinHandles` (borrowed: `GCHandle.ToIntPtr`; `ReleasePayload` frees it); tracked sends with
+   (pinned, shared), a pin handle in `Entries.PinHandles` (borrowed: `GCHandle.ToIntPtr`; `ReleasePayload` frees it) or a reference on a
+   `SharedLeaseTable` (`AttachShared`, see below; `ReleasePayload` drops it); tracked sends with
    `PeerCore.TryTrack(slot, options.Context, out request.Token)`; queue on the channel (intrusive `Entries.Next`). Any failure after
-   allocation: `PeerCore.DiscardEntry(slot)` (releases token as Canceled, payload, slot). Nothing reaches the transport in `Admit`
-   except `Immediate` sends.
+   allocation: `PeerCore.DiscardEntry(slot)` (releases token as Canceled, payload, slot). Nothing reaches the transport in `Admit`.
+   The datagram engines' admission as built is in §7.1, the ordered engine's in §7.2.
+3. With `PeerOptions.ThreadSafeSend`, a send from a thread other than the game thread (the thread that last entered Poll or
+   Flush) takes the path of §7.3 instead: its payload is copied into a send lease and a 64-byte request is queued for the game
+   thread.
+
+**`SendShared`** (`QuiclyPeer.Shared.cs`; ARCHITECTURE.md §4.1). `SendResult SendShared(in SendHeader header, SharedLeaseTable table,
+in SharedLease lease, int length, SendOptions options = default)` is `SendPinned` over a reference-counted block, so a server
+serialises a snapshot once and sends it to N peers with no copy. `SendPayloadKind.Shared` takes the pointer as it is and is **never**
+compressed — the caller compresses once before sharing, and compressing per peer would undo the point of the path, so `RawLength` is
+0 on the wire — which makes it work on every channel mode that exists today. `EnginePayload.Commit` calls `PeerCore.AttachShared`,
+which does one `SharedLeaseTable.Retain` and records the pair in a cold per-slot side table; `ReleasePayload` does the single matching
+`Release`: at a datagram's `Sent` notice, when the packer has copied the message into a container, when an ordered channel's carrier
+is acknowledged, when the entry is discarded (expired, canceled, refused), when the session closes, and when the peer is disposed
+with the send in flight. A rejected admission never retained, so the caller keeps its own count; an empty payload takes no reference
+at all. From another thread (`ThreadSafeSend`) the bytes are copied at the call and no reference is taken, like every other
+foreign-thread path.
 
 ### 4.2 Flush (game thread)
 
-1. `now` once; `DrainCompletions()` (frees slots before new work); `RunTimers(now)`: admission deadline (Connecting/Handshaking),
-   ping schedule + `PingClock.Advance` + heartbeat (Connected), close linger (Closing).
-2. While `Connected`: `FlushContext { NowMicros, Tick, MaxDatagramPayload (current), DatagramsEnabled, NextDeadline }`; every
-   engine's `Tick(now, ref flush.NextDeadline)`; then `FlushEngines(ref flush)` — **the step-2 seam**: it calls every engine's
-   `Flush` once in mode order today; step 2 replaces its body with the scheduler (channel priority order precomputed, admission order
-   within a channel, expiry at scheduling time, token bucket `MaxSendBytesPerSecond`) and the per-peer packer.
-3. `NextDeadlineMicros = min(timer deadline, engine deadline)`.
+1. `now` once; `DrainCompletions()` (the transport's completion ring, then the completions the game thread queued itself with
+   `PeerCore.QueueLocalCompletion`; frees slots before new work); the `ThreadSafeSend` front is admitted and the waiting `SendAsync`
+   calls are retried (§7.3); `RunTimers(now)`: admission deadline (Connecting/Handshaking), ping schedule + `PingClock.Advance` +
+   heartbeat (Connected), close linger (Closing).
+2. While `Connected`: `FlushContext { NowMicros, Tick, MaxDatagramPayload (current), DatagramsEnabled, NextDeadline, BudgetBytes,
+   BudgetExhausted, BytesSubmitted, CancelBlockedDatagrams }`; every engine's `Tick(now, ref flush.NextDeadline)`; then
+   `FlushEngines(ref flush)`, the scheduler (§7.1): send-cap refill, every channel's `FlushChannel` in `PeerCore.ScheduleOrder`, every
+   engine's `Flush`, `Packer.Finish`, the cap charged with the bytes submitted, then the pass's local completions routed.
+3. `NextDeadlineMicros = min(timer deadline, engine deadline)`; a pass held back by the send cap lowers the engine deadline to the
+   cap's refill time. Then the `FlushAsync` calls whose watermark was reached complete (§7.3); an `Immediate` send's pass does the
+   same.
+
+The same pass runs at the end of an admitted `Immediate` send (`FlushImmediate`): no `Tick`, the container tick of the last
+`Flush(tick)`, wrapped in the lifetime in-call bit because a continuation run by its local completions may dispose the peer.
 
 Submission primitives (`PeerCore`): `SubmitDatagram(slot, flags)` sends the entry's header+payload pair (1 or 2 segments; sets
-`SendEntryFlags.Datagram`); `SubmitStream(stream, segments, count, slot, flags)` sends a segment array whose completion carries the
-slot's context. Both publish before the call; on a failed call the entry is back in `Filling` and still owned by the caller.
+`SendEntryFlags.Datagram`); for datagram channels its only caller is the packer (§7.1). `SubmitStream(stream, segments, count, slot,
+flags)` sends a segment array whose completion carries the slot's context. Both publish before the call; on a failed call the entry
+is back in `Filling` and still owned by the caller.
 
 ### 4.3 Receive path (transport thread)
 
@@ -188,7 +220,7 @@ slot's context. Both publish before the call; on a failed call the entry is back
     reset `UnsupportedChannel`; malformed ⇒ reset `ProtocolViolation`; otherwise `engine.OnStreamOpened(id, channel, groupId)` →
     `Accept(cookie)` / `Reject(code)` (reset) / `CloseConnection(code)`.
   * Events ⇒ `engine.OnStreamMessage(ref StreamMessageContext)` (`Start`, `Chunk`, `End`, `BulkHeader`) → `Continue`, `Pend` (the
-    parser is restored to its snapshot before the event, the call returns `PendingAfter(bytes before the event)`, the stream id goes to
+    parser is restored from a `StreamFrameParser.Mark` taken before the event, a whole copy on bulk streams; the call returns `PendingAfter(bytes before the event)`, the stream id goes to
     `PendedStreams` and Poll calls `ResumeStreamReceive(id, 0)`), `ResetStream(code)` or `CloseConnection(code)`.
     The context (`Chunk`, `Header`, `Bulk` and the `Cookie` ref) is valid only during the call (the peer declares it `scoped`);
     copy what you keep.
@@ -200,6 +232,21 @@ slot's context. Both publish before the call; on a failed call the entry is back
     `Consumed` and never `Consumed(0)` for a non-empty indication, because both mean back-pressure in the `ReceiveResult` contract.
     `ResumeStreamReceive` is called only from Poll on the game thread, never from inside the receive callback; a resume that races
     the returning callback takes effect when it returns.
+  * **Mid-message idle** (PROTOCOL.md §7, `PeerOptions.StreamIdleTimeout`, default 30 s). The transport thread arms
+    `StreamRecord.MidMessageMicros` on every accepted message event and clears it at the message's end (and when the stream is
+    given up), so a stream is watched only while a half-received message pins its staging lease and its ring reservation.
+    `RunTimers` (game thread, `now` read once) resets every stream whose stamp is older than the timeout with
+    `AbortStream(Timeout, Both)`, counts `PeerStatistics.StreamIdleTimeouts` and lowers `NextDeadline` to the oldest stamp's
+    expiry. It does **not** free anything itself: the transport's shutdown-complete takes the ordinary `OnStreamClosed` path, where
+    the owning engine releases the lease and cancels the reservation on the transport thread (ADR 0008 invariant 4), which covers
+    every mode's engine without a timer of its own. This sweep is the only game-thread reader of the stream table: per slot it reads
+    one 64-bit stamp and one packed id from a snapshot of the record array and disarms an expired stamp with a compare-exchange.
+  * **`CloseStream` is deferred by the transport.** The peer calls it from the transport thread after shutdown complete
+    (`HandleStreamShutdownComplete`), and `ReliableOrderedEngine.AbandonStream` calls it from inside a scheduler pass. ADR 0008
+    invariant 7 wants `StreamClose` off callback threads and outside passes, so the session layer relies on the transport deferring
+    the real close: the MsQuic transport moves every `StreamClose` onto its cleanup work item (docs/benchmarks/msquic-transport.md
+    R1/R2) and the simulator does the equivalent. A transport that closed the stream inline from those calls would break the
+    invariant, so this is a requirement on new transports, not an accident.
 * Control stream (both directions start with `0x00`; `StreamFrameParser(Control)`; bodies used in place or assembled in a lazily
   grown array; control-rate limit): server — the first frame must be Hello, a second Hello or a HelloAck is a violation, the Hello body
   is copied and signalled (malformed ⇒ violation; version ≠ 1 ⇒ answered with status 1); client — the first frame must be a HelloAck
@@ -210,7 +257,9 @@ slot's context. Both publish before the call; on a failed call the entry is back
 
 ### 4.4 Poll (game thread)
 
-1. `now` once; `DrainCompletions()` — with `CompletionMode.PollOnly` tracked-send continuations run here.
+1. `now` once; `DrainCompletions()` — with `CompletionMode.PollOnly` tracked-send continuations run here; the `ThreadSafeSend`
+   front is admitted (an `Immediate` request among them runs one scheduler pass here, on the game thread) and the waiting
+   `SendAsync` calls are retried (§7.3).
 2. `ProcessSignals(now)`, in this order: Connected (Connecting → Handshaking; the client opens the control stream and sends Hello),
    the queued local close (before the Hello so a violating client is never admitted), peer Close, Hello (server), HelloAck (client),
    table info / table request, transport closed; then pong samples (matched against the last eight pings; unmatched are counted) and
@@ -222,8 +271,9 @@ slot's context. Both publish before the call; on a failed call the entry is back
    Compressed messages are decoded with `Lz4Block.DecompressExact` into a second lease (decoded-bytes budget; a failure drops and
    counts `DecodeFailures`). The lease is released after the handler unless `Retain` was called; handler exceptions propagate.
 5. `ResumePendedStreams()`.
-6. Closed: engines' `OnPeerClosed`, every receive lease released, the Closed event raised last; afterwards Poll/Flush do nothing and
-   no handler or event runs.
+6. Closed: engines' `OnPeerClosed`, requests still in the `ThreadSafeSend` front dropped (leases returned), every receive lease
+   released, waiting `SendAsync` calls completed `NotConnected` and `FlushAsync` calls completed, the Closed event raised last;
+   afterwards Poll/Flush do nothing and no handler or event runs.
 
 ### 4.5 Control protocol
 
@@ -254,12 +304,84 @@ slot's context. Both publish before the call; on a failed call the entry is back
 
 ### 4.6 Engines
 
-* Wave C1 step 2: `UnreliableUnordered` and `UnreliableSequenced` engines (per-key acceptance with `KeyTable`/`DenseKeyTable`,
-  coalescing mailboxes), the scheduler and the packer.
-* Wave C1 step 3: the `ReliableOrdered` engine (lazy persistent stream, gather send, progressive receive, back-pressure).
+* Wave C1 step 2 (done, §7.1): `UnreliableUnorderedEngine` and `UnreliableSequencedEngine` over the shared `DatagramEngine` base
+  (per-key acceptance with `ReceiveKeyTracker` over `KeyTable`/`DenseKeyTable` and LRU eviction, coalescing mailboxes), the
+  scheduler (`QuiclyPeer.FlushEngines`) and the packer (`DatagramPacker`).
+* Wave C1 step 3 (done, §7.2): the `ReliableOrdered` engine (lazy persistent stream, carrier gathers, refused-start retry,
+  progressive receive, back-pressure); the async APIs and the `ThreadSafeSend` front (§7.3).
 * Wave C2: `ReliableLatestEngine`, `GroupStreamEngine` (`ReliableUnordered`), `BulkEngine`, fragmentation in the unreliable engines,
   request/response in the ordered engine.
 * `PingClock` is peer-level (`Session/PingClock.cs`), not an engine.
+
+### 4.7 Host hooks (work signal, split deadlines, robustness)
+
+* **Work signal.** `PeerOptions.WorkSignal` (`IPeerWorkSignal { void OnWork(QuiclyPeer peer); }`) is called by
+  `QuiclyPeer.NoteWork()` the first time the peer publishes game-thread work after each `Poll`, so a host can wake a sleeping game
+  thread instead of polling idle peers. It is an **edge with set-once semantics**: one `Interlocked.Exchange` on a word guards the
+  call and `Poll` re-arms it at entry, so a burst of a thousand messages costs one host call — and work that Poll does not consume (a
+  message of a channel without a handler, engine work that needs a `Flush`) raises no second call, because `HasPendingWork` is the
+  level. Raised from the transport thread by `Signal(bit)` (every handshake, close and table signal), `TryEnqueueReceive`,
+  `PublishReserved`, a coalescing mailbox post, `PushCompletion`, `NotePendedStream` and the pong / stream-ping rings; and from the
+  game thread by `SetState` (a queued `StateChanged` is work, which covers `Close` and `CompleteAdmission` without a hook of their
+  own), `QueueLocalCompletion` and a send queued by another thread. Allocation-free — two field reads when no signal is configured —
+  and a host exception is wrapped like a transport callback fault (counted, kept in `LastCallbackFault`, turned into a queued
+  `InternalError` close), so it never reaches the transport.
+* **`HasPendingWork`** answers whether anything is really waiting: the signal word, the completion ring and the local completions,
+  the receive ring, the per-channel drain queues and the held entry, the mailbox dirty bitsets (`Mailboxes.HasDirty`),
+  `PendedStreams`, the pong and stream-ping rings, the `ThreadSafeSend` front, a state transition that has not been raised, and a due
+  timer (`NextDeadlineMicros` passed). `false` once the session is closed or the peer disposed. The rings, the bitsets and the signal
+  word are read with acquire semantics; the game thread's own bookkeeping is read plainly, so a foreign caller gets an advisory
+  answer — which is why a host wakes on the edge and decides on this probe from its game thread.
+* **Split deadlines.** `NextPollDeadlineMicros` is the peer's own timers (ping schedule, heartbeat, admission timeout, close linger,
+  the mid-message stream idle sweep). `NextFlushDeadlineMicros` is the engine work only a scheduler pass can serve (retries, expiry,
+  the send cap's refill time), and is `long.MaxValue` unless the session is `Connected`. `NextDeadline`/`NextDeadlineMicros` stay the
+  minimum of both, so a host with one loop is unaffected; a host that polls on network wake-ups and flushes on its own tick sleeps
+  the polling loop on the poll deadline and brings a flush forward to the flush deadline, because `Poll` does not run the scheduler.
+* **`IsDisposed`** lets a host skip a peer it disposed from inside a handler without catching `ObjectDisposedException`.
+* **A throwing `StateChanged` handler** cannot stall the state machine: `RaiseTransitions` takes a transition out of the queue
+  *before* invoking the handlers, so the same change can never be raised again by the next `Poll`; the exception is counted as
+  `PeerStatistics.CallbackFaults`, kept in `LastCallbackFault` and swallowed, and the transitions behind it still go out. Receive
+  handlers keep propagating: they run on the host's own dispatch and hold no session state.
+
+### 4.8 In-place resume (`Reconnect`, PROTOCOL.md §4.1)
+
+`void Reconnect(ITransportConnector connector, EndPoint endpoint, string? serverName, ReadOnlySpan<byte> authToken)` resumes a
+**client** peer's session over a new transport after the connection was lost (transport close, link loss, heartbeat timeout).
+Preconditions: client role, not inside `Poll`/`Flush`, and the lost transport has reported its close
+(`PeerCore.IsTransportClosed`), so no callback can race the reset.
+
+1. `SettleLostConnection()` does what the Closed step of `Poll` does, for a host that has not polled that far: completions drained,
+   every engine's `OnPeerClosed` (queued sends complete `Disconnected`), receive leases and the `ThreadSafeSend` front released,
+   waiting `SendAsync`/`FlushAsync` calls completed. Sends that were in flight are already finished, because the `ITransport`
+   contract completes every accepted send before `OnClosed`.
+2. The auth token is replaced, the resume token becomes the token of the last HelloAck and `LastEpoch` the current `Epoch`.
+3. `PeerCore.ResetForReconnect()`: every engine's `OnReconnecting()` (stream ids, phases, half-received messages, queued notices),
+   then any entry still allocated completes `Disconnected` (`AbandonEntries`), the completion ring and `PendedStreams` are emptied,
+   the transport reference, admission, the datagram capabilities, a client's session message cap and the receive reservations go back
+   to their pre-handshake values, and the stream table, the container packer and the segment arena are cleared. Kept: the channel
+   table, the engines, every counter, the budgets and `Epoch` — the epoch is what the Hello presents as `LastEpoch`.
+4. The peer's own per-connection state starts over (signals, handshake bodies, control stream id, close reason, the ping clock and
+   its RTT window, the admission deadline) and the lifetime word's ClosedSeen bit is cleared: the new transport will call back again,
+   so `Dispose` must not free the native memory early. The rate limiters keep their state on purpose — they are per peer, not per
+   connection, and refill with time.
+5. `PeerState.Reconnecting` is queued and the new transport attached. `OnTransportConnected` treats `Reconnecting` like
+   `Connecting`, so `Reconnecting → Handshaking` opens a control stream and sends Hello with the session token and `LastEpoch`; the
+   admission deadline covers `Reconnecting` too. On acceptance the engines get `OnEpochReset(resumed: epoch > 1)` and the
+   PROTOCOL.md §4.1 channel rules apply (`UnreliableSequenced` tables reset, in-flight `ReliableOrdered` sends already completed
+   `Disconnected`, live `ReliableLatest` keys re-queued and resumable `Bulk` transfers re-requested by their engines in wave C2). A
+   connector that throws leaves the peer `Closed` — no transport means no close callback — and the exception propagates.
+
+Kept across the resume: the registered handlers, `Index`, `Tag`, the `StateChanged` subscribers, the channel table and every
+statistic.
+
+**The server cannot do this, and that is a protocol consequence, not an omission.** A listener's `AcceptCallback` must return an
+`ITransportSink` synchronously, before a single QUICLY byte was read, so the server does not yet know which session the connection
+belongs to: the token arrives in the Hello, which is parsed *by the sink it already had to hand out*. A resumed connection therefore
+always gets a new server peer (`CreateServerPeer`), and the host carries the session identity over when `IPeerAdmission.Admit`
+matches the token — copy `Index`, `Tag` and the per-session application state onto the new peer, register the same handlers, answer
+`AdmissionResult.Accept` with the session's id and the next epoch, and close the replaced connection's peer with `SessionReplaced`.
+Per-peer statistics do not carry over (they belong to the peer object); a host that reports per session aggregates them itself.
+`Reconnect` throws `InvalidOperationException` for a server peer.
 
 ## 5. SimulatedTransport (Tedd.Quicly.Testing)
 
@@ -302,8 +424,11 @@ Notes for session-layer tests over the simulator:
 1. After an API call, `Advance(0)` before expecting its callback.
 2. Payloads are copied when a send is accepted, so the simulator cannot catch a caller that reuses a buffer before its completion
    (ADR 0008 invariant 1). Cover that rule in the session layer's own tests or end to end over MsQuic.
-3. Stream flow control is not modelled. Sends complete while the receiver stays Pending, and the receive buffer is unbounded, so
-   sender-side back-pressure cannot be exercised here yet.
+3. Stream flow control is modelled only with `LinkOptions.StreamReceiveWindowBytes` (per stream, like QUIC's MAX_STREAM_DATA): the
+   sender holds back packets beyond the receiver's consumed offset plus the window, the receiver raises the limit once its
+   application consumed a quarter of the window (one one-way delay later), and a send completes only when all of its bytes were
+   delivered, so back-pressure reaches the sender. Without it sends complete while the receiver stays Pending and the receive buffer
+   is unbounded.
 4. Stream limits count concurrently open streams. The defaults are 1 bidi and 0 uni until `UpdatePeerStreamLimits`.
 5. A partial consume without `Pending` (at least one byte) keeps the remainder and indicates it again at the next step, together with
    any data that arrived meanwhile, without waiting for new data (MsQuic re-indicates it right after the callback). Consuming nothing of
@@ -315,6 +440,12 @@ Notes for session-layer tests over the simulator:
 8. Link options are fixed at creation. There is no mid-run change of loss, delay or bandwidth; use the targeted drops or a new link.
 9. `CloseStream` before shutdown aborts both directions with code 0. Pending completions are still reported (canceled), but the shutdown
    callback is not.
+10. A start beyond the peer's stream limit is refused the way MsQuic refuses it: the call returns Success, then
+    `OnStreamStarted(StreamLimitReached)`, the canceled completion of a send made with Start and `OnStreamShutdownComplete` follow at
+    the next step; the stream never starts (a later start returns InvalidState).
+11. The simulator honours `CancelOnBlocked` (`TransportCapabilities.CancelOnBlocked` is true): a datagram that finds its direction's
+    serializer busy is canceled, so a session's unreliable datagrams are dropped (`Expired`) while stream data keeps the link busy.
+    Tests that want queueing wrap the connector (`FlagRecordingConnector(connector, cancelOnBlocked: false)`).
 
 ## 6. Tests that must exist (Core)
 
@@ -333,6 +464,61 @@ frames assembled across packets, engine-bound control routing, control-stream ab
 stream, stream pong limits, bulk headers, engine faults in stream callbacks, drain paths, `Dispose` from a handler, callbacks after
 the peer was freed).
 
+Step 2 (datagram delivery) adds: `DatagramTestKit.cs` (`DatagramTables.Main`, `DatagramKit` — quiet options without pings or
+heartbeat, link statistics, wire parsing of containers, hand-written frames — `FlagRecordingTransport`/`FlagRecordingConnector`,
+which record send flags and can refuse datagrams, wired through the new `SessionHarness(connector:)` parameter, and a
+`NativeMemoryManager` for borrowed memory that is not an array); `SchedulerTests` (packing counted with the simulator's link
+statistics, a message sent alone, container tick, container size after an MTU change, a queued message failing after the limit
+shrank, priority and admission order, starvation of low priority under the cap, the cap's byte rate and refill deadline, no message
+older than its expiry delivered under the cap, `Immediate` sends, send flags, refused datagrams, datagrams unavailable);
+`DatagramDeliveryTests` (unordered under loss/reorder/jitter, sequenced newest-only per key under reorder, the 16-bit wrap,
+coalescing on vs off at 60 Hz, unordered coalescing, ring overflow, receive budget, LRU eviction and the replay window, dense key
+spaces, a second epoch on one engine); `DatagramSendPathTests` (every send path alone and packed, borrowed pins released only when
+the transport is done, owned leases and refusals, tracked Delivered/Lost/Expired/Canceled/Disconnected, a transport-canceled
+datagram completing Expired, container members completing in both completion modes, compression round trip and the RawLength
+rules on the wire, admission refusals, send budget); `DatagramZeroAllocationTests` (60 Hz traffic of 64-byte messages over
+unordered, sequenced, coalescing, compressed and tracked channels; a capped scheduler with expiring messages); `SchedulerUnitTests`
+(`TokenBucket` overdraft, `ReceiveKeyTracker`, local completions, the idle packer) and `Framing/PackedContainerWriterResumeTests`.
+
+Step 3 (ordered delivery, async APIs, sends from other threads) adds: `OrderedTestKit.cs` (`OrderedTables.Main`, `OrderedKit` —
+roomy budgets, payload patterns, engine phase accessors — and `AsyncRefusalTransport`/`AsyncRefusalConnector`, which refuse a stream
+start the MsQuic way or synchronously); `OrderedDeliveryTests` (10 000 messages of 1 B … 64 KiB in order and byte-exact under
+datagram loss, jitter, reordering, stream packet loss, a bandwidth limit and flow control; one flush of 100 messages = four stream
+sends; a message cut into 600 packets; keys, request ids and compression in the frame; gathered pages; movement datagrams flowing
+during a large ordered transfer with DropWhenBlocked); `OrderedStreamTests` (stream credit, asynchronous and synchronous refusals
+re-sent on a new stream, STOP_SENDING closes the channel, a duplicate persistent stream and an oversized or FIN-cut frame are
+protocol violations, the sender's size limit, a full ring and an exhausted receive budget hold the stream back, a message that can
+never fit closes with LimitExceeded, expiry before the stream, close completes queued messages Disconnected, the send-table reserve,
+the queue limit counts bytes in flight, back-pressure from a receiver that stops polling to QueueFull and back, a segment arena of
+eight entries, an Immediate send without a Flush, a message that expires behind the head left out of the stream send);
+`AsyncApiTests` (SendAsync at once, waiting in call order, waiting for the send budget, canceled, unreliable, NotConnected and
+disposed, from another thread while the ThreadSafeSend front is full; FlushAsync at once, under the send cap,
+waiting for stream credit; WaitAsync / Wait / GetDeliveryStatus of both stages; ThreadPool completion; TryCancel while queued);
+`ThreadSafeSendTests` (four producer threads, a foreign Immediate send's pass on the game thread, tracked sends refused, every send
+path, drops counted, the checks made before a request is queued); `OrderedZeroAllocationTests` (ordered traffic both ways on a
+clean link — where the simulator itself allocates nothing, so a window measures only the session layer — the same workload under
+jitter and 2 % stream loss as a delivery test, the synchronous paths of SendAsync and FlushAsync, admitting sends queued by another
+thread); the CancelOnBlocked capability tests in `SchedulerTests`; and, in the simulator's own suite, `FlowControlTests`.
+
+The hooks wave (§4.7, §4.8) adds `HookTestKit.cs` (`RecordingWorkSignal`, `SharedPool` — a host-owned allocator with its
+`SharedLeaseTable` — and `QuietOptions`), `WorkSignalTests` (one signal per Poll for a burst of messages, an idle peer that never
+signals, a due timer in `HasPendingWork`, work created by `Close` / `CompleteAdmission` / a foreign-thread send, the
+coalescing-mailbox path, a throwing signal, and no allocation in the steady state), `SharedSendTests` (the shared reference released
+exactly once on every path: delivered, packed into a container, an ordered carrier acknowledged, a rejected admission, canceled, the
+session closed with the send queued, the peer disposed with the send in flight, a foreign-thread copy, argument validation, and zero
+allocation), `PeerSurfaceTests` (the split deadlines and their minimum, a send cap's flush deadline that Poll does not serve, a host
+loop driven by the two deadlines, `PeerOptions.Clone`/`Validate`, `IsDisposed`, and a throwing `StateChanged` handler that is not
+re-raised) and `ReconnectTests` (a full client resume with a new epoch on the same session id; handlers, `Index`, `Tag` and
+statistics kept; the lost connection's sends completing `Disconnected` with and without the host polling to Closed; an in-flight
+carrier's segment run reclaimed; the engines' second `OnEpochReset`; a refused resume that becomes a fresh session; and the
+refusals — a server peer, a live connection, a disposed peer, bad arguments, a call from inside `Poll`, and a connector that throws).
+
+The two review waves add `ReviewContractTests` (an unreliable send is never `Delivered` on a carrier without datagram send state,
+a stream stalled mid-message stops pinning the receive budget) and `ReviewPerfTests` (the receive ring is `capacity × 64 B` of
+64-byte-aligned native memory, the completion ring holds at most two completions per send entry, and receiving on a channel without
+a handler does not allocate in `Poll`), plus `OrderedDeliveryTests.Request_And_Response_Ids_Reach_The_Handler_On_A_RequestResponse_Channel`
+for the receive side of PROTOCOL.md §3.1 request ids.
+
 ## 7. Engine boundary and implementation waves
 
 The peer never contains mode-specific logic. It owns the shared tables (send entries, receive ring, mailboxes,
@@ -350,12 +536,16 @@ internal abstract class ChannelEngine : IDisposable     // Session/Engines/Chann
 
     // game thread
     public abstract SendStatus Admit(ref SendRequest request);          // validate, fill entry, enqueue (no transport call except Immediate)
-    public abstract void Flush(ref FlushContext flush);                 // submit queued work (called from the scheduler seam)
+    public virtual void FlushChannel(int channelIndex, ref FlushContext flush);   // scheduler pass over one channel (priority order): hand queued work over
+    public abstract void Flush(ref FlushContext flush);                 // engine-level work after every channel's pass (retries, bulk)
     public abstract void Tick(long nowMicros, ref long nextDeadline);    // retries, expiry, timers (every Flush while Connected)
     public abstract void OnSendCompleted(int entrySlot, in CompletionEntry completion);  // final completion, or the early Sent notice
     public abstract void OnEpochReset(bool resumed);                     // when the session becomes Connected (resumed = epoch > 1)
     public virtual bool TryCancel(int entrySlot);                        // default false
+    public virtual long OldestQueuedStamp();                             // FlushAsync watermark (default long.MaxValue)
+    public virtual void AddStatistics(int channelIndex, ref ChannelStatistics statistics);   // queued / in-flight numbers
     public virtual void OnPeerClosed();                                  // after Closed: complete queued entries Disconnected
+    public virtual void OnReconnecting();                                // Reconnect (§4.8): drop transport-bound state (streams, phases, notices)
     public virtual SendStatus RetireKey(ChannelDefinition, ulong key);   // C2 hooks: default NotSupported / NotSupportedException
     public virtual ValueTask<ReceiveLease> SendRequestAsync(ref SendRequest, long timeoutMicros, CancellationToken);
     public virtual SendStatus Respond(in ReceiveHeader request, ref SendRequest response);
@@ -367,6 +557,7 @@ internal abstract class ChannelEngine : IDisposable     // Session/Engines/Chann
     public abstract StreamAccept OnStreamOpened(TransportStreamId id, ushort channel, ulong groupId);       // Accept/Reject/CloseConnection
     public abstract StreamConsume OnStreamMessage(ref StreamMessageContext message);   // Start/Chunk/End/BulkHeader → Continue/Pend/ResetStream/CloseConnection
     public abstract void OnStreamClosed(TransportStreamId id, bool aborted, ulong errorCode);   // once per accepted stream; local stream events broadcast
+    public virtual void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status);   // a stream this engine opened (routed by the context's mode)
     public virtual bool OnControl(ControlType type, ReadOnlySpan<byte> body, bool onStream, long nowMicros);   // validated, admitted; false = violation / drop
     public virtual void Dispose();                                       // after the transport can no longer call back
 }
@@ -375,74 +566,250 @@ internal abstract class ChannelEngine : IDisposable     // Session/Engines/Chann
 `PeerCore` (Session/PeerCore.cs) is the engine-facing façade. Game thread: `TryAllocateEntry`, `TryTrack`, `AttachLease`,
 `SetPayload`, `Entries` (header blocks, cold SoA, `PinHandles`, `Next`/`BatchHead`), `Segments` (`SegmentArena`), `SubmitDatagram`,
 `SubmitStream`, `OpenStream`, `CompleteStage`, `CompleteEntry` (accepts Completed, InFlight and Filling entries), `DiscardEntry`,
-`ReleasePayload`, `TryRentSend`/`ReturnSend`, `SendCounters(ci)`, `MapDatagramState`, `MapStreamCompletion`, `GetToken`,
-`GetUserContext`, `CreateMailbox` (from `Initialize`), `CreateKeyTable(channel)`. Transport thread: `TryRentReceive`,
+`ReleasePayload`, `AttachShared` (one `SendShared` reference, dropped by `ReleasePayload`), `ResetForReconnect` (§4.8),
+`TryRentSend`/`ReturnSend`, `SendCounters(ci)`, `MapDatagramState`, `MapStreamCompletion`, `MapCompletion`,
+`MapSubmitFailure`, `QueueLocalCompletion`/`TryDequeueLocalCompletion`, `Packer`, `ScheduleOrder`, `GetToken`,
+`GetUserContext`, `CreateMailbox` (from `Initialize`), `CreateKeyTable(channel)`, `StampAdmission`/`GetAdmissionStamp`/
+`LastAdmissionStamp`, `CurrentPassMicros`/`NotePass` (the clock stamp of the current Poll/Flush/Immediate pass, so engines never
+read the clock per admitted message: ADR 0008 invariant 9). Transport thread: `TryRentReceive`,
 `TryEnqueueReceive`, `TryReserveReceive`/`PublishReserved`/`CancelReservation`, `NotePendedStream`, `RecvCounters(ci)`,
 `CountDatagramDropped`, `CurrentSenderTick`, `Streams`. Any thread: `RequestClose(code)`, `ReturnReceive`, `GetPointer`/`GetSpan`,
 `ChannelIndexOf`, `GetChannel`, `GetEngine`, `EffectiveMaxMessageSize`, `SessionMaxMessageSize`, `MaxDatagramPayload`,
 `DatagramsEnabled`, `DatagramStatesReported`, `StreamCreditGeneration`, `IsAdmitted`, `IsTransportClosing`, `Epoch`, `Clock`,
-`ConnectionStartMicros`, `StampReceive`/`RestoreReceive`, `Counters`.
+`ConnectionStartMicros`, `StampReceive`/`RestoreReceive`, `Counters`, `MakeEngineStreamContext`/`TryDecodeEngineStreamContext`,
+`CancelOnBlockedHonoured`, `ReceiveBudgetBytes`, `NoteWork` (the host work signal, §4.7). The send paths every engine shares (copy,
+owned, pinned, shared, borrowed, gather, LZ4) are `EnginePayload.TryPrepare`/`Commit`/`Release`.
 
 Completion rules. The transport thread validates the generation-tagged context (`Entries.TryTransitionContext`), moves the entry to
 `Completed` on a final state (datagram `Acknowledged`/`AcknowledgedSpurious`/`LostDiscarded`/`Canceled`, or `Sent` when the transport
-does not report states; any stream completion) and pushes a `CompletionEntry { Final = true }`; a tracked or container datagram
-entry also gets one early `Sent` notice (`Final = false`, entry still in flight). Stale contexts are counted. The game thread routes
-by the entry's channel: 0 → the peer's control traffic, 1 → `PeerCore.OnContainerCompleted` (packer seam), otherwise the channel's
-engine. With `CompletionMode.ThreadPool` the transport thread also completes the token of a tracked, non-container entry with the
-default mapping (unless the entry has `SendEntryFlags.EngineCompletes`); the game-thread `CompleteEntry` is then a no-op for the token
-and only frees the slot.
+does not report states; any stream completion) and pushes a `CompletionEntry { Final = true }`; **every** datagram entry also gets one
+early `Sent` notice (`Final = false`, entry still in flight), tracked or not, because the payload block is released at `Sent`
+(ADR 0008 invariant 1) — hence two ring items per entry. Stale contexts are counted. `PeerCore.MapDatagramState` maps an
+acknowledgement to `Delivered` and a final `Sent` (a carrier without per-datagram send state) to `DeliveryStatus.Sent`, never to
+`Delivered`: PROTOCOL.md §4.3 allows `Delivered` only when the transport reports datagram state. The game thread routes
+(`QuiclyPeer.RouteCompletion`) by the entry's channel: 0 → the peer's control traffic, 1 → the packer's fan-out
+(`PeerCore.OnContainerCompleted` → `DatagramPacker.OnContainerCompleted`, which routes every member back through `RouteCompletion`),
+otherwise the channel's engine. Completions the game thread decides itself — expiry at scheduling time, a cancellation, a refused
+submission — are queued with `PeerCore.QueueLocalCompletion` (`CompletionKind.Local` with a `Status`) and routed the same way at the
+end of the scheduler pass or at the start of the next Poll/Flush; `PeerCore.MapCompletion` maps any final completion. With
+`CompletionMode.ThreadPool` the transport thread also completes the token of a tracked, non-container entry with the default mapping
+(unless the entry has `SendEntryFlags.EngineCompletes`); the game-thread `CompleteEntry` is then a no-op for the token and only frees
+the slot.
 
-### 7.1 Seams for step 2 (datagram engines, scheduler, packer)
+### 7.1 Datagram delivery (as built: wave C1, step 2)
 
-* Register `UnreliableUnordered` and `UnreliableSequenced` engines in `ChannelEngines.Create`. `SessionSupportTests.
-  Every_Mode_Has_A_Registered_Engine` asserts placeholders only for the C2 modes.
-* Replace the body of `QuiclyPeer.FlushEngines(ref FlushContext)` (QuiclyPeer.Flush.cs) with the scheduler; keep engine `Tick`
-  where it is. Put the token bucket (`TokenBucket`, `PeerOptions.MaxSendBytesPerSecond`) in the scheduler.
-* The packer: container entries use channel id `PeerCore.ContainerChannelId` (1) and `SendEntryFlags.Container`, member entries join
-  with `Entries.AddToBatch` and are never submitted themselves; replace `PeerCore.OnContainerCompleted` with the fan-out (release on
-  the early Sent notice, finish members with `CompleteEntry` — it accepts their `Filling` state). In ThreadPool mode containers are not
-  signalled by the transport thread; fan out on the game thread (or extend `PeerCore.SignalFinal`).
-* Send flags per PROTOCOL.md §4.5 go through `SubmitDatagram(slot, flags)`; datagram size is `FlushContext.MaxDatagramPayload`.
-* Receive: `TryRentReceive` (count `Counters.OutOfReceiveBuffers` and the channel's `OutOfBuffers` on failure), copy, fill a
-  `ReceiveEntry` (`ReceivedMicrosDelta = PeerCore.StampReceive(now)`, `SenderTick = CurrentSenderTick`, `RawLength`,
-  `ReceiveFlags.Compressed` when `header.Compressed`), then `TryEnqueueReceive` (false ⇒ return the lease, count the channel's
-  `RingDrops`) or, for coalescing keyed channels, a mailbox from `CreateMailbox` (`TryPost`; return the displaced lease and count
-  `Superseded`). Poll decodes LZ4, dispatches and releases; engines never touch the game-thread side of a received message.
-* Send flags: set `TransportSendFlags.CancelOnBlocked` (PROTOCOL.md §4.5 `DropWhenBlocked` for unreliable datagrams) only when the
-  transport reports `TransportCapabilities.CancelOnBlocked`; without it the datagram is queued instead of being dropped and counted
-  `Expired`. Do not set `DelaySend` for tick bursts: it measured 16-19 % slower per datagram for bursts of 32 on MsQuic loopback.
-* `SessionTestKit.TestEngine` is a working example of every one of these calls.
+**Scheduler** (`QuiclyPeer.FlushEngines`, QuiclyPeer.Flush.cs). A pass runs in every `Flush` while Connected (after the engines'
+`Tick`) and at the end of every admitted `Immediate` send (`FlushImmediate`):
 
-### 7.2 Seams for step 3 (ordered-stream engine, async completion APIs)
+1. the send cap refills — a `TokenBucket` of `PeerOptions.MaxSendBytesPerSecond` bytes per second (0, or 2·10⁹ and more, means no
+   cap) whose burst is two flush intervals' worth (the interval clamped to 10 … 500 ms) — and `FlushContext.BudgetBytes = Available(now)`;
+2. `FlushContext.CancelBlockedDatagrams = TransportHonoursCancelOnBlocked()` (see send flags);
+3. `Packer.Begin`: the current `MaxDatagramPayload` (0 while datagrams are off) and the tick;
+4. every channel in `PeerCore.ScheduleOrder` (dense indices by priority descending, id ascending among equals; computed at
+   construction) gets `engine.FlushChannel(channelIndex, ref flush)`; within a channel the engine keeps admission order;
+5. every engine's `Flush(ref flush)`: work PROTOCOL.md §4.5 schedules after fresh real-time traffic (retries, bulk); the datagram
+   engines have none;
+6. `Packer.Finish` submits the open container or the held message;
+7. `flush.BytesSubmitted` is charged to the bucket (`Consume`; the balance may go negative and later refills repay it); when work was
+   held back (`BudgetExhausted`) `NextDeadline` becomes the refill time;
+8. after the pass, the local completions it queued are routed (`DrainLocalCompletions`).
 
-* Register the `ReliableOrdered` engine in `ChannelEngines.Create`.
-* Send: `PeerCore.OpenStream(StreamKind.Unidirectional, context, priority)` (context ≠ `PeerCore.ControlStreamContext`), the first
-  `SubmitStream` with `TransportSendFlags.Start`; retry opens that hit `StreamLimitReached` when `StreamCreditGeneration` changes.
-  Gathers: `Segments.TryAllocate(count ≤ 64, out start)`, copy each entry's pair from `Entries.GetSegments(slot)`, `SubmitStream(stream,
-  Segments.GetPointer(start), count, contextSlot, flags)`, keep `start` in the context entry (`Aux0`) and `Segments.Free(start)` when
-  its completion is drained; finish the covered entries with `CompleteEntry`.
-* Receive: a second persistent stream for a channel ⇒ `StreamAccept.CloseConnection(ProtocolViolation)`; `Start` ⇒
-  `TryReserveReceive` then `TryRentReceive(Header.Length)` (either failing ⇒ `StreamConsume.Pend`; the peer un-reads the event and
-  resumes the stream from Poll); `Chunk` ⇒ copy; `End` ⇒ `PublishReserved`; `OnStreamClosed` ⇒ cancel the reservation and return the
-  lease. `MaxMessageSize` (session cap included) is enforced by `StreamFrameParser` (`MessageTooLarge`), which the peer turns into a
-  connection `ProtocolViolation` on an ordered stream. Local-stream events (`OnStreamClosed` broadcast) arrive on the transport thread:
-  hand them to the game thread with an `Interlocked` flag per channel.
-* Local streams: one whose first `SubmitStream` (with `Start`) failed was never started — release it with `PeerCore.Transport.CloseStream`
-  (`AbortStream` does the same for it), expect no callback and treat the id as stale; only a started stream reports
-  `OnStreamShutdownComplete`. Back-pressure is `StreamConsume.Pend`: never call `ResumeStreamReceive` from inside a receive callback,
-  the peer resumes pended streams from Poll.
-* Async APIs: `QuiclyPeer.SendAsync` (today one synchronous admission attempt), `FlushAsync` (today `Flush()` + a completed task),
-  `WaitAsync`/`Wait`/`GetDeliveryStatus` (wired to `CompletionTable`) and `TryCancel` (wired to `ChannelEngine.TryCancel` through
-  `PeerCore.EntryOfToken`). `PeerOptions.ThreadSafeSend` is reserved: add the Vyukov MPSC front in QuiclyPeer.Send.cs and drain it at
-  the start of `Flush`/`Poll`.
+The pass is not re-entrant (`_inScheduler`). No user code runs inside it, because every completion it decides is queued, so only a
+continuation run in step 8 can start another pass, after the first ended. Budget rule for every consumer: hand bytes over only while
+`BudgetBytes > 0`, subtract them, add them to `BytesSubmitted`, set `BudgetExhausted` when stopping for the budget; the last message of
+a pass may overdraw.
+
+**Send flags** (`DatagramPacker.SendFlags`, PROTOCOL.md §4.5). `Priority` for messages of channels with priority ≥ 192
+(`DatagramPacker.PriorityThreshold`) and for `Immediate` sends; a container carries it when any member does. `CancelOnBlocked` for
+unreliable datagrams (a container only when every member is unreliable) and only when the pass allows it:
+`QuiclyPeer.TransportHonoursCancelOnBlocked()` is the one place that decides: it returns `TransportCapabilities.CancelOnBlocked`,
+which `PeerCore` records at `OnConnected` and again at every `OnDatagramCapabilityChanged` (MsQuic 2.4 and later and the simulator
+honour the flag; otherwise blocked datagrams are queued by the transport). Within a pass the transport-call order keeps the priority
+order: a stream engine hands the packer's pending container over (`DatagramPacker.SubmitPending`) before its own stream sends, so
+datagrams of channels the scheduler reached earlier never wait behind stream data. `DelaySend` is never set: it measured 16-19 %
+slower per datagram for tick bursts on MsQuic loopback and a later re-run found no measurable effect either way (the original step
+text asked for it on buffered sends). PROTOCOL.md §4.5 and ARCHITECTURE.md §7 record that measurement and that the flag is unused.
+
+**Packer** (`DatagramPacker`, `PeerCore.Packer`; PROTOCOL.md §2.2, ADR 0008 invariant 14). Engines hand it filled `Filling` entries
+(`Add(slot, hints, ref flush)`); it answers `Accepted` (it owns the entry for this pass), `Blocked` (budget), `Unavailable` (no
+datagrams: keep it queued) or `TooLarge` (header + payload above the current limit). It holds the first message; when a second one
+fits next to it, a container opens — its own entry on channel 1 (`PeerCore.ContainerChannelId`, `SendEntryFlags.Container`) with a
+send lease of `MaxDatagramPayload` bytes, written with a `PackedContainerWriter` resumed for every message (the new
+`PackedContainerWriter(buffer, length, count)` constructor), with the tick flag when `Flush(tick)` passed one — and later messages are
+appended while they fit (bytes, and at most 64 messages). A message that fits next to nothing goes out alone, zero copy; so does
+everything when no container lease or entry is available. Members join with `Entries.AddToBatch` (reusing `Next`), stay `Filling`,
+are never submitted, and their payload is returned as soon as it was copied (their BufferReleased stage still completes at the
+container's Sent). The container's `Aux0` counts tracked members. A refused `SubmitDatagram` queues a local completion
+(`MapSubmitFailure`: `Disconnected` while closing, otherwise `Failed`).
+
+Fan-out (`PeerCore.OnContainerCompleted` → `DatagramPacker.OnContainerCompleted`): the Sent notice returns the container's lease
+and, when a member is tracked, passes the notice to every member's owner; the final completion (transport or local) is copied to every
+member (slot and generation replaced) and routed through `QuiclyPeer.RouteCompletion`, so each owner finishes its member with
+`CompleteEntry` (which accepts `Filling`); then the container entry is finished. In ThreadPool mode the transport thread signals neither
+containers nor members; the fan-out on the game thread completes their tokens.
+
+**Datagram engines** (`Engines/DatagramEngine.cs`, `UnreliableUnorderedEngine`, `UnreliableSequencedEngine`, `ReceiveKeyTracker`;
+registered in `ChannelEngines.Create`).
+
+* State per channel of the mode (engine-local index): `ChannelSendState` (FIFO head/tail/count/bytes over `Entries.Next`,
+  `NextSequence`) and `ChannelRecvState` (unkeyed sequenced: `LastAccepted`, `HasAccepted`) in native arrays, the resolved default
+  expiry, the send hints, a `ReceiveKeyTracker` for keyed sequenced and for coalescing channels, a mailbox (`CreateMailbox(dense,
+  MaxKeys)`) for coalescing channels. Entry scratch: `Aux0` = admitted length, `Aux1` = queued, handed to the packer, or finished.
+* `Admit`: raw length ≤ `EffectiveMaxMessageSize` (`TooLarge`); a key beyond a dense key space (`KeyTableFull`); `QueueLimitBytes`
+  (`QueueFull`); an entry (`QueueFull`); the payload (`OutOfBuffers`): Copy → one lease, compressed into it when that shrinks the
+  payload; Owned → the caller's lease (zero copy) or a compressed lease (the caller's lease then returns to the pool at commit);
+  Pinned → the pointer (zero copy) or compressed; Borrowed → an array pinned with a `GCHandle` (`SendEntryFlags.Pinned`, freed with
+  the payload) or compressed, while memory that is not an array is copied; Gather → the pages copied into one lease (compressed when
+  that shrinks it), the pages returned at commit. LZ4 applies when `Compression == Lz4`, the length is at least max(2,
+  `MinCompressSize`) and the block is strictly shorter (the destination is one byte short), giving `RawLength = length`; otherwise
+  `RawLength` is 0. Encoded size above the current `MaxDatagramPayload` ⇒ `TooLarge` (fragmenting channels: the `AdmitFragmented`
+  hook, `NotSupported` until C2). Tracking (`QueueFull` when the completion table is full). Commit: the sequence from the channel
+  counter (16/32-bit wrap), header, payload, `Sequences`/`Keys`/`Deadlines` (admission clock + `SendOptions.ExpiryMicros`, or the
+  channel's resolved default; 0 = never), the `Immediate` flag, FIFO append. On any rejection the caller keeps its lease or pages.
+* `FlushChannel`: from the head — `now > deadline` ⇒ `Expired` counter + local completion `Expired`; `Packer.Add` ⇒ `Accepted`
+  (`Sent`, `Bytes`), `TooLarge` (`TooLarge` counter + local `Failed`: the limit shrank after admission), `Blocked`/`Unavailable` ⇒ stop
+  with the entry at the head. The queue link is read before `Add` (the packer reuses it).
+* `OnSendCompleted`: the Sent notice ⇒ `ReleasePayload` + BufferReleased; final ⇒ `CompleteEntry(MapCompletion)`; a local completion
+  of an entry the packer had taken (a refused datagram) un-counts `Sent`/`Bytes`.
+* `TryCancel`: only while queued; unlinked, local completion `Canceled` (finished at the next Poll/Flush). `OnPeerClosed`: queued
+  entries ⇒ `Disconnected`. `OnEpochReset`: the first call opens the first epoch; a later one on the same engine restarts
+  `NextSequence` and has the transport thread clear the receive tables before its next datagram (PROTOCOL.md §4.1). `Tick` and `Flush`
+  do nothing: expiry is evaluated when the scheduler reaches an entry.
+* `OnDatagram` (transport thread): fragments ⇒ the `OnFragment` hook (dropped and counted until C2); acceptance — unordered: always
+  (coalescing: the key's slot); sequenced unkeyed: newer than the channel's last (serial, 16 or 32 bits); sequenced keyed:
+  `ReceiveKeyTracker.TryAcceptSequence` (stale ⇒ `Dropped`, a dense key out of range ⇒ `KeyTableFull`); the receive lease
+  (`OutOfBuffers`, peer `OutOfReceiveBuffers`); the `ReceiveEntry` (sequence, key, `RawLength`, `Compressed`, `StampReceive(now)`,
+  `CurrentSenderTick`); coalescing ⇒ `ReceiveMailbox.TryPost(…, out displaced, out replaced)` (`Superseded`), otherwise
+  `TryEnqueueReceive` (full ⇒ the newest is dropped: `RingDrops`, peer `ReceiveRingDrops`); `Received`/`Bytes`.
+* `ReceiveKeyTracker`: the channel's key table (a hashed `KeyTable(MaxKeys, 64)` that grows, or a `DenseKeyTable`), the last accepted
+  sequence per slot and, for hashed tables, a least-recently-updated list: a full table evicts the key updated longest ago (stale
+  values do not refresh a key), and an evicted key re-accepts any sequence when it returns (the PROTOCOL.md §7 replay window). The
+  per-slot arrays grow with the slots in use.
+
+**Statistics.** `PeerStatistics.DatagramsSent`, `DatagramBytesSent`, `ContainersSent` and `MessagesPacked` (application datagrams:
+messages sent alone and containers; control datagrams are not included); per channel the send counters `Sent`, `BytesSent`,
+`Expired`, `QueueFull`, `TooLarge`, `SendKeyTableFull` and the receive counters `Received`, `BytesReceived`, `Dropped`,
+`ReceiveSuperseded`, `RingDrops`, `ReceiveKeyTableFull`, `OutOfBuffers`.
+
+### 7.2 Reliable ordered delivery (as built: wave C1, step 3)
+
+**Engine** (`Engines/ReliableOrderedEngine.cs`, registered in `ChannelEngines.Create`). One instance per peer owns every
+`ReliableOrdered` channel: a 64-byte `OrderedSendState` per channel in native memory, owned by the game thread (the FIFO over
+`Entries.Next`, queued and in-flight counts and bytes, the send stream with its serial and phase, the stream credit generation
+read before the last open, the carriers outstanding, the carrier of an unconfirmed start), and a 64-byte `OrderedRecvState` per
+channel owned by the transport thread (the peer's stream, the lease and header fields of the message being received, flags).
+
+* `Admit`: `ChannelClosed` once the channel's stream failed; raw length ≤ `EffectiveMaxMessageSize` (`TooLarge`);
+  `QueueLimitBytes` bounds the bytes admitted and not yet acknowledged, queued plus in flight (`QueueFull`; a message larger than
+  the limit still goes alone); the entry table keeps a reserve of one entry per ordered channel plus one for the carriers that
+  drain the queues (`QueueFull` before it is touched, so a full table cannot deadlock); the payload by every send path
+  (`EnginePayload`, `OutOfBuffers`; a single gathered page is taken as it is); tracking (`QueueFull`). Commit: the frame header
+  (Length, Key, RequestId, RawLength — PROTOCOL.md §3.1, at most 24 bytes) in the entry's header block, the payload segment, the
+  expiry deadline (none by default on reliable channels), the admission stamp, FIFO append. `Aux0` = admitted length, `Aux1` =
+  queued, in a carrier, or finished.
+* `FlushChannel` (every scheduler pass, in priority order): the notices of the channel's streams are applied first; a closed
+  channel fails its queue; `Starting` and `Refused` wait; `Blocked` waits until `StreamCreditGeneration` changes; expired messages
+  at the head are dropped (`Expired`, local completion). Then carriers go out. A **carrier** is an untracked send entry of the
+  channel whose `Aux0` is a run of `PeerCore.Segments` — at most 64 segments: the preamble, then each message's header/payload pair
+  (ADR 0008 invariant 1) — and whose batch list (`BatchHead`, the members linked through `Next` in admission order) names the
+  messages it carries. The members stay `Filling`, are never submitted themselves, and keep their header blocks and payloads until
+  the carrier completes. Stream bytes (preamble, headers, payloads) follow the budget rule of §7.1, and the packer's pending
+  container is handed over first (`DatagramPacker.SubmitPending`) so datagrams of channels the scheduler reached earlier never
+  queue behind stream data. One `SubmitStream` per carrier, 32 messages per call on an open stream (ADR 0008 invariant 14). The
+  stream is opened lazily (`OpenStream(Unidirectional, PeerCore.MakeEngineStreamContext(ReliableOrdered, channel, serial),
+  priority × 257)`); the first carrier carries the preamble (in its own header block) and `Start`, and nothing more is sent until
+  the start is confirmed.
+* **Stream lifecycle** (`StreamPhase`): `NoStream` → (first carrier accepted with `Start`) `Starting` → (`OnStreamStarted(Success)`)
+  `Open`. A start the peer's stream limit refuses never reached the peer, so its messages are sent again, first, on a new stream:
+  refused synchronously (the send returns `StreamLimitReached`; the stream is released with `CloseStream`, the carrier unwound and
+  the messages put back at the head) → `Blocked`; refused asynchronously, as MsQuic and the simulator do
+  (`OnStreamStarted(StreamLimitReached)`, then the carrier's canceled completion, then `OnStreamShutdownComplete`, after which the
+  peer's shutdown handling calls `CloseStream`) → `Refused` → (the carrier completes canceled: its messages go back to the head and
+  their `Sent` counts are taken back) → `Blocked` → (`OnStreamsAvailable` changed `StreamCreditGeneration`) `NoStream` → a new
+  stream with the next serial. A stream the peer stops (STOP_SENDING, `OnStreamClosed(aborted)`), one that fails to start for
+  another reason, and one that shuts down while open close the channel for the connection (`Closed`): queued messages complete
+  `Failed` (`Disconnected` when the connection goes down), in-flight ones with their canceled carriers, and `Admit` answers
+  `ChannelClosed`. An `OpenStream` failure other than the limit (`OutOfMemory` while a closed slot is still being released,
+  `InvalidState` after shutdown) is retried at the next pass.
+* **Notices.** Local-stream events arrive on the transport thread. `OnStreamStarted` (routed by the context's mode; it records the
+  stream id and serial per channel in transport-thread arrays) and the broadcast `OnStreamClosed` (matched by stream id) post a
+  notice `(channel, serial, kind)` into an SPSC ring (16 per channel); the game thread drains it before every decision that depends
+  on it (`Admit`, `FlushChannel`, a carrier's completion, `OnPeerClosed`) and ignores the notices of earlier serials.
+* **Completions.** A carrier's final completion frees its segment run. Not canceled ⇒ every member `CompleteEntry(Delivered)`, in
+  admission order; both stages complete together, since BufferReleased and Delivered are the same event for reliable streams
+  (PROTOCOL.md §4.3). Canceled while the transport closes ⇒ `Disconnected`; canceled after a refusal of the current stream ⇒
+  re-queued; otherwise ⇒ `Failed`, and the channel closes. Local completions finish members that never went out (expired,
+  canceled, failed). `TryCancel` works while a message is queued (unlinked, local `Canceled`). `OnPeerClosed`: queued ⇒
+  `Disconnected`.
+* **Receive** (transport thread). `OnStreamOpened` accepts one stream per channel per connection; a second is
+  `CloseConnection(ProtocolViolation)` (PROTOCOL.md §3). `Start`: a message that could never be buffered (larger than the receive
+  budget or the largest pool block) ⇒ `CloseConnection(LimitExceeded)`; otherwise `TryReserveReceive`, then `TryRentReceive(Length)`
+  (nothing for an empty message) — either failing ⇒ `Pend` (the peer un-reads the event and Poll resumes the stream;
+  `PeerStatistics.StreamReceivePends`). `Chunk` ⇒ copied into the lease. `End` ⇒ `PublishReserved` (`Compressed` and `RawLength`
+  for LZ4, decoded in Poll; `IsRequest`/`IsResponse` when a request id is present). `OnStreamClosed` ⇒ the reservation is cancelled
+  and the lease returned, and the peer's mid-message idle sweep (§4.3) resets a stream that stops half way through a message.
+  `MaxMessageSize` (session cap included), frame errors and a FIN inside a message are enforced by the
+  peer's parser: a connection `ProtocolViolation` on ordered streams.
+* **Receive-budget sizing rule.** The staging lease of an ordered message is rented whole, so the engine's limit is
+  `min(PeerOptions.ReceiveBudgetBytes, allocator's largest block)`: a message that is within its channel's `MaxMessageSize` but
+  above that limit could never be buffered and closes the connection with `LimitExceeded`. A peer's receive budget **and** its
+  pool's largest size class must therefore be at least the largest `MaxMessageSize` of any ordered (or group) channel it accepts.
+  The defaults satisfy it with room to spare (256 KiB budget, a 256 KiB largest block, 64 KiB reliable `MaxMessageSize`); a host
+  that raises `MaxMessageSize`, shrinks `ReceiveBudgetBytes` or supplies a pool without a large size class must keep the rule.
+* **Statistics.** Per channel: `Sent`/`BytesSent` at hand-off (taken back after a refusal), `Received`/`BytesReceived` at the end
+  of a message, `Expired`, `QueueFull`, `TooLarge`, `ReceiveTooLarge`, and the engine's `QueuedMessages`, `QueuedBytes`,
+  `InFlightMessages`, `InFlightBytes` (`ChannelEngine.AddStatistics`). Per peer: `StreamSends`, `StreamBytesSent`,
+  `StreamReceivePends`, `StreamIdleTimeouts`.
+
+### 7.3 Async APIs and sends from other threads (as built: wave C1, step 3)
+
+* `SendAsync(header, payload, options, ct)` makes one synchronous `SendCopy`. `QueueFull` or `OutOfBuffers` on a reliable channel
+  of a connected session makes it a waiter (a `TaskCompletionSource`, allocated only then) that is retried after the completions
+  were drained in every Poll and Flush, in call order per channel (a channel stops at its first send that still does not fit).
+  While a channel has waiters, synchronous sends on it answer `QueueFull`, so nothing overtakes them. The task completes with the
+  admission result (continuations inline with `PollOnly`, on the thread pool with `ThreadPool`), with `NotConnected` when the
+  session closes, and faults with `ObjectDisposedException` on `Dispose`; the token cancels the wait (a canceled waiter is never
+  admitted). The synchronous path allocates nothing.
+* `FlushAsync(ct)` runs `Flush()`, then compares a watermark: the stamp of the last admitted message (`PeerCore.LastAdmissionStamp`)
+  against the oldest stamp any engine still holds (`ChannelEngine.OldestQueuedStamp`: queue heads, and for an ordered channel whose
+  start is unconfirmed the first member of its start carrier, because a refused start comes back). Nothing older left ⇒ a
+  completed `ValueTask`, no allocation; otherwise a waiter completed after the scheduler pass that hands the last of them over
+  (a Flush or an Immediate send), or when the session closes; `ObjectDisposedException` on `Dispose`.
+* `WaitAsync`/`Wait`/`GetDeliveryStatus` read the `CompletionTable`; `TryCancel` goes through `PeerCore.EntryOfToken` to the
+  channel's engine.
+* `ThreadSafeSend`. The game thread is the thread that last entered Poll or Flush (before that, the thread that created the peer).
+  A send from any other thread copies the payload into a send lease (`TryRentSend`, whose budget accounting becomes atomic; an
+  owned lease moves as it is), writes a 56-byte `ForeignSend` (lease, key, context, expiry, length, channel, mode) into a Vyukov
+  `MpscRing` (with its sequence word a 64-byte slot; capacity `SendTableCapacity`) and answers `Admitted` without a token
+  (`QueueFull` when the ring is full; tracked sends answer `NotSupported`, because tokens belong to the game thread). The game
+  thread admits the requests at the start of Poll and Flush as owned sends, oldest first; a request that does not fit yet stays
+  first for the next call, and one refused for good is dropped and counted (`PeerStatistics.ThreadSafeSendDrops`). An `Immediate`
+  request never runs a pass on the producing thread: Poll runs one after it drained the ring. A `SendAsync` from another thread
+  retries every millisecond while the ring is full. Requests of one thread keep their order; there is no order between threads.
+
+### 7.4 Seams for wave C2
+
+* A mode engine replaces its placeholder in `ChannelEngines.Create` and reuses what the ordered engine uses: `EnginePayload` for the
+  send paths; carriers over `Segments` runs for stream gathers; `PeerCore.MakeEngineStreamContext` for every stream it opens (the
+  peer routes their `OnStreamStarted` by the context's mode); an SPSC ring of notices for local-stream events; `QueueLocalCompletion`
+  inside passes; `StampAdmission` at commit with `OldestQueuedStamp` for `FlushAsync`; `AddStatistics`.
+* Group streams (`ReliableUnordered`, large `ReliableLatest` values): one stream per group, and the refusal handling above applies
+  per stream (a refused group waits for credit and goes out on a new stream: PROTOCOL.md §3.2, "the group waits, it never fails").
+  The peer grants Σ max(MaxGroups, 1) unidirectional streams.
+* Request/response (ordered channels with `RequestResponse`): the frame's RequestId is written from `SendRequest.RequestId` and
+  parsed into `ReceiveEntry.RequestId` with `IsRequest`/`IsResponse`; `SendRequestAsync`/`Respond` are the engine hooks
+  (`NotSupported` until C2).
+* Fragmentation: `DatagramEngine.AdmitFragmented`/`OnFragment` (§7.1).
+* Bulk: `PeerOptions.BulkShareOfEstimatedBandwidth`/`BulkMaxBytesPerSecond` and `OnIdealSendBufferSize` are not used yet; bulk
+  streams share the send cap and the budget rule of `FlushChannel`.
 
 Waves:
 
 | Wave | Content | Depends on |
 |---|---|---|
 | C1 step 1 (done) | `PeerCore`, `QuiclyPeer` public API, handshake/control/ping/close, `ChannelEngine` base + registry + placeholder, stream table, completions, Poll/Drain/handlers, statistics | State, Framing, Channels, Control, SimulatedTransport |
-| C1 step 2 | packer + scheduler, engines for `UnreliableUnordered`, `UnreliableSequenced` (incl. coalescing mailboxes), all send paths, tracked sends, compression on send | step 1 |
-| C1 step 3 | `ReliableOrdered` engine (persistent stream, gather send, progressive receive, back-pressure), `SendAsync`/`FlushAsync`/`ThreadSafeSend`, benchmarks | steps 1–2 |
+| C1 step 2 (done) | packer + scheduler (§7.1), engines for `UnreliableUnordered`, `UnreliableSequenced` (incl. coalescing mailboxes and LRU key tables), all send paths, tracked sends, compression on send, send cap, `Immediate` sends | step 1 |
+| C1 step 3 (done) | `ReliableOrdered` engine (persistent stream, carrier gathers, refused-start retry, progressive receive, back-pressure), `SendAsync`/`FlushAsync`/`ThreadSafeSend`, simulator flow control, benchmarks (§7.2, §7.3) | steps 1–2 |
 | C2 (parallel) | `ReliableLatestEngine`; `GroupStreamEngine` (`ReliableUnordered`); `BulkEngine`; fragmentation in the unreliable engines; request/response in the ordered engine | C1 |
 | C3 | `MsQuicTransport` (ITransport over the MsQuic wrappers) + listener/connector; `QuiclyServer` / `QuiclyClient`; admission; reconnect | C1, msquic bindings |
 | C4 | WebTransport-over-HTTP/3 carrier (opt-in), HTTP/3 static responder | C3, Http3 |

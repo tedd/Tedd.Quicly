@@ -1,0 +1,104 @@
+using Tedd.Quicly.Core.Channels;
+using Tedd.Quicly.Core.Session;
+using Tedd.Quicly.Testing.Simulation;
+
+namespace Tedd.Quicly.Core.Tests.Session;
+
+/// <summary>
+/// Steady-state send, flush, packing and poll of the datagram engines must not allocate (ADR 0008). The simulator raises the
+/// transport callbacks on the test thread, so the transport-thread receive paths are measured too.
+/// </summary>
+public class DatagramZeroAllocationTests
+{
+    private static readonly ChannelTable Table = DatagramTables.Main;
+
+    [Fact]
+    public void Sixty_Hertz_Traffic_Of_64_Byte_Messages_Does_Not_Allocate()
+    {
+        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 10_000, JitterMicros = 2_000 }, table: Table);
+        SimulatedNetwork network = h.Network;
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        long received = 0;
+        MessageHandler count = (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++;
+        server.RegisterHandler(2, count);
+        server.RegisterHandler(3, count);
+        server.RegisterHandler(4, count);
+        server.RegisterHandler(5, count);
+        byte[] payload = new byte[64];
+        byte[] compressible = new byte[200];
+        uint tick = 0;
+        void Tick()
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                client.SendCopy(new SendHeader(2), payload);
+                client.SendCopy(new SendHeader(3, (ulong)i), payload);
+                client.SendCopy(new SendHeader(4, (ulong)i), payload);
+            }
+
+            client.SendCopy(new SendHeader(5), compressible);
+            client.SendCopy(new SendHeader(2), payload, SendOptions.Tracked);
+            client.Flush(++tick);
+            network.Advance(16_667);
+            server.Poll();
+            server.Flush();
+            client.Poll();
+        }
+
+        for (int i = 0; i < 600; i++)
+        {
+            Tick();
+        }
+
+        WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 120; i++)
+            {
+                Tick();
+            }
+        });
+        Assert.True(received > 600 * 20, $"{received} messages");
+        Assert.Equal(PeerState.Connected, client.State);
+    }
+
+    [Fact]
+    public void A_Capped_Scheduler_With_Expiring_Messages_Does_Not_Allocate()
+    {
+        using SessionHarness h = new(table: Table, client: o => o.MaxSendBytesPerSecond = 30_000);
+        SimulatedNetwork network = h.Network;
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        long received = 0;
+        server.RegisterHandler(14, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
+        byte[] payload = new byte[64];
+        uint tick = 0;
+        void Tick()
+        {
+            for (int i = 0; i < 16; i++)
+            {
+                client.SendCopy(new SendHeader(14, (ulong)i), payload);
+            }
+
+            client.Flush(++tick);
+            network.Advance(16_667);
+            server.Poll();
+            client.Poll();
+        }
+
+        for (int i = 0; i < 600; i++)
+        {
+            Tick();
+        }
+
+        WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 120; i++)
+            {
+                Tick();
+            }
+        });
+        Assert.True(received > 1_000, $"{received} messages");
+        Assert.True(DatagramKit.ChannelStats(client, 14).Expired > 1_000);
+    }
+}

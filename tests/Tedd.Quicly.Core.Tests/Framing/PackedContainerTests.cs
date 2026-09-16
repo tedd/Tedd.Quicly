@@ -190,8 +190,10 @@ public class PackedContainerTests
     }
 
     [Fact]
-    public void More_Than_64_Messages_Is_Rejected()
+    public void More_Messages_Than_The_Sender_Packs_Are_Accepted()
     {
+        // PROTOCOL.md §2.2/§8: the receiver accepts as many messages as the datagram holds (its length is the implicit
+        // bound); PackedContainer.MaxMessages is only what this implementation packs into one container.
         List<byte> bytes = new() { 0x01, 0x00 };
         for (int i = 0; i < 65; i++)
         {
@@ -199,10 +201,27 @@ public class PackedContainerTests
             bytes.Add(0x02);
         }
 
-        Assert.Equal(ParseStatus.TooManyMessages, PackedContainer.TryParse(bytes.ToArray(), out _));
-        bytes.RemoveRange(bytes.Count - 2, 2);
         Assert.Equal(ParseStatus.Ok, PackedContainer.TryParse(bytes.ToArray(), out PackedContainerReader reader));
-        Assert.Equal(64, reader.Count);
+        Assert.Equal(65, reader.Count);
+
+        // A conformant peer fits hundreds of two-byte messages in one 1 200-byte datagram.
+        bytes = new List<byte> { 0x01, 0x00 };
+        for (int i = 0; i < 399; i++)
+        {
+            bytes.Add(0x01);
+            bytes.Add(0x02);
+        }
+
+        Assert.Equal(ParseStatus.Ok, PackedContainer.TryParse(bytes.ToArray(), out PackedContainerReader many));
+        Assert.Equal(399, many.Count);
+        int seen = 0;
+        foreach (ReadOnlySpan<byte> message in many)
+        {
+            Assert.Equal(1, message.Length);
+            seen++;
+        }
+
+        Assert.Equal(399, seen);
     }
 
     [Fact]

@@ -47,8 +47,16 @@ public sealed class PeerOptions
     public CompletionMode CompletionMode { get; set; } = CompletionMode.PollOnly;
 
     /// <summary>
-    /// Allow <c>Send*</c> from threads other than the game thread (a multi-producer front drained at Flush/Poll).
-    /// Reserved: the multi-producer front arrives with the delivery engines; until then sends must come from the game thread.
+    /// Allow <c>SendCopy</c>/<c>SendOwned</c>/<c>SendPinned</c>/<c>SendBorrowed</c>/<c>SendGather</c>/<c>SendAsync</c> and
+    /// <c>RentBuffer</c>/<c>ReturnBuffer</c> from threads other than the game thread (ARCHITECTURE.md §3). The game thread is
+    /// the thread that last entered <c>Poll</c> or <c>Flush</c> (before the first call: the thread that created the peer);
+    /// its sends are admitted directly. A send from any other thread copies the payload into a send lease (an owned lease
+    /// moves as it is), queues a 64-byte request in a lock-free multi-producer ring of <see cref="SendTableCapacity"/> slots
+    /// and answers <c>Admitted</c> without a token (<c>QueueFull</c> when the ring is full; tracked sends answer
+    /// <c>NotSupported</c> because tokens belong to the game thread). The game thread admits the requests, oldest first, at
+    /// the start of its next <c>Poll</c> or <c>Flush</c>; <c>Immediate</c> from another thread means "at the next Poll or
+    /// Flush". Requests of one thread keep their order; there is no order between threads. The send budget is then kept with
+    /// atomic operations. Off by default: all other members stay game-thread only.
     /// </summary>
     public bool ThreadSafeSend { get; set; }
 
@@ -77,6 +85,14 @@ public sealed class PeerOptions
     public TimeSpan HeartbeatTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>
+    /// A stream of the peer that stops making progress in the middle of a message for this long is reset with
+    /// <see cref="QuiclyErrorCode.Timeout"/> (PROTOCOL.md §7 "stream idle mid-message"), which releases the staging
+    /// lease and the receive-ring reservation the half-received message holds; the connection survives.
+    /// <see cref="TimeSpan.Zero"/> disables the check. Default 30 s.
+    /// </summary>
+    public TimeSpan StreamIdleTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// After Close is sent, how long the peer waits for the control stream to deliver it before closing the transport
     /// anyway. Default 1 s.
     /// </summary>
@@ -88,7 +104,12 @@ public sealed class PeerOptions
     /// <summary>The host's expected flush period, used to resolve <see cref="ChannelDefinition.ExpiryTwiceFlushInterval"/>. Default 1/60 s.</summary>
     public TimeSpan FlushInterval { get; set; } = TimeSpan.FromTicks(166_667);
 
-    /// <summary>Send bandwidth cap in bytes per second (token bucket, PROTOCOL.md §4.5); 0 = unlimited.</summary>
+    /// <summary>
+    /// Send cap in bytes per second (a token bucket, PROTOCOL.md §4.5): the scheduler hands application datagrams (and, with the
+    /// ordered-stream engine, stream data) to the transport only while the bucket is positive; its burst is two flush intervals'
+    /// worth, and a pass held back by it lowers <see cref="QuiclyPeer.NextDeadline"/> to the refill time. Control traffic (pings,
+    /// the handshake, close) is not capped. 0, or 2 000 000 000 and more, means no cap.
+    /// </summary>
     public long MaxSendBytesPerSecond { get; set; }
 
     /// <summary>Bulk traffic's share of the estimated bandwidth (PROTOCOL.md §4.5). Reserved for the bulk engine. Default 0.5.</summary>
@@ -139,13 +160,35 @@ public sealed class PeerOptions
     /// </summary>
     public bool FailFastOnCallbackException { get; set; }
 
+    /// <summary>
+    /// Told once, without blocking, whenever the peer publishes game-thread work — received messages, completions, control
+    /// frames and the handshake from the transport thread, and work an application call created
+    /// (<see cref="QuiclyPeer.Close(CloseReason)"/>, <see cref="QuiclyPeer.CompleteAdmission"/>, a send from another
+    /// thread) — so a host can wake a sleeping game thread instead of polling idle peers. Set-once until the next
+    /// <see cref="QuiclyPeer.Poll"/>; <see cref="QuiclyPeer.HasPendingWork"/> says whether anything is really waiting.
+    /// <see langword="null"/> (the default) means the host polls on its own schedule.
+    /// </summary>
+    public IPeerWorkSignal? WorkSignal { get; set; }
+
     /// <summary>Test hook: overrides the engine created for a delivery mode (return <see langword="null"/> to keep the default).</summary>
     internal Func<ChannelMode, ChannelEngine?>? EngineFactory { get; set; }
 
-    /// <summary>Checks every value.</summary>
+    /// <summary>
+    /// An independent copy of these options, so a host can hand every peer its own instance instead of sharing one (and
+    /// without copying property by property). Shallow: the copy shares the <see cref="Clock"/>, <see cref="Allocator"/>,
+    /// <see cref="AllocatorOptions"/> and <see cref="WorkSignal"/> instances and the memory behind
+    /// <see cref="SessionToken"/>, which is what a host wants — one pool and one clock serve many peers.
+    /// </summary>
+    /// <returns>The copy.</returns>
+    public PeerOptions Clone() => (PeerOptions)MemberwiseClone();
+
+    /// <summary>
+    /// Checks every value, exactly as <see cref="QuiclyPeer.Connect"/> and <see cref="QuiclyPeer.CreateServerPeer"/> do, so
+    /// a host can reject a bad configuration at start-up instead of when its first connection arrives.
+    /// </summary>
     /// <exception cref="ArgumentException">A value is out of range.</exception>
     /// <exception cref="NotSupportedException"><see cref="AutoFlushInterval"/> is not zero.</exception>
-    internal void Validate()
+    public void Validate()
     {
         if (Clock is null)
         {
@@ -169,6 +212,7 @@ public sealed class PeerOptions
         CheckNonNegative(AckDelay, nameof(AckDelay));
         CheckNonNegative(FastLockDuration, nameof(FastLockDuration));
         CheckNonNegative(HeartbeatTimeout, nameof(HeartbeatTimeout));
+        CheckNonNegative(StreamIdleTimeout, nameof(StreamIdleTimeout));
         CheckNonNegative(CloseLinger, nameof(CloseLinger));
         CheckNonNegative(SessionGrace, nameof(SessionGrace));
         if (MaxSendBytesPerSecond < 0 || BulkMaxBytesPerSecond < 0)

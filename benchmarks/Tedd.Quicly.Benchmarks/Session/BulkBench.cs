@@ -52,8 +52,8 @@ public class BulkBench
         _network = new SimulatedNetwork(_clock, 1);
         _listener = new SimulatedListener(_network);
         _source = new BulkSource();
-        PeerOptions serverOptions = Options(new BulkRouter());
-        PeerOptions clientOptions = Options(null);
+        PeerOptions serverOptions = Options(_clock, new BulkRouter());
+        PeerOptions clientOptions = Options(_clock, null);
         QuiclyPeer? accepted = null;
         _listener.Start(static (in NewConnectionInfo _) => PreHandshakeDecision.Accept, (ITransport transport, in NewConnectionInfo info) =>
         {
@@ -136,9 +136,15 @@ public class BulkBench
     /// <summary>Transfer records the sending engine still holds on the bulk channel.</summary>
     private long LiveTransfers() => _client.GetChannelStatistics(5, out ChannelStatistics statistics) ? statistics.QueuedMessages : 0;
 
-    private static PeerOptions Options(IBulkRouter? router)
+    /// <summary>
+    /// Both peers share the simulated network's clock. Unlike the other session benchmarks, this one generates real
+    /// control traffic — one <c>BulkProgress</c> per 64 KiB accepted (PROTOCOL.md §2.3) — and a peer whose clock never
+    /// advances can never refill its control-message bucket, so it would close the session with <c>LimitExceeded</c> part
+    /// way through the run and the remaining invocations would measure a dead session.
+    /// </summary>
+    private static PeerOptions Options(VirtualClock clock, IBulkRouter? router)
     {
-        PeerOptions options = SessionFixture.Options(new VirtualClock(), compact: false);
+        PeerOptions options = SessionFixture.Options(clock, compact: false);
         options.SendBudgetBytes = 4 * Mib;
         options.ReceiveBudgetBytes = 4 * Mib;
         options.BulkSendWindowBytes = 256 * 1024;

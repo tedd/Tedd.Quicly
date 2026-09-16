@@ -382,6 +382,48 @@ public class BulkDeliveryTests
         Assert.Equal(PeerState.Connected, h.Server!.State);
     }
 
+    [Fact]
+    public void Many_Sequential_Transfers_Reuse_Their_Records_And_Streams()
+    {
+        // One object after another on the same session, driven like the benchmark's loop: every transfer takes a record
+        // and a stream and must give both back, or a later one is refused and the session eventually goes down.
+        const int size = 256 * 1024;
+        CountingSink sink = new();
+        AcceptRouter router = new(_ => sink);
+        using SessionHarness h = new(
+            table: BulkTables.Main,
+            client: o =>
+            {
+                BulkKit.Quiet(o);
+                o.BulkSendWindowBytes = 256 * 1024;
+            },
+            server: BulkKit.Receiver(router));
+
+        for (int i = 0; i < 40; i++)
+        {
+            BulkTransfer transfer = h.Client.BeginBulkSendAsync(new BulkDescriptor(5, (ulong)i, 1, size), new PatternSource(size))
+                .AsTask().GetAwaiter().GetResult();
+            for (int pass = 0; pass < 400 && (!transfer.IsFinished || BulkKit.SendTransfers(h.Client, 5) > 0); pass++)
+            {
+                h.Client.Flush();
+                h.Network.Advance(0);
+                h.Server!.Poll();
+                h.Server!.Flush();
+                h.Network.Advance(1_000);
+                h.Client.Poll();
+            }
+
+            Assert.True(
+                transfer.Status == BulkStatus.Completed,
+                $"transfer {i} ended {transfer.Status}: client {h.Client.State} {h.Client.CloseReason.Code} from "
+                + $"{h.Client.CloseReason.Source}, server fault {h.Server!.LastCallbackFault}, client fault {h.Client.LastCallbackFault}");
+            Assert.Equal(0, BulkKit.SendTransfers(h.Client, 5));
+        }
+
+        Assert.Equal(40L * size, sink.BytesWritten);
+        Assert.Equal(PeerState.Connected, h.Client.State);
+    }
+
     private static byte[] Payload(int length)
     {
         byte[] payload = new byte[length];

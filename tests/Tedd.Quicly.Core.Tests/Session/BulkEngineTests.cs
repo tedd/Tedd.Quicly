@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Framing;
@@ -46,6 +47,69 @@ public class BulkEngineTests
         // A transfer with no engine behind it still records the request, so a later Cancel is inert rather than a throw.
         transfer.Cancel();
         Assert.True(transfer.CancelRequested);
+    }
+
+    [Fact]
+    public async Task A_Peer_Cancel_Ends_The_Transfer_This_End_Is_Sending()
+    {
+        AcceptRouter router = AcceptRouter.Pattern();
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 5_000, BandwidthBitsPerSecond = 4_000_000 },
+            table: BulkTables.Main,
+            client: BulkKit.Quiet,
+            server: BulkKit.Receiver(router));
+
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, 4 * 1024 * 1024), new PatternSource(4 * 1024 * 1024));
+        Assert.True(h.RunUntil(() => transfer.BytesTransferred > 0), "the transfer never started moving");
+
+        // PROTOCOL.md §3.4: the peer may cancel a transfer it is receiving. A cancel for an id that is not running is
+        // well formed and ignored; the one that names this transfer ends it Canceled and gives its record back.
+        BulkEngine engine = BulkKit.Engine(h.Client);
+        Assert.True(engine.OnControl(ControlType.BulkCancel, Cancel(9999, QuiclyErrorCode.BulkCanceled), onStream: true, 0));
+        h.Run(2_000);
+        Assert.Equal(BulkStatus.Running, transfer.Status);
+
+        Assert.True(engine.OnControl(ControlType.BulkCancel, Cancel(transfer.TransferId, QuiclyErrorCode.BulkCanceled), onStream: true, 0));
+        Assert.True(h.RunUntil(() => transfer.IsFinished), "the peer's cancel did not end the transfer");
+
+        Assert.Equal(BulkStatus.Canceled, transfer.Status);
+        Assert.Equal(QuiclyErrorCode.BulkCanceled, transfer.Result.Code);
+        Assert.True(h.RunUntil(() => BulkKit.SendTransfers(h.Client, 5) == 0), "the record was not released");
+        Assert.Equal(PeerState.Connected, h.Client.State);
+
+        static byte[] Cancel(ulong transferId, QuiclyErrorCode code)
+        {
+            byte[] body = new byte[16];
+            int position = VarInt.Write(body, transferId);
+            BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(position), (uint)code);
+            return body.AsSpan(0, position + 4).ToArray();
+        }
+    }
+
+    [Fact]
+    public void Closing_The_Session_Releases_A_Range_Request_That_Was_Never_Answered()
+    {
+        DenyRouter router = new();
+        using SessionHarness h = new(
+            table: BulkTables.Main,
+            client: o =>
+            {
+                BulkKit.Quiet(o);
+                o.BulkRouter = router;
+            },
+            server: BulkKit.Quiet);
+
+        // Closed before the request could be answered: a request that is not resumable is dropped and the router is told,
+        // rather than being kept for a resume that will never come (PROTOCOL.md §4.1).
+        h.Client.RequestBulk(new BulkRangeRequest(5, 1, 1, 0, 1000));
+        Assert.Equal(1, BulkKit.Engine(h.Client).PendingRequests);
+
+        h.Client.Close(CloseReason.Normal);
+        Assert.True(h.RunUntilClosed(), "the session did not close");
+
+        Assert.NotEmpty(router.Rejections);
+        Assert.Equal(1UL, router.Rejections[0].Request.ObjectId);
+        Assert.Equal(0, BulkKit.Engine(h.Client).PendingRequests);
     }
 
     [Fact]

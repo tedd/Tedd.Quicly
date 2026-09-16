@@ -33,10 +33,12 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// the receive ring — or, on a <see cref="ChannelDefinition.CoalesceOnReceive"/> channel, to the key's mailbox (latest
 /// wins, no ring entry). A full ring drops the newest message; Poll decodes compressed payloads, dispatches and
 /// releases.</para>
-/// <para><b>Wave C2 hooks.</b> <see cref="AdmitFragmented"/> and <see cref="OnFragment"/> (fragmentation) answer
-/// <see cref="SendStatus.NotSupported"/> and drop until the fragmenting engines replace them.</para>
+/// <para><b>Fragmentation</b> (<see cref="ChannelDefinition.Fragmentation"/>, PROTOCOL.md §2.1; the
+/// <c>DatagramEngine.Fragmentation.cs</c> half of this class): a message that does not fit one datagram goes out as at most
+/// 8 fragments of one owner entry, and the receive side reassembles per channel within
+/// <see cref="ChannelDefinition.MaxReassemblies"/> partials.</para>
 /// </remarks>
-internal abstract unsafe class DatagramEngine : ChannelEngine
+internal abstract unsafe partial class DatagramEngine : ChannelEngine
 {
     private const long InQueue = 0;
     private const long HandedToPacker = 1;
@@ -88,6 +90,8 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
                 _mailboxes[local] = core.CreateMailbox(dense, channel.MaxKeys);
             }
         }
+
+        InitializeFragmentation(core, channelsOfMode);
     }
 
     /// <summary>Whether received messages of <paramref name="channel"/> need per-key state (a <see cref="ReceiveKeyTracker"/>).</summary>
@@ -188,6 +192,7 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
             return SendStatus.QueueFull;
         }
 
+        NoteOrdinaryEntry(slot);
         PreparedPayload payload = default;
         if (!EnginePayload.TryPrepare(_core, ref request, channel, length, takeSinglePage: false, ref payload))
         {
@@ -267,14 +272,6 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
         return SendStatus.Admitted;
     }
 
-    /// <summary>
-    /// Wave C2 hook: a message of a fragmenting channel that does not fit one datagram (after compression). Called after
-    /// every resource of the first attempt was released. Default <see cref="SendStatus.NotSupported"/>.
-    /// </summary>
-    /// <param name="request">The request.</param>
-    /// <returns>The admission result.</returns>
-    protected virtual SendStatus AdmitFragmented(ref SendRequest request) => SendStatus.NotSupported;
-
     /// <inheritdoc/>
     public override void FlushChannel(int channelIndex, ref FlushContext flush)
     {
@@ -349,14 +346,27 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
     }
 
     /// <inheritdoc/>
-    /// <remarks>Nothing is time-driven here: expiry is evaluated when the scheduler reaches an entry.</remarks>
+    /// <remarks>
+    /// Nothing is time-driven here: expiry is evaluated when the scheduler reaches an entry. The receive side's reassembly
+    /// window (2 × RTT + 100 ms, PROTOCOL.md §7) is refreshed for the transport thread to read, which publishes no deadline —
+    /// partials are swept when a fragment of their channel arrives.
+    /// </remarks>
     public override void Tick(long nowMicros, ref long nextDeadline)
     {
+        if (Fragments)
+        {
+            RefreshReassemblyWindow(nowMicros);
+        }
     }
 
     /// <inheritdoc/>
     public override void OnSendCompleted(int entrySlot, in CompletionEntry completion)
     {
+        if (TryCompleteFragment(entrySlot, in completion))
+        {
+            return;
+        }
+
         if (!completion.Final)
         {
             // DatagramSendState.Sent: the transport (or the container) no longer references the payload.
@@ -382,6 +392,12 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
     public override bool TryCancel(int entrySlot)
     {
         SendEntryTable entries = _core.Entries;
+        if (Fragments && _fragmentOwner[entrySlot] == entrySlot && entries.GetState(entrySlot) == SendEntryState.Filling)
+        {
+            // The token of a fragmented message names its owner entry (docs/design/session-layer.md §7.8).
+            return TryCancelFragmented(entrySlot);
+        }
+
         ref SendEntry entry = ref entries[entrySlot];
         if (entries.GetState(entrySlot) != SendEntryState.Filling || entry.Aux1 != InQueue)
         {
@@ -446,6 +462,9 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
                 slot = next;
             }
         }
+
+        // The fragments were just finished one by one, so what is left of a fragmented message is its owner entry.
+        AbandonFragmentedMessages(DeliveryStatus.Disconnected);
     }
 
     /// <inheritdoc/>
@@ -488,6 +507,7 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
         }
 
         Volatile.Write(ref _resetReceive, 0);
+        ResetFragmentOwners();
         ResetReceiveState();
     }
 
@@ -569,13 +589,6 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
         counters.Bytes += payload.Length;
     }
 
-    /// <summary>Wave C2 hook: one fragment of a larger message (<see cref="MessageHeader.IsFragment"/>). Default: dropped and counted.</summary>
-    /// <param name="header">The fragment's header.</param>
-    /// <param name="payload">The fragment's payload.</param>
-    /// <param name="nowMicros">Clock micros of the callback.</param>
-    protected virtual void OnFragment(in MessageHeader header, ReadOnlySpan<byte> payload, long nowMicros) =>
-        _core.CountDatagramDropped(header.Channel);
-
     /// <inheritdoc/>
     /// <remarks>Datagram-only channels never carry streams; the peer resets such streams before they get here.</remarks>
     public override StreamAccept OnStreamOpened(TransportStreamId id, ushort channel, ulong groupId) => StreamAccept.Reject(QuiclyErrorCode.UnsupportedChannel);
@@ -591,6 +604,7 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
     /// <inheritdoc/>
     public override void Dispose()
     {
+        DisposeFragmentation();
         _send?.Dispose();
         _recv?.Dispose();
         foreach (ReceiveKeyTracker? keys in _keys)
@@ -601,6 +615,8 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
 
     private void ResetReceiveState()
     {
+        // The partials of the epoch that ended are given up first: their count lives in the receive state below.
+        ClearReassemblies();
         for (int local = 0; local < _channels.Length; local++)
         {
             _recv[local] = default;

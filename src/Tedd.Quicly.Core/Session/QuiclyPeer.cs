@@ -335,6 +335,16 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.ThreadSafeSendDrops = Volatile.Read(ref c.ThreadSafeSendDrops);
         statistics.SendBytesOutstanding = _core.SendBytesOutstanding;
         statistics.ReceiveBytesOutstanding = _core.ReceiveBytesOutstanding;
+        statistics.FragmentedMessagesSent = c.FragmentedMessagesSent;
+        statistics.FragmentsSent = c.FragmentsSent;
+        statistics.FragmentsReceived = Volatile.Read(ref c.FragmentsReceived);
+        statistics.FragmentedMessagesReceived = Volatile.Read(ref c.FragmentedMessagesReceived);
+        statistics.FragmentsDropped = Volatile.Read(ref c.FragmentsDropped);
+        statistics.ReassembliesAbandoned = Volatile.Read(ref c.ReassembliesAbandoned);
+        statistics.ReassembliesExpired = Volatile.Read(ref c.ReassembliesExpired);
+        statistics.RequestsSent = c.RequestsSent;
+        statistics.RequestsTimedOut = c.RequestsTimedOut;
+        statistics.ResponsesUnmatched = c.ResponsesUnmatched;
     }
 
     /// <summary>Copies the counters of one channel into <paramref name="statistics"/>. Allocation-free; game thread.</summary>

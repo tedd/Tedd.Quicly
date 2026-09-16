@@ -14,7 +14,7 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 | Core · State | native arrays, send-entry table, key tables, mailboxes, channel state, segment arena | in Core | 99.8 % | [state](benchmarks/state.md) |
 | Core · Channels / Framing | channel table + canonical hash, datagram/container/stream framing, incremental stream parser | in Core | 99.9 % | [framing](benchmarks/framing.md) |
 | Core · Control | control-protocol codec, session tokens, auth-failure limiter | in Core | 100 % | control numbers in the module notes |
-| Core · Session | `QuiclyPeer`, handshake and admission, control stream, ping and clock sync, scheduler and packer, unreliable / sequenced / ordered / group-stream / latest-value engines, async completion APIs, thread-safe send, Poll/Drain, per-stream idle timeout, plus the host hooks (work signal and `HasPendingWork`, peer-level `SendShared`, split poll/flush deadlines, in-place reconnect with session resume, `PeerOptions.Clone`/`Validate`, `IsDisposed`) | in Core | 96.6 % | [session](benchmarks/session.md) |
+| Core · Session | `QuiclyPeer`, handshake and admission, control stream, ping and clock sync, scheduler and packer, unreliable / sequenced / ordered / group-stream / latest-value engines, datagram fragmentation and correlated request/response, async completion APIs, thread-safe send, Poll/Drain, per-stream idle timeout, plus the host hooks (work signal and `HasPendingWork`, peer-level `SendShared`, split poll/flush deadlines, in-place reconnect with session resume, `PeerOptions.Clone`/`Validate`, `IsDisposed`) | in Core | 96.6 % | [session](benchmarks/session.md) |
 | **Core total** | | **3 426** | | |
 | Http3 | HTTP/3 frames, QPACK (static + Huffman), HTTP datagrams, WebTransport framing and capsules | 504 | 100 % | [http3](benchmarks/http3.md) |
 | Transport.MsQuic | layout-validated MsQuic interop and wrappers; MsQuic-backed `ITransport`, connector, listener with reference-counted certificate hot swap | 722 (4 skipped off-Windows) | 98.4 % bindings, 93.5 % transport | [msquic-transport](benchmarks/msquic-transport.md) |
@@ -31,7 +31,6 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 | Module | Content |
 |---|---|
 | Core · Bulk (wave C2) | large-object transfers: per-transfer streams, chunking and compression, progress, cancel, resume, request authorisation, whole-object hash |
-| Core · fragmentation and request/response (wave C2) | unreliable messages split across datagrams with bounded reassembly; correlated request and response on ordered channels |
 
 ## Remaining
 

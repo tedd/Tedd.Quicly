@@ -1,6 +1,7 @@
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Framing;
+using Tedd.Quicly.Core.State;
 using Tedd.Quicly.Core.Transport;
 
 namespace Tedd.Quicly.Core.Session.Engines;
@@ -129,6 +130,32 @@ internal abstract class ChannelEngine : IDisposable
     /// <param name="response">The response payload.</param>
     /// <returns>The outcome.</returns>
     public virtual SendStatus Respond(in ReceiveHeader requestHeader, ref SendRequest response) => SendStatus.NotSupported;
+
+    /// <summary>
+    /// Deadline work a <see cref="QuiclyPeer.Poll"/> serves as well as a <see cref="QuiclyPeer.Flush"/>: the request table's
+    /// timeouts (docs/design/session-layer.md §7.8). Called from the peer's timer pass in both, while the session is
+    /// <see cref="PeerState.Connected"/>, with <paramref name="nowMicros"/> read once by the caller. Lower
+    /// <paramref name="nextDeadline"/> to the engine's next due time — never to a time at or before
+    /// <paramref name="nowMicros"/>, because a host that sleeps until the deadline would spin on it. Work only a scheduler
+    /// pass can serve (retries, expiry, the send cap) belongs in <see cref="Tick"/> instead. Default: nothing.
+    /// </summary>
+    /// <param name="nowMicros">Clock micros of this pass.</param>
+    /// <param name="nextDeadline">Lower it to the engine's next deadline.</param>
+    public virtual void RunPollDeadlines(long nowMicros, ref long nextDeadline)
+    {
+    }
+
+    /// <summary>
+    /// A received message carrying <see cref="ReceiveFlags.IsResponse"/> is offered to the engine before it is dispatched or
+    /// drained (game thread, from <see cref="QuiclyPeer.Poll"/> and <see cref="QuiclyPeer.Drain"/>): the engine matches it
+    /// against its request table and, when a request is waiting, takes <paramref name="response"/> (whose lease it then owns
+    /// and hands to the awaiter of <see cref="SendRequestAsync"/>) and answers <see langword="true"/>. A response no request
+    /// matches is dropped and counted by the peer (<see cref="PeerStatistics.ResponsesUnmatched"/>, PROTOCOL.md §3.1).
+    /// Default: <see langword="false"/> — the message is dispatched like any other.
+    /// </summary>
+    /// <param name="response">The response, with the header the application would have seen.</param>
+    /// <returns><see langword="true"/> when the engine took the response and its lease.</returns>
+    public virtual bool TryTakeResponse(in ReceiveLease response) => false;
 
     /// <summary>Starts a bulk transfer (wave C2). Default: faults with <see cref="NotSupportedException"/>.</summary>
     /// <param name="channel">The bulk channel.</param>

@@ -219,17 +219,54 @@ public sealed unsafe partial class QuiclyPeer
         return new ValueTask<SendResult>(waiter.Source.Task);
     }
 
-    /// <summary>Sends a request on a request/response channel and waits for the response (routed to the channel's engine).</summary>
+    /// <summary>
+    /// Sends a request on a <see cref="Channels.ChannelDefinition.RequestResponse"/> channel and waits for the peer's
+    /// response (PROTOCOL.md §3.1, §4.3: the only application-level acknowledgement in v1). The frame carries an odd
+    /// <c>RequestId</c> from the channel's counter and the peer answers with <c>RequestId + 1</c>
+    /// (<see cref="Respond"/>); the response is matched on the game thread inside <see cref="Poll"/> — or inside
+    /// <see cref="Flush"/>, which is where timeouts are processed as well — and never reaches the channel's
+    /// <see cref="MessageHandler"/>.
+    /// </summary>
+    /// <remarks>
+    /// The request itself is an ordinary buffered message of the channel, so a <see cref="Flush"/> transmits it; only the
+    /// wait is asynchronous. The value task is backed by a pooled source, so the library allocates nothing per request in
+    /// steady state (the caller's own <c>await</c> state machine is the caller's cost). The payload is pinned or copied like
+    /// <see cref="SendBorrowed"/>, so it must stay unchanged until the request has been handed to the transport.
+    /// An empty response yields a lease with an empty payload; releasing it is a no-op.
+    /// </remarks>
     /// <param name="header">Channel and key.</param>
     /// <param name="payload">The request.</param>
-    /// <param name="timeout">Response timeout.</param>
-    /// <param name="cancellationToken">Cancels the wait.</param>
-    /// <returns>The response payload (release it with <see cref="Release(in ReceiveLease)"/>).</returns>
+    /// <param name="timeout">
+    /// How long to wait for the response; <see cref="TimeSpan.Zero"/> waits until the response arrives, the wait is canceled
+    /// or the session ends.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Cancels the <em>wait</em>, never the send (ADR 0004): the request still goes out and its response is dropped and
+    /// counted when it arrives.
+    /// </param>
+    /// <returns>
+    /// The response payload (release it with <see cref="Release(in ReceiveLease)"/>). Faults with
+    /// <see cref="TimeoutException"/> when the timeout elapses first, with <see cref="OperationCanceledException"/> when the
+    /// wait is canceled, with <see cref="InvalidOperationException"/> when the request is not admitted or the session ends
+    /// (close or reconnect) and with <see cref="ObjectDisposedException"/> when the peer is disposed.
+    /// </returns>
     /// <exception cref="ArgumentException">The channel is not in the table.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeout"/> is negative, or the channel is keyed and the key exceeds 2^62 − 1.</exception>
     public ValueTask<ReceiveLease> SendRequestAsync(in SendHeader header, ReadOnlyMemory<byte> payload, TimeSpan timeout, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
         int index = ChannelIndexOrThrow(header.Channel);
+        if (_core.GetChannel(index).Keyed && header.Key > VarInt.MaxValue)
+        {
+            ThrowKeyOutOfRange(header.Key);
+        }
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return ValueTask.FromCanceled<ReceiveLease>(cancellationToken);
+        }
+
         if (_state != PeerState.Connected)
         {
             return ValueTask.FromException<ReceiveLease>(new InvalidOperationException("The peer is not connected."));

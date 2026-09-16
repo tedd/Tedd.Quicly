@@ -321,9 +321,10 @@ is back in `Filling` and still owned by the caller.
   scheduler (`QuiclyPeer.FlushEngines`) and the packer (`DatagramPacker`).
 * Wave C1 step 3 (done, §7.2): the `ReliableOrdered` engine (lazy persistent stream, carrier gathers, refused-start retry,
   progressive receive, back-pressure); the async APIs and the `ThreadSafeSend` front (§7.3).
-* Wave C2a (done, §7.5): the `ReliableLatest` engine (per-key values, retransmission, group streams for large values,
-  coalesced acks, key retirement). Still open in wave C2: `GroupStreamEngine` (`ReliableUnordered`), `BulkEngine`,
-  fragmentation in the unreliable engines, request/response in the ordered engine.
+* Wave C2a (done, §7.6): the `ReliableLatest` engine (per-key values, retransmission, group streams for large values,
+  coalesced acks, key retirement). Wave C2b (done, §7.5): the `GroupStreamEngine` (`ReliableUnordered`). Wave C2d (done,
+  §7.8): fragmentation in the shared datagram engine and request/response in the ordered engine. Still open in wave C2:
+  `BulkEngine`.
 * `PingClock` is peer-level (`Session/PingClock.cs`), not an engine.
 
 ### 4.7 Host hooks (work signal, split deadlines, robustness)
@@ -827,8 +828,8 @@ channel owned by the transport thread (the peer's stream, the lease and header f
   waits, it never fails"). The peer grants Σ max(MaxGroups, 1) unidirectional streams.
 * Request/response (ordered channels with `RequestResponse`): the frame's RequestId is written from `SendRequest.RequestId` and
   parsed into `ReceiveEntry.RequestId` with `IsRequest`/`IsResponse`; `SendRequestAsync`/`Respond` are the engine hooks
-  (`NotSupported` until C2).
-* Fragmentation: `DatagramEngine.AdmitFragmented`/`OnFragment` (§7.1).
+  (as built: §7.8, which added `ChannelEngine.RunPollDeadlines` and `ChannelEngine.TryTakeResponse` next to them).
+* Fragmentation: the send and receive halves of `DatagramEngine` (§7.1, as built: §7.8).
 * Bulk: `PeerOptions.BulkShareOfEstimatedBandwidth`/`BulkMaxBytesPerSecond` and `OnIdealSendBufferSize` are not used yet; bulk
   streams share the send cap and the budget rule of `FlushChannel`.
 
@@ -1076,6 +1077,133 @@ state of the peer's group streams. Every per-key array grows with the slots in u
   unclaimed) and `TokenBucket.SetRate` (a rate change that carries the level). `PeerOptions` gained
   `RetryShareOfEstimatedBandwidth` and `MaxRetryBytesPerSecond`.
 
+### 7.8 Fragmentation and request/response (as built: wave C2d)
+
+Two features that ride on engines that already exist: fragmentation is the second half of the shared
+`DatagramEngine` (`Engines/DatagramEngine.Fragmentation.cs`), request/response the second half of the ordered engine
+(`Engines/ReliableOrderedEngine.RequestResponse.cs`). No new engine, no new mode.
+
+#### Fragmentation (PROTOCOL.md §2.1, §7)
+
+* **When.** `Admit` prepares the payload as usual and, when the encoded message does not fit the *current*
+  `MaxDatagramPayload` on a channel with `Fragmentation`, releases that attempt and calls `AdmitFragmented` (a channel
+  without it answers `TooLarge`). Because the single-datagram header is one byte shorter than a fragment's (no
+  `FragIndex`), a message that gets here always needs at least two fragments.
+* **Layout.** `count = ceil(wire / capacity)` with `capacity = MaxDatagramPayload − header(FragCount > 1)`, and
+  `size = ceil(wire / count)`, so every fragment but the last has the size of fragment 0 and the last carries the rest
+  (1 … size) — the shape PROTOCOL.md §2.1 requires so that a receiver can bound the total from any single fragment.
+  `count > 8` ⇒ `TooLarge` (the per-channel `MaxMessageSize` of a fragmenting channel is 8 × 1 100 for exactly this
+  reason). `wire` is the *compressed* size when the channel compresses: LZ4 runs once over the whole message and
+  `RawLength` (the reassembled size) is repeated in every fragment.
+* **Entries.** One **owner** entry holds the message: its payload (a copy, the caller's own lease, pinned or shared
+  memory — whatever `EnginePayload.TryPrepare`/`Commit` produced, so a `SendShared` block is retained once and released
+  once), its tracking token, its admission stamp, the admitted length in `Aux0` and, packed into `Aux1`, the fragments
+  still outstanding, the payload references still held and the worst status seen so far. Each **fragment** is an
+  untracked entry whose payload segment points into the owner's bytes — no fragment copies anything — with the base
+  engine's own `Aux0`/`Aux1` (queue bytes and phase), so the scheduler, the packer and expiry treat it exactly like any
+  other datagram message. A per-peer `int[]` by send-entry slot says which owner a fragment belongs to (-1 = an ordinary
+  message, the slot itself = an owner); every allocation this engine makes writes it, so a recycled slot never inherits a
+  stale owner.
+* **Completions.** A fragment's `Sent` notice gives back one payload reference; when the last one is gone the owner's
+  payload is released and the message's **BufferReleased** stage completes — which is what makes pinned, borrowed,
+  gathered and shared payloads safe to reuse. A fragment that travelled inside a packed container gets no `Sent` notice
+  of its own (the packer only forwards it to tracked members), so its final completion gives the reference back instead.
+  Each final completion folds into the owner, worst outcome wins (`Disconnected` > `Failed` > `Lost` > `Expired` >
+  `Canceled` > `Sent` > `Delivered`), and the last one completes the message. So a fragmented message is `Delivered` only
+  if every fragment was, and one lost datagram makes the whole message `Lost`.
+* **The trade-off, on purpose.** Delivery probability is (1 − loss)^FragCount: at 2 % loss a two-fragment message
+  arrives 96 % of the time and an eight-fragment one 85 %. Fragmentation exists so that a slightly oversized unreliable
+  message still works, not so that large ones become normal — that is what the reliable modes are for — and the cap of 8
+  is the bound that keeps the worst case visible.
+* **Cancel, expiry, close.** `TryCancel` names the owner (the token's entry) and works only while *every* fragment is
+  still queued; it unlinks them all and they complete `Canceled`. Expiry is per fragment at scheduling time
+  (PROTOCOL.md §4.5), so a message whose deadline passes is dropped as a whole in one pass. `OnPeerClosed` finishes the
+  queued fragments and then completes what is left of their messages `Disconnected`; `OnReconnecting` additionally
+  forgets the owner map.
+* **Receive** (transport thread). `MaxReassemblies` records per channel (default 16, a contiguous range of one native
+  array, 64 B each) hold the partial messages, keyed by the message's key — so a keyed channel reassembles up to
+  `MaxReassemblies` messages at once and an unkeyed one exactly one at a time, which is what "a newer sequence for the
+  same key abandons the older partial" means when every message has key 0. Order of work, all of it before a buffer is
+  chosen: the framing layer has already bounded the implied total against the channel's `MaxMessageSize`; the engine
+  bounds it again against `min(ReceiveBudgetBytes, largest pool block)`; expired partials of the channel are swept; a
+  fragment of an older sequence is dropped, of a newer one abandons the partial; `FragCount`, `RawLength` and the
+  fragment sizes must agree with what the partial already knows; a duplicate index is ignored. Only then is a buffer
+  rented — `size × count` when fragment 0's size is known, the channel's limit when the *last* fragment arrived first
+  (its size says nothing about the others; its bytes wait at the front of the buffer and move once the size is known, a
+  single memmove in that one case).
+* **Publishing.** The completed message needs no copy: the partial's own buffer *is* the payload. It goes through the
+  mode's `Accept` (so a stale sequenced message is dropped exactly as an unfragmented one would be) and then into the
+  key's mailbox or the receive ring, with `ReceiveFlags.Fragmented` and, for a compressed message, `Compressed` +
+  `RawLength` — which `Poll` decodes like any other compressed message. Coalescing channels use no ring entry and no
+  reservation (ADR 0008 invariant 6); no other path here reserves either, because a datagram message is published in one
+  step.
+* **Expiry is swept lazily.** 2 × RTT + 100 ms (PROTOCOL.md §7). The window is recomputed by the engine's `Tick` on the
+  game thread and read by the transport thread; the sweep itself runs when a fragment of the channel arrives, because the
+  table belongs to the transport thread (ADR 0008 invariant 4) and a deadline for it would be a timer nothing else
+  needs. A channel that goes quiet therefore holds its partials' buffers until it hears from the peer again, until the
+  epoch resets, or until the peer is closed or disposed — bounded by `MaxReassemblies × MaxMessageSize` per channel,
+  which is the sizing rule in ARCHITECTURE.md §9.
+* **Epoch reset.** `OnEpochReset(resumed: true)` restarts the send counters and asks the transport thread to forget its
+  receive tables before the next datagram; the partials go with them (their buffers are returned), because their
+  sequences belong to the epoch that ended.
+* **Statistics.** Per peer: `FragmentedMessagesSent`, `FragmentsSent`, `FragmentsReceived`,
+  `FragmentedMessagesReceived`, `FragmentsDropped` (duplicates, inconsistent fields, limits, no buffer),
+  `ReassembliesAbandoned` (a newer sequence, or the cap evicting the oldest) and `ReassembliesExpired`. Per channel the
+  ordinary counters apply, with one twist worth knowing: **each fragment is one `Sent`** of its channel, because each is
+  a datagram the scheduler hands over separately, while `Received` counts reassembled messages.
+
+#### Request/response (PROTOCOL.md §3.1, §4.3)
+
+* **Ids.** Per channel, odd, from a counter that starts at 1 and skips `0xFFFFFFFF` (its response would not fit 32
+  bits); the response carries `RequestId + 1`. `Respond` refuses anything that is not a request — id 0, an even id, that
+  one odd id, or a channel without `RequestResponse` — with `SendStatus.NotSupported`, and otherwise admits the response
+  as an ordinary message of the channel, so requests, responses and plain messages share the channel's order.
+* **The table.** At most `MaxOutstandingRequests` = 256 requests per peer wait at once (a 257th is refused). A slot is a
+  pooled `IValueTaskSource<ReceiveLease>` created on first use and reused for the life of the peer, so the synchronous
+  path allocates nothing: no state machine, no `Task`, no registration unless the caller passes a cancellable token. A
+  slot leaves the live set when it is completed and returns to the free list when its value task has been *consumed* —
+  the `CompletionTable` contract, for the same reason: the source's version is what invalidates an earlier occupant's
+  value task. The free list is a lock-free stack because `CompletionMode.ThreadPool` consumes a value task on a pool
+  thread. Matching a response is a scan of the 256 slots, which happens once per response and never per message.
+* **Timeouts without a timer.** `ChannelEngine.RunPollDeadlines(now, ref nextDeadline)` is called from the peer's timer
+  pass, which both `Poll` and `Flush` run, so a request times out for a host that only polls as well as for one that only
+  flushes (ADR 0008 invariant 9). The engine keeps the earliest deadline and publishes it only while it is **in the
+  future**: a deadline at or before `now` would make a host that sleeps on `NextPollDeadlineMicros` spin. A timeout
+  faults the value task with `TimeoutException` and counts `RequestsTimedOut`; `timeout` 0 means "wait until the response
+  arrives, the wait is canceled or the session ends".
+* **Where a response is matched.** On the game thread, where the message is dispatched: `QuiclyPeer.Poll` (and `Drain`)
+  offer every message flagged `IsResponse` to the channel's engine through `ChannelEngine.TryTakeResponse(in
+  ReceiveLease)` *before* a handler or a drain queue sees it — a compressed response is decoded first, exactly as a
+  dispatched message would be. The engine takes the lease for the awaiter (the application releases it with
+  `Release(in ReceiveLease)`); a response no request matches is dropped and counted (`ResponsesUnmatched`). The request
+  table is send-side state, so nothing of this happens on the transport thread.
+* **Cancellation, close, reconnect, dispose.** Cancelling the wait never cancels the send (ADR 0004): the request still
+  goes out and its response is dropped and counted when it arrives. `OnPeerClosed`, `OnReconnecting` and `Dispose` fail
+  every outstanding request with a clear reason (`InvalidOperationException` for a closed or lost session,
+  `ObjectDisposedException` for a disposed peer), so a request never hangs on a session that ended.
+* **Shared seams added for it** (one region each): `ChannelEngine.RunPollDeadlines` and `ChannelEngine.TryTakeResponse`
+  (both virtual no-ops), the engine loop in `QuiclyPeer.RunTimers`, `QuiclyPeer.TakeResponse` in the Poll/Drain paths, and
+  ten counters in `PeerCounters`/`PeerStatistics` (seven for fragmentation, three for requests).
+* **Statistics.** `RequestsSent`, `RequestsTimedOut`, `ResponsesUnmatched`; a request and its response also count as
+  ordinary messages of their channel.
+
+**Tests** (`Session/FragmentTestKit.cs` — `FragmentTables.Main` with fragmenting unordered, sequenced keyed, compressed,
+small-limit, two-reassembly and coalescing channels, a hand-written fragment writer that can break every rule, and a
+splitter that produces a sender's own fragments): `FragmentDeliveryTests` (every fragment count 2 … 8 byte-exact, a lost
+fragment dropping only its own message, reordering and duplicates, the last fragment arriving first, partials of
+different keys side by side, the newer-sequence abandon, compression on top of fragmentation, a reassembled message in a
+coalescing mailbox, and 200 messages under 2 % loss with reordering and jitter); `FragmentEdgeTests` (hostile
+`FragCount`/`FragIndex`/empty-payload/oversized-bound frames dropped without closing the connection, fragments that
+disagree about their message, a bound above what the receive budget could ever hold, the cap evicting the oldest partial,
+the expiry sweep, a message that would need more than eight fragments refused, every send path fragmenting — including a
+`SendShared` block retained and released exactly once — a tracked message ending `Delivered` and, with one fragment lost,
+`Lost`, cancel, expiry at scheduling time, close, and an epoch reset returning a partial's buffer);
+`RequestResponseTests` (the happy path, keyed and compressed requests, 64 concurrent requests answered in reverse order,
+timeouts served by Poll and by Flush, a response after the timeout, cancellation that does not cancel the send, an
+unmatched response, close, a lost connection followed by a resume, dispose, the refusal matrix and the table's bound);
+and `FragmentRequestZeroAllocationTests` (fragmented traffic at 60 Hz, and four request round trips per cycle, 0 B per
+window).
+
 Waves:
 
 | Wave | Content | Depends on |
@@ -1085,7 +1213,8 @@ Waves:
 | C1 step 3 (done) | `ReliableOrdered` engine (persistent stream, carrier gathers, refused-start retry, progressive receive, back-pressure), `SendAsync`/`FlushAsync`/`ThreadSafeSend`, simulator flow control, benchmarks (§7.2, §7.3) | steps 1–2 |
 | C2a (done) | `ReliableLatestEngine` (§7.6): per-key values and versions, supersede, retransmission and budgets, large values on group streams, coalescing receive with cumulative acks, ack coalescing, epoch resync, key retirement | C1 |
 | C2b (done) | `GroupStreamEngine` (`ReliableUnordered`, §7.5): groups and carriers, refused starts, per-group failure, progressive receive | C1 |
-| C2 (parallel) | `BulkEngine`; fragmentation in the unreliable engines; request/response in the ordered engine | C1 |
+| C2d (done) | fragmentation in the shared datagram engine and request/response in the ordered engine (§7.8): at most 8 fragments per message with a bounded reassembly table, correlated requests with a pooled value-task source and timeouts served by Poll and Flush | C1 |
+| C2 (parallel) | `BulkEngine` | C1 |
 | C3 | `MsQuicTransport` (ITransport over the MsQuic wrappers) + listener/connector; `QuiclyServer` / `QuiclyClient`; admission; reconnect | C1, msquic bindings |
 | C4 | WebTransport-over-HTTP/3 carrier (opt-in), HTTP/3 static responder | C3, Http3 |
 | C5 | End-to-end tests (MsQuic loopback, ACME mock CA + HTTP server + QUIC listener cert swap), samples, E2E benchmarks | all |

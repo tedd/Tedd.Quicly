@@ -131,12 +131,24 @@ public sealed unsafe partial class QuiclyPeer
                 _queuedWithHandler--;
             }
 
+            if (IsResponse(in entry))
+            {
+                TakeResponse(ref entry, now);
+                continue;
+            }
+
             Emit(ref entry, now, into, ref written);
         }
 
         if (_hasHeld && written < into.Length)
         {
-            if (_held.Channel == channel)
+            if (IsResponse(in _held))
+            {
+                ReceiveEntry entry = _held;
+                _hasHeld = false;
+                TakeResponse(ref entry, now);
+            }
+            else if (_held.Channel == channel)
             {
                 ReceiveEntry entry = _held;
                 _hasHeld = false;
@@ -151,7 +163,12 @@ public sealed unsafe partial class QuiclyPeer
         SpscRing<ReceiveEntry> ring = _core.ReceiveRing;
         while (!_hasHeld && written < into.Length && ring.TryDequeue(out ReceiveEntry entry))
         {
-            if (entry.Channel == channel)
+            if (IsResponse(in entry))
+            {
+                // A response never reaches the application: it completes its SendRequestAsync, or is dropped and counted.
+                TakeResponse(ref entry, now);
+            }
+            else if (entry.Channel == channel)
             {
                 Emit(ref entry, now, into, ref written);
             }
@@ -324,6 +341,12 @@ public sealed unsafe partial class QuiclyPeer
 
     private bool Route(ref ReceiveEntry entry, long now, ref int dispatched)
     {
+        if (IsResponse(in entry))
+        {
+            TakeResponse(ref entry, now);
+            return true;
+        }
+
         int index = _core.ChannelIndexOf(entry.Channel);
         MessageHandler? handler = index >= 0 ? _handlers[index] : null;
         if (handler is not null)
@@ -369,6 +392,12 @@ public sealed unsafe partial class QuiclyPeer
             while (handler is not null && dispatched < maxItems && !_disposed && queues.TryTake(index, out ReceiveEntry entry))
             {
                 _queuedWithHandler--;
+                if (IsResponse(in entry))
+                {
+                    TakeResponse(ref entry, now);
+                    continue;
+                }
+
                 Dispatch(handler, ref entry, now);
                 dispatched++;
                 handler = _handlers[index];
@@ -433,6 +462,37 @@ public sealed unsafe partial class QuiclyPeer
                 _core.ReturnReceive(in entry.Lease);
             }
         }
+    }
+
+    /// <summary>Whether a received message is the response of a request/response channel (PROTOCOL.md §3.1).</summary>
+    private static bool IsResponse(in ReceiveEntry entry) => (entry.Flags & ReceiveFlags.IsResponse) != 0;
+
+    /// <summary>
+    /// Hands a response to the engine of its channel instead of the application (game thread, from <see cref="Poll"/> and
+    /// <see cref="Drain"/>): a request waiting for it completes with the payload, and a response no request matches is
+    /// dropped and counted (PROTOCOL.md §3.1). A compressed response is decoded first, exactly as a dispatched message is.
+    /// </summary>
+    private void TakeResponse(ref ReceiveEntry entry, long now)
+    {
+        if ((entry.Flags & ReceiveFlags.Compressed) != 0 && !TryDecode(ref entry, now))
+        {
+            // Dropped and counted (DecodeFailures); the request ends with its timeout.
+            return;
+        }
+
+        int index = _core.ChannelIndexOf(entry.Channel);
+        if (index >= 0)
+        {
+            byte* data = entry.Lease.IsEmpty ? null : _core.GetPointer(in entry.Lease);
+            ReceiveLease response = new(MakeHeader(in entry, now), in entry.Lease, data);
+            if (_core.GetEngine(index).TryTakeResponse(in response))
+            {
+                return;
+            }
+        }
+
+        _core.Counters.ResponsesUnmatched++;
+        _core.ReturnReceive(in entry.Lease);
     }
 
     private void Emit(ref ReceiveEntry entry, long now, Span<ReceivedMessage> into, ref int written)

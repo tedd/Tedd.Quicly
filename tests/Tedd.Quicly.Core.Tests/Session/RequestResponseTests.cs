@@ -2,6 +2,7 @@ using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Session.Engines;
 using Tedd.Quicly.Core.State;
+using Tedd.Quicly.Testing.Simulation;
 
 namespace Tedd.Quicly.Core.Tests.Session;
 
@@ -512,6 +513,142 @@ public class RequestResponseTests
         ReceiveLease response = patient.Result;
         Assert.Equal(new byte[] { 3 }, response.Payload.ToArray());
         client.Release(in response);
+    }
+
+    [Fact]
+    public void Requests_Are_Answered_On_A_Lossy_Reordering_Link()
+    {
+        // Requests ride the channel's persistent ordered stream, so the loss of PROTOCOL.md §3.1 is a retransmission delay and
+        // never a gap: every response must arrive, and nothing but its id may decide which request it completes. The
+        // reordering is applied where a stream channel can have it — the peer answers in reverse order and plain messages of
+        // the same channel travel between the requests — while the link delays, jitters and retransmits underneath.
+        const int Count = 32;
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 5_000, JitterMicros = 2_000, StreamLossPercent = 5 },
+            table: Table,
+            client: DatagramKit.Quiet,
+            server: DatagramKit.Quiet);
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        List<(ReceiveHeader Header, byte[] Payload)> requests = [];
+        int plain = 0;
+        server.RegisterHandler(10, (QuiclyPeer _, in ReceiveHeader header, ReadOnlySpan<byte> payload) =>
+        {
+            if (header.Flags.HasFlag(ReceiveFlags.IsRequest))
+            {
+                requests.Add((header, payload.ToArray()));
+            }
+            else
+            {
+                plain++;
+            }
+        });
+        List<(ReceiveHeader Header, byte[] Payload)> onClient = [];
+        client.RegisterHandler(10, Handlers.Collect(onClient));
+
+        ValueTask<ReceiveLease>[] pending = new ValueTask<ReceiveLease>[Count];
+        for (int i = 0; i < Count; i++)
+        {
+            pending[i] = client.SendRequestAsync(new SendHeader(10), new byte[] { (byte)i, 0xAA }, TimeSpan.Zero);
+            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), [(byte)i]).Status);
+        }
+
+        Assert.True(
+            h.RunUntil(() => requests.Count == Count && plain == Count),
+            $"{requests.Count} requests and {plain} plain messages of {Count} each reached the peer");
+        for (int i = Count - 1; i >= 0; i--)
+        {
+            ReceiveHeader request = requests[i].Header;
+            Assert.Equal(SendStatus.Admitted, server.Respond(in request, [requests[i].Payload[0], 0xBB]).Status);
+        }
+
+        Assert.True(h.RunUntil(() => pending.All(p => p.IsCompleted)), $"{pending.Count(p => p.IsCompleted)} of {Count} responses arrived");
+        for (int i = 0; i < Count; i++)
+        {
+            ReceiveLease response = pending[i].Result;
+            Assert.Equal(new byte[] { (byte)i, 0xBB }, response.Payload.ToArray());
+            Assert.Equal((uint)((i * 2) + 2), response.Header.RequestId);
+            client.Release(in response);
+        }
+
+        Assert.Empty(onClient);
+        PeerStatistics statistics = DatagramKit.Statistics(client);
+        Assert.Equal(Count, statistics.RequestsSent);
+        Assert.Equal(0, statistics.RequestsTimedOut);
+        Assert.Equal(0, statistics.ResponsesUnmatched);
+        Assert.Equal(0, OrderedKit.Engine(client).OutstandingRequests);
+        Assert.Equal(PeerState.Connected, client.State);
+    }
+
+    [Fact]
+    public void A_Drained_Response_Completes_Its_Request_And_Reclaims_A_Canceled_Slot()
+    {
+        // Two things only the batch API reaches. Drain offers a response to the engine before it would write it to the
+        // caller's span (PROTOCOL.md §3.1), and because Drain runs no timer pass the slot of the canceled wait is still in the
+        // live set when the engine walks its table — which is the walk that takes it out.
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        List<(ReceiveHeader Header, byte[] Payload)> requests = [];
+        server.RegisterHandler(10, Handlers.Collect(requests));
+        using CancellationTokenSource cts = new();
+
+        ValueTask<ReceiveLease> canceled = client.SendRequestAsync(new SendHeader(10), new byte[] { 1 }, TimeSpan.Zero, cts.Token);
+        ValueTask<ReceiveLease> kept = client.SendRequestAsync(new SendHeader(10), new byte[] { 2 }, TimeSpan.Zero);
+        Assert.True(h.RunUntil(() => requests.Count == 2), $"{requests.Count} of 2 requests arrived");
+        cts.Cancel();
+        Assert.Throws<OperationCanceledException>(() => _ = canceled.Result);
+        Assert.Equal(2, OrderedKit.Engine(client).OutstandingRequests);
+
+        // No client Poll and no client Flush from here, so nothing sweeps the canceled slot before the walk does.
+        ReceiveHeader second = requests[1].Header;
+        Assert.Equal(SendStatus.Admitted, server.Respond(in second, [9]).Status);
+        server.Flush();
+        h.Network.Advance(100_000);
+
+        ReceivedMessage[] buffer = new ReceivedMessage[4];
+        Assert.Equal(0, client.Drain(10, buffer));
+        Assert.True(kept.IsCompleted, "the drained response did not complete its request");
+        ReceiveLease response = kept.Result;
+        Assert.Equal(new byte[] { 9 }, response.Payload.ToArray());
+        client.Release(in response);
+        Assert.Equal(0, OrderedKit.Engine(client).OutstandingRequests);
+        Assert.Equal(0, DatagramKit.Statistics(client).ResponsesUnmatched);
+        Assert.Equal(0, DatagramKit.Statistics(client).ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void Drain_Never_Hands_A_Response_To_The_Batch_API()
+    {
+        // The batch alternative to a handler is as blind to responses as Poll is: of a response and a plain message of the
+        // same channel, only the plain one reaches the caller's span.
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        List<(ReceiveHeader Header, byte[] Payload)> requests = [];
+        server.RegisterHandler(10, Handlers.Collect(requests));
+
+        ValueTask<ReceiveLease> pending = client.SendRequestAsync(new SendHeader(10), new byte[] { 1 }, TimeSpan.Zero);
+        Assert.True(h.RunUntil(() => requests.Count == 1), "the request did not arrive");
+        ReceiveHeader request = requests[0].Header;
+        Assert.Equal(SendStatus.Admitted, server.Respond(in request, [7]).Status);
+        Assert.Equal(SendStatus.Admitted, server.SendCopy(new SendHeader(10), [8]).Status);
+        server.Flush();
+        h.Network.Advance(100_000);
+
+        ReceivedMessage[] buffer = new ReceivedMessage[4];
+        int drained = client.Drain(10, buffer);
+        Assert.Equal(1, drained);
+        Assert.Equal(new byte[] { 8 }, buffer[0].Payload.ToArray());
+        Assert.False(buffer[0].Header.Flags.HasFlag(ReceiveFlags.IsResponse), "a response reached the batch API");
+        client.Release(buffer.AsSpan(0, drained));
+
+        Assert.True(pending.IsCompleted, "the response did not complete its request");
+        ReceiveLease response = pending.Result;
+        Assert.Equal(new byte[] { 7 }, response.Payload.ToArray());
+        Assert.True(response.Header.Flags.HasFlag(ReceiveFlags.IsResponse));
+        client.Release(in response);
+        Assert.Equal(0, DatagramKit.Statistics(client).ReceiveBytesOutstanding);
     }
 
     [Fact]

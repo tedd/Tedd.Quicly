@@ -279,7 +279,7 @@ public sealed unsafe partial class QuiclyPeer
         request.Kind = SendPayloadKind.Borrowed;
         request.Borrowed = payload;
         request.Length = payload.Length;
-        return _core.GetEngine(index).SendRequestAsync(ref request, PeerOptions.ToMicros(timeout), cancellationToken);
+        return _core.GetEngine(index).SendRequestAsync(ref request, PeerOptions.ToTimeoutMicros(timeout), cancellationToken);
     }
 
     /// <summary>Answers a request received on a request/response channel (routed to the channel's engine).</summary>
@@ -563,17 +563,27 @@ public sealed unsafe partial class QuiclyPeer
         ready.Clear();
     }
 
-    /// <summary>The waiters of <see cref="SendAsync"/> and <see cref="FlushAsync"/> fail with <see cref="ObjectDisposedException"/> (Dispose).</summary>
+    /// <summary>
+    /// Every wait the peer handed out fails with <see cref="ObjectDisposedException"/> (Dispose): the waiters of
+    /// <see cref="SendAsync"/> and <see cref="FlushAsync"/>, and the ones its engines hold — a request waiting for its
+    /// response (<see cref="SendRequestAsync"/>). The engines fail those in their own <c>Dispose</c> as well, but that runs
+    /// from <c>FreeResources</c>, which waits for the transport's close callback: disposing a peer without closing it first is
+    /// ordinary teardown, so an <c>await</c> must not be left hanging on a callback that may come much later or never.
+    /// </summary>
     private void FailWaitersOnDispose()
     {
-        if (_sendWaiters.Count == 0 && _flushWaiters.Count == 0)
+        ObjectDisposedException disposed = new(nameof(QuiclyPeer));
+        if (_sendWaiters.Count != 0 || _flushWaiters.Count != 0)
         {
-            return;
+            CompleteSendWaiters(disposed);
+            FailFlushWaiters(disposed);
         }
 
-        ObjectDisposedException disposed = new(nameof(QuiclyPeer));
-        CompleteSendWaiters(disposed);
-        FailFlushWaiters(disposed);
+        ReadOnlySpan<ChannelEngine> engines = _core.ActiveEngines;
+        for (int i = 0; i < engines.Length; i++)
+        {
+            engines[i].FailWaitsOnDispose(disposed);
+        }
     }
 
     // ------------------------------------------------------------------ sends from other threads (ThreadSafeSend)

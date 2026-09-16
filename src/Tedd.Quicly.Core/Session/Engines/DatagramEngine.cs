@@ -207,13 +207,15 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
         int headerLength = DatagramFraming.GetHeaderLength(channel, in header);
         if (_core.DatagramsEnabled && headerLength + payload.Length > _core.MaxDatagramPayload)
         {
-            EnginePayload.Release(_core, in payload);
             _core.DiscardEntry(slot);
             if (channel.Fragmentation)
             {
-                return AdmitFragmented(ref request);
+                // The payload is prepared once for both shapes (docs/design/session-layer.md §7.8): the fragments point into
+                // these very bytes, so the LZ4 pass, the send lease and the pin of a borrowed array are not repeated.
+                return AdmitFragmented(ref request, length, ref payload);
             }
 
+            EnginePayload.Release(_core, in payload);
             counters.TooLarge++;
             return SendStatus.TooLarge;
         }
@@ -457,13 +459,29 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
             while (slot >= 0)
             {
                 int next = links[slot];
-                entries[slot].Aux1 = Finished;
-                _core.CompleteEntry(slot, DeliveryStatus.Disconnected);
+                // A fragment is finished through the fragment path, so its payload reference goes back to its message and its
+                // outcome folds into it exactly as a transport completion would (docs/design/session-layer.md §7.8).
+                CompletionEntry completion = new()
+                {
+                    Slot = slot,
+                    Generation = entries[slot].Generation,
+                    Kind = CompletionKind.Local,
+                    Canceled = true,
+                    Final = true,
+                    Status = DeliveryStatus.Disconnected,
+                };
+                if (!TryCompleteFragment(slot, in completion))
+                {
+                    entries[slot].Aux1 = Finished;
+                    _core.CompleteEntry(slot, DeliveryStatus.Disconnected);
+                }
+
                 slot = next;
             }
         }
 
-        // The fragments were just finished one by one, so what is left of a fragmented message is its owner entry.
+        // The fragments were just finished one by one, so what is left of a fragmented message is its owner entry (a message
+        // whose fragments the transport still holds; the queued ones completed their message above).
         AbandonFragmentedMessages(DeliveryStatus.Disconnected);
     }
 

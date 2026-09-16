@@ -354,6 +354,109 @@ public unsafe class FragmentEdgeTests
     }
 
     [Fact]
+    public void A_Fragmented_Message_Held_Back_By_The_Send_Cap_Still_Arrives_Whole()
+    {
+        // PROTOCOL.md §4.5: the send cap is a token bucket whose burst is two flush intervals' worth — 4 000 bytes at
+        // 120 kB/s — so a six-fragment message does not fit one pass. The fragments the pass cannot take stay queued in
+        // order and go out from later passes, and the receiver reassembles a message whose fragments never shared a pass.
+        using SessionHarness h = new(
+            table: Table,
+            client: o =>
+            {
+                DatagramKit.Quiet(o);
+                o.MaxSendBytesPerSecond = 120_000;
+            },
+            server: DatagramKit.Quiet);
+        QuiclyPeer client = h.Client;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(2, Handlers.Collect(got));
+        byte[] payload = DatagramKit.Payload(1, 6_000);
+
+        SendResult result = client.SendCopy(new SendHeader(2), payload, SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, result.Status);
+        Assert.Equal(6, DatagramKit.ChannelStats(client, 2).QueuedMessages);
+
+        client.Flush();
+        long queued = DatagramKit.ChannelStats(client, 2).QueuedMessages;
+        Assert.InRange(queued, 1, 5);
+        Assert.True(DatagramKit.ChannelStats(client, 2).Sent > 0, "the pass handed over the fragments the cap allowed");
+
+        Assert.True(h.RunUntil(() => got.Count == 1, 2_000_000), "the capped message never arrived");
+        Assert.Equal(payload, got[0].Payload);
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 2).QueuedMessages);
+        Assert.True(h.RunUntil(() => client.GetDeliveryStatus(result.Token) == DeliveryStatus.Delivered),
+            $"the message ended as {client.GetDeliveryStatus(result.Token)}");
+        Assert.Equal(0, DatagramKit.Statistics(client).SendBytesOutstanding);
+    }
+
+    [Fact]
+    public void A_Fragmented_Message_On_A_Carrier_Without_Send_States_Completes_Sent()
+    {
+        // PROTOCOL.md §4.3: a carrier that reports no per-datagram send state completes every datagram `Sent`, which is final.
+        // The worst outcome of a message's fragments decides the message, and `Sent` outranks `Delivered`, so such a message
+        // is never reported delivered however well it travelled — and it still arrives whole.
+        using SessionHarness h = new(
+            link: new LinkOptions { DatagramSendStateReporting = false },
+            table: Table,
+            client: DatagramKit.Quiet,
+            server: DatagramKit.Quiet);
+        QuiclyPeer client = h.Client;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(2, Handlers.Collect(got));
+        byte[] payload = DatagramKit.Payload(1, 4_000);
+
+        SendResult result = client.SendCopy(new SendHeader(2), payload, SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, result.Status);
+        Assert.True(h.RunUntil(() => client.GetDeliveryStatus(result.Token) == DeliveryStatus.Sent),
+            $"the message ended as {client.GetDeliveryStatus(result.Token)}");
+        Assert.Single(got);
+        Assert.Equal(payload, got[0].Payload);
+        Assert.Equal(0, DatagramKit.Statistics(client).SendBytesOutstanding);
+    }
+
+    [Fact]
+    public void A_Resumed_Session_Fragments_Again_After_The_Owner_Map_Was_Reset()
+    {
+        // PROTOCOL.md §4.1: a resume starts a new epoch. The lost connection's fragment bookkeeping is forgotten
+        // (`OnReconnecting`) and the send counters restart, so the resumed session's fragments own their entries again and its
+        // first message carries sequence 0.
+        using SessionHarness h = new(connect: false, table: Table, client: DatagramKit.Quiet, server: DatagramKit.Quiet);
+        h.Admission.Handler = static (in HelloInfo hello, QuiclyPeer _) =>
+            AdmissionResult.Accept(new byte[] { 5, 6, 7 }, 4242, epoch: hello.SessionToken.IsEmpty ? 1u : 2u);
+        Assert.True(h.RunUntilConnected(), "the session did not connect");
+        QuiclyPeer client = h.Client;
+        QuiclyPeer oldServer = h.Server!;
+
+        SendResult lost = client.SendCopy(new SendHeader(2), DatagramKit.Payload(1, 4_000), SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, lost.Status);
+        oldServer.Core.Transport!.Close(0, default);
+        Assert.True(h.RunUntil(() => client.State == PeerState.Closed), "the client did not see the loss");
+        Assert.Equal(DeliveryStatus.Disconnected, client.GetDeliveryStatus(lost.Token));
+        Assert.Equal(0, DatagramKit.Statistics(client).SendBytesOutstanding);
+
+        client.Reconnect(h.Connector, h.Listener.LocalEndPoint, "test", default);
+        Assert.True(
+            h.RunUntil(() => client.State == PeerState.Connected && h.Server is not null
+                && !ReferenceEquals(h.Server, oldServer) && h.Server.State == PeerState.Connected),
+            "the session did not resume");
+        oldServer.Dispose();
+        Assert.Equal(2u, client.Epoch);
+
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(2, Handlers.Collect(got));
+        byte[] payload = DatagramKit.Payload(2, 4_000);
+        SendResult resumed = client.SendCopy(new SendHeader(2), payload, SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, resumed.Status);
+        Assert.True(h.RunUntil(() => got.Count == 1), "the resumed session delivered no fragmented message");
+        Assert.Equal(payload, got[0].Payload);
+        Assert.Equal(0u, got[0].Header.Sequence);
+        Assert.True(h.RunUntil(() => client.GetDeliveryStatus(resumed.Token) == DeliveryStatus.Delivered),
+            $"the resumed message ended as {client.GetDeliveryStatus(resumed.Token)}");
+        Assert.Equal(0, DatagramKit.Statistics(client).SendBytesOutstanding);
+        Assert.Equal(0, FragmentKit.Reassemblies(h.Server, 2));
+    }
+
+    [Fact]
     public void A_Fragmented_Message_Needs_Its_Owner_And_Every_Fragment_In_The_Send_Table()
     {
         // The reserve is checked for the worst case (an owner plus eight fragments), so a nearly full table refuses a
@@ -466,18 +569,22 @@ public unsafe class FragmentEdgeTests
     [Fact]
     public void A_Fragment_Of_An_Older_Message_Does_Not_Disturb_The_Partial_Of_A_Newer_One()
     {
+        // Channel 3 is UnreliableSequenced, so its sequence orders the channel's messages and the §7 rules about older and
+        // newer sequences of one key apply: the older message is obsolete by definition. On an unordered channel the sequence
+        // is only a reassembly id (PROTOCOL.md §2.1), and both messages are reassembled instead — that is
+        // ReviewFragmentRequestTests.Two_Fragmented_Messages_Whose_Fragments_Interleave_Are_Both_Reassembled.
         using ServerHarness h = new(table: Table);
         Assert.True(h.Admit(), "the raw client was not admitted");
         QuiclyPeer server = h.Server!;
-        ChannelDefinition channel = Table[2]!;
-        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(FragmentKit.Split(channel, 5, 0, DatagramKit.Payload(1, 2_000), 2)[0]));
+        ChannelDefinition channel = Table[3]!;
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(FragmentKit.Split(channel, 5, 7, DatagramKit.Payload(1, 2_000), 2)[0]));
         h.Run(10_000);
-        Assert.Equal(1, FragmentKit.Reassemblies(server, 2));
+        Assert.Equal(1, FragmentKit.Reassemblies(server, 3));
 
         // A fragment of a message the key has already moved past is dropped without touching the live partial.
-        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(FragmentKit.Split(channel, 4, 0, DatagramKit.Payload(2, 2_000), 2)[0]));
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(FragmentKit.Split(channel, 4, 7, DatagramKit.Payload(2, 2_000), 2)[0]));
         h.Run(10_000);
-        Assert.Equal(1, FragmentKit.Reassemblies(server, 2));
+        Assert.Equal(1, FragmentKit.Reassemblies(server, 3));
         Assert.Equal(1, h.Statistics().FragmentsDropped);
         Assert.Equal(0, h.Statistics().ReassembliesAbandoned);
     }

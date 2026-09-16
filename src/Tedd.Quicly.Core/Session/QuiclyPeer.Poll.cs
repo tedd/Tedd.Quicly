@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Primitives;
@@ -131,24 +132,16 @@ public sealed unsafe partial class QuiclyPeer
                 _queuedWithHandler--;
             }
 
-            if (IsResponse(in entry))
-            {
-                TakeResponse(ref entry, now);
-                continue;
-            }
-
+            // A response is taken by its engine where it leaves the receive ring (below, and in Route), and that is the only
+            // way into a per-channel queue or the held slot, so neither can hold one (see IsResponse).
+            Debug.Assert(!IsResponse(in entry), "a response never reaches a per-channel queue");
             Emit(ref entry, now, into, ref written);
         }
 
         if (_hasHeld && written < into.Length)
         {
-            if (IsResponse(in _held))
-            {
-                ReceiveEntry entry = _held;
-                _hasHeld = false;
-                TakeResponse(ref entry, now);
-            }
-            else if (_held.Channel == channel)
+            Debug.Assert(!IsResponse(in _held), "a response never reaches the held slot");
+            if (_held.Channel == channel)
             {
                 ReceiveEntry entry = _held;
                 _hasHeld = false;
@@ -392,12 +385,7 @@ public sealed unsafe partial class QuiclyPeer
             while (handler is not null && dispatched < maxItems && !_disposed && queues.TryTake(index, out ReceiveEntry entry))
             {
                 _queuedWithHandler--;
-                if (IsResponse(in entry))
-                {
-                    TakeResponse(ref entry, now);
-                    continue;
-                }
-
+                Debug.Assert(!IsResponse(in entry), "a response never reaches a per-channel queue");
                 Dispatch(handler, ref entry, now);
                 dispatched++;
                 handler = _handlers[index];
@@ -464,7 +452,17 @@ public sealed unsafe partial class QuiclyPeer
         }
     }
 
-    /// <summary>Whether a received message is the response of a request/response channel (PROTOCOL.md §3.1).</summary>
+    /// <summary>
+    /// Whether a received message is the response of a request/response channel (PROTOCOL.md §3.1).
+    /// </summary>
+    /// <remarks>
+    /// Every message the game thread takes out of the receive ring is offered to its engine first — in <see cref="Route"/> for
+    /// <see cref="Poll"/>, in the ring loop of <see cref="Drain"/> for the batch API — and only a message that is not a
+    /// response is dispatched, written to the caller's span, queued for another channel or held. Those two are therefore the
+    /// only interception points the peer needs: a per-channel queue and the held slot can only ever receive what already
+    /// passed one of them, so no channel handler and no <see cref="Drain"/> caller can see a response. The queue and held
+    /// paths assert that invariant instead of checking it again.
+    /// </remarks>
     private static bool IsResponse(in ReceiveEntry entry) => (entry.Flags & ReceiveFlags.IsResponse) != 0;
 
     /// <summary>

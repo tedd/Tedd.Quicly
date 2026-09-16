@@ -276,6 +276,20 @@ public sealed class PeerOptions
 
     internal static long ToMicros(TimeSpan value) => value.Ticks / (TimeSpan.TicksPerMillisecond / 1000);
 
+    /// <summary>
+    /// A <em>timeout</em> in microseconds: a positive duration always becomes at least one micro. Timeouts read 0 as their
+    /// "no timeout" sentinel (<see cref="QuiclyPeer.SendRequestAsync"/>), so the truncation towards zero that
+    /// <see cref="ToMicros"/> does — and that its other callers, where 0 means "off" or "every pass", rely on — would turn a
+    /// positive sub-microsecond timeout into "wait until the response arrives or the session ends".
+    /// </summary>
+    /// <param name="value">A non-negative duration.</param>
+    /// <returns>0 only for <see cref="TimeSpan.Zero"/>, otherwise at least 1.</returns>
+    internal static long ToTimeoutMicros(TimeSpan value)
+    {
+        long micros = ToMicros(value);
+        return micros == 0 && value > TimeSpan.Zero ? 1 : micros;
+    }
+
     private static void CheckRange(int value, int min, int max, string name)
     {
         if (value < min || value > max)

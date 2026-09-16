@@ -1106,8 +1106,10 @@ Two features that ride on engines that already exist: fragmentation is the secon
 #### Fragmentation (PROTOCOL.md §2.1, §7)
 
 * **When.** `Admit` prepares the payload as usual and, when the encoded message does not fit the *current*
-  `MaxDatagramPayload` on a channel with `Fragmentation`, releases that attempt and calls `AdmitFragmented` (a channel
-  without it answers `TooLarge`). Because the single-datagram header is one byte shorter than a fragment's (no
+  `MaxDatagramPayload` on a channel with `Fragmentation`, gives back the entry of that attempt and hands the **prepared
+  payload** to `AdmitFragmented` (a channel without it answers `TooLarge`). The payload is prepared exactly once for both
+  shapes: the fragments point into those very bytes, so a compressed message runs LZ4 once into one send lease and a
+  borrowed array is pinned once. Because the single-datagram header is one byte shorter than a fragment's (no
   `FragIndex`), a message that gets here always needs at least two fragments.
 * **Layout.** `count = ceil(wire / capacity)` with `capacity = MaxDatagramPayload − header(FragCount > 1)`, and
   `size = ceil(wire / count)`, so every fragment but the last has the size of fragment 0 and the last carries the rest
@@ -1126,8 +1128,12 @@ Two features that ride on engines that already exist: fragmentation is the secon
   stale owner.
 * **Completions.** A fragment's `Sent` notice gives back one payload reference; when the last one is gone the owner's
   payload is released and the message's **BufferReleased** stage completes — which is what makes pinned, borrowed,
-  gathered and shared payloads safe to reuse. A fragment that travelled inside a packed container gets no `Sent` notice
-  of its own (the packer only forwards it to tracked members), so its final completion gives the reference back instead.
+  gathered and shared payloads safe to reuse. A fragment that travelled inside a packed container may get the container's
+  `Sent` notice as well: the packer forwards the non-final notice to *every* member of the container as soon as **any** of
+  them is tracked (it keeps that count in the container entry's `Aux0`), and a fragment is never tracked itself, so whether
+  it is notified depends on the neighbours it shared the datagram with. The reference is given back exactly once either way,
+  because a fragment carries a *payload released* bit in `Aux1` that both the notice and the final completion test first: a
+  fragment that was notified returns the reference there, one that was not returns it at its final completion.
   Each final completion folds into the owner, worst outcome wins (`Disconnected` > `Failed` > `Lost` > `Expired` >
   `Canceled` > `Sent` > `Delivered`), and the last one completes the message. So a fragmented message is `Delivered` only
   if every fragment was, and one lost datagram makes the whole message `Lost`.
@@ -1141,16 +1147,29 @@ Two features that ride on engines that already exist: fragmentation is the secon
   queued fragments and then completes what is left of their messages `Disconnected`; `OnReconnecting` additionally
   forgets the owner map.
 * **Receive** (transport thread). `MaxReassemblies` records per channel (default 16, a contiguous range of one native
-  array, 64 B each) hold the partial messages, keyed by the message's key — so a keyed channel reassembles up to
-  `MaxReassemblies` messages at once and an unkeyed one exactly one at a time, which is what "a newer sequence for the
-  same key abandons the older partial" means when every message has key 0. Order of work, all of it before a buffer is
-  chosen: the framing layer has already bounded the implied total against the channel's `MaxMessageSize`; the engine
-  bounds it again against `min(ReceiveBudgetBytes, largest pool block)`; expired partials of the channel are swept; a
-  fragment of an older sequence is dropped, of a newer one abandons the partial; `FragCount`, `RawLength` and the
-  fragment sizes must agree with what the partial already knows; a duplicate index is ignored. Only then is a buffer
-  rented — `size × count` when fragment 0's size is known, the channel's limit when the *last* fragment arrived first
+  array, 64 B each) hold the partial messages, and the **reassembly scope is `(channel, key, sequence)`** exactly as
+  PROTOCOL.md §2.1 says: a fragment belongs to the partial of its own key *and* sequence, so the channel reassembles as
+  many messages at once as the cap allows, whether it is keyed or not. That is the normal case, not an unusual one — a
+  fragmented message is several datagrams, and §4.5 paces them, so any jitter or reordering between two consecutive
+  messages interleaves their fragments.
+  The §7 rule that "a newer sequence for the same key abandons the older partial" therefore applies **only where the
+  sequence carries ordering**: on an `UnreliableSequenced` channel, where a newer message of a key makes the older one
+  obsolete by definition (and a fragment of an older sequence of that key is dropped for the same reason). On
+  `UnreliableUnordered` the sequence is nothing but a reassembly id (§2.1), so neither rule applies there and the cap with
+  its oldest-first eviction is the whole concurrency bound.
+  Order of work, all of it before a buffer is chosen: the framing layer has already bounded the implied total against the
+  channel's `MaxMessageSize`; the engine bounds it again against `min(ReceiveBudgetBytes, largest pool block)`; expired
+  partials of the channel are swept; the ordering verdict above is applied; `FragCount`, `RawLength` and the fragment sizes
+  must agree with what the partial already knows; a duplicate index is ignored. Only then is a buffer rented —
+  `min(size × count, limit)` when fragment 0's size is known, the channel's limit when the *last* fragment arrived first
   (its size says nothing about the others; its bytes wait at the front of the buffer and move once the size is known, a
-  single memmove in that one case).
+  single memmove in that one case). The clamp matters: a fragment's own §8 bound can pass while `size × count` is far above
+  what the channel promised, and renting that would charge the receive budget — and count `OutOfReceiveBuffers` — for bytes
+  no message of that channel may ever have.
+  One bound needs *both* sizes and so cannot be checked per fragment: the two §8 bounds are lower bounds, so each can hold
+  for a set whose real total does not. Whichever of the two sizes arrives second, the engine checks
+  `FragmentSize × (count − 1) + LastLength` against the limit and drops the fragment with its partial when it exceeds it
+  (PROTOCOL.md §8 says so now; before that it was enforced in one arrival order only).
 * **Publishing.** The completed message needs no copy: the partial's own buffer *is* the payload. It goes through the
   mode's `Accept` (so a stale sequenced message is dropped exactly as an unfragmented one would be) and then into the
   key's mailbox or the receive ring, with `ReceiveFlags.Fragmented` and, for a compressed message, `Compressed` +
@@ -1165,10 +1184,19 @@ Two features that ride on engines that already exist: fragmentation is the secon
   which is the sizing rule in ARCHITECTURE.md §9.
 * **Epoch reset.** `OnEpochReset(resumed: true)` restarts the send counters and asks the transport thread to forget its
   receive tables before the next datagram; the partials go with them (their buffers are returned), because their
-  sequences belong to the epoch that ended.
+  sequences belong to the epoch that ended. The request is a flag, not work: the reset happens inside the *next* datagram
+  of any channel of the engine, so an engine that hears nothing after the resume keeps the old epoch's partial buffers
+  until it does. **That is accepted, deliberately.** The receive tables belong to the transport thread (ADR 0008
+  invariant 4), so clearing them from the game thread would need a handshake for a case that costs nothing: the buffers are
+  bounded by `MaxReassemblies × MaxMessageSize` per channel either way (ARCHITECTURE.md §9), they are already counted in
+  the peer's receive budget, no fragment of the new epoch can be mixed into them (the reset runs *before* that fragment is
+  processed), and the two ways a peer really stops — `OnReconnecting` and `Dispose` — clear the table directly, because no
+  callback can arrive then. A host that wants the memory back sooner closes the peer.
 * **Statistics.** Per peer: `FragmentedMessagesSent`, `FragmentsSent`, `FragmentsReceived`,
   `FragmentedMessagesReceived`, `FragmentsDropped` (duplicates, inconsistent fields, limits, no buffer),
-  `ReassembliesAbandoned` (a newer sequence, or the cap evicting the oldest) and `ReassembliesExpired`. Per channel the
+  `ReassembliesAbandoned` (a newer sequence of a key on a *sequenced* channel, or the cap evicting the oldest) and
+  `ReassembliesExpired`. `Reassemblies(channelIndex)` reads the transport thread's count with one volatile read and is
+  diagnostics only (ADR 0008 invariant 13). Per channel the
   ordinary counters apply, with one twist worth knowing: **each fragment is one `Sent`** of its channel, because each is
   a datagram the scheduler hands over separately, while `Received` counts reassembled messages.
 
@@ -1200,10 +1228,20 @@ Two features that ride on engines that already exist: fragmentation is the secon
 * **Cancellation, close, reconnect, dispose.** Cancelling the wait never cancels the send (ADR 0004): the request still
   goes out and its response is dropped and counted when it arrives. `OnPeerClosed`, `OnReconnecting` and `Dispose` fail
   every outstanding request with a clear reason (`InvalidOperationException` for a closed or lost session,
-  `ObjectDisposedException` for a disposed peer), so a request never hangs on a session that ended.
-* **Shared seams added for it** (one region each): `ChannelEngine.RunPollDeadlines` and `ChannelEngine.TryTakeResponse`
-  (both virtual no-ops), the engine loop in `QuiclyPeer.RunTimers`, `QuiclyPeer.TakeResponse` in the Poll/Drain paths, and
-  ten counters in `PeerCounters`/`PeerStatistics` (seven for fragmentation, three for requests).
+  `ObjectDisposedException` for a disposed peer), so a request never hangs on a session that ended. `Dispose` fails them
+  **synchronously**, through `ChannelEngine.FailWaitsOnDispose` next to the peer's own send and flush waiters: the engine's
+  `Dispose` would fail them too, but that runs from `FreeResources`, which waits until the transport has reported its close
+  — for a peer disposed without being closed first (ordinary teardown) that is much later, and for a transport that reports
+  no close it is never. An `await` must not outlive the peer that handed it out.
+* **Shared seams added for it** (one region each): `ChannelEngine.RunPollDeadlines`, `ChannelEngine.TryTakeResponse` and
+  `ChannelEngine.FailWaitsOnDispose` (all virtual no-ops), the engine loop in `QuiclyPeer.RunTimers`,
+  `QuiclyPeer.TakeResponse` in the Poll/Drain paths, the engine loop in `QuiclyPeer.FailWaitersOnDispose`, and ten counters
+  in `PeerCounters`/`PeerStatistics` (seven for fragmentation, three for requests).
+* **Where responses are intercepted.** Two places, not five: `Route` (Poll) and the ring loop of `Drain`. Those are the only
+  paths that take a message out of the receive ring, and everything else the peer holds — a per-channel queue, the single
+  held entry — can only receive what already passed one of them, so neither can ever contain a response. The queue and held
+  paths assert that invariant (`Debug.Assert`) instead of testing it again, which is why no channel handler and no `Drain`
+  caller can see a response even though only two checks exist.
 * **Statistics.** `RequestsSent`, `RequestsTimedOut`, `ResponsesUnmatched`; a request and its response also count as
   ordinary messages of their channel.
 
@@ -1211,17 +1249,23 @@ Two features that ride on engines that already exist: fragmentation is the secon
 small-limit, two-reassembly and coalescing channels, a hand-written fragment writer that can break every rule, and a
 splitter that produces a sender's own fragments): `FragmentDeliveryTests` (every fragment count 2 … 8 byte-exact, a lost
 fragment dropping only its own message, reordering and duplicates, the last fragment arriving first, partials of
-different keys side by side, the newer-sequence abandon, compression on top of fragmentation, a reassembled message in a
-coalescing mailbox, and 200 messages under 2 % loss with reordering and jitter); `FragmentEdgeTests` (hostile
-`FragCount`/`FragIndex`/empty-payload/oversized-bound frames dropped without closing the connection, fragments that
-disagree about their message, a bound above what the receive budget could ever hold, the cap evicting the oldest partial,
-the expiry sweep, a message that would need more than eight fragments refused, every send path fragmenting — including a
-`SendShared` block retained and released exactly once — a tracked message ending `Delivered` and, with one fragment lost,
-`Lost`, cancel, expiry at scheduling time, close, and an epoch reset returning a partial's buffer);
-`RequestResponseTests` (the happy path, keyed and compressed requests, 64 concurrent requests answered in reverse order,
-timeouts served by Poll and by Flush, a response after the timeout, cancellation that does not cancel the send, an
-unmatched response, close, a lost connection followed by a resume, dispose, the refusal matrix and the table's bound);
-and `FragmentRequestZeroAllocationTests` (fragmented traffic at 60 Hz, and four request round trips per cycle, 0 B per
+different keys side by side, the newer-sequence abandon on a sequenced channel, compression on top of fragmentation, a
+reassembled message in a coalescing mailbox, and 80 messages over a reordering, jittering link with the losses **chosen**,
+so the set that must arrive is exact — a tolerance would not tell link loss from a reassembly bug); `FragmentEdgeTests`
+(hostile `FragCount`/`FragIndex`/empty-payload/oversized-bound frames dropped without closing the connection, fragments
+that disagree about their message, a bound above what the receive budget could ever hold, the cap evicting the oldest
+partial, the expiry sweep, a message that would need more than eight fragments refused, every send path fragmenting —
+including a `SendShared` block retained and released exactly once — a tracked message ending `Delivered` and, with one
+fragment lost, `Lost`, a carrier without per-datagram send states ending it `Sent`, a message the send cap splits across
+passes, cancel, expiry at scheduling time, close, an epoch reset returning a partial's buffer, and a resume that fragments
+again after the owner map was reset); `RequestResponseTests` (the happy path, keyed and compressed requests, 64 concurrent
+requests answered in reverse order, 32 of them over a lossy, jittering link with plain messages interleaved, timeouts
+served by Poll and by Flush, a response after the timeout, cancellation that does not cancel the send, an unmatched
+response, a response drained rather than polled — which is also what reclaims a canceled slot — a `Drain` that hands the
+caller the plain message and not the response, close, a lost connection followed by a resume, dispose, the refusal matrix
+and the table's bound); `ReviewFragmentRequestTests` (the review's own three: the real total against `MaxMessageSize`,
+interleaved messages both reassembled, and a sub-microsecond timeout that still elapses); and
+`FragmentRequestZeroAllocationTests` (fragmented traffic at 60 Hz, and four request round trips per cycle, 0 B per
 window).
 
 Waves:

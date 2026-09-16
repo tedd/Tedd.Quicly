@@ -49,9 +49,14 @@ internal abstract unsafe partial class DatagramEngine
     /// <summary>Whether any channel of this engine fragments (else every fragmentation path is skipped).</summary>
     private bool Fragments => _partials is not null;
 
-    /// <summary>Partial reassemblies a channel holds right now (game thread and tests; statistics).</summary>
+    /// <summary>
+    /// Partial reassemblies a channel holds right now (diagnostics only: statistics and tests). The field belongs to the
+    /// transport thread (ADR 0008 invariant 4), so this is a single volatile read of one counter — the same shape as the
+    /// receive-side counters <see cref="QuiclyPeer.GetStatistics"/> snapshots. It may be one fragment out of date, and nothing
+    /// in the engine decides anything from it.
+    /// </summary>
     /// <param name="channelIndex">Dense index of a channel of this engine.</param>
-    internal int Reassemblies(int channelIndex) => _recv[_localOf[channelIndex]].Reassemblies;
+    internal int Reassemblies(int channelIndex) => Volatile.Read(ref _recv[_localOf[channelIndex]].Reassemblies);
 
     /// <summary>The reassembly expiry window in micros as the transport thread sees it (tests).</summary>
     internal long ReassemblyWindowMicros => Volatile.Read(ref _reassemblyWindowMicros);
@@ -119,7 +124,8 @@ internal abstract unsafe partial class DatagramEngine
     /// <summary>
     /// A message of a fragmenting channel that does not fit one datagram (PROTOCOL.md §2.1): it goes out as
     /// <c>FragCount</c> ≤ 8 fragments of one <c>(channel, key, sequence)</c>, all of the size of fragment 0 except the last.
-    /// Called by <see cref="Admit"/> after every resource of its single-datagram attempt was released.
+    /// Called by <see cref="Admit"/> once its single-datagram attempt gave up its entry; the payload it prepared is handed
+    /// over here rather than prepared a second time.
     /// </summary>
     /// <remarks>
     /// The message keeps <em>one</em> owner entry: it holds the payload (a copy, the caller's own lease, pinned or shared
@@ -134,28 +140,27 @@ internal abstract unsafe partial class DatagramEngine
     /// anything larger belongs on a reliable channel.</para>
     /// </remarks>
     /// <param name="request">The request.</param>
+    /// <param name="length">Raw payload bytes of the message (a gather's total).</param>
+    /// <param name="payload">
+    /// The payload <see cref="Admit"/> prepared for its single-datagram attempt — the very bytes the fragments point into.
+    /// This method owns it: it releases it when the message is refused, and commits it to the owner entry otherwise.
+    /// </param>
     /// <returns>The admission result.</returns>
-    private SendStatus AdmitFragmented(ref SendRequest request)
+    private SendStatus AdmitFragmented(ref SendRequest request, int length, ref PreparedPayload payload)
     {
         ChannelDefinition channel = request.Channel;
         int dense = request.ChannelIndex;
         int local = _localOf[dense];
         ref ChannelSendCounters counters = ref _core.SendCounters(dense);
         SendEntryTable entries = _core.Entries;
-        int length = request.Kind == SendPayloadKind.Gather ? EnginePayload.GatherLength(request.Gather) : request.Length;
 
-        // One owner entry plus at most eight fragments; the exact count is only known after the payload was prepared, so the
+        // One owner entry plus at most eight fragments; the exact count is only known once the payload is prepared, so the
         // reserve is checked for the worst case (a fragmented message is rare and never urgent).
         if (entries.Available <= MaxFragments + 1)
         {
+            EnginePayload.Release(_core, in payload);
             counters.QueueFull++;
             return SendStatus.QueueFull;
-        }
-
-        PreparedPayload payload = default;
-        if (!EnginePayload.TryPrepare(_core, ref request, channel, length, takeSinglePage: false, ref payload))
-        {
-            return SendStatus.OutOfBuffers;
         }
 
         MessageHeader header = default;
@@ -187,6 +192,9 @@ internal abstract unsafe partial class DatagramEngine
         {
             bool reserved = _core.TryAllocateEntry(channel.Id, SendEntryFlags.None, out slots[i]);
             Debug.Assert(reserved, "the entry reserve of a fragmented message");
+            // Every allocation this engine makes writes the owner map at once, so a recycled slot never inherits a stale
+            // owner and the unwind below leaves none behind either (docs/design/session-layer.md §7.8).
+            _fragmentOwner[slots[i]] = -1;
         }
 
         int owner = slots[0];
@@ -502,8 +510,9 @@ internal abstract unsafe partial class DatagramEngine
 
     /// <summary>
     /// One fragment of a larger message (PROTOCOL.md §2.1, §7): every limit is checked from this single fragment before a
-    /// buffer is chosen, then the fragment is copied into the partial message of its <c>(channel, key)</c> and the message is
-    /// published when the last missing fragment arrives. Transport thread.
+    /// buffer is chosen, then the fragment is copied into the partial message of its <c>(channel, key, sequence)</c> — the
+    /// reassembly scope of PROTOCOL.md §2.1 — and the message is published when the last missing fragment arrives. Transport
+    /// thread.
     /// </summary>
     /// <remarks>
     /// The framing layer has already checked the fragment fields (<c>FragCount</c> ∈ [1, 8], <c>FragIndex</c> &lt;
@@ -511,8 +520,13 @@ internal abstract unsafe partial class DatagramEngine
     /// <c>MaxMessageSize</c>). This method adds what only the session knows: the same bound against what this peer could ever
     /// buffer, the channel's <see cref="ChannelDefinition.MaxReassemblies"/> cap (the oldest partial is evicted),
     /// the expiry of 2 × RTT + 100 ms, consistency of <c>FragCount</c>, <c>RawLength</c> and the fragment sizes within one
-    /// message, and duplicates (ignored). A newer sequence for the same key abandons the older partial, and an older one is
-    /// dropped.
+    /// message, the message's <em>real</em> total once both sizes are known, and duplicates (ignored).
+    /// <para>Two messages of one channel reassemble side by side: they differ in their sequence, which is part of the scope.
+    /// The §7 rule that "a newer sequence for the same key abandons the older partial" applies only where the sequence carries
+    /// ordering — an <see cref="ChannelMode.UnreliableSequenced"/> channel, where the older message is obsolete anyway — and a
+    /// fragment of an older sequence is dropped there for the same reason. On <see cref="ChannelMode.UnreliableUnordered"/>
+    /// the sequence is nothing but a reassembly id (PROTOCOL.md §2.1), so neither rule applies and the channel's cap alone
+    /// bounds how many messages it reassembles at once.</para>
     /// </remarks>
     /// <param name="header">The fragment's header.</param>
     /// <param name="payload">The fragment's payload (valid during the call).</param>
@@ -547,28 +561,28 @@ internal abstract unsafe partial class DatagramEngine
             return;
         }
 
-        int record = FindPartial(local, header.Key, nowMicros, ref counters);
+        int record = FindPartial(local, channel, in header, nowMicros, ref counters, out SequenceVerdict verdict, out int related);
+        if (verdict == SequenceVerdict.Stale)
+        {
+            // A fragment of a message this key has already moved past; only a channel whose sequence orders its messages can
+            // know that.
+            peer.FragmentsDropped++;
+            return;
+        }
+
+        if (verdict == SequenceVerdict.Superseded)
+        {
+            // PROTOCOL.md §7: on a channel whose sequence carries ordering, a newer sequence for the same key abandons the
+            // older partial.
+            ReleasePartial(local, ref _partials![related]);
+            peer.ReassembliesAbandoned++;
+            counters.Dropped++;
+        }
+
         if (record >= 0)
         {
             ref Reassembly existing = ref _partials[record];
-            if (existing.Sequence != header.Sequence)
-            {
-                bool newer = channel.SequenceBits == 16
-                    ? SerialNumber.IsNewer((ushort)header.Sequence, (ushort)existing.Sequence)
-                    : SerialNumber.IsNewer(header.Sequence, existing.Sequence);
-                if (!newer)
-                {
-                    // A fragment of a message this key has already moved past.
-                    peer.FragmentsDropped++;
-                    return;
-                }
-
-                // PROTOCOL.md §7: a newer sequence for the same key abandons the older partial.
-                ReleasePartial(local, ref existing);
-                peer.ReassembliesAbandoned++;
-                counters.Dropped++;
-            }
-            else if (existing.FragCount != count || existing.RawLength != header.RawLength
+            if (existing.FragCount != count || existing.RawLength != header.RawLength
                 || (!last && existing.FragmentSize != 0 && size != existing.FragmentSize)
                 || (last && existing.LastLength != 0 && size != existing.LastLength))
             {
@@ -579,7 +593,8 @@ internal abstract unsafe partial class DatagramEngine
                 counters.Dropped++;
                 return;
             }
-            else if ((existing.Mask & (byte)(1 << index)) != 0)
+
+            if ((existing.Mask & (byte)(1 << index)) != 0)
             {
                 // A duplicate fragment is ignored (PROTOCOL.md §2.1).
                 peer.FragmentsDropped++;
@@ -595,8 +610,10 @@ internal abstract unsafe partial class DatagramEngine
         if ((partial.Flags & PartialInUse) == 0)
         {
             // A fresh partial: the buffer is the exact bound when fragment 0's size is known, and the channel's limit when
-            // the last fragment arrived first (its own size says nothing about the others).
-            int wanted = last ? limit : size * count;
+            // the last fragment arrived first (its own size says nothing about the others). Never more than the limit: a
+            // fragment whose own §8 bound passes can still name a count whose product exceeds what the channel promised, and
+            // renting that would charge the receive budget — and count OutOfReceiveBuffers — for bytes no message may have.
+            int wanted = last ? limit : (int)Math.Min((long)size * count, limit);
             if (!_core.TryRentReceive(wanted, out BufferLease lease))
             {
                 _core.Counters.OutOfReceiveBuffers++;
@@ -621,10 +638,13 @@ internal abstract unsafe partial class DatagramEngine
         int available = partial.Lease.Length;
         if (last)
         {
-            if (partial.FragmentSize != 0 && size > partial.FragmentSize)
+            if (partial.FragmentSize != 0 && (size > partial.FragmentSize || ((long)partial.FragmentSize * (count - 1)) + size > limit))
             {
                 // The last fragment is never larger than fragment 0 (PROTOCOL.md §8): a claim that it is would write past
-                // the message inside the buffer that was reserved for it.
+                // the message inside the buffer that was reserved for it. And with both sizes known the message's real total
+                // is known too, so it is checked against the channel's limit here (PROTOCOL.md §7, §8): the two per-fragment
+                // bounds are each satisfied by sets whose sum is not, and the non-last branch below makes the same check for
+                // the other arrival order.
                 ReleasePartial(local, ref partial);
                 peer.FragmentsDropped++;
                 counters.Dropped++;
@@ -685,13 +705,45 @@ internal abstract unsafe partial class DatagramEngine
         PublishReassembled(local, dense, in header, in message, length, nowMicros, ref counters);
     }
 
-    /// <summary>The channel's partial of <paramref name="key"/>, or -1; expires the partials whose window has passed.</summary>
-    private int FindPartial(int local, ulong key, long nowMicros, ref ChannelRecvCounters counters)
+    /// <summary>What the partials a channel already holds for a fragment's key say about the fragment's sequence.</summary>
+    private enum SequenceVerdict : byte
+    {
+        /// <summary>Nothing contradicts the fragment (always the answer on a channel whose sequence carries no ordering).</summary>
+        Independent = 0,
+
+        /// <summary>A sequenced channel holds a partial of a newer sequence for the key: the fragment is obsolete.</summary>
+        Stale = 1,
+
+        /// <summary>A sequenced channel holds a partial of an older sequence for the key: that partial is abandoned.</summary>
+        Superseded = 2,
+    }
+
+    /// <summary>
+    /// The channel's partial of this fragment's <c>(key, sequence)</c> — the reassembly scope of PROTOCOL.md §2.1 — or -1;
+    /// expires the partials whose window has passed on the way, and reports what the key's <em>other</em> partials mean for
+    /// this fragment (PROTOCOL.md §7, only on a channel whose sequence carries ordering).
+    /// </summary>
+    /// <param name="local">The channel's index within this engine.</param>
+    /// <param name="channel">The channel.</param>
+    /// <param name="header">The fragment's header.</param>
+    /// <param name="nowMicros">Clock micros of the callback.</param>
+    /// <param name="counters">The channel's receive counters.</param>
+    /// <param name="verdict">What the key's other partials say about this sequence.</param>
+    /// <param name="related">The partial <paramref name="verdict"/> is about, or -1.</param>
+    /// <returns>The record of this message's partial, or -1 when the channel holds none.</returns>
+    private int FindPartial(int local, ChannelDefinition channel, in MessageHeader header, long nowMicros, ref ChannelRecvCounters counters,
+        out SequenceVerdict verdict, out int related)
     {
         int start = _partialBase[local];
         int end = start + _partialCap[local];
         long window = Volatile.Read(ref _reassemblyWindowMicros);
+        // On an unordered channel the sequence is only a reassembly id (PROTOCOL.md §2.1), so a partial of another sequence is
+        // another message, never an obsolete version of this one.
+        bool ordered = channel.Mode == ChannelMode.UnreliableSequenced;
+        bool sixteenBit = channel.SequenceBits == 16;
         int found = -1;
+        verdict = SequenceVerdict.Independent;
+        related = -1;
         for (int i = start; i < end; i++)
         {
             ref Reassembly partial = ref _partials![i];
@@ -710,14 +762,29 @@ internal abstract unsafe partial class DatagramEngine
                 continue;
             }
 
-            if (partial.Key == key)
+            if (partial.Key != header.Key)
+            {
+                continue;
+            }
+
+            if (partial.Sequence == header.Sequence)
             {
                 found = i;
+            }
+            else if (ordered && verdict != SequenceVerdict.Stale)
+            {
+                bool newer = IsNewerSequence(header.Sequence, partial.Sequence, sixteenBit);
+                verdict = newer ? SequenceVerdict.Superseded : SequenceVerdict.Stale;
+                related = i;
             }
         }
 
         return found;
     }
+
+    /// <summary>RFC 1982 serial comparison in the channel's sequence width (PROTOCOL.md §1).</summary>
+    private static bool IsNewerSequence(uint sequence, uint other, bool sixteenBit) =>
+        sixteenBit ? SerialNumber.IsNewer((ushort)sequence, (ushort)other) : SerialNumber.IsNewer(sequence, other);
 
     /// <summary>A free record of the channel, evicting its oldest partial when the cap is reached (PROTOCOL.md §7).</summary>
     private int TakeRecord(int local, long nowMicros, ref ChannelRecvCounters counters)

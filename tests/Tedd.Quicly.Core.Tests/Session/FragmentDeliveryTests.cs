@@ -259,49 +259,74 @@ public class FragmentDeliveryTests
     }
 
     [Fact]
-    public void Fragmented_Traffic_Survives_Loss_Reordering_And_Jitter()
+    public void Fragmented_Traffic_Under_Reordering_And_Jitter_Delivers_Exactly_The_Complete_Messages()
     {
+        // Deterministic by construction. The link reorders and jitters — which is what makes the fragments of two consecutive
+        // messages interleave, the ordinary case PROTOCOL.md §4.5 produces — but loses nothing of its own: every loss here is
+        // chosen, so the test knows exactly which messages must arrive. A tolerance like "100 to 200 of 200" cannot tell link
+        // loss from a reassembly bug. The channel is unkeyed, so every message of it shares the whole reassembly scope except
+        // its sequence (PROTOCOL.md §2.1), which is where an implementation that keys partials by key alone loses messages.
+        const int Ticks = 40;
         using SessionHarness h = new(
-            link: new LinkOptions { DelayMicros = 5_000, JitterMicros = 2_000, LossPercent = 2, ReorderPercent = 5 },
+            link: new LinkOptions { DelayMicros = 5_000, JitterMicros = 2_000, ReorderPercent = 50 },
             table: Table,
             client: DatagramKit.Quiet,
             server: DatagramKit.Quiet);
         QuiclyPeer client = h.Client;
         QuiclyPeer server = h.Server!;
-        int received = 0;
-        string? failure = null;
-        server.RegisterHandler(3, (QuiclyPeer _, in ReceiveHeader header, ReadOnlySpan<byte> payload) =>
+        List<int> arrived = [];
+        string? damaged = null;
+        server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) =>
         {
-            int id = (int)header.Sequence;
-            if (failure is null && !payload.SequenceEqual(DatagramKit.Payload(id, payload.Length)))
+            int id = payload.Length >= 4 ? BitConverter.ToInt32(payload) : -1;
+            if (damaged is null && (id < 0 || !payload.SequenceEqual(DatagramKit.Payload(id, payload.Length))))
             {
-                failure = $"message {id} arrived damaged";
+                damaged = $"a message arrived damaged ({payload.Length} bytes, id {id})";
             }
 
-            received++;
+            arrived.Add(id);
         });
 
-        int sent = 0;
-        for (int i = 0; i < 200; i++)
+        // The handshake's own traffic is behind us, so the only datagrams the client hands over from here are these fragments.
+        h.Run(200_000);
+        List<int> expected = [];
+        for (int tick = 0; tick < Ticks; tick++)
         {
-            byte[] payload = DatagramKit.Payload(i, 2_000 + (i % 7 * 400));
-            if (client.SendCopy(new SendHeader(3, (ulong)(i % 4)), payload).IsAdmitted)
+            int first = tick * 2;
+            int second = first + 1;
+            if (tick % 5 == 2)
             {
-                sent++;
+                // The next datagram the client hands over is the first fragment of the first message of this tick, so that
+                // message can never be reassembled — and its neighbour, whose fragments travel interleaved with it, must be.
+                DatagramKit.TransportOf(client).DropNextDatagrams(1);
+            }
+            else
+            {
+                expected.Add(first);
             }
 
+            expected.Add(second);
+            Assert.True(client.SendCopy(new SendHeader(2), DatagramKit.Payload(first, 3_000)).IsAdmitted, $"message {first} was refused");
+            Assert.True(client.SendCopy(new SendHeader(2), DatagramKit.Payload(second, 3_000)).IsAdmitted, $"message {second} was refused");
             client.Flush();
             h.Network.Advance(16_667);
             server.Poll();
             client.Poll();
         }
 
-        h.Run(500_000);
-        Assert.Null(failure);
-        Assert.Equal(200, sent);
-        // Every fragment must arrive for its message to, so a 2 % loss costs several of them: the rest is byte-exact.
-        Assert.InRange(received, 100, 200);
+        PeerStatistics before = DatagramKit.Statistics(server);
+        Assert.True(
+            h.RunUntil(() => arrived.Count >= expected.Count, 1_000_000),
+            $"{arrived.Count} of {expected.Count} messages arrived (FragmentsReceived {before.FragmentsReceived}, "
+            + $"FragmentsDropped {before.FragmentsDropped}, ReassembliesAbandoned {before.ReassembliesAbandoned})");
+        Assert.Null(damaged);
+        arrived.Sort();
+        Assert.Equal(expected, arrived);
+        PeerStatistics statistics = DatagramKit.Statistics(server);
+        Assert.Equal(expected.Count, statistics.FragmentedMessagesReceived);
+        // Nothing was abandoned: on an unkeyed unordered channel two interleaved messages are two partials, never one
+        // replacing the other (PROTOCOL.md §2.1, §7).
+        Assert.Equal(0, statistics.ReassembliesAbandoned);
         Assert.Equal(PeerState.Connected, client.State);
-        Assert.Equal(0, FragmentKit.Reassemblies(server, 3));
     }
 }

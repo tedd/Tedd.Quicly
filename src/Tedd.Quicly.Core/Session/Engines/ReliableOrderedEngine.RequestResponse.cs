@@ -184,6 +184,16 @@ internal sealed unsafe partial class ReliableOrderedEngine
         }
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The only wait this engine hands out is <see cref="SendRequestAsync"/>, and only an arriving response, a timeout, a
+    /// close or a cancellation completes it — none of which happens after the peer is disposed. <see cref="Dispose"/> fails
+    /// them too, but it runs from the peer's <c>FreeResources</c>, which waits for the transport's close callback, so a peer
+    /// disposed without being closed first would leave every outstanding request awaiting forever until (or unless) that
+    /// callback arrives. <see cref="FailRequests"/> is idempotent, so failing them again in <see cref="Dispose"/> is a no-op.
+    /// </remarks>
+    public override void FailWaitsOnDispose(Exception reason) => FailRequests(reason);
+
     /// <summary>Sets up the request table when a channel of this engine carries request ids (constructor time, game thread).</summary>
     /// <param name="channelsOfMode">The channels of this engine.</param>
     private void InitializeRequestResponse(ReadOnlySpan<ChannelDefinition> channelsOfMode)

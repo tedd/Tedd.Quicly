@@ -64,6 +64,10 @@ real client or server where the transport worker and the game thread are differe
 | `SessionPassBench.SendCopy` | the admission of one 64-byte message (channel lookup, entry, lease, copy, header, queue); 4 × 100 per invocation, delivery in the iteration cleanup | message |
 | `LatestBench.Latest1000Keys` | 1 000 keys of a `ReliableLatest` channel updated once per 60 Hz tick: `SendCopy` per key, client `Flush`, one tick of virtual time, server `Poll` (dispatch) + `Flush` (the coalesced `LatestAck` batch), client `Poll` (the acks and the completions) | value |
 | `LatestBench.Latest64Keys` | the same cycle with 64 keys, so the per-value cost can be separated from the per-pass cost | value |
+| `FragmentBench.Fragment3` | 20 × `SendCopy` of 2 400 B on an unreliable **fragmenting** channel (three fragments each), then passes until the server has dispatched all 20: admission of one owner entry plus its fragments, one datagram per fragment, reassembly into one pooled lease, dispatch, and the fragments' completions | message |
+| `FragmentBench.Fragment8` | the same cycle with 8 375 B, which is eight fragments — the most PROTOCOL.md §2.1 allows | message |
+| `RequestResponseBench.RequestRoundTrip` | 16 `SendRequestAsync` calls in flight at once on a request/response ordered channel, answered by the peer's handler with `Respond`, then consumed: the request's id and table slot, both carriers, the peer's dispatch, the matching that completes the value task | request |
+| `RequestResponseBench.RequestSingle` | one request at a time through the same cycle, so the per-pass cost is not shared | request |
 | `StreamReceiveLoopBench` | the ADR 0007 loop below | message |
 
 `SessionPassBench` times one invocation per iteration (its setup and cleanup must stay outside the measurement), so
@@ -307,6 +311,51 @@ than replaced, because no run separates the three. What they all agree on is the
 * The single-core caveat of the tables above applies unchanged: both peers and the simulator run on one thread, so the
   transport-thread → game-thread hand-offs (mailboxes, the ack ring, the completion ring) cost no cross-core coherence here.
   Another agent was building and testing on the machine during the run.
+
+## Fragmentation and request/response (wave C2d)
+
+`FragmentBench` and `RequestResponseBench` (added with the two features of docs/design/session-layer.md §7.8) measure them
+on the same machine and with the same `InProcessShortRunConfig` as the tables above, on net10.0 (measured 2026-09-16), with
+`dotnet run -c Release -f net10.0 --project benchmarks/Tedd.Quicly.Benchmarks -- --filter '*Request*' '*Fragment*'`.
+As everywhere in this file both peers and the simulator share one thread, so these are single-core figures with no
+cross-thread coherence cost, and another agent was building and testing on the machine throughout.
+
+| Method           | Toolchain              | Mean       | Error      | StdDev    | Derived              | Allocated |
+|----------------- |----------------------- |-----------:|-----------:|----------:|---------------------:|----------:|
+| Fragment3        | Default                |   2.416 µs | 1.4401 µs  | 0.0789 µs | 0.81 µs per fragment, 993 MB/s | - |
+| Fragment8        | Default                |   8.231 µs | 7.2771 µs  | 0.3989 µs | 1.03 µs per fragment, 1.02 GB/s | - |
+| Fragment3        | InProcessEmitToolchain |   3.137 µs | 0.5479 µs  | 0.0300 µs | 1.05 µs per fragment, 765 MB/s | - |
+| Fragment8        | InProcessEmitToolchain |   7.634 µs | 0.7838 µs  | 0.0430 µs | 0.95 µs per fragment, 1.10 GB/s | - |
+| RequestRoundTrip | Default                |   811.6 ns |   827.5 ns |  45.36 ns | 1.23 M requests/s    |         - |
+| RequestSingle    | Default                | 2,171.6 ns | 6,678.6 ns | 366.08 ns |   460 k requests/s   |         - |
+| RequestRoundTrip | InProcessEmitToolchain |   971.5 ns |   269.2 ns |  14.76 ns | 1.03 M requests/s    |         - |
+| RequestSingle    | InProcessEmitToolchain | 2,528.4 ns | 2,051.0 ns | 112.42 ns |   396 k requests/s   |         - |
+
+ShortRun is N = 3, and two of these rows have an *Error* wider than their own mean (`Fragment8` out of process,
+`RequestSingle`), so read the means and StdDevs and treat anything under ~20 % as noise — the same rule as the tables
+above.
+
+### Reading
+
+* **A fragment costs about what a datagram of its size costs: 0.8 … 1.05 µs.** Three fragments take 2.4 … 3.1 µs and
+  eight take 7.6 … 8.2 µs, so the per-fragment cost is flat in the count — there is no per-message penalty that grows
+  with the number of fragments. Against `Unreliable64Loose` (624 ns for one 64-byte datagram) a fragment costs
+  200 … 400 ns more, which is the larger copy on each side: the sender's `SendCopy` into the owner's lease and the
+  receiver's copy of each fragment into the partial message's buffer.
+* **About 1 GB/s of fragmented payload on one core** (993 MB/s … 1.10 GB/s), with both peers and the simulator on that
+  same core. The fragments of one message are never packed together — by construction two of them cannot share a
+  datagram — so this is one `SendDatagram` and one completion per fragment.
+* **Nothing allocates**, in either job, for either feature: the owner entry, the fragment entries, the reassembly
+  records and the request table's value-task sources are all pooled. `FragmentRequestZeroAllocationTests` asserts the
+  same thing over five windows of 60 Hz traffic and of request round trips.
+* **A request round trip costs 0.81 … 0.97 µs with 16 in flight** — roughly what two `Ordered64` messages cost
+  (262 ns each in the end-to-end table) plus ~290 ns for the request id, the table slot, the pooled value-task source
+  and the matching scan. It is *one* round trip, not two messages: the application learns that the peer applied the
+  message, which is the only application-level acknowledgement v1 has (PROTOCOL.md §4.3).
+* **One request at a time costs 2.2 … 2.5 µs**, about 1.4 … 1.6 µs more. That difference is the per-pass cost of the
+  cycle (both peers' `Flush`/`Poll`, the simulator's delivery) which 16 requests share and one request pays alone — the
+  same shape as the packing difference between `Unreliable64Packed` and `Unreliable64Loose`. A game that issues its
+  requests together per tick gets the first number.
 
 ## Allocation
 

@@ -34,6 +34,36 @@ public class SchedulerUnitTests
         Assert.Equal(long.MaxValue, stopped.MicrosUntil(1));
     }
 
+    [Fact]
+    public void Token_Bucket_Carries_Its_Level_Across_A_Rate_Change()
+    {
+        // The ReliableLatest retry budget derives its rate from the congestion window, so the rate moves on every pass: a
+        // change must carry the level over instead of refilling, or the cap would hand out a full burst each time and never
+        // bind (PROTOCOL.md §4.4).
+        TokenBucket fresh = default;
+        fresh.SetRate(1_000, 100, 0);
+        Assert.Equal(100, fresh.Available(0));
+
+        TokenBucket bucket = default;
+        bucket.Initialize(1_000, 100, 0);
+        bucket.Consume(90);
+        Assert.Equal(10, bucket.Available(0));
+
+        // The level survives the change; the new rate then refills it up to the new burst.
+        bucket.SetRate(2_000, 200, 0);
+        Assert.Equal(10, bucket.Available(0));
+        Assert.Equal(200, bucket.Available(1_000_000));
+
+        // A smaller burst clamps what is already there.
+        bucket.SetRate(500, 5, 1_000_000);
+        Assert.Equal(5, bucket.Available(1_000_000));
+
+        // A debt is carried too, not forgiven.
+        bucket.Consume(20);
+        bucket.SetRate(1_000, 50, 1_000_000);
+        Assert.Equal(-15, bucket.Available(1_000_000));
+    }
+
     private static readonly ChannelTable KeyTables = ChannelTable.Create()
         .Add(2, "hashed", ChannelMode.UnreliableSequenced, o =>
         {

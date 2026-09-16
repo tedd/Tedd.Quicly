@@ -271,9 +271,13 @@ completion it produces. Channel 2 is a `ReliableLatest` channel with a dense key
 
 An earlier valid run of the same benchmark — before the session hooks were merged and before the engine started limiting
 its own large-value streams — reported 471.8 / 470.9 ns out of process and 610.4 / 564.4 ns in process: the two runs
-straddle each other and the toolchains swapped places, with error bars of ±86 … ±633 ns. **The honest reading is therefore
-0.46 … 0.61 µs per value, about 1.6 … 2.2 M values per second on one core, with no allocation** — not a figure to quote to
-three digits. What both runs agree on is the shape of the cost, below.
+straddle each other and the toolchains swapped places, with error bars of ±86 … ±633 ns. A **third** run, after the wave C2a
+review fixes (the shared payload committed through `EnginePayload.Commit`, the ack measured against the highest version
+transmitted, the epoch reset consumed on every receive path, the counted stream slots), reported 495.4 / 442.1 ns out of
+process and 558.5 / 491.0 ns in process — inside the band of the first two, with the toolchains swapping places for the third
+time. **The honest reading is therefore 0.46 … 0.61 µs per value, about 1.6 … 2.2 M values per second on one core, with no
+allocation** — not a figure to quote to three digits, and unchanged by the fixes: the table above is kept as measured rather
+than replaced, because no run separates the three. What they all agree on is the shape of the cost, below.
 
 ### Reading
 

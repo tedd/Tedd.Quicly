@@ -781,4 +781,71 @@ public class LatestEdgeTests
         Assert.Equal(0, DatagramKit.Statistics(h.Server).StreamsReset);
         Assert.Equal(2, received.Count(value => value.Payload.Length == 20_000));
     }
+
+    [Fact]
+    public void A_Retired_Key_Gives_Its_Receive_Slot_Back_When_The_Table_Is_Full()
+    {
+        // Channel 6 holds four keys and never evicts a live one (PROTOCOL.md §7). A key whose retirement the application has
+        // already seen is not live, so its slot must not keep a fifth key out for the rest of the epoch.
+        using SessionHarness h = Harness();
+        List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
+        h.Server!.RegisterHandler(6, LatestKit.Collect(received));
+        for (ulong key = 0; key < 4; key++)
+        {
+            Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(6, key), LatestKit.Payload((int)key, 16)).Status);
+        }
+
+        Assert.True(h.RunUntil(() => received.Count == 4, 5_000_000), $"{received.Count} of 4 values arrived");
+        Assert.Equal(SendStatus.Admitted, h.Client.RetireKey(6, 0));
+        Assert.True(h.RunUntil(() => received.Count == 5, 5_000_000), "the retirement was not delivered");
+        Assert.Equal(ReceiveFlags.KeyRetired, received[4].Flags);
+
+        // The fifth key now fits on both sides: the retired key's slot was reclaimed, not held for the epoch.
+        SendResult fifth = h.Client.SendCopy(new SendHeader(6, 9), LatestKit.Payload(9, 16), SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, fifth.Status);
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(fifth.Token) == DeliveryStatus.Delivered, 5_000_000),
+            $"status {h.Client.GetDeliveryStatus(fifth.Token)}");
+        Assert.Contains(received, value => value.Key == 9 && LatestKit.Matches(value.Payload, 9, 16));
+    }
+
+    [Fact]
+    public void The_Transport_Thread_Hooks_Ignore_Streams_That_Are_Not_This_Engines()
+    {
+        using SessionHarness h = Harness();
+        ReliableLatestEngine engine = LatestKit.Engine(h.Client);
+
+        // A close for an invalid id, a start whose context is not an engine context, one of another mode, one naming a
+        // channel index outside this engine and one naming a channel of another engine: none of them records anything.
+        engine.OnStreamClosed(default, aborted: false, 0);
+        engine.OnStreamStarted(default, 0, TransportStatus.Success);
+        engine.OnStreamStarted(new TransportStreamId(5_000, 1),
+            PeerCore.MakeEngineStreamContext(ChannelMode.ReliableOrdered, 0, 1), TransportStatus.Success);
+        engine.OnStreamStarted(new TransportStreamId(5_001, 1),
+            PeerCore.MakeEngineStreamContext(ChannelMode.ReliableLatest, 9_999, 1), TransportStatus.Success);
+        engine.OnStreamStarted(new TransportStreamId(5_002, 1),
+            PeerCore.MakeEngineStreamContext(ChannelMode.ReliableLatest, h.Client.Core.ChannelIndexOf(3), 1), TransportStatus.Success);
+
+        // A message event whose cookie names a staging record that is not in use: the records are pooled, so a record is only
+        // ever read for the stream it was handed to.
+        long[] cookie = [0];
+        StreamMessageContext message = default;
+        message.Cookie = ref cookie[0];
+        message.Id = new TransportStreamId(5_003, 1);
+        Assert.Equal(StreamConsumeAction.ResetStream, engine.OnStreamMessage(ref message).Action);
+
+        // A shutdown notice the game thread has not applied yet is dropped with the epoch that ends, not carried into the new
+        // one (its slot is still given back).
+        TransportStreamId phantom = new(5_004, 1);
+        engine.OnStreamStarted(phantom, PeerCore.MakeEngineStreamContext(ChannelMode.ReliableLatest, h.Client.Core.ChannelIndexOf(2), 7),
+            TransportStatus.Success);
+        engine.OnStreamClosed(phantom, aborted: true, 0);
+        engine.OnEpochReset(resumed: true);
+        Assert.Equal(1u, LatestKit.NextVersion(h.Client, 2));
+
+        // The session is untouched by all of it, and a value still goes out.
+        SendResult result = h.Client.SendCopy(new SendHeader(2, 111), LatestKit.Payload(1, 32), SendOptions.Tracked);
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(result.Token) == DeliveryStatus.Delivered, 5_000_000),
+            $"status {h.Client.GetDeliveryStatus(result.Token)}");
+        Assert.Equal(PeerState.Connected, h.Client.State);
+    }
 }

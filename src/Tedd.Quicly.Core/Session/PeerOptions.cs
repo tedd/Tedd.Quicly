@@ -173,13 +173,35 @@ public sealed class PeerOptions
     /// </summary>
     public bool FailFastOnCallbackException { get; set; }
 
+    /// <summary>
+    /// Told once, without blocking, whenever the peer publishes game-thread work — received messages, completions, control
+    /// frames and the handshake from the transport thread, and work an application call created
+    /// (<see cref="QuiclyPeer.Close(CloseReason)"/>, <see cref="QuiclyPeer.CompleteAdmission"/>, a send from another
+    /// thread) — so a host can wake a sleeping game thread instead of polling idle peers. Set-once until the next
+    /// <see cref="QuiclyPeer.Poll"/>; <see cref="QuiclyPeer.HasPendingWork"/> says whether anything is really waiting.
+    /// <see langword="null"/> (the default) means the host polls on its own schedule.
+    /// </summary>
+    public IPeerWorkSignal? WorkSignal { get; set; }
+
     /// <summary>Test hook: overrides the engine created for a delivery mode (return <see langword="null"/> to keep the default).</summary>
     internal Func<ChannelMode, ChannelEngine?>? EngineFactory { get; set; }
 
-    /// <summary>Checks every value.</summary>
+    /// <summary>
+    /// An independent copy of these options, so a host can hand every peer its own instance instead of sharing one (and
+    /// without copying property by property). Shallow: the copy shares the <see cref="Clock"/>, <see cref="Allocator"/>,
+    /// <see cref="AllocatorOptions"/> and <see cref="WorkSignal"/> instances and the memory behind
+    /// <see cref="SessionToken"/>, which is what a host wants — one pool and one clock serve many peers.
+    /// </summary>
+    /// <returns>The copy.</returns>
+    public PeerOptions Clone() => (PeerOptions)MemberwiseClone();
+
+    /// <summary>
+    /// Checks every value, exactly as <see cref="QuiclyPeer.Connect"/> and <see cref="QuiclyPeer.CreateServerPeer"/> do, so
+    /// a host can reject a bad configuration at start-up instead of when its first connection arrives.
+    /// </summary>
     /// <exception cref="ArgumentException">A value is out of range.</exception>
     /// <exception cref="NotSupportedException"><see cref="AutoFlushInterval"/> is not zero.</exception>
-    internal void Validate()
+    public void Validate()
     {
         if (Clock is null)
         {

@@ -87,6 +87,22 @@ internal sealed unsafe class DatagramPacker
     /// <summary>True between passes: no message is held and no container is open.</summary>
     public bool IsIdle => _pending < 0 && _container < 0;
 
+    /// <summary>
+    /// Forgets what the packer holds without submitting it (<see cref="QuiclyPeer.Reconnect"/>: the entries themselves are
+    /// completed by the peer, and the container's lease goes back with its entry). Game thread, between passes.
+    /// </summary>
+    public void Reset()
+    {
+        _pending = -1;
+        _container = -1;
+        _buffer = null;
+        _length = 0;
+        _count = 0;
+        _trackedMembers = 0;
+        _containerPriority = false;
+        _containerUnreliable = false;
+    }
+
     /// <summary>Starts a pass: the current datagram limit, the tick and the send-flag policy (scheduler).</summary>
     /// <param name="flush">The pass.</param>
     public void Begin(in FlushContext flush)

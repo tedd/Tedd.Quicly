@@ -14,8 +14,8 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 | Core · State | native arrays, send-entry table, key tables, mailboxes, channel state | in Core | 99.8 % | [state](benchmarks/state.md) |
 | Core · Channels / Framing | channel table + canonical hash, datagram/container/stream framing, incremental stream parser | in Core | 99.9 % | [framing](benchmarks/framing.md) |
 | Core · Control | control-protocol codec, session tokens, auth-failure limiter | in Core | 100 % | control numbers in the module notes |
-| Core · Session | `QuiclyPeer`, handshake and admission, control stream, ping and clock sync, scheduler and packer, unreliable / sequenced / ordered engines, async completion APIs, thread-safe send, Poll/Drain, per-stream idle timeout | in Core | 96.4 % | [session](benchmarks/session.md) |
-| **Core total** | | **3 154** | | |
+| Core · Session | `QuiclyPeer`, handshake and admission, control stream, ping and clock sync, scheduler and packer, unreliable / sequenced / ordered engines, async completion APIs, thread-safe send, Poll/Drain, per-stream idle timeout plus the host hooks (work signal, peer-level shared send, split poll/flush deadlines, in-place reconnect with session resume, options clone and validate, `IsDisposed`) | in Core | 96.8 % | [session](benchmarks/session.md) |
+| **Core total** | | **3 222** | | |
 | Http3 | HTTP/3 frames, QPACK (static + Huffman), HTTP datagrams, WebTransport framing and capsules | 504 | 100 % | [http3](benchmarks/http3.md) |
 | Transport.MsQuic | layout-validated MsQuic interop and wrappers; MsQuic-backed `ITransport`, connector, listener with reference-counted certificate hot swap | 722 (4 skipped off-Windows) | 98.4 % bindings, 93.5 % transport | [msquic-transport](benchmarks/msquic-transport.md) |
 | Testing | deterministic simulated network and transport, recording sink, test certificates, in-process fake ACME CA, transport conformance suite (24 scenarios, run against the simulator and MsQuic) | 360 | 97.6 % | [simulation](benchmarks/simulation.md) |
@@ -29,8 +29,9 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 
 | Module | Content |
 |---|---|
-| Core · Session hooks | host-facing additions the server and client asked for: work signal, peer-level shared send, split poll/flush deadlines, in-place resume with session resumption, options clone and validate, `IsDisposed` |
-| Server / Client (wave C3) | `QuiclyServer` and `QuiclyClient` implemented and reviewed; the fix pass for eight blocking findings (including a kicked-session resume hole) is in verification |
+| Server / Client (wave C3) | implemented, reviewed and fixed (eight blocking findings, including a kicked-session resume hole); now adopting the session hooks and the replay-cache decision before merging |
+| Core · ReliableLatest (wave C2) | versioned per-key state, loss- and timer-driven retransmission, acks and rejects, large values on group streams, key retirement |
+| Core · ReliableUnordered (wave C2) | group streams: one stream per flush group, independent loss, stream-credit waiting, receive-side group limits |
 
 ## Remaining
 

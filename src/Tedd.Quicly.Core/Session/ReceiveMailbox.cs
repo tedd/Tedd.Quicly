@@ -57,6 +57,9 @@ internal sealed class ReceiveMailbox : IDisposable
     /// <summary>Number of key slots.</summary>
     public int KeySlots => Boxes.Capacity;
 
+    /// <summary>Whether any key of this channel holds a value the game thread has not claimed (<see cref="QuiclyPeer.HasPendingWork"/>; any thread).</summary>
+    public bool HasDirty => Boxes.HasDirty;
+
     /// <summary>
     /// Posts <paramref name="entry"/> as the latest value of <paramref name="keySlot"/>. Transport thread. On success,
     /// <paramref name="displaced"/> is the lease of a value the game thread never saw (the caller returns it and counts

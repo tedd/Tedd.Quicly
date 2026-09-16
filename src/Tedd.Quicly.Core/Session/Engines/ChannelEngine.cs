@@ -198,6 +198,18 @@ internal abstract class ChannelEngine : IDisposable
     }
 
     /// <summary>
+    /// The transport published the ideal number of bytes to keep outstanding on one of this engine's streams
+    /// (<see cref="ITransportSink.OnIdealSendBufferSize"/>, only when
+    /// <see cref="TransportCapabilities.IdealSendBufferSize"/> is set). Broadcast to every engine like the local-stream
+    /// events, so an engine ignores ids it does not own. Transport thread. Default: nothing.
+    /// </summary>
+    /// <param name="id">The stream.</param>
+    /// <param name="bytes">Bytes the transport would like kept outstanding.</param>
+    public virtual void OnIdealSendBufferSize(TransportStreamId id, ulong bytes)
+    {
+    }
+
+    /// <summary>
     /// A control message addressed to this mode (LatestAck/LatestReject → ReliableLatest; BulkProgress/BulkRequest/
     /// BulkCancel/BulkReject → Bulk; KeyRetired → the channel's mode). The peer has validated the frame with
     /// <see cref="ControlCodec"/> (batch structure, channel ranges) and the session is admitted. Transport thread.

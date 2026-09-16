@@ -105,6 +105,62 @@ public sealed class PeerOptions
 
     // ---- end of the wave C2b region
 
+    // ---- region added by wave C2c (Bulk transfers)
+
+    /// <summary>
+    /// Where the bytes of a bulk transfer the peer opened are written (PROTOCOL.md §3.3, ARCHITECTURE.md §4.2 "Direct
+    /// mode"). <see langword="null"/> (the default) refuses every peer-initiated transfer, which is what PROTOCOL.md §3.3
+    /// requires of the receive router, and it also refuses the answer to a range this end asked for — an application that
+    /// calls <see cref="QuiclyPeer.RequestBulk"/> supplies a router that recognises what it requested.
+    /// </summary>
+    public IBulkRouter? BulkRouter { get; set; }
+
+    /// <summary>
+    /// Decides whether the peer may have a range it asked for with <c>BulkRequest</c> (PROTOCOL.md §3.4).
+    /// <see langword="null"/> (the default) refuses every request with <c>BulkReject</c>: serving bulk objects is opt-in.
+    /// </summary>
+    public IBulkAuthorizer? BulkAuthorizer { get; set; }
+
+    /// <summary>Supplies the object an authorised <c>BulkRequest</c> asked for; <see langword="null"/> refuses every request.</summary>
+    public IBulkProvider? BulkProvider { get; set; }
+
+    /// <summary>
+    /// Concurrent bulk transfers per direction per peer (PROTOCOL.md §7); further peer streams are reset
+    /// <see cref="QuiclyErrorCode.LimitExceeded"/> and further requests answered <c>BulkReject</c>. Default 2.
+    /// </summary>
+    public int BulkTransfersPerDirection { get; set; } = 2;
+
+    /// <summary>
+    /// Bulk bytes one transfer keeps outstanding (submitted and not yet completed) when the transport reports no
+    /// <c>IdealSendBufferSize</c> for its stream (<see cref="Transport.TransportCapabilities.IdealSendBufferSize"/>);
+    /// when it does, that value is the window instead. Default 256 KiB.
+    /// </summary>
+    public int BulkSendWindowBytes { get; set; } = 256 * 1024;
+
+    /// <summary>
+    /// Bulk's share of the transport's congestion window (ARCHITECTURE.md §7): the send window is additionally capped to
+    /// this fraction of the window, because datagrams and streams share one congestion window and stream priority alone
+    /// cannot protect real-time latency. Default 0.5.
+    /// </summary>
+    public double BulkShareOfCongestionWindow { get; set; } = 0.5;
+
+    /// <summary>
+    /// Bytes of object payload one bulk stream send carries (one pooled block; also the size of a compressed chunk's
+    /// input). Default 64 KiB, which fits the default pool's largest size classes on both ends.
+    /// </summary>
+    public int BulkChunkBytes { get; set; } = 64 * 1024;
+
+    /// <summary>
+    /// Largest chunk this end sends and stages on receive (PROTOCOL.md §3.3 <c>BulkMaxChunk</c>, at most 1 MiB). The
+    /// receive side stages a <em>compressed</em> chunk in a pooled lease and decodes it into a second one, so the
+    /// effective receive limit is <c>min(this, the pool's largest block)</c> and a larger chunk resets its stream with
+    /// <see cref="QuiclyErrorCode.LimitExceeded"/>. Default 1 MiB (the protocol maximum); the sender is bounded by
+    /// <see cref="BulkChunkBytes"/>.
+    /// </summary>
+    public int BulkMaxChunk { get; set; } = Framing.StreamFraming.DefaultBulkMaxChunk;
+
+    // ---- end of the wave C2c region
+
     /// <summary>
     /// After Close is sent, how long the peer waits for the control stream to deliver it before closing the transport
     /// anyway. Default 1 s.
@@ -125,10 +181,15 @@ public sealed class PeerOptions
     /// </summary>
     public long MaxSendBytesPerSecond { get; set; }
 
-    /// <summary>Bulk traffic's share of the estimated bandwidth (PROTOCOL.md §4.5). Reserved for the bulk engine. Default 0.5.</summary>
+    /// <summary>
+    /// Bulk traffic's share of the estimated bandwidth (PROTOCOL.md §4.5): the rate at which the bulk engine hands
+    /// stream bytes to the transport, so real-time traffic keeps flowing. The estimate is the transport's congestion
+    /// window divided by its RTT, or <see cref="MaxSendBytesPerSecond"/> when the transport reports no window.
+    /// Default 0.5.
+    /// </summary>
     public double BulkShareOfEstimatedBandwidth { get; set; } = 0.5;
 
-    /// <summary>Absolute cap on bulk bytes per second; 0 = only the share applies. Reserved for the bulk engine.</summary>
+    /// <summary>Absolute cap on bulk bytes per second; 0 (the default) derives the cap from <see cref="BulkShareOfEstimatedBandwidth"/>.</summary>
     public long BulkMaxBytesPerSecond { get; set; }
 
     /// <summary>
@@ -256,6 +317,20 @@ public sealed class PeerOptions
         if (!(BulkShareOfEstimatedBandwidth > 0 && BulkShareOfEstimatedBandwidth <= 1))
         {
             throw new ArgumentException("BulkShareOfEstimatedBandwidth must be in (0, 1].", nameof(BulkShareOfEstimatedBandwidth));
+        }
+
+        if (!(BulkShareOfCongestionWindow > 0 && BulkShareOfCongestionWindow <= 1))
+        {
+            throw new ArgumentException("BulkShareOfCongestionWindow must be in (0, 1].", nameof(BulkShareOfCongestionWindow));
+        }
+
+        CheckRange(BulkTransfersPerDirection, 1, 1024, nameof(BulkTransfersPerDirection));
+        CheckRange(BulkSendWindowBytes, 1, int.MaxValue, nameof(BulkSendWindowBytes));
+        CheckRange(BulkChunkBytes, 1, Framing.StreamFraming.DefaultBulkMaxChunk, nameof(BulkChunkBytes));
+        CheckRange(BulkMaxChunk, 1, Framing.StreamFraming.DefaultBulkMaxChunk, nameof(BulkMaxChunk));
+        if (BulkChunkBytes > BulkMaxChunk)
+        {
+            throw new ArgumentException($"BulkChunkBytes ({BulkChunkBytes}) must not exceed BulkMaxChunk ({BulkMaxChunk}).", nameof(BulkChunkBytes));
         }
 
         if (!(RetryShareOfEstimatedBandwidth > 0 && RetryShareOfEstimatedBandwidth <= 1))

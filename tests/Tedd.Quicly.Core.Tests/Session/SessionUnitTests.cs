@@ -602,9 +602,7 @@ public class SessionSupportTests
         Assert.IsType<ReliableLatestEngine>(ChannelEngines.Create(ChannelMode.ReliableLatest));
 
         Assert.IsType<GroupStreamEngine>(ChannelEngines.Create(ChannelMode.ReliableUnordered));
-
-        // The remaining wave C2 mode stays a placeholder until its engine lands.
-        Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.Bulk));
+        Assert.IsType<BulkEngine>(ChannelEngines.Create(ChannelMode.Bulk));
         Assert.Throws<ArgumentOutOfRangeException>(() => ChannelEngines.Create((ChannelMode)6));
         Assert.Equal(6, ChannelEngines.ModeCount);
     }
@@ -626,7 +624,9 @@ public class SessionSupportTests
     [Fact]
     public void Placeholder_Engine_Refuses_Everything()
     {
-        using SessionHarness h = new(table: TestTables.AllModes);
+        // Every mode has a real engine now, so the placeholder is substituted for one to keep its own behaviour covered.
+        using SessionHarness h = new(table: TestTables.AllModes,
+            client: o => o.EngineFactory = m => m == ChannelMode.Bulk ? new PlaceholderEngine(m) : null);
         PeerCore core = h.Client.Core;
         ChannelEngine engine = core.GetEngine(ChannelMode.Bulk)!;
         Assert.IsType<PlaceholderEngine>(engine);

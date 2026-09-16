@@ -168,6 +168,16 @@ internal sealed unsafe class PeerCore : IDisposable
         RetryShareOfEstimatedBandwidth = options.RetryShareOfEstimatedBandwidth;
         MaxRetryBytesPerSecond = options.MaxRetryBytesPerSecond;
         MaxSendBytesPerSecond = options.MaxSendBytesPerSecond;
+        BulkTransfersPerDirection = options.BulkTransfersPerDirection;
+        BulkSendWindowBytes = options.BulkSendWindowBytes;
+        BulkShareOfCongestionWindow = options.BulkShareOfCongestionWindow;
+        BulkShareOfEstimatedBandwidth = options.BulkShareOfEstimatedBandwidth;
+        BulkMaxBytesPerSecond = options.BulkMaxBytesPerSecond;
+        BulkChunkBytes = options.BulkChunkBytes;
+        BulkMaxChunk = options.BulkMaxChunk;
+        BulkRouter = options.BulkRouter;
+        BulkAuthorizer = options.BulkAuthorizer;
+        BulkProvider = options.BulkProvider;
         Packer = new DatagramPacker(this);
     }
 
@@ -383,6 +393,40 @@ internal sealed unsafe class PeerCore : IDisposable
     public long GroupMinIntervalMicros { get; }
 
     // ---- end of the wave C2b seam
+
+    // ---- seam added by wave C2c (Bulk transfers; docs/design/session-layer.md §7.7)
+
+    /// <summary>Concurrent bulk transfers per direction per peer (<see cref="PeerOptions.BulkTransfersPerDirection"/>, PROTOCOL.md §7).</summary>
+    public int BulkTransfersPerDirection { get; }
+
+    /// <summary>Fixed bulk send window in bytes when the transport reports no ideal send buffer size (<see cref="PeerOptions.BulkSendWindowBytes"/>).</summary>
+    public int BulkSendWindowBytes { get; }
+
+    /// <summary>Bulk's share of the transport's congestion window (<see cref="PeerOptions.BulkShareOfCongestionWindow"/>, ARCHITECTURE.md §7).</summary>
+    public double BulkShareOfCongestionWindow { get; }
+
+    /// <summary>Bulk traffic's share of the estimated bandwidth (<see cref="PeerOptions.BulkShareOfEstimatedBandwidth"/>, PROTOCOL.md §4.5).</summary>
+    public double BulkShareOfEstimatedBandwidth { get; }
+
+    /// <summary>Absolute cap on bulk bytes per second (<see cref="PeerOptions.BulkMaxBytesPerSecond"/>; 0 = derive from the share).</summary>
+    public long BulkMaxBytesPerSecond { get; }
+
+    /// <summary>Object payload bytes one bulk stream send carries (<see cref="PeerOptions.BulkChunkBytes"/>).</summary>
+    public int BulkChunkBytes { get; }
+
+    /// <summary>Largest bulk chunk sent and staged (<see cref="PeerOptions.BulkMaxChunk"/>, PROTOCOL.md §3.3).</summary>
+    public int BulkMaxChunk { get; }
+
+    /// <summary>Where a peer-initiated bulk transfer's bytes go; <see langword="null"/> refuses every one (PROTOCOL.md §3.3).</summary>
+    public IBulkRouter? BulkRouter { get; }
+
+    /// <summary>Whether the peer may have a range it asked for; <see langword="null"/> refuses every request.</summary>
+    public IBulkAuthorizer? BulkAuthorizer { get; }
+
+    /// <summary>Supplies the object of an authorised request; <see langword="null"/> refuses every request.</summary>
+    public IBulkProvider? BulkProvider { get; }
+
+    // ---- end of the wave C2c seam
 
     /// <summary>The buffer pool (shared or private).</summary>
     public SlabAllocator Allocator => _allocator;

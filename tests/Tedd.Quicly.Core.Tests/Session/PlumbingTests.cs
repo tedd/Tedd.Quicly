@@ -526,8 +526,11 @@ public class SendPlumbingTests
         Assert.Equal(SendStatus.Admitted, h.Client.RetireKey(6, 1));
         Assert.Equal(SendStatus.NotSupported, h.Client.Respond(new ReceiveHeader { Channel = 4, RequestId = 1 }, data).Status);
         await Assert.ThrowsAsync<NotSupportedException>(async () => await h.Client.SendRequestAsync(new SendHeader(4), data, TimeSpan.FromSeconds(1)));
-        await Assert.ThrowsAsync<NotSupportedException>(async () => await h.Client.BeginBulkSendAsync(new BulkDescriptor(7, 1, 1, 10), new EmptySource()));
-        Assert.Throws<NotSupportedException>(() => h.Client.RequestBulk(new BulkRangeRequest(7, 1, 1, 0, 10)));
+        // Bulk is implemented (wave C2c): a transfer begins and a range request is accepted. BulkTests covers both.
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(7, 1, 1, 10), new EmptySource());
+        Assert.Equal(BulkStatus.Running, transfer.Status);
+        transfer.Cancel();
+        h.Client.RequestBulk(new BulkRangeRequest(7, 1, 1, 0, 10));
         Assert.Throws<ArgumentNullException>(() => h.Client.BeginBulkSendAsync(new BulkDescriptor(7, 1, 1, 10), null!));
         Assert.False(h.Client.TryCancel(default));
     }

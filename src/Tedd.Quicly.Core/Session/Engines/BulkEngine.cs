@@ -1,0 +1,1716 @@
+using System.Runtime.InteropServices;
+using Tedd.Quicly.Core.Channels;
+using Tedd.Quicly.Core.Control;
+using Tedd.Quicly.Core.Framing;
+using Tedd.Quicly.Core.Memory;
+using Tedd.Quicly.Core.Primitives;
+using Tedd.Quicly.Core.State;
+using Tedd.Quicly.Core.Threading;
+using Tedd.Quicly.Core.Transport;
+
+namespace Tedd.Quicly.Core.Session.Engines;
+
+/// <summary>
+/// The <see cref="ChannelMode.Bulk"/> engine (PROTOCOL.md §3.3; docs/design/session-layer.md §7.7): large objects on one
+/// unidirectional stream per transfer, at the lowest stream priority, windowed so real-time traffic keeps flowing, with
+/// progress, cancel, resume, request authorisation and a whole-object SHA-256.
+/// </summary>
+/// <remarks>
+/// <para><b>Send (game thread).</b> <see cref="BeginBulkSendAsync"/> registers a transfer and answers a
+/// <see cref="BulkTransfer"/>; nothing is read from the <see cref="IBulkSource"/> until a scheduler pass reaches it. All
+/// send work happens in <see cref="Flush"/>, after every channel's <see cref="ChannelEngine.FlushChannel"/>, because
+/// PROTOCOL.md §4.5 schedules bulk <em>after</em> fresh real-time traffic. Each pass opens the transfer's stream if it has
+/// none (priority band 0), then submits body pieces while three limits allow: the pass's send cap
+/// (<see cref="FlushContext.BudgetBytes"/>), a per-peer rate bucket
+/// (<see cref="PeerOptions.BulkMaxBytesPerSecond"/> / <see cref="PeerOptions.BulkShareOfEstimatedBandwidth"/>) and a
+/// per-transfer send window of <c>min(IdealSendBufferSize or PeerOptions.BulkSendWindowBytes,
+/// BulkShareOfCongestionWindow × cwnd)</c> outstanding wire bytes — stream priority alone cannot protect datagram
+/// latency, because datagrams and streams share one congestion window (ARCHITECTURE.md §7).</para>
+/// <para><b>Completion.</b> A submission's completion releases its pooled block (PROTOCOL.md §4.3: BufferReleased per
+/// chunk) and frees window; the transfer completes <see cref="BulkStatus.Completed"/> when the peer's
+/// <c>BulkProgress</c> reaches the range's length, which is the mode's <c>Delivered</c>. A refused stream start
+/// (<see cref="TransportStatus.StreamLimitReached"/>) never reached the peer, so the transfer rewinds to the last
+/// completed byte and goes out on a new stream once <see cref="PeerCore.StreamCreditGeneration"/> changes; a
+/// <c>SubmitStream</c> that fails for any <em>other</em> reason after the open succeeded does not park the transfer on the
+/// current credit generation, because nothing took credit and no credit event is coming.</para>
+/// <para><b>The channel's stream cap binds the sender too.</b> Both ends hold the same table, so more than
+/// <c>max(MaxGroups, 1)</c> streams on a Bulk channel would have the receiver reset a live transfer of ours
+/// (PROTOCOL.md §7). The slot is held by the transfer whose stream it is and released on that stream's <em>one</em> close
+/// notice (<see cref="OnStreamClosed"/> is called exactly once per stream), which is also when the peer frees its own
+/// slot and returns credit.</para>
+/// <para><b>Receive</b> is in BulkEngine.Receive.cs: peer-initiated transfers go through the direct-mode receive router
+/// (<see cref="PeerOptions.BulkRouter"/>, default reject), their bytes are written progressively into the application's
+/// <see cref="IBulkSink"/> — never buffered at the declared size — and the whole-object hash is verified when the
+/// transfer carried the whole object.</para>
+/// </remarks>
+internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
+{
+    /// <summary>Bytes reserved in a submission's block for the preamble, the §3.3 header and a chunk header.</summary>
+    private const int MaxPrefixBytes = 128;
+
+    /// <summary>Floor of the bulk rate budget so a transfer always progresses, even with a tiny bandwidth estimate.</summary>
+    private const long MinBulkBytesPerSecond = 16 * 1024;
+
+    // Flags of BulkSend.Flags.
+    private const byte SendHeaderWritten = 1;
+    private const byte SendFinSent = 2;
+    private const byte SendCounted = 4;
+    private const byte SendFreed = 8;
+    private const byte SendCompress = 16;
+    private const byte SendHasHash = 32;
+
+    /// <summary>A transfer whose stream was never refused: it may open one as soon as a pass reaches it.</summary>
+    private const int CreditUnrefused = int.MinValue;
+
+    private PeerCore _core = null!;
+    private ChannelDefinition[] _channels = [];
+    private int[] _localOf = [];
+    private int[] _denseOf = [];
+    private int[] _maxStreams = [];
+    private NativeArray<BulkSendState> _send = null!;
+    private NativeArray<BulkSend> _records = null!;
+    private NativeArray<byte> _scratch = null!;
+    private IBulkSource?[] _sources = [];
+    private BulkTransfer?[] _transfers = [];
+    private byte[] _sendHashes = [];
+    private TransportStreamId[] _txStreams = [];
+    private uint[] _txSerials = [];
+    private SpscRing<StreamNotice> _notices = null!;
+    private SpscRing<ControlNotice> _control = null!;
+    private PendingRequest[] _requests = [];
+    private int _freeSend = -1;
+    private int _liveSends;
+    private ulong _nextTransferId = 1;
+    private ulong _nextRequestId = 1;
+    private int _chunkBytes;
+    private int _bodyBytes;
+    private long _windowBytes;
+    private double _cwndShare;
+    private double _rateShare;
+    private long _rateCap;
+    private long _rate;
+    private TokenBucket _bucket;
+    private long _cwnd;
+    private bool _bucketStarted;
+
+    /// <summary>Where a send transfer is in its lifecycle (game thread).</summary>
+    internal enum BulkPhase : byte
+    {
+        /// <summary>Registered, no stream: the next pass opens one unless it is waiting for stream credit.</summary>
+        Waiting = 0,
+
+        /// <summary>The first send (with Start, the preamble and the §3.3 header) is out; nothing more goes out until the start is confirmed.</summary>
+        Starting = 1,
+
+        /// <summary>Started: body pieces flow, and the piece carrying the last byte carries FIN.</summary>
+        Open = 2,
+
+        /// <summary>The peer's stream limit refused the start; the submission is being cancelled back.</summary>
+        Refused = 3,
+
+        /// <summary>Terminal: the transfer completed, failed or was cancelled.</summary>
+        Finished = 4,
+    }
+
+    private enum NoticeKind : byte
+    {
+        Started,
+        Refused,
+        StartFailed,
+        Stopped,
+        ShutDown,
+    }
+
+    private enum ControlKind : byte
+    {
+        Progress,
+        Cancel,
+        Reject,
+        Request,
+    }
+
+    /// <inheritdoc/>
+    public override ChannelMode Mode => ChannelMode.Bulk;
+
+    /// <summary>Stream starts the peer's stream limit refused (the transfer goes out again on a new stream; tests).</summary>
+    internal long StreamsRefused { get; private set; }
+
+    /// <summary>Control notices dropped because the hand-off ring was full (tests; progress is cumulative, so nothing is lost).</summary>
+    internal long ControlNoticesDropped { get; private set; }
+
+    /// <inheritdoc/>
+    public override void Initialize(PeerCore core, ReadOnlySpan<ChannelDefinition> channelsOfMode)
+    {
+        _core = core;
+        int count = channelsOfMode.Length;
+        _channels = channelsOfMode.ToArray();
+        _localOf = new int[core.ChannelCount];
+        Array.Fill(_localOf, -1);
+        _denseOf = new int[count];
+        _maxStreams = new int[count];
+        _send = new NativeArray<BulkSendState>(Math.Max(count, 1));
+        for (int local = 0; local < count; local++)
+        {
+            ChannelDefinition channel = _channels[local];
+            int dense = core.ChannelIndexOf(channel.Id);
+            _localOf[dense] = local;
+            _denseOf[local] = dense;
+
+            // Both ends read the same table, so MaxGroups bounds the streams this end may open on the channel as well as
+            // the peer streams it accepts (PROTOCOL.md §7): a sender that exceeded it would have its own transfers reset.
+            _maxStreams[local] = Math.Max(channel.MaxGroups, 1);
+            ref BulkSendState send = ref _send[local];
+            send.ListHead = -1;
+            send.ListTail = -1;
+        }
+
+        int transfers = Math.Max(core.BulkTransfersPerDirection, 1);
+        _records = new NativeArray<BulkSend>(transfers);
+        _sources = new IBulkSource?[transfers];
+        _transfers = new BulkTransfer?[transfers];
+        _sendHashes = new byte[transfers * StreamFraming.BulkHashLength];
+        for (int record = transfers - 1; record >= 0; record--)
+        {
+            ref BulkSend send = ref _records[record];
+            send = default;
+            send.Next = _freeSend;
+            send.Prev = -1;
+            send.Flags = SendFreed;
+            send.Phase = BulkPhase.Finished;
+            _freeSend = record;
+        }
+
+        _txStreams = new TransportStreamId[transfers];
+        _txSerials = new uint[transfers];
+        // At most three notices per live stream between two drains.
+        _notices = new SpscRing<StreamNotice>((4 * transfers) + 8);
+        _control = new SpscRing<ControlNotice>(64);
+        // PROTOCOL.md §7: two transfers per direction "(+ 1 pending request)".
+        _requests = new PendingRequest[transfers + 1];
+        _chunkBytes = Math.Max(MaxPrefixBytes + 1, Math.Min(core.BulkChunkBytes, core.BulkMaxChunk));
+        _bodyBytes = _chunkBytes - MaxPrefixBytes;
+        _scratch = new NativeArray<byte>(_bodyBytes);
+        _windowBytes = Math.Max(1, core.BulkSendWindowBytes);
+        _cwndShare = core.BulkShareOfCongestionWindow;
+        _rateShare = core.BulkShareOfEstimatedBandwidth;
+        _rateCap = core.BulkMaxBytesPerSecond;
+        InitializeReceive(core, count, transfers);
+    }
+
+    /// <summary>Live send transfers of a channel (tests).</summary>
+    /// <param name="channelIndex">Dense index of a channel of this engine.</param>
+    /// <returns>The number of live transfers.</returns>
+    internal int SendTransfersOf(int channelIndex) => _send[_localOf[channelIndex]].Count;
+
+    /// <summary>Send transfers of a channel that hold a stream (bounded by <see cref="ChannelDefinition.MaxGroups"/>; tests).</summary>
+    /// <param name="channelIndex">Dense index of a channel of this engine.</param>
+    /// <returns>The number of streams open.</returns>
+    internal int SendStreamsOf(int channelIndex) => _send[_localOf[channelIndex]].StreamedCount;
+
+    /// <summary>Phases of a channel's live send transfers, oldest first (tests).</summary>
+    /// <param name="channelIndex">Dense index of a channel of this engine.</param>
+    /// <returns>One phase per live transfer.</returns>
+    internal List<BulkPhase> SendPhasesOf(int channelIndex)
+    {
+        List<BulkPhase> phases = [];
+        for (int record = _send[_localOf[channelIndex]].ListHead; record >= 0; record = _records[record].Next)
+        {
+            phases.Add(_records[record].Phase);
+        }
+
+        return phases;
+    }
+
+    /// <summary>Outbound range requests waiting for an answer (tests).</summary>
+    internal int PendingRequests
+    {
+        get
+        {
+            int count = 0;
+            foreach (PendingRequest request in _requests)
+            {
+                if (request.InUse)
+                {
+                    count++;
+                }
+            }
+
+            return count;
+        }
+    }
+
+    // ------------------------------------------------------------------ send admission (game thread)
+
+    /// <inheritdoc/>
+    /// <remarks>Bulk channels carry no messages: an object is sent with <see cref="BeginBulkSendAsync"/>.</remarks>
+    public override SendStatus Admit(ref SendRequest request) => SendStatus.NotSupported;
+
+    /// <inheritdoc/>
+    public override ValueTask<BulkTransfer> BeginBulkSendAsync(
+        ChannelDefinition channel, in BulkDescriptor descriptor, IBulkSource source, CancellationToken cancellationToken)
+    {
+        int dense = _core.ChannelIndexOf(channel.Id);
+        int local = dense >= 0 ? _localOf[dense] : -1;
+        if (local < 0)
+        {
+            throw new ArgumentException($"Channel {channel.Id} is not a Bulk channel of this peer.", nameof(channel));
+        }
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return ValueTask.FromCanceled<BulkTransfer>(cancellationToken);
+        }
+
+        long total = descriptor.TotalLength;
+        long offset = descriptor.Offset;
+        long length = descriptor.EffectiveLength;
+        if (total < 0 || total > (long)VarInt.MaxValue || offset < 0 || offset > total || length <= 0 || length > total - offset)
+        {
+            throw new ArgumentOutOfRangeException(nameof(descriptor), "A bulk range needs Length > 0 and Offset + Length <= TotalLength <= 2^62-1.");
+        }
+
+        int limit = _core.EffectiveMaxMessageSize(channel);
+        if (length > limit)
+        {
+            _core.SendCounters(dense).TooLarge++;
+            throw new ArgumentOutOfRangeException(nameof(descriptor), $"A transfer carries at most {limit} bytes on channel {channel.Id} (asked for {length}).");
+        }
+
+        ReadOnlySpan<byte> hash = descriptor.Sha256.Span;
+        if (hash.Length is not (0 or StreamFraming.BulkHashLength))
+        {
+            throw new ArgumentException($"A bulk object hash is {StreamFraming.BulkHashLength} bytes or empty.", nameof(descriptor));
+        }
+
+        BulkTransfer transfer = StartSend(local, dense, in descriptor, length, source, hash, out bool started);
+        if (!started)
+        {
+            // Not connected, or the peer-wide / per-channel limit is reached: the transfer is finished before it began and
+            // the application may retry (PROTOCOL.md §7 answers a peer's request the same way, with BulkReject).
+            _core.SendCounters(dense).QueueFull++;
+        }
+
+        return ValueTask.FromResult(transfer);
+    }
+
+    /// <summary>Registers a send transfer, or answers a finished, rejected one when it cannot start now.</summary>
+    private BulkTransfer StartSend(
+        int local, int dense, in BulkDescriptor descriptor, long length, IBulkSource source, ReadOnlySpan<byte> hash, out bool started)
+    {
+        DrainNotices();
+        started = false;
+        if (_core.Peer.State != PeerState.Connected || _freeSend < 0 || _liveSends >= _core.BulkTransfersPerDirection)
+        {
+            BulkTransfer rejected = new(in descriptor, 0, length);
+            rejected.Finish(new BulkResult(BulkStatus.Rejected, 0, BulkHashState.None, QuiclyErrorCode.BulkRejected));
+            return rejected;
+        }
+
+        int record = _freeSend;
+        ref BulkSend send = ref _records[record];
+        _freeSend = send.Next;
+        uint serial = send.Serial;
+        send = default;
+        send.Serial = serial;
+        send.Local = local;
+        send.Next = -1;
+        send.Prev = -1;
+        send.Phase = BulkPhase.Waiting;
+        send.CreditGeneration = CreditUnrefused;
+        send.TransferId = _nextTransferId++;
+        send.ObjectId = descriptor.ObjectId;
+        send.ObjectVersion = descriptor.ObjectVersion;
+        send.TotalLength = descriptor.TotalLength;
+        send.Offset = descriptor.Offset;
+        send.Length = length;
+        if (descriptor.Compress)
+        {
+            send.Flags |= SendCompress;
+        }
+
+        if (!hash.IsEmpty)
+        {
+            send.Flags |= SendHasHash;
+            hash.CopyTo(_sendHashes.AsSpan(record * StreamFraming.BulkHashLength));
+        }
+
+        BulkTransfer transfer = new(in descriptor, send.TransferId, length, this, record, serial);
+        _sources[record] = source;
+        _transfers[record] = transfer;
+        Link(local, record);
+        _liveSends++;
+        started = true;
+        _core.NoteWork();
+        return transfer;
+    }
+
+    private void Link(int local, int record)
+    {
+        ref BulkSendState state = ref _send[local];
+        ref BulkSend send = ref _records[record];
+        send.Prev = state.ListTail;
+        send.Next = -1;
+        if (state.ListTail < 0)
+        {
+            state.ListHead = record;
+        }
+        else
+        {
+            _records[state.ListTail].Next = record;
+        }
+
+        state.ListTail = record;
+        state.Count++;
+    }
+
+    /// <inheritdoc/>
+    void IBulkCancelSink.RequestCancel(int slot, uint serial)
+    {
+        // Any thread: the flag itself lives in the BulkTransfer the application holds, so the next pass sees it. Waking a
+        // sleeping host is all that is needed here.
+        _core.NoteWork();
+    }
+
+    // ------------------------------------------------------------------ scheduling (game thread)
+
+    /// <inheritdoc/>
+    /// <remarks>Bulk does nothing per channel: PROTOCOL.md §4.5 schedules it after every channel's fresh traffic, in <see cref="Flush"/>.</remarks>
+    public override void FlushChannel(int channelIndex, ref FlushContext flush)
+    {
+    }
+
+    /// <inheritdoc/>
+    public override void Flush(ref FlushContext flush)
+    {
+        DrainNotices();
+        DrainControl(ref flush);
+        _cwnd = ReadCongestionWindow();
+        RefillBudget(flush.NowMicros);
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            FlushTransfers(local, ref flush);
+        }
+
+        FlushProgress(ref flush);
+    }
+
+    /// <inheritdoc/>
+    public override void Tick(long nowMicros, ref long nextDeadline)
+    {
+        TickProgress(nowMicros, ref nextDeadline);
+        if (_liveSends > 0 && _rate > 0 && _bucketStarted)
+        {
+            // A transfer held back by the rate budget must come back without new application work.
+            long wait = _bucket.MicrosUntil(1);
+            if (wait > 0 && wait < long.MaxValue)
+            {
+                LowerDeadline(nowMicros, nowMicros + wait, ref nextDeadline);
+            }
+        }
+    }
+
+    /// <summary>Lowers <paramref name="nextDeadline"/> to <paramref name="deadline"/>, never to a time at or before now.</summary>
+    private static void LowerDeadline(long nowMicros, long deadline, ref long nextDeadline)
+    {
+        if (deadline <= nowMicros)
+        {
+            deadline = nowMicros + 1;
+        }
+
+        if (deadline < nextDeadline)
+        {
+            nextDeadline = deadline;
+        }
+    }
+
+    private void FlushTransfers(int local, ref FlushContext flush)
+    {
+        ref BulkSendState state = ref _send[local];
+        if (state.ListHead < 0)
+        {
+            return;
+        }
+
+        bool noMoreStreams = false;
+        int record = state.ListHead;
+        while (record >= 0)
+        {
+            // Read the link first: a finished transfer leaves the list inside the loop.
+            int next = _records[record].Next;
+            if (!TryCancelRequested(local, record))
+            {
+                BulkPhase phase = _records[record].Phase;
+                if (phase == BulkPhase.Waiting)
+                {
+                    if (noMoreStreams || state.StreamedCount >= _maxStreams[local]
+                        || (_records[record].CreditGeneration != CreditUnrefused && _records[record].CreditGeneration == _core.StreamCreditGeneration))
+                    {
+                        // Every later transfer of the channel would wait on the same credit, so the pass stops opening here.
+                        noMoreStreams = true;
+                        record = next;
+                        continue;
+                    }
+
+                    if (!SubmitPiece(local, record, ref state, ref flush))
+                    {
+                        noMoreStreams |= _records[record].Phase == BulkPhase.Waiting && _records[record].CreditGeneration != CreditUnrefused;
+                    }
+                }
+                else if (phase == BulkPhase.Open)
+                {
+                    while (SubmitPiece(local, record, ref state, ref flush))
+                    {
+                    }
+                }
+            }
+
+            ReleaseIfDone(record, ref state);
+            record = next;
+        }
+    }
+
+    /// <summary>Acts on a <see cref="BulkTransfer.Cancel"/> the application asked for; true when the transfer is finished.</summary>
+    private bool TryCancelRequested(int local, int record)
+    {
+        if (_transfers[record] is not { CancelRequested: true } transfer || transfer.IsFinished)
+        {
+            return _records[record].Phase == BulkPhase.Finished;
+        }
+
+        SendBulkCancel(_records[record].TransferId, QuiclyErrorCode.BulkCanceled);
+        FinishSend(local, record, BulkStatus.Canceled, QuiclyErrorCode.BulkCanceled);
+        return true;
+    }
+
+    /// <summary>
+    /// Hands one body piece of a transfer to its stream, opening the stream first when it has none and setting FIN on the
+    /// piece that carries the last byte. Returns <see langword="false"/> when this transfer can send no more in this pass.
+    /// </summary>
+    private bool SubmitPiece(int local, int record, ref BulkSendState state, ref FlushContext flush)
+    {
+        ref BulkSend send = ref _records[record];
+        long remaining = send.Length - send.BytesRead;
+        if (remaining <= 0)
+        {
+            return false;
+        }
+
+        if (flush.BudgetBytes <= 0)
+        {
+            flush.BudgetExhausted = true;
+            return false;
+        }
+
+        // The transport may have published a window for this stream since the last pass (advisory; see _idealSendBuffer).
+        send.IdealSendBuffer = Volatile.Read(ref _idealSendBuffer[record]);
+        long window = WindowOf(in send) - send.WireOutstanding;
+        if (window <= 0)
+        {
+            return false;
+        }
+
+        long allowance = _rate > 0 ? _bucket.Available(flush.NowMicros) : long.MaxValue;
+        if (allowance <= 0)
+        {
+            return false;
+        }
+
+        bool opening = send.Phase == BulkPhase.Waiting;
+        int body = (int)Math.Min(Math.Min(remaining, _bodyBytes), Math.Min(Math.Min(window, allowance), flush.BudgetBytes));
+        if (body <= 0)
+        {
+            return false;
+        }
+
+        ChannelDefinition channel = _channels[local];
+        if (!_core.TryAllocateEntry(channel.Id, SendEntryFlags.None, out int slot))
+        {
+            return false;
+        }
+
+        if (!_core.TryRentSend(_chunkBytes, out BufferLease lease))
+        {
+            _core.DiscardEntry(slot);
+            return false;
+        }
+
+        Span<byte> block = _core.GetSpan(in lease);
+        int written = 0;
+        if (opening)
+        {
+            written = WriteHeader(record, block, in send, channel);
+        }
+
+        int encoded = EncodeBody(record, block.Slice(written), in send, body, out int decoded);
+        if (encoded < 0)
+        {
+            // The source ran dry: the range it promised does not exist any more (PROTOCOL.md §3.3 has no way to shorten a
+            // transfer once its header is out), so the transfer fails and its stream is reset.
+            _core.ReturnSend(in lease);
+            _core.DiscardEntry(slot);
+            AbortSendStream(ref send, QuiclyErrorCode.InternalError);
+            FinishSend(local, record, BulkStatus.Failed, QuiclyErrorCode.InternalError);
+            return false;
+        }
+
+        written += encoded;
+        if (opening && !TryOpenStream(record, ref send, channel))
+        {
+            _core.ReturnSend(in lease);
+            _core.DiscardEntry(slot);
+            return false;
+        }
+
+        _core.AttachLease(slot, in lease, written);
+        SendEntryTable entries = _core.Entries;
+        ref SendEntry entry = ref entries[slot];
+        entry.Aux0 = MakeTag(record, send.Serial);
+        entry.Aux1 = ((long)written << 32) | (uint)decoded;
+        _core.StampAdmission(slot);
+        bool fin = send.BytesRead + decoded >= send.Length;
+        TransportSendFlags flags = opening ? TransportSendFlags.Start : TransportSendFlags.None;
+        if (fin)
+        {
+            flags |= TransportSendFlags.Fin;
+            entry.Flags |= SendEntryFlags.Fin;
+        }
+
+        // Datagrams the scheduler handed to the packer earlier in this pass (every real-time channel) leave first.
+        _core.Packer.SubmitPending(ref flush);
+        TransportStatus status = _core.SubmitStream(send.Stream, entries.GetSegments(slot) + 1, 1, slot, flags);
+        if (status != TransportStatus.Success)
+        {
+            // No completion follows a refused call: the bytes were never read, so nothing has to be rewound.
+            _core.DiscardEntry(slot);
+            if (opening)
+            {
+                AbandonStream(ref send);
+                if (status == TransportStatus.StreamLimitReached)
+                {
+                    send.CreditGeneration = _core.StreamCreditGeneration;
+                    StreamsRefused++;
+                }
+                else
+                {
+                    // The open succeeded and only the send failed: no stream limit refused this transfer, so it must not
+                    // wait for credit it already has — nothing took credit, so no credit event is coming.
+                    send.CreditGeneration = CreditUnrefused;
+                }
+            }
+
+            return false;
+        }
+
+        send.BytesRead += decoded;
+        send.WireOutstanding += written;
+        send.CarriersOutstanding++;
+        if (fin)
+        {
+            send.Flags |= SendFinSent;
+        }
+
+        if (opening)
+        {
+            send.Phase = BulkPhase.Starting;
+            send.Flags |= SendCounted | SendHeaderWritten;
+            state.StreamedCount++;
+        }
+
+        if (_rate > 0)
+        {
+            _bucket.Consume(written);
+        }
+
+        flush.BudgetBytes -= written;
+        flush.BytesSubmitted += written;
+        ref ChannelSendCounters counters = ref _core.SendCounters(_denseOf[local]);
+        counters.Sent++;
+        counters.Bytes += decoded;
+        PeerCounters peerCounters = _core.Counters;
+        peerCounters.StreamSends++;
+        peerCounters.StreamBytesSent += written;
+
+        // Nothing more goes out until the start is confirmed (a refused start comes back and is sent again).
+        return !opening && send.BytesRead < send.Length;
+    }
+
+    /// <summary>Writes the preamble and the PROTOCOL.md §3.3 header of a transfer's first piece.</summary>
+    private int WriteHeader(int record, Span<byte> destination, in BulkSend send, ChannelDefinition channel)
+    {
+        int written = StreamFraming.WritePreamble(destination, channel.Id);
+        BulkHeader header = new()
+        {
+            TransferId = send.TransferId,
+            ObjectId = send.ObjectId,
+            ObjectVersion = send.ObjectVersion,
+            TotalLength = (ulong)send.TotalLength,
+            Offset = (ulong)send.Offset,
+            Length = (ulong)send.Length,
+            Flags = ((send.Flags & SendHasHash) != 0 ? BulkFlags.HashPresent : BulkFlags.None)
+                | ((send.Flags & SendCompress) != 0 ? BulkFlags.Chunked : BulkFlags.None),
+        };
+        if ((send.Flags & SendHasHash) != 0)
+        {
+            _sendHashes.AsSpan(record * StreamFraming.BulkHashLength, StreamFraming.BulkHashLength).CopyTo(header.Hash);
+        }
+
+        return written + StreamFraming.WriteBulkHeader(destination.Slice(written), in header);
+    }
+
+    /// <summary>
+    /// Encodes up to <paramref name="body"/> object bytes into <paramref name="destination"/>: raw for an unchunked body,
+    /// otherwise one chunk (<c>ChunkLength, RawLength, bytes</c>, PROTOCOL.md §3.3). Returns the bytes written, or −1 when
+    /// the source ran dry; <paramref name="decoded"/> is the object bytes the piece carries.
+    /// </summary>
+    private int EncodeBody(int record, Span<byte> destination, in BulkSend send, int body, out int decoded)
+    {
+        decoded = 0;
+        long offset = send.Offset + send.BytesRead;
+        IBulkSource source = _sources[record]!;
+        if ((send.Flags & SendCompress) == 0)
+        {
+            int read = source.Read(offset, destination.Slice(0, body));
+            if (read <= 0)
+            {
+                return -1;
+            }
+
+            decoded = read;
+            return read;
+        }
+
+        Span<byte> raw = _scratch.AsSpan(0, body);
+        int taken = source.Read(offset, raw);
+        if (taken <= 0)
+        {
+            return -1;
+        }
+
+        decoded = taken;
+        raw = raw.Slice(0, taken);
+        int headerLength = StreamFraming.GetBulkChunkHeaderLength(taken, taken);
+        int compressed = 0;
+        if (taken >= 2)
+        {
+            // PROTOCOL.md §8: a compressed chunk is strictly shorter than its RawLength, so the destination is one byte short.
+            compressed = Lz4Block.Compress(raw, destination.Slice(headerLength, taken - 1));
+        }
+
+        if (compressed > 0)
+        {
+            int prefix = StreamFraming.WriteBulkChunkHeader(destination, compressed, taken);
+            if (prefix != headerLength)
+            {
+                // The two varints are sized from (taken, taken), which is never shorter than (compressed, taken).
+                destination.Slice(headerLength, compressed).CopyTo(destination.Slice(prefix));
+            }
+
+            return prefix + compressed;
+        }
+
+        int written = StreamFraming.WriteBulkChunkHeader(destination, taken, 0);
+        raw.CopyTo(destination.Slice(written));
+        return written + taken;
+    }
+
+    /// <summary>The outstanding wire bytes one transfer may keep on its stream (ARCHITECTURE.md §7).</summary>
+    private long WindowOf(in BulkSend send)
+    {
+        long window = send.IdealSendBuffer > 0 ? send.IdealSendBuffer : _windowBytes;
+        if (_cwnd > 0)
+        {
+            long share = (long)(_cwnd * _cwndShare);
+            window = Math.Min(window, Math.Max(1, share));
+        }
+
+        return window;
+    }
+
+    private long ReadCongestionWindow()
+    {
+        ITransport? transport = _core.Transport;
+        if (transport is null || _core.IsTransportClosed)
+        {
+            return 0;
+        }
+
+        transport.GetStatistics(out TransportStatistics statistics);
+        return statistics.CongestionWindowBytes;
+    }
+
+    /// <summary>Bulk's share of the estimated bandwidth (PROTOCOL.md §4.5), floored so a transfer always progresses.</summary>
+    private void RefillBudget(long now)
+    {
+        long rate = _rateCap;
+        if (rate == 0)
+        {
+            long estimate = 0;
+            ITransport? transport = _core.Transport;
+            if (_cwnd > 0 && transport is not null && !_core.IsTransportClosed)
+            {
+                transport.GetStatistics(out TransportStatistics statistics);
+                if (statistics.RttMicros > 0)
+                {
+                    estimate = _cwnd * 1_000_000 / statistics.RttMicros;
+                }
+            }
+
+            if (estimate <= 0)
+            {
+                estimate = _core.MaxSendBytesPerSecond;
+            }
+
+            rate = estimate <= 0 ? 0 : Math.Max(MinBulkBytesPerSecond, (long)(estimate * _rateShare));
+        }
+
+        if (rate == _rate)
+        {
+            return;
+        }
+
+        _rate = rate;
+        if (rate > 0)
+        {
+            // The level is carried across the change, not refilled: a rate derived from the congestion window moves on
+            // every pass, and re-initialising the bucket would hand out a full burst each time, so the cap would never bind.
+            _bucket.SetRate(rate, Math.Max(1, rate / 10), now);
+            _bucketStarted = true;
+        }
+    }
+
+    private static long MakeTag(int record, uint serial) => ((long)record << 24) | (serial & PeerCore.EngineStreamSerialMask);
+
+    private bool TryOpenStream(int record, ref BulkSend send, ChannelDefinition channel)
+    {
+        int credit = _core.StreamCreditGeneration;
+        uint serial = (send.Serial + 1) & PeerCore.EngineStreamSerialMask;
+        ulong context = PeerCore.MakeEngineStreamContext(ChannelMode.Bulk, record, serial);
+
+        // PROTOCOL.md §4.5: Bulk streams get priority band 0, below every real-time channel.
+        TransportStatus status = _core.OpenStream(StreamKind.Unidirectional, context, 0, out TransportStreamId id);
+        if (status != TransportStatus.Success)
+        {
+            if (status == TransportStatus.StreamLimitReached)
+            {
+                send.CreditGeneration = credit;
+                StreamsRefused++;
+            }
+
+            return false;
+        }
+
+        send.Stream = id;
+        send.Serial = serial;
+        send.CreditGeneration = credit;
+        send.CarriersOutstanding = 0;
+        send.IdealSendBuffer = 0;
+        Volatile.Write(ref _idealSendBuffer[record], 0);
+        return true;
+    }
+
+    /// <summary>Releases a stream that never started (no accepted send carried Start): no callback follows for it.</summary>
+    private void AbandonStream(ref BulkSend send)
+    {
+        _core.Transport?.CloseStream(send.Stream);
+        send.Stream = default;
+        send.Phase = BulkPhase.Waiting;
+
+        // The header must be written again on the new stream.
+        send.Flags = (byte)(send.Flags & ~(SendHeaderWritten | SendFinSent));
+    }
+
+    private void AbortSendStream(ref BulkSend send, QuiclyErrorCode code)
+    {
+        if (send.Stream.IsValid)
+        {
+            _core.Transport?.AbortStream(send.Stream, (ulong)code, StreamAbortDirection.Send);
+        }
+    }
+
+    // ------------------------------------------------------------------ completions (game thread)
+
+    /// <inheritdoc/>
+    public override void OnSendCompleted(int entrySlot, in CompletionEntry completion)
+    {
+        if (!completion.Final)
+        {
+            return;
+        }
+
+        DrainNotices();
+        SendEntryTable entries = _core.Entries;
+        ref SendEntry entry = ref entries[entrySlot];
+        long tag = entry.Aux0;
+        int record = (int)(tag >> 24);
+        uint serial = (uint)(tag & PeerCore.EngineStreamSerialMask);
+        int wire = (int)(entry.Aux1 >> 32);
+        int decoded = (int)(uint)entry.Aux1;
+        if ((uint)record >= (uint)_records.Length)
+        {
+            _core.CompleteEntry(entrySlot, _core.MapCompletion(in completion));
+            return;
+        }
+
+        ref BulkSend send = ref _records[record];
+        int local = send.Local;
+        ref BulkSendState state = ref _send[local];
+        bool current = serial == send.Serial && (send.Flags & SendFreed) == 0;
+        if (current)
+        {
+            send.CarriersOutstanding--;
+            send.WireOutstanding -= wire;
+        }
+
+        // The piece's block goes back here: PROTOCOL.md §4.3 releases a bulk buffer per chunk.
+        _core.CompleteEntry(entrySlot, completion.Canceled ? _core.MapCompletion(in completion) : DeliveryStatus.Delivered);
+        if (!current)
+        {
+            return;
+        }
+
+        if (!completion.Canceled)
+        {
+            send.BytesCompleted += decoded;
+        }
+        else if (_core.IsTransportClosing)
+        {
+            FinishSend(local, record, BulkStatus.Disconnected, QuiclyErrorCode.NoError);
+        }
+        else if (send.Phase == BulkPhase.Refused)
+        {
+            // The peer's stream limit refused the start: nothing reached the peer, so the transfer rewinds to its last
+            // completed byte and goes out on a new stream once the peer grants credit.
+            if (send.CarriersOutstanding == 0)
+            {
+                send.BytesRead = send.BytesCompleted;
+                send.WireOutstanding = 0;
+                send.Phase = BulkPhase.Waiting;
+                send.Stream = default;
+                send.Flags = (byte)(send.Flags & ~(SendHeaderWritten | SendFinSent));
+                ReleaseStreamSlot(ref send, ref state);
+            }
+        }
+        else if (send.Phase is BulkPhase.Starting or BulkPhase.Open)
+        {
+            FinishSend(local, record, BulkStatus.Failed, QuiclyErrorCode.NoError);
+        }
+
+        ReleaseIfDone(record, ref state);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>A bulk transfer is cancelled through <see cref="BulkTransfer.Cancel"/>, not through a send token.</remarks>
+    public override bool TryCancel(int entrySlot) => false;
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// A bulk transfer is never a <see cref="QuiclyPeer.FlushAsync"/> watermark: it is minutes of traffic under a rate cap,
+    /// so waiting for it would turn <c>FlushAsync</c> into "wait for the object".
+    /// </remarks>
+    public override long OldestQueuedStamp() => long.MaxValue;
+
+    /// <inheritdoc/>
+    public override void AddStatistics(int channelIndex, ref ChannelStatistics statistics)
+    {
+        ref BulkSendState state = ref _send[_localOf[channelIndex]];
+        for (int record = state.ListHead; record >= 0; record = _records[record].Next)
+        {
+            ref BulkSend send = ref _records[record];
+            statistics.QueuedMessages++;
+            statistics.QueuedBytes += Math.Max(0, send.Length - send.BytesRead);
+            statistics.InFlightBytes += send.WireOutstanding;
+            if (send.CarriersOutstanding > 0)
+            {
+                statistics.InFlightMessages += send.CarriersOutstanding;
+            }
+        }
+    }
+
+    /// <summary>Finishes a send transfer once: its application transfer completes and its stream slot goes back.</summary>
+    private void FinishSend(int local, int record, BulkStatus status, QuiclyErrorCode code)
+    {
+        ref BulkSend send = ref _records[record];
+        if (send.Phase == BulkPhase.Finished)
+        {
+            return;
+        }
+
+        send.Phase = BulkPhase.Finished;
+        ReleaseStreamSlot(ref send, ref _send[local]);
+        _transfers[record]?.Finish(new BulkResult(status, send.BytesAcked, BulkHashState.None, code));
+    }
+
+    /// <summary>Gives back the channel's bulk-stream slot when a transfer stops holding a stream (at most once per open).</summary>
+    private static void ReleaseStreamSlot(ref BulkSend send, ref BulkSendState state)
+    {
+        if ((send.Flags & SendCounted) != 0)
+        {
+            send.Flags = (byte)(send.Flags & ~SendCounted);
+            state.StreamedCount--;
+        }
+    }
+
+    /// <summary>
+    /// Returns a finished transfer whose pieces have all completed to the free list. Idempotent: a record already on the
+    /// free list is left alone, so a second close notice for one stream could never release it twice.
+    /// </summary>
+    private void ReleaseIfDone(int record, ref BulkSendState state)
+    {
+        ref BulkSend send = ref _records[record];
+        if ((send.Flags & SendFreed) != 0 || send.Phase != BulkPhase.Finished || send.CarriersOutstanding > 0)
+        {
+            return;
+        }
+
+        // A transfer that still holds a stream keeps its record: the slot (and the peer's credit) return when the stream
+        // shuts down, which is also when the receiving end frees its own slot.
+        if ((send.Flags & SendCounted) != 0)
+        {
+            return;
+        }
+
+        int previous = send.Prev;
+        int after = send.Next;
+        if (previous < 0)
+        {
+            state.ListHead = after;
+        }
+        else
+        {
+            _records[previous].Next = after;
+        }
+
+        if (after < 0)
+        {
+            state.ListTail = previous;
+        }
+        else
+        {
+            _records[after].Prev = previous;
+        }
+
+        state.Count--;
+        _liveSends--;
+        _sources[record] = null;
+        _transfers[record] = null;
+        send.Stream = default;
+        send.Prev = -1;
+
+        // Serials only ever rise for a record, so every notice and every piece tag of the stream it just had is stale.
+        send.Serial = (send.Serial + 1) & PeerCore.EngineStreamSerialMask;
+        send.Flags = SendFreed;
+        send.Next = _freeSend;
+        _freeSend = record;
+    }
+
+    /// <inheritdoc/>
+    public override void OnPeerClosed()
+    {
+        DrainNotices();
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            ref BulkSendState state = ref _send[local];
+            int record = state.ListHead;
+            while (record >= 0)
+            {
+                int next = _records[record].Next;
+                ref BulkSend send = ref _records[record];
+                send.Stream = default;
+
+                // Nothing will shut a stream down after the connection is gone, so the slots go back here.
+                FinishSend(local, record, BulkStatus.Disconnected, QuiclyErrorCode.NoError);
+                if (send.CarriersOutstanding == 0)
+                {
+                    ReleaseIfDone(record, ref state);
+                }
+
+                record = next;
+            }
+        }
+
+        ClosePendingRequests(BulkStatus.Disconnected);
+        OnPeerClosedReceive();
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Everything bound to the lost transport goes: the transfers' streams (their pieces already completed
+    /// <see cref="DeliveryStatus.Disconnected"/>, and <see cref="OnPeerClosed"/> finished the transfers themselves), the
+    /// per-channel stream counts, the notices the transport thread handed over and the half-received transfers. The
+    /// session's own rule — resumable ranges re-requested — belongs to <see cref="OnEpochReset"/>, which runs when the
+    /// resume is accepted.
+    /// </remarks>
+    public override void OnReconnecting()
+    {
+        while (_notices.TryDequeue(out _))
+        {
+        }
+
+        while (_control.TryDequeue(out _))
+        {
+        }
+
+        _freeSend = -1;
+        for (int record = _records.Length - 1; record >= 0; record--)
+        {
+            ref BulkSend send = ref _records[record];
+            _transfers[record]?.Finish(new BulkResult(BulkStatus.Disconnected, send.BytesAcked, BulkHashState.None, QuiclyErrorCode.NoError));
+            uint serial = (send.Serial + 1) & PeerCore.EngineStreamSerialMask;
+            send = default;
+            send.Serial = serial;
+            send.Phase = BulkPhase.Finished;
+            send.Flags = SendFreed;
+            send.Prev = -1;
+            send.Next = _freeSend;
+            _freeSend = record;
+            _sources[record] = null;
+            _transfers[record] = null;
+        }
+
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            ref BulkSendState state = ref _send[local];
+            state.ListHead = -1;
+            state.ListTail = -1;
+            state.Count = 0;
+            state.StreamedCount = 0;
+        }
+
+        for (int record = 0; record < _txStreams.Length; record++)
+        {
+            _txStreams[record] = default;
+            _txSerials[record] = 0;
+        }
+
+        _liveSends = 0;
+        OnReconnectingReceive();
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// PROTOCOL.md §4.1: "Bulk transfers marked <c>Resumable</c> are re-requested by the library for the remaining range."
+    /// It is the end that <em>asked</em> for a range that re-asks, so every resumable outbound request whose transfer did
+    /// not complete goes out again for the bytes still missing, under a fresh request id. Transfer ids are scoped to the
+    /// epoch, so the receive side forgets the ids it has seen before the next transfer arrives.
+    /// </remarks>
+    public override void OnEpochReset(bool resumed)
+    {
+        if (!resumed)
+        {
+            return;
+        }
+
+        for (int i = 0; i < _requests.Length; i++)
+        {
+            ref PendingRequest request = ref _requests[i];
+            if (!request.InUse || !request.Range.Resumable || request.Range.Length <= 0)
+            {
+                request = default;
+                continue;
+            }
+
+            request.RequestId = _nextRequestId++;
+            SendBulkRequest(in request);
+        }
+
+        ResetReceiveState();
+    }
+
+    // ------------------------------------------------------------------ range requests (game thread)
+
+    /// <inheritdoc/>
+    public override void RequestBulk(ChannelDefinition channel, in BulkRangeRequest request)
+    {
+        int dense = _core.ChannelIndexOf(channel.Id);
+        int local = dense >= 0 ? _localOf[dense] : -1;
+        if (local < 0)
+        {
+            throw new ArgumentException($"Channel {channel.Id} is not a Bulk channel of this peer.", nameof(channel));
+        }
+
+        if (request.Offset < 0 || request.Length <= 0 || request.Offset > (long)VarInt.MaxValue - request.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(request), "A bulk request needs Length > 0 and Offset + Length <= 2^62-1.");
+        }
+
+        int slot = -1;
+        for (int i = 0; i < _requests.Length; i++)
+        {
+            if (!_requests[i].InUse)
+            {
+                slot = i;
+                break;
+            }
+        }
+
+        if (slot < 0)
+        {
+            // PROTOCOL.md §7 bounds the requests in flight; the application retries.
+            _core.SendCounters(dense).QueueFull++;
+            return;
+        }
+
+        _requests[slot] = new PendingRequest { InUse = true, RequestId = _nextRequestId++, Range = request };
+        SendBulkRequest(in _requests[slot]);
+    }
+
+    private void SendBulkRequest(in PendingRequest pending)
+    {
+        BulkRangeRequest range = pending.Range;
+        Span<byte> frame = stackalloc byte[64];
+        BulkRequest message = new(pending.RequestId, range.Channel, range.ObjectId, range.ObjectVersion, (ulong)range.Offset, (ulong)range.Length);
+        if (ControlCodec.TryWrite(frame, in message, out int written))
+        {
+            _core.SendControlFrame(frame.Slice(0, written), ControlCarrier.Stream);
+        }
+    }
+
+    private void SendBulkCancel(ulong transferId, QuiclyErrorCode code)
+    {
+        Span<byte> frame = stackalloc byte[32];
+        if (ControlCodec.TryWrite(frame, new BulkCancel(transferId, code), out int written))
+        {
+            _core.SendControlFrame(frame.Slice(0, written), ControlCarrier.Stream);
+        }
+    }
+
+    private void SendBulkReject(ulong requestId, QuiclyErrorCode code)
+    {
+        Span<byte> frame = stackalloc byte[32];
+        if (ControlCodec.TryWrite(frame, new BulkReject(requestId, code), out int written))
+        {
+            _core.SendControlFrame(frame.Slice(0, written), ControlCarrier.Stream);
+        }
+    }
+
+    /// <summary>
+    /// Drops the outbound requests a lost connection cannot answer. A <em>resumable</em> request is kept, because
+    /// <see cref="OnEpochReset"/> asks for its remaining range again on the resumed session (PROTOCOL.md §4.1).
+    /// </summary>
+    private void ClosePendingRequests(BulkStatus status)
+    {
+        for (int i = 0; i < _requests.Length; i++)
+        {
+            ref PendingRequest request = ref _requests[i];
+            if (request.InUse && (!request.Range.Resumable || status != BulkStatus.Disconnected))
+            {
+                BulkRangeRequest range = request.Range;
+                request = default;
+                _core.BulkRouter?.OnRequestRejected(in range, QuiclyErrorCode.NoError);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ control messages
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The peer's <c>BulkProgress</c>, <c>BulkCancel</c>, <c>BulkReject</c> and <c>BulkRequest</c> (the frames are already
+    /// validated by <see cref="ControlCodec"/>). They change game-thread state — a transfer's acknowledged bytes, an
+    /// authorisation decision — so they are handed over through an SPSC ring and applied in the next scheduler pass.
+    /// </remarks>
+    public override bool OnControl(ControlType type, ReadOnlySpan<byte> body, bool onStream, long nowMicros)
+    {
+        ConsumeEpochReset();
+        ControlNotice notice = default;
+        switch (type)
+        {
+            case ControlType.BulkProgress:
+            {
+                if (ControlCodec.TryParse(body, out BulkProgress progress) != ControlParseStatus.Ok)
+                {
+                    return false;
+                }
+
+                notice.Kind = ControlKind.Progress;
+                notice.Id = progress.TransferId;
+                notice.Offset = (long)progress.BytesAccepted;
+                break;
+            }
+
+            case ControlType.BulkCancel:
+            {
+                // PROTOCOL.md §3.4: types 0x10-0x17 are control-stream only.
+                if (!onStream || ControlCodec.TryParse(body, out BulkCancel cancel) != ControlParseStatus.Ok)
+                {
+                    return false;
+                }
+
+                notice.Kind = ControlKind.Cancel;
+                notice.Id = cancel.TransferId;
+                notice.Code = (uint)cancel.Code;
+                break;
+            }
+
+            case ControlType.BulkReject:
+            {
+                if (!onStream || ControlCodec.TryParse(body, out BulkReject reject) != ControlParseStatus.Ok)
+                {
+                    return false;
+                }
+
+                notice.Kind = ControlKind.Reject;
+                notice.Id = reject.RequestId;
+                notice.Code = (uint)reject.Code;
+                break;
+            }
+
+            case ControlType.BulkRequest:
+            {
+                if (!onStream || ControlCodec.TryParse(body, out BulkRequest request) != ControlParseStatus.Ok)
+                {
+                    return false;
+                }
+
+                int dense = _core.ChannelIndexOf(request.Channel);
+                if (dense < 0 || _localOf[dense] < 0)
+                {
+                    // The request names a channel that is not a Bulk channel of this session.
+                    return false;
+                }
+
+                notice.Kind = ControlKind.Request;
+                notice.Channel = request.Channel;
+                notice.Id = request.RequestId;
+                notice.ObjectId = request.ObjectId;
+                notice.ObjectVersion = request.ObjectVersion;
+                notice.Offset = (long)request.Offset;
+                notice.Length = (long)request.Length;
+                break;
+            }
+
+            default:
+                return false;
+        }
+
+        if (!_control.TryEnqueue(in notice))
+        {
+            // Progress is cumulative, so a dropped one is superseded by the next; a dropped cancel is still carried by the
+            // stream reset that accompanies it, and a dropped request or reject is the peer's to retry.
+            ControlNoticesDropped++;
+            return true;
+        }
+
+        _core.NoteWork();
+        return true;
+    }
+
+    /// <summary>Applies the peer's control messages to the send side (game thread, start of every pass).</summary>
+    private void DrainControl(ref FlushContext flush)
+    {
+        while (_control.TryDequeue(out ControlNotice notice))
+        {
+            switch (notice.Kind)
+            {
+                case ControlKind.Progress:
+                    ApplyProgress(notice.Id, notice.Offset);
+                    break;
+                case ControlKind.Cancel:
+                    ApplyCancel(notice.Id, (QuiclyErrorCode)notice.Code);
+                    break;
+                case ControlKind.Reject:
+                    ApplyReject(notice.Id, (QuiclyErrorCode)notice.Code);
+                    break;
+                default:
+                    ApplyRequest(in notice);
+                    break;
+            }
+        }
+    }
+
+    /// <summary>The peer accepted bytes of a transfer this end is sending (PROTOCOL.md §4.3: its length is <c>Delivered</c>).</summary>
+    private void ApplyProgress(ulong transferId, long bytesAccepted)
+    {
+        int record = FindSend(transferId);
+        if (record < 0)
+        {
+            return;
+        }
+
+        ref BulkSend send = ref _records[record];
+
+        // A progress frame is cumulative; an older or torn one never moves the count backwards.
+        if (bytesAccepted <= send.BytesAcked)
+        {
+            return;
+        }
+
+        send.BytesAcked = Math.Min(bytesAccepted, send.Length);
+        BulkTransfer? transfer = _transfers[record];
+        transfer?.Advance(send.BytesAcked);
+        if (send.BytesAcked >= send.Length && send.Phase != BulkPhase.Finished)
+        {
+            int local = send.Local;
+            send.Phase = BulkPhase.Finished;
+            ReleaseStreamSlot(ref send, ref _send[local]);
+            transfer?.Finish(new BulkResult(BulkStatus.Completed, send.BytesAcked, BulkHashState.None, QuiclyErrorCode.NoError));
+            ReleaseIfDone(record, ref _send[local]);
+        }
+    }
+
+    private void ApplyCancel(ulong transferId, QuiclyErrorCode code)
+    {
+        int record = FindSend(transferId);
+        if (record < 0)
+        {
+            return;
+        }
+
+        ref BulkSend send = ref _records[record];
+        int local = send.Local;
+        AbortSendStream(ref send, code);
+        FinishSend(local, record, BulkStatus.Canceled, code);
+        ReleaseIfDone(record, ref _send[local]);
+    }
+
+    private void ApplyReject(ulong requestId, QuiclyErrorCode code)
+    {
+        for (int i = 0; i < _requests.Length; i++)
+        {
+            ref PendingRequest request = ref _requests[i];
+            if (request.InUse && request.RequestId == requestId)
+            {
+                BulkRangeRequest range = request.Range;
+                request = default;
+                _core.BulkRouter?.OnRequestRejected(in range, code);
+                return;
+            }
+        }
+    }
+
+    /// <summary>Authorises a range the peer asked for and starts serving it (game thread; default deny).</summary>
+    private void ApplyRequest(in ControlNotice notice)
+    {
+        int dense = _core.ChannelIndexOf(notice.Channel);
+        int local = dense >= 0 ? _localOf[dense] : -1;
+        if (local < 0)
+        {
+            return;
+        }
+
+        BulkRequestInfo info = new()
+        {
+            Channel = notice.Channel,
+            RequestId = notice.Id,
+            ObjectId = notice.ObjectId,
+            ObjectVersion = notice.ObjectVersion,
+            Offset = notice.Offset,
+            Length = notice.Length,
+            PeerIndex = _core.Peer.Index,
+        };
+
+        // ADR 0009: serving bulk objects is opt-in, so no authorizer (or no provider) means every request is refused.
+        if (_core.BulkAuthorizer is not { } authorizer || !authorizer.Authorize(in info)
+            || _core.BulkProvider is not { } provider || !provider.TryGetObject(in info, out BulkDescriptor descriptor, out IBulkSource? source)
+            || source is null)
+        {
+            SendBulkReject(notice.Id, QuiclyErrorCode.BulkRejected);
+            return;
+        }
+
+        ChannelDefinition channel = _channels[local];
+        long length = descriptor.EffectiveLength;
+        if (descriptor.Channel != channel.Id || descriptor.TotalLength < 0 || descriptor.TotalLength > (long)VarInt.MaxValue
+            || descriptor.Offset < 0 || descriptor.Offset > descriptor.TotalLength || length <= 0
+            || length > descriptor.TotalLength - descriptor.Offset || length > _core.EffectiveMaxMessageSize(channel)
+            || descriptor.Sha256.Length is not (0 or StreamFraming.BulkHashLength))
+        {
+            SendBulkReject(notice.Id, QuiclyErrorCode.BulkRejected);
+            return;
+        }
+
+        StartSend(local, dense, in descriptor, length, source, descriptor.Sha256.Span, out bool started);
+        if (!started)
+        {
+            SendBulkReject(notice.Id, QuiclyErrorCode.BulkRejected);
+        }
+    }
+
+    private int FindSend(ulong transferId)
+    {
+        for (int record = 0; record < _records.Length; record++)
+        {
+            ref BulkSend send = ref _records[record];
+            if ((send.Flags & SendFreed) == 0 && send.TransferId == transferId)
+            {
+                return record;
+            }
+        }
+
+        return -1;
+    }
+
+    // ------------------------------------------------------------------ local stream events
+
+    /// <inheritdoc/>
+    public override void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status)
+    {
+        if (!PeerCore.TryDecodeEngineStreamContext(context, out ChannelMode mode, out int record, out uint serial)
+            || mode != ChannelMode.Bulk || (uint)record >= (uint)_txStreams.Length)
+        {
+            return;
+        }
+
+        _txStreams[record] = id;
+        _txSerials[record] = serial;
+        NoticeKind kind = status switch
+        {
+            TransportStatus.Success => NoticeKind.Started,
+            TransportStatus.StreamLimitReached => NoticeKind.Refused,
+            _ => NoticeKind.StartFailed,
+        };
+        Post(record, serial, kind, 0);
+    }
+
+    /// <inheritdoc/>
+    public override void OnIdealSendBufferSize(TransportStreamId id, ulong bytes)
+    {
+        for (int record = 0; record < _txStreams.Length; record++)
+        {
+            if (_txStreams[record] == id)
+            {
+                // A window the transport asked for: the game thread reads it when it next fills the stream.
+                Volatile.Write(ref _idealSendBuffer[record], (long)Math.Min(bytes, long.MaxValue));
+                return;
+            }
+        }
+    }
+
+    private void Post(int record, uint serial, NoticeKind kind, ulong errorCode)
+    {
+        StreamNotice notice = new() { Record = record, Serial = serial, Kind = kind, ErrorCode = errorCode };
+        if (!_notices.TryEnqueue(in notice))
+        {
+            // Sized for every live stream's notices between two drains; cannot happen.
+            _core.Counters.CallbackFaults++;
+        }
+
+        _core.NoteWork();
+    }
+
+    /// <summary>Applies the transport-thread notices of this engine's own streams (game thread).</summary>
+    private void DrainNotices()
+    {
+        while (_notices.TryDequeue(out StreamNotice notice))
+        {
+            int record = notice.Record;
+            ref BulkSend send = ref _records[record];
+            if (notice.Serial != send.Serial || (send.Flags & SendFreed) != 0)
+            {
+                continue; // an earlier stream of this record, or of an earlier occupant
+            }
+
+            int local = send.Local;
+            ref BulkSendState state = ref _send[local];
+            switch (notice.Kind)
+            {
+                case NoticeKind.Started:
+                    if (send.Phase == BulkPhase.Starting)
+                    {
+                        send.Phase = BulkPhase.Open;
+                    }
+
+                    break;
+                case NoticeKind.Refused:
+                    if (send.Phase == BulkPhase.Starting)
+                    {
+                        StreamsRefused++;
+                        if (send.CarriersOutstanding == 0)
+                        {
+                            send.BytesRead = send.BytesCompleted;
+                            send.WireOutstanding = 0;
+                            send.Phase = BulkPhase.Waiting;
+                            send.Stream = default;
+                            send.Flags = (byte)(send.Flags & ~(SendHeaderWritten | SendFinSent));
+                            ReleaseStreamSlot(ref send, ref state);
+                        }
+                        else
+                        {
+                            send.Phase = BulkPhase.Refused;
+                        }
+                    }
+
+                    break;
+                case NoticeKind.ShutDown:
+                    if (send.Phase is BulkPhase.Starting or BulkPhase.Open && (send.Flags & SendFinSent) == 0)
+                    {
+                        FinishSend(local, record, _core.IsTransportClosing ? BulkStatus.Disconnected : BulkStatus.Failed, QuiclyErrorCode.NoError);
+                    }
+
+                    // The stream is gone: its slot (and the peer's credit) are free again.
+                    ReleaseStreamSlot(ref send, ref state);
+                    break;
+                default:
+                    // Stopped by the peer (STOP_SENDING) or failed to start.
+                    if (send.Phase is BulkPhase.Starting or BulkPhase.Open)
+                    {
+                        QuiclyErrorCode code = (QuiclyErrorCode)notice.ErrorCode;
+                        BulkStatus status = _core.IsTransportClosing ? BulkStatus.Disconnected
+                            : code == QuiclyErrorCode.BulkCanceled ? BulkStatus.Canceled
+                            : BulkStatus.Failed;
+                        FinishSend(local, record, status, code);
+                    }
+
+                    ReleaseStreamSlot(ref send, ref state);
+                    break;
+            }
+
+            ReleaseIfDone(record, ref state);
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>Bulk channels carry no datagrams (the peer rejects them before they get here); counted as dropped.</remarks>
+    public override void OnDatagram(in MessageHeader header, ReadOnlySpan<byte> payload, long nowMicros) =>
+        _core.CountDatagramDropped(header.Channel);
+
+    /// <inheritdoc/>
+    public override void Dispose()
+    {
+        DisposeReceive();
+        _send?.Dispose();
+        _records?.Dispose();
+        _scratch?.Dispose();
+        _notices?.Dispose();
+        _control?.Dispose();
+    }
+
+    /// <summary>A transport-thread event of one of this engine's own bulk streams, handed to the game thread.</summary>
+    private struct StreamNotice
+    {
+        /// <summary>The transfer record the stream belongs to.</summary>
+        public int Record;
+
+        /// <summary>Serial of the stream (notices of earlier streams are ignored).</summary>
+        public uint Serial;
+
+        /// <summary>What happened.</summary>
+        public NoticeKind Kind;
+
+        /// <summary>The reset code of a stop.</summary>
+        public ulong ErrorCode;
+    }
+
+    /// <summary>A control message of the peer, handed from the transport thread to the game thread.</summary>
+    private struct ControlNotice
+    {
+        /// <summary>Which message.</summary>
+        public ControlKind Kind;
+
+        /// <summary>Bulk channel (requests only).</summary>
+        public ushort Channel;
+
+        /// <summary>Error code (cancel and reject).</summary>
+        public uint Code;
+
+        /// <summary>Transfer id (progress, cancel) or request id (reject, request).</summary>
+        public ulong Id;
+
+        /// <summary>Requested object (requests only).</summary>
+        public ulong ObjectId;
+
+        /// <summary>Requested object version (requests only).</summary>
+        public ulong ObjectVersion;
+
+        /// <summary>Bytes accepted (progress) or the range's offset (request).</summary>
+        public long Offset;
+
+        /// <summary>The range's length (request).</summary>
+        public long Length;
+    }
+
+    /// <summary>A range this end asked for and has not been answered yet (game thread).</summary>
+    private struct PendingRequest
+    {
+        /// <summary>Whether the slot holds a request.</summary>
+        public bool InUse;
+
+        /// <summary>The request id on the wire.</summary>
+        public ulong RequestId;
+
+        /// <summary>What was asked for; its offset and length advance as the answer arrives, so a resume asks for the rest.</summary>
+        public BulkRangeRequest Range;
+    }
+
+    /// <summary>Send-side state of one Bulk channel: one cache line, native memory, game thread only.</summary>
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    private struct BulkSendState
+    {
+        /// <summary>Oldest live transfer of the channel (-1 = none).</summary>
+        [FieldOffset(0)] public int ListHead;
+
+        /// <summary>Newest live transfer of the channel (-1 = none).</summary>
+        [FieldOffset(4)] public int ListTail;
+
+        /// <summary>Live transfers of the channel.</summary>
+        [FieldOffset(8)] public int Count;
+
+        /// <summary>Transfers of the channel holding a stream (bounded by <see cref="ChannelDefinition.MaxGroups"/>).</summary>
+        [FieldOffset(12)] public int StreamedCount;
+    }
+
+    /// <summary>One send transfer: its range, its stream and its phase. Two cache lines, native memory, game thread only.</summary>
+    [StructLayout(LayoutKind.Explicit, Size = 128)]
+    private struct BulkSend
+    {
+        /// <summary>The transfer id on the wire.</summary>
+        [FieldOffset(0)] public ulong TransferId;
+
+        /// <summary>Object identity.</summary>
+        [FieldOffset(8)] public ulong ObjectId;
+
+        /// <summary>Object version.</summary>
+        [FieldOffset(16)] public ulong ObjectVersion;
+
+        /// <summary>Size of the whole object.</summary>
+        [FieldOffset(24)] public long TotalLength;
+
+        /// <summary>First object byte of the range.</summary>
+        [FieldOffset(32)] public long Offset;
+
+        /// <summary>Object bytes the range carries.</summary>
+        [FieldOffset(40)] public long Length;
+
+        /// <summary>Object bytes read from the source and handed to the transport.</summary>
+        [FieldOffset(48)] public long BytesRead;
+
+        /// <summary>Object bytes whose stream sends completed.</summary>
+        [FieldOffset(56)] public long BytesCompleted;
+
+        /// <summary>Object bytes the peer reported accepted (<c>BulkProgress</c>); the range's length is <c>Delivered</c>.</summary>
+        [FieldOffset(64)] public long BytesAcked;
+
+        /// <summary>Wire bytes submitted and not yet completed (what the send window bounds).</summary>
+        [FieldOffset(72)] public long WireOutstanding;
+
+        /// <summary>Bytes the transport asked to keep outstanding on this stream, or 0.</summary>
+        [FieldOffset(80)] public long IdealSendBuffer;
+
+        /// <summary>The transfer's stream (valid from the open until it ends or is abandoned).</summary>
+        [FieldOffset(88)] public TransportStreamId Stream;
+
+        /// <summary>Serial of the current stream (in its context; notices of earlier streams are ignored).</summary>
+        [FieldOffset(96)] public uint Serial;
+
+        /// <summary><see cref="PeerCore.StreamCreditGeneration"/> read before the last open, or <see cref="CreditUnrefused"/>.</summary>
+        [FieldOffset(100)] public int CreditGeneration;
+
+        /// <summary>Pieces of the current stream not yet completed.</summary>
+        [FieldOffset(104)] public int CarriersOutstanding;
+
+        /// <summary>Next live transfer of the channel, or the next free record (-1 = none).</summary>
+        [FieldOffset(108)] public int Next;
+
+        /// <summary>Previous live transfer of the channel (-1 = none).</summary>
+        [FieldOffset(112)] public int Prev;
+
+        /// <summary>Engine-local index of the transfer's channel.</summary>
+        [FieldOffset(116)] public int Local;
+
+        /// <summary>Lifecycle of the transfer.</summary>
+        [FieldOffset(120)] public BulkPhase Phase;
+
+        /// <summary><see cref="SendHeaderWritten"/>, <see cref="SendFinSent"/>, <see cref="SendCounted"/>, <see cref="SendFreed"/>, <see cref="SendCompress"/>, <see cref="SendHasHash"/>.</summary>
+        [FieldOffset(121)] public byte Flags;
+    }
+}

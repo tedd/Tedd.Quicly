@@ -23,7 +23,8 @@ public unsafe class SendEntryTableTests
         Assert.Equal(SendEntry.HeaderLengthOffset, (int)((byte*)&e.HeaderLength - b));
         Assert.Equal(SendEntry.HeaderOffset, (int)((byte*)&e.Header - b));
         Assert.Equal(SendEntry.PayloadOffset, (int)((byte*)&e.Payload - b));
-        Assert.Equal(SendEntry.HeaderScratchOffset, (int)(e.HeaderScratch - b));
+        Assert.Equal(SendEntry.AuxOffset, (int)((byte*)&e.Aux0 - b));
+        Assert.Equal(SendEntry.AuxOffset + 8, (int)((byte*)&e.Aux1 - b));
         Assert.Equal(0, SendEntry.StateOffset);
         Assert.Equal(4, SendEntry.GenerationOffset);
         Assert.Equal(8, SendEntry.ChannelOffset);
@@ -31,8 +32,8 @@ public unsafe class SendEntryTableTests
         Assert.Equal(11, SendEntry.HeaderLengthOffset);
         Assert.Equal(16, SendEntry.HeaderOffset);
         Assert.Equal(32, SendEntry.PayloadOffset);
-        Assert.Equal(48, SendEntry.HeaderScratchOffset);
-        Assert.Equal(16, SendEntry.HeaderScratchSize);
+        Assert.Equal(48, SendEntry.AuxOffset);
+        Assert.Equal(32, SendEntryTable.HeaderBlockSize);
     }
 
     [Fact]
@@ -43,12 +44,40 @@ public unsafe class SendEntryTableTests
         Assert.True(segments + 1 == &e.Payload);
         Assert.Equal(16, sizeof(TransportSegment));
 
-        e.Header = new TransportSegment(e.HeaderScratch, 5);
+        e.Header = new TransportSegment((byte*)0x2000, 5);
         e.Payload = new TransportSegment((byte*)0x1000, 77);
         Assert.Equal(5u, segments[0].Length);
         Assert.Equal(77u, segments[1].Length);
-        Assert.True(segments[0].Buffer == e.HeaderScratch);
-        Assert.True(e.HeaderScratch + SendEntry.HeaderScratchSize == (byte*)&e + SendEntry.Size);
+        Assert.True((byte*)(segments + 2) == (byte*)&e.Aux0);
+    }
+
+    [Fact]
+    public void Header_Blocks_Hold_The_Largest_Datagram_Header_And_Are_Zeroed_Aux_At_Allocation()
+    {
+        using var table = new SendEntryTable(4);
+        Assert.True(table.TryAllocate(out int slot));
+        Assert.True(Tedd.Quicly.Core.Framing.DatagramFraming.MaxHeaderLength <= SendEntryTable.HeaderBlockSize);
+        Span<byte> block = table.GetHeaderBlock(slot);
+        Assert.Equal(SendEntryTable.HeaderBlockSize, block.Length);
+        for (int i = 0; i < 24; i++)
+            block[i] = (byte)i;
+        table.SetHeaderLength(slot, 24);
+        Assert.Equal(24, table[slot].HeaderLength);
+        Assert.Equal(24u, table[slot].Header.Length);
+        Assert.True(Unsafe.AreSame(ref *table[slot].Header.Buffer, ref block[0]));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.SetHeaderLength(slot, 33));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.SetHeaderLength(slot, -1));
+
+        // Blocks of different slots do not overlap, and the aux words are reset on reuse.
+        Assert.True(table.TryAllocate(out int other));
+        Assert.Equal(SendEntryTable.HeaderBlockSize, (int)((byte*)Unsafe.AsPointer(ref table.GetHeaderBlock(other)[0]) - (byte*)Unsafe.AsPointer(ref table.GetHeaderBlock(slot)[0])) * (other > slot ? 1 : -1) / Math.Abs(other - slot));
+        table[slot].Aux0 = 5;
+        table[slot].Aux1 = 6;
+        table.Discard(slot);
+        Assert.True(table.TryAllocate(out int again));
+        Assert.Equal(slot, again);
+        Assert.Equal(0, table[again].Aux0);
+        Assert.Equal(0, table[again].Aux1);
     }
 
     [Fact]
@@ -316,7 +345,7 @@ public unsafe class SendEntryTableTests
         Assert.Throws<ArgumentOutOfRangeException>(() => table.GetState(2));
         Assert.Throws<ArgumentOutOfRangeException>(() => table.MakeContext(2));
         Assert.Throws<ArgumentOutOfRangeException>(() => table.SetHeader(2, [1]));
-        Assert.Throws<ArgumentOutOfRangeException>(() => table.GetHeaderScratch(-1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.GetHeaderBlock(-1));
         Assert.Throws<ArgumentOutOfRangeException>(() => { _ = table.GetSegments(2); });
         Assert.Throws<ArgumentOutOfRangeException>(() => table.AddToBatch(0, 2));
     }
@@ -359,7 +388,7 @@ public unsafe class SendEntryTableTests
     }
 
     [Fact]
-    public void SetHeader_Copies_Into_Scratch_And_Points_The_Header_Segment_At_It()
+    public void SetHeader_Copies_Into_The_Header_Block_And_Points_The_Header_Segment_At_It()
     {
         using var table = new SendEntryTable(4);
         Assert.True(table.TryAllocate(out int slot));
@@ -367,19 +396,18 @@ public unsafe class SendEntryTableTests
         table.SetHeader(slot, header);
 
         ref SendEntry e = ref table[slot];
-        byte* scratch = (byte*)Unsafe.AsPointer(ref e) + SendEntry.HeaderScratchOffset;
+        byte* block = (byte*)Unsafe.AsPointer(ref table.GetHeaderBlock(slot)[0]);
         Assert.Equal(7, e.HeaderLength);
         Assert.Equal(7u, e.Header.Length);
-        Assert.True(e.Header.Buffer == scratch);
+        Assert.True(e.Header.Buffer == block);
         Assert.Equal(header, e.Header.AsSpan().ToArray());
-        Assert.Equal(header, table.GetHeaderScratch(slot)[..7].ToArray());
-        Assert.Equal(SendEntry.HeaderScratchSize, table.GetHeaderScratch(slot).Length);
-        Assert.True(Unsafe.AreSame(ref table.GetHeaderScratch(slot)[0], ref *scratch));
+        Assert.Equal(header, table.GetHeaderBlock(slot)[..7].ToArray());
+        Assert.Equal(SendEntryTable.HeaderBlockSize, table.GetHeaderBlock(slot).Length);
 
-        table.SetHeader(slot, new byte[16]);
-        Assert.Equal(16, e.HeaderLength);
-        Assert.Throws<ArgumentOutOfRangeException>(() => table.SetHeader(slot, new byte[17]));
-        Assert.Equal(16, e.HeaderLength);
+        table.SetHeader(slot, new byte[32]);
+        Assert.Equal(32, e.HeaderLength);
+        Assert.Throws<ArgumentOutOfRangeException>(() => table.SetHeader(slot, new byte[33]));
+        Assert.Equal(32, e.HeaderLength);
 
         table.SetHeader(slot, ReadOnlySpan<byte>.Empty);
         Assert.Equal(0, e.HeaderLength);
@@ -482,10 +510,7 @@ public unsafe class SendEntryTableTests
         using var table = new SendEntryTable(64);
         RunLoop(table, 1_000);
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        RunLoop(table, 100_000);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() => RunLoop(table, 20_000));
 
         static void RunLoop(SendEntryTable table, int iterations)
         {

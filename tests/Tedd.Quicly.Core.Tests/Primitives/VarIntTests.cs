@@ -396,11 +396,7 @@ public class VarIntTests
         ulong sink = 0;
 
         Run(buffer, values, ref sink); // warm-up
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        Run(buffer, values, ref sink);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() => Run(buffer, values, ref sink));
         Assert.NotEqual(0UL, sink);
 
         static void Run(byte[] buffer, ulong[] values, ref ulong sink)

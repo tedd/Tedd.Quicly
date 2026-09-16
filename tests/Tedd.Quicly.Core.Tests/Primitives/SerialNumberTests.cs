@@ -117,10 +117,7 @@ public class SerialNumberTests
     {
         int sink = 0;
         Run(ref sink);
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        Run(ref sink);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() => Run(ref sink));
         Assert.NotEqual(0, sink);
 
         static void Run(ref int sink)

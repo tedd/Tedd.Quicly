@@ -78,11 +78,11 @@ public class LeaseExtensionsTests
         for (int i = 0; i < 1_000; i++)
             RentCopyReturn(allocator, source);
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 100_000; i++)
-            RentCopyReturn(allocator, source);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 20_000; i++)
+                RentCopyReturn(allocator, source);
+        });
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]

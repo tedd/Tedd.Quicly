@@ -11,7 +11,11 @@ public static class PackedContainer
     /// <summary>Channel id of a packed container.</summary>
     public const byte ChannelId = 1;
 
-    /// <summary>Most messages one container may hold.</summary>
+    /// <summary>
+    /// Most messages <em>this implementation packs</em> into one container (PROTOCOL.md §2.2/§8). It is a sender-side
+    /// limit only: <see cref="TryParse"/> accepts as many messages as a datagram holds, because a conformant peer may
+    /// pack more (about 599 two-byte messages fit 1 200 bytes).
+    /// </summary>
     public const int MaxMessages = 64;
 
     /// <summary>Flags bit: a tick varint follows the flags byte.</summary>
@@ -54,15 +58,17 @@ public static class PackedContainer
     /// <summary>
     /// Validates a whole container and returns an iterator over its messages. Validation is complete before the
     /// first message is yielded: channel byte 0x01, no reserved flag bits, tick ≤ 2^32−1, every length ≥ 1 and within
-    /// the remaining bytes, no inner channel 1, at most 64 messages, at least one message, no trailing bytes.
+    /// the remaining bytes, no inner channel 1, at least one message, no trailing bytes. The number of messages is
+    /// bounded only by the datagram's length (PROTOCOL.md §2.2): <see cref="MaxMessages"/> is what this implementation
+    /// packs, not what it accepts.
     /// </summary>
     /// <param name="datagram">The whole datagram, starting with the channel id 0x01.</param>
     /// <param name="reader">The iterator (default on failure).</param>
     /// <returns>
     /// <see cref="ParseStatus.Ok"/>, <see cref="ParseStatus.NotContainer"/>, <see cref="ParseStatus.Truncated"/>,
     /// <see cref="ParseStatus.NonMinimalVarint"/>, <see cref="ParseStatus.BadFlags"/>, <see cref="ParseStatus.ValueOutOfRange"/>,
-    /// <see cref="ParseStatus.BadLength"/>, <see cref="ParseStatus.NestedContainer"/>, <see cref="ParseStatus.TooManyMessages"/>
-    /// or <see cref="ParseStatus.ContainerEmpty"/>.
+    /// <see cref="ParseStatus.BadLength"/>, <see cref="ParseStatus.NestedContainer"/> or
+    /// <see cref="ParseStatus.ContainerEmpty"/>.
     /// </returns>
     public static ParseStatus TryParse(ReadOnlySpan<byte> datagram, out PackedContainerReader reader)
     {
@@ -126,11 +132,9 @@ public static class PackedContainer
                 return ParseStatus.NestedContainer;
             }
 
-            if (++count > MaxMessages)
-            {
-                return ParseStatus.TooManyMessages;
-            }
-
+            // PROTOCOL.md §2.2: the receiver accepts as many messages as the datagram actually holds (its length is the
+            // implicit bound); only the sender keeps to MaxMessages per container.
+            count++;
             pos += (int)length;
         }
 
@@ -219,6 +223,32 @@ public ref struct PackedContainerWriter
         _buffer = buffer;
         _length = PackedContainer.WriteHeader(buffer, tick, hasTick);
         _count = 0;
+    }
+
+    /// <summary>
+    /// Continues a container whose first <paramref name="length"/> bytes (its header and <paramref name="count"/> entries)
+    /// were written into <paramref name="buffer"/> earlier. The writer is a <c>ref struct</c> and cannot be stored, so a
+    /// packer that appends across calls keeps <see cref="Length"/> and <see cref="Count"/> and resumes with them.
+    /// </summary>
+    /// <param name="buffer">The destination the container was started in.</param>
+    /// <param name="length">Bytes written so far (the previous writer's <see cref="Length"/>).</param>
+    /// <param name="count">Messages appended so far (the previous writer's <see cref="Count"/>).</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="length"/> is shorter than a header or longer than the buffer, or <paramref name="count"/> is outside 0 … <see cref="PackedContainer.MaxMessages"/>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="buffer"/> does not start with a container header.</exception>
+    public PackedContainerWriter(Span<byte> buffer, int length, int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(length, 2);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(length, buffer.Length);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(count, PackedContainer.MaxMessages);
+        if (buffer[0] != PackedContainer.ChannelId)
+        {
+            throw new ArgumentException("The buffer does not start with a packed container header.", nameof(buffer));
+        }
+
+        _buffer = buffer;
+        _length = length;
+        _count = count;
     }
 
     /// <summary>Bytes written so far (header + entries).</summary>

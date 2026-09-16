@@ -35,16 +35,24 @@ namespace Tedd.Quicly.Core.State;
 /// <see cref="BatchHead"/>/<see cref="BatchCount"/> (members of a container entry) and <see cref="PinHandles"/>
 /// (a managed <see cref="nint"/> array for the pin handles of the <c>SendBorrowed</c> convenience path,
 /// ADR 0008 invariant 11).</para>
+/// <para><b>Header blocks.</b> The encoded header of each slot lives in a cold native array of
+/// <see cref="HeaderBlockSize"/>-byte blocks (<see cref="GetHeaderBlock"/>), large enough for the 24-byte maximum
+/// datagram header; <see cref="SetHeader"/> points <see cref="SendEntry.Header"/> at it. The block never moves and
+/// is reused only after the slot is freed, so it satisfies ADR 0008 invariant 1.</para>
 /// <para><b>Gathers.</b> One entry's <see cref="SendEntry.Header"/>/<see cref="SendEntry.Payload"/> pair is a
 /// contiguous <c>QUIC_BUFFER[2]</c> (<see cref="GetSegments"/>). Consecutive entries are <em>not</em> one contiguous
-/// segment array (each entry's 16-byte header scratch sits between its payload segment and the next entry's
-/// header segment); a multi-entry gather copies the pairs into a per-stream segment array.</para>
+/// segment array (each pair is followed by the entry's two scratch words); a multi-entry stream gather copies the pairs
+/// into a per-submission contiguous array taken from a <see cref="SegmentArena"/>.</para>
 /// </remarks>
 public sealed unsafe class SendEntryTable : IDisposable
 {
+    /// <summary>Size of one slot's header block in bytes (covers the 24-byte maximum datagram header).</summary>
+    public const int HeaderBlockSize = 32;
+
     private const long GenerationMask = unchecked((long)0xFFFF_FFFF_0000_0000UL);
 
     private readonly NativeArray<SendEntry> _entries;
+    private readonly NativeArray<byte> _headerBlocks;
     private readonly NativeArray<int> _freeStack;
     private int _freeCount;
     private bool _disposed;
@@ -59,6 +67,7 @@ public sealed unsafe class SendEntryTable : IDisposable
         int capacity = (int)BitOperations.RoundUpToPowerOf2((uint)minimumCapacity);
 
         _entries = new NativeArray<SendEntry>(capacity);
+        _headerBlocks = new NativeArray<byte>(capacity * HeaderBlockSize);
         _freeStack = new NativeArray<int>(capacity);
         Leases = new NativeArray<BufferLease>(capacity);
         Keys = new NativeArray<ulong>(capacity);
@@ -157,6 +166,8 @@ public sealed unsafe class SendEntryTable : IDisposable
         e->HeaderLength = 0;
         e->Header = default;
         e->Payload = default;
+        e->Aux0 = 0;
+        e->Aux1 = 0;
 
         Leases.Pointer[s] = BufferLease.Empty;
         Keys.Pointer[s] = 0;
@@ -174,27 +185,50 @@ public sealed unsafe class SendEntryTable : IDisposable
     }
 
     /// <summary>
-    /// Copies <paramref name="header"/> into the entry's <see cref="SendEntry.HeaderScratch"/> and points
-    /// <see cref="SendEntry.Header"/> at it. Owner thread, while <see cref="SendEntryState.Filling"/>.
+    /// Copies <paramref name="header"/> into the slot's header block and points <see cref="SendEntry.Header"/> at it.
+    /// Owner thread, while <see cref="SendEntryState.Filling"/>.
     /// </summary>
     /// <param name="slot">Slot index.</param>
-    /// <param name="header">Encoded header, at most <see cref="SendEntry.HeaderScratchSize"/> bytes.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="header"/> does not fit the scratch area, or <paramref name="slot"/> is outside the table.</exception>
+    /// <param name="header">Encoded header, at most <see cref="HeaderBlockSize"/> bytes.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="header"/> does not fit the block, or <paramref name="slot"/> is outside the table.</exception>
     public void SetHeader(int slot, ReadOnlySpan<byte> header)
     {
-        ArgumentOutOfRangeException.ThrowIfGreaterThan(header.Length, SendEntry.HeaderScratchSize);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(header.Length, HeaderBlockSize);
         SendEntry* e = (SendEntry*)Unsafe.AsPointer(ref _entries[slot]);
-        byte* scratch = e->HeaderScratch;
-        header.CopyTo(new Span<byte>(scratch, SendEntry.HeaderScratchSize));
+        byte* block = _headerBlocks.Pointer + ((nint)slot * HeaderBlockSize);
+        header.CopyTo(new Span<byte>(block, HeaderBlockSize));
         e->HeaderLength = (byte)header.Length;
-        e->Header = new TransportSegment(scratch, header.Length);
+        e->Header = new TransportSegment(block, header.Length);
     }
 
-    /// <summary>The 16-byte header scratch area of <paramref name="slot"/> as a writable span (for encoding a header in place; then set <see cref="SendEntry.Header"/>).</summary>
+    /// <summary>
+    /// Points <see cref="SendEntry.Header"/> at the first <paramref name="length"/> bytes of the slot's header block,
+    /// after the caller encoded the header in place through <see cref="GetHeaderBlock"/>. Owner thread.
+    /// </summary>
+    /// <param name="slot">Slot index.</param>
+    /// <param name="length">Encoded header length, 0 … <see cref="HeaderBlockSize"/>.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="length"/> or <paramref name="slot"/> is out of range.</exception>
+    public void SetHeaderLength(int slot, int length)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(length);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(length, HeaderBlockSize);
+        SendEntry* e = (SendEntry*)Unsafe.AsPointer(ref _entries[slot]);
+        e->HeaderLength = (byte)length;
+        e->Header = new TransportSegment(_headerBlocks.Pointer + ((nint)slot * HeaderBlockSize), length);
+    }
+
+    /// <summary>
+    /// The <see cref="HeaderBlockSize"/>-byte header block of <paramref name="slot"/> as a writable span (for encoding a
+    /// header in place; then call <see cref="SetHeaderLength"/>). The block lives in native memory and never moves.
+    /// </summary>
     /// <param name="slot">Slot index.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="slot"/> is outside the table.</exception>
-    public Span<byte> GetHeaderScratch(int slot) =>
-        new(((SendEntry*)Unsafe.AsPointer(ref _entries[slot]))->HeaderScratch, SendEntry.HeaderScratchSize);
+    public Span<byte> GetHeaderBlock(int slot)
+    {
+        if ((uint)slot >= (uint)_entries.Length)
+            ThrowSlotOutOfRange(slot);
+        return new Span<byte>(_headerBlocks.Pointer + ((nint)slot * HeaderBlockSize), HeaderBlockSize);
+    }
 
     /// <summary>
     /// Pointer to the entry's <see cref="SendEntry.Header"/>, which together with the adjacent
@@ -383,6 +417,7 @@ public sealed unsafe class SendEntryTable : IDisposable
         _disposed = true;
         _freeCount = 0;
         _entries.Dispose();
+        _headerBlocks.Dispose();
         _freeStack.Dispose();
         Leases.Dispose();
         Keys.Dispose();
@@ -393,6 +428,10 @@ public sealed unsafe class SendEntryTable : IDisposable
         BatchHead.Dispose();
         BatchCount.Dispose();
     }
+
+    [DoesNotReturn]
+    private static void ThrowSlotOutOfRange(int slot) =>
+        throw new ArgumentOutOfRangeException(nameof(slot), slot, "Slot is outside the send entry table.");
 
     [DoesNotReturn]
     private static void ThrowWrongState(int slot, SendEntryState actual, SendEntryState expected) =>

@@ -86,10 +86,7 @@ public class XxHash64Tests
         new Random(9).NextBytes(data);
         ulong sink = 0;
         Run(data, ref sink);
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        Run(data, ref sink);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() => Run(data, ref sink));
         Assert.NotEqual(0UL, sink);
 
         static void Run(byte[] data, ref ulong sink)

@@ -181,11 +181,7 @@ public class MpscRingTests
         long[] batch = new long[8];
         RunLoop(ring, batch, 10_000);
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        RunLoop(ring, batch, 100_000);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() => RunLoop(ring, batch, 20_000));
 
         static void RunLoop(MpscRing<long> ring, long[] batch, int iterations)
         {

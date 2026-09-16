@@ -23,12 +23,14 @@ namespace Tedd.Quicly.Testing.Simulation;
 /// <para>
 /// Streams: data is cut into packets of the current maximum datagram payload, reassembled in order at the receiver
 /// and delivered as one segment per packet; a send completes one one-way delay after all of its bytes (and every
-/// byte before them) reached the peer's transport. Flow control is not modelled; receive back-pressure is
-/// <see cref="ReceiveResult.PendingAfter"/>. Consuming at least one byte but fewer than delivered, without <c>Pending</c>,
-/// keeps the remainder and indicates it again at the next advance step, together with any data that arrived meanwhile;
-/// consuming nothing of a non-empty indication counts as <c>PendingAfter(0)</c> (both as the <see cref="ReceiveResult"/>
-/// contract states, and as MsQuicTransport behaves). Aborting a local stream that was never started releases it like
-/// <see cref="ITransport.CloseStream"/>.
+/// byte before them) reached the peer's transport. Flow control is modelled only with
+/// <see cref="LinkOptions.StreamReceiveWindowBytes"/> (per stream: the sender holds back packets beyond the receiver's consumed
+/// offset plus the window, and the receiver raises the limit as its application consumes); otherwise the only receive
+/// back-pressure is <see cref="ReceiveResult.PendingAfter"/>. Consuming at least one byte but fewer than delivered, without
+/// <c>Pending</c>, keeps the remainder and indicates it again at the next advance step, together with any data that arrived
+/// meanwhile; consuming nothing of a non-empty indication counts as <c>PendingAfter(0)</c> (both as the
+/// <see cref="ReceiveResult"/> contract states, and as MsQuicTransport behaves). Aborting a local stream that was never
+/// started releases it like <see cref="ITransport.CloseStream"/>.
 /// <see cref="ITransportSink.OnStreamAborted"/> reports the direction the peer aborted:
 /// <see cref="StreamAbortDirection.Send"/> (reset: our receive side is dead) or <see cref="StreamAbortDirection.Receive"/>
 /// (stop-sending: our pending sends are canceled). Aborts are causal: the peer keeps delivering data it already holds

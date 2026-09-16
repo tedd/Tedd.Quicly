@@ -178,10 +178,7 @@ public class DenseKeyTableTests
     {
         using var table = new DenseKeyTable(4096);
         Run(table, 1_000);
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        Run(table, 100_000);
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        WindowedAllocation.AssertNone(() => Run(table, 20_000));
 
         static int Run(DenseKeyTable table, int iterations)
         {

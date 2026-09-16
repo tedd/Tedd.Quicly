@@ -130,7 +130,7 @@ Body
 Control datagrams are sent with the transport's high-priority datagram flag so they never queue behind
 application datagrams. Pong is sent for at most 4 Pings per second per peer, with a burst allowance of 32
 (`PeerOptions.PongsPerSecond` / `PongBurst`) so that the peer's 10 Hz fast lock over the first 3 s of a session
-(§4.6) is answered in full; excess Pings are ignored and counted. Acks are coalesced: at most one LatestAck/LatestReject datagram per peer per `AckDelay` (default 5 ms) or per Poll,
+(§4.6) is answered in full; excess Pings are ignored and counted. Acks are coalesced: at most one LatestAck/LatestReject transmission per peer per `AckDelay`, which MAY span several datagrams (at most 8) when one datagram cannot carry every pending key (default 5 ms) or per Poll,
 de-duplicated by (channel, key) keeping the highest version. BulkProgress is sent at most every 64 KiB or
 100 ms per transfer, and on completion. Every control datagram type MAY also be carried as a control-stream
 message (§3.4) when a datagram cannot be sent.
@@ -444,7 +444,7 @@ logging.
 | stream idle mid-message | 30 s | stream reset `Timeout` |
 | concurrent reassemblies per channel (`MaxReassemblies`) | 16 | evict oldest; reassembly expiry 2 × RTT + 100 ms; a newer sequence for the same key abandons the older partial |
 | fragmented message size | ≤ 255 × (maxDatagram − header) and ≤ `MaxMessageSize` | drop before any buffer is chosen |
-| control messages per second | 200 | connection close `LimitExceeded` |
+| control messages per second | 2 000 (per peer, configurable; size it from the channel table, because acks scale with keyed `ReliableLatest` traffic and one ack datagram carries about 170 keys) | connection close `LimitExceeded` |
 | decoded (decompressed) bytes per second per peer | 8 MiB/s | further compressed messages dropped + counted |
 | bulk transfers per direction per peer | 2 (+ 1 pending request) | `BulkReject` |
 | receive ring depth per peer | 4 096 entries | see byte budget row; latest/coalescing channels use per-key mailboxes instead of ring entries |

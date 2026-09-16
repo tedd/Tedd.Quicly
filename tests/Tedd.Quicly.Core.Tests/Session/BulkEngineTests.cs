@@ -5,6 +5,7 @@ using Tedd.Quicly.Core.Framing;
 using Tedd.Quicly.Core.Primitives;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Session.Engines;
+using Tedd.Quicly.Core.State;
 using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Testing.Simulation;
 
@@ -316,6 +317,33 @@ public class BulkEngineTests
         Assert.False(engine.CancelReceive(h.Client.Core.ChannelIndexOf(2), 1, QuiclyErrorCode.BulkCanceled));
         Assert.False(engine.CancelReceive(-1, 1, QuiclyErrorCode.BulkCanceled));
 
+        Assert.Equal(PeerState.Connected, h.Client.State);
+    }
+
+    [Fact]
+    public void The_Completion_Handler_Ignores_What_Is_Not_Its_Own()
+    {
+        using SessionHarness h = new(table: BulkTables.Main, client: BulkKit.Quiet, server: BulkKit.Quiet);
+        BulkEngine engine = BulkKit.Engine(h.Client);
+        PeerCore core = h.Client.Core;
+
+        // The early notice carries no verdict for a bulk piece (its block goes back with the final completion), so the
+        // entry is left exactly as it was.
+        Assert.True(core.TryAllocateEntry(5, SendEntryFlags.None, out int slot));
+        engine.OnSendCompleted(slot, new CompletionEntry { Slot = slot, Final = false });
+        Assert.NotEqual(SendEntryState.Free, core.Entries.GetState(slot));
+
+        // A tag whose record is outside the table: the slot is still freed, which is what stops a stray entry leaking.
+        core.Entries[slot].Aux0 = 9999L << 24;
+        engine.OnSendCompleted(slot, new CompletionEntry { Slot = slot, Generation = core.Entries[slot].Generation, Final = true });
+        Assert.Equal(SendEntryState.Free, core.Entries.GetState(slot));
+
+        // A serial no stream of that record ever had: the piece completes and the record itself is not touched.
+        Assert.True(core.TryAllocateEntry(5, SendEntryFlags.None, out int stale));
+        core.Entries[stale].Aux0 = 0xAB_CDEF;
+        engine.OnSendCompleted(stale, new CompletionEntry { Slot = stale, Generation = core.Entries[stale].Generation, Final = true });
+        Assert.Equal(SendEntryState.Free, core.Entries.GetState(stale));
+        Assert.Equal(0, BulkKit.SendTransfers(h.Client, 5));
         Assert.Equal(PeerState.Connected, h.Client.State);
     }
 

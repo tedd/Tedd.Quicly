@@ -297,6 +297,8 @@ public sealed unsafe partial class QuiclyPeer
         {
             _core.Counters.PongSamplesDropped++;
         }
+
+        NoteWork();
     }
 
     private bool RouteControl(ChannelMode mode, ControlType type, ReadOnlySpan<byte> body, bool onStream, long now)
@@ -678,6 +680,8 @@ public sealed unsafe partial class QuiclyPeer
         {
             _core.Counters.PingsIgnored++;
         }
+
+        NoteWork();
     }
 
     private void HandlePeerClose(ReadOnlySpan<byte> body)

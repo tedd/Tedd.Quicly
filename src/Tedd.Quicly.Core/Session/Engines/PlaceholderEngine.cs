@@ -51,6 +51,16 @@ internal sealed class PlaceholderEngine(ChannelMode mode) : ChannelEngine
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Nothing to reset: a placeholder never sends and never accepts a stream. Wave C2's <c>ReliableLatest</c> engine
+    /// re-queues every live key at its current version here or in <see cref="OnEpochReset"/> (PROTOCOL.md §4.1: a resumed
+    /// session gets a free full-state resync), and the Bulk engine re-requests its resumable transfers.
+    /// </remarks>
+    public override void OnReconnecting()
+    {
+    }
+
+    /// <inheritdoc/>
     public override void OnDatagram(in MessageHeader header, ReadOnlySpan<byte> payload, long nowMicros) => _core.CountDatagramDropped(header.Channel);
 
     /// <inheritdoc/>

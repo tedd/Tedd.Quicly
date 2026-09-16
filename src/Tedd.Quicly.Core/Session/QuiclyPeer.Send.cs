@@ -604,6 +604,14 @@ public sealed unsafe partial class QuiclyPeer
                 case SendPayloadKind.Borrowed:
                     request.Borrowed.Span.CopyTo(target);
                     break;
+                case SendPayloadKind.Shared:
+                {
+                    // Copied at the call, like every other foreign-thread path: the caller's reference is untouched, so
+                    // a fan-out never depends on when the game thread gets round to admitting the request.
+                    BufferLease block = request.Shared.Lease;
+                    new ReadOnlySpan<byte>(_core.GetPointer(in block), length).CopyTo(target);
+                    break;
+                }
                 default:
                 {
                     int offset = 0;
@@ -648,6 +656,8 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         Interlocked.Increment(ref _core.Counters.ThreadSafeSends);
+        // The game thread has to admit it: that is work, even though nothing arrived from the network.
+        NoteWork();
         return new SendResult(SendStatus.Admitted, default);
     }
 

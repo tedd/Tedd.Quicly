@@ -94,6 +94,16 @@ internal sealed unsafe class TransportControlPool : IDisposable
         }
     }
 
+    /// <summary>
+    /// Frees every buffer without waiting for a completion (<see cref="QuiclyPeer.Reconnect"/>: the lost transport's
+    /// contexts will never complete). Game thread, while no callback can arrive.
+    /// </summary>
+    public void Reset()
+    {
+        Array.Clear(_busy);
+        InUse = 0;
+    }
+
     /// <summary>Frees the native memory.</summary>
     public void Dispose()
     {

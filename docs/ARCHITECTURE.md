@@ -400,6 +400,7 @@ logs a warning per connection). Session/auth token rules, admission timeouts, re
 | segment arena | peer | 1 024 × 16 B | per-submission gather arrays for stream sends |
 | channel state | peer × channel | 2 × 64 B | send + receive halves |
 | group records | peer × group channel | `(3 × max(MaxGroups, 1) + 4) × 64 B` send + `max(MaxGroups, 1) × 64 B` receive | `ReliableUnordered`: one record per live group (filling, waiting, or holding a stream) and one per accepted peer stream; the engine's notice ring adds `4 × its send records + 8` × 12 B |
+| bulk transfers | peer (both directions) | `BulkTransfersPerDirection` × 128 B send + × 192 B receive | `Bulk`: one record per transfer in each direction (2 + 2 by default = 640 B), plus the engine's rings — stream notices `(4 × transfers + 8) × 24 B`, peer control messages 64 × 48 B, and two `transfers + 8` slot rings of 4 B — about 4 KiB per peer in total. A transfer that **compresses** also rents one `BulkChunkBytes` scratch block (64 KiB, lazily, per peer); the staging of a received compressed chunk comes from the receive budget, not from here |
 | key slots | peer × keyed channel | `MaxKeys` × 64 B (+ mailbox) | dense or hashed |
 
 With the defaults a peer's fixed native tables are therefore about **560 KiB**: 256 KiB receive ring, 32 KiB

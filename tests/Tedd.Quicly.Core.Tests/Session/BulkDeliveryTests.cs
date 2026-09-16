@@ -30,6 +30,10 @@ public class BulkDeliveryTests
         Assert.Equal(BulkStatus.Running, transfer.Status);
         Assert.True(h.RunUntil(() => transfer.IsFinished), "the transfer did not finish");
 
+        // A transport callback that throws is turned into an InternalError close, which would show up here only as a
+        // Disconnected transfer; name the fault instead.
+        Assert.True(h.Server!.LastCallbackFault is null, $"the receiver faulted: {h.Server!.LastCallbackFault}");
+        Assert.True(h.Client.LastCallbackFault is null, $"the sender faulted: {h.Client.LastCallbackFault}");
         Assert.Equal(BulkStatus.Completed, transfer.Status);
         Assert.Equal(payload.Length, transfer.BytesTransferred);
         Assert.Equal(1, transfer.Progress);
@@ -98,6 +102,8 @@ public class BulkDeliveryTests
             $"the object did not finish: {transfers.Count(t => t.IsFinished)}/{transfers.Count} ranges");
 
         Assert.Equal(4, transfers.Count);
+        Assert.True(h.Client.State == PeerState.Connected,
+            $"the session ended early: {h.Client.State} {h.Client.CloseReason.Code} from {h.Client.CloseReason.Source}");
         Assert.All(transfers, t => Assert.Equal(BulkStatus.Completed, t.Status));
 
         // Every byte of every range was verified against the object's pattern as it arrived.
@@ -167,15 +173,17 @@ public class BulkDeliveryTests
             wrong[0] ^= 0xFF;
             BulkDescriptor descriptor = new(5, 1, 1, payload.Length) { Sha256 = wrong };
             BulkTransfer transfer = await h.Client.BeginBulkSendAsync(descriptor, new MemorySource(payload));
-            Assert.True(h.RunUntil(() => bad.Sink<MemorySink>().IsFinished), "the receiver did not finish the transfer");
+            Assert.True(h.RunUntil(() => bad.Sinks.Count > 0 && bad.Sink<MemorySink>().IsFinished), "the receiver did not finish the transfer");
 
             BulkResult result = bad.Sink<MemorySink>().Result!.Value;
             Assert.Equal(BulkHashState.Mismatch, result.Hash);
             Assert.Equal(BulkStatus.Failed, result.Status);
 
-            // Every byte still arrived: the hash is an integrity check over the object, not a framing rule.
+            // Every byte still arrived: the hash is an integrity check over the object, not a framing rule. The sender saw
+            // every byte accepted, so its own transfer completes normally — acting on the mismatch is the receiver's.
             Assert.Equal(payload, bad.Sink<MemorySink>().Bytes);
-            Assert.NotEqual(BulkStatus.Running, transfer.Status);
+            Assert.True(h.RunUntil(() => transfer.IsFinished), "the sender's transfer did not finish");
+            Assert.Equal(BulkStatus.Completed, transfer.Status);
         }
     }
 
@@ -265,10 +273,11 @@ public class BulkDeliveryTests
         Assert.Equal(2, BulkKit.SendTransfers(h.Client, 5));
         Assert.Equal(1, BulkKit.Stats(h.Client, 5).QueueFull);
 
-        h.Run(20_000);
-
-        // Both ends hold the same table, so the receiver accepted exactly the two streams the sender opened.
-        Assert.Equal(2, BulkKit.ReceiveStreams(h.Server!, 5));
+        // Both ends hold the same table, so the receiver accepts exactly the two streams the sender opens.
+        Assert.True(
+            h.RunUntil(() => BulkKit.ReceiveStreams(h.Server!, 5) == 2, 5_000_000),
+            $"the receiver held {BulkKit.ReceiveStreams(h.Server!, 5)} streams while the sender held "
+            + $"{BulkKit.SendStreams(h.Client, 5)} for {BulkKit.SendTransfers(h.Client, 5)} transfers");
         Assert.True(h.RunUntil(() => first.IsFinished && second.IsFinished, 60_000_000), "the transfers did not finish");
         Assert.Equal(BulkStatus.Completed, first.Status);
         Assert.Equal(BulkStatus.Completed, second.Status);

@@ -69,7 +69,9 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     private int[] _maxStreams = [];
     private NativeArray<BulkSendState> _send = null!;
     private NativeArray<BulkSend> _records = null!;
-    private NativeArray<byte> _scratch = null!;
+
+    /// <summary>Raw bytes of the chunk being compressed; rented lazily, because only a compressing transfer needs it.</summary>
+    private NativeArray<byte>? _scratch;
     private IBulkSource?[] _sources = [];
     private BulkTransfer?[] _transfers = [];
     private byte[] _sendHashes = [];
@@ -189,7 +191,6 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         _requests = new PendingRequest[transfers + 1];
         _chunkBytes = Math.Max(MaxPrefixBytes + 1, Math.Min(core.BulkChunkBytes, core.BulkMaxChunk));
         _bodyBytes = _chunkBytes - MaxPrefixBytes;
-        _scratch = new NativeArray<byte>(_bodyBytes);
         _windowBytes = Math.Max(1, core.BulkSendWindowBytes);
         _cwndShare = core.BulkShareOfCongestionWindow;
         _rateShare = core.BulkShareOfEstimatedBandwidth;
@@ -519,7 +520,13 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         }
 
         bool opening = send.Phase == BulkPhase.Waiting;
-        int body = (int)Math.Min(Math.Min(remaining, _bodyBytes), Math.Min(Math.Min(window, allowance), flush.BudgetBytes));
+
+        // The three gates above decide *whether* another piece goes out; the piece itself is sized from the object alone.
+        // Sizing it from them would be wrong for a chunked body, whose wire cost is a fraction of the bytes it carries — a
+        // 64 KiB chunk of compressible data costs a few hundred bytes — so a window in wire bytes would cut the piece to a
+        // few hundred object bytes and turn one transfer into thousands of chunks. Each gate is charged the wire bytes the
+        // piece really cost, and the last piece of a pass may overdraw, as §7.1's budget rule allows.
+        int body = (int)Math.Min(remaining, _bodyBytes);
         if (body <= 0)
         {
             return false;
@@ -682,6 +689,9 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             return read;
         }
 
+        // Only a compressing transfer needs a scratch block (the source writes raw bytes that LZ4 then reads), so a peer
+        // that never compresses a bulk object never holds one.
+        _scratch ??= new NativeArray<byte>(_bodyBytes);
         Span<byte> raw = _scratch.AsSpan(0, body);
         int taken = source.Read(offset, raw);
         if (taken <= 0)
@@ -878,6 +888,8 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         else if (_core.IsTransportClosing)
         {
             FinishSend(local, record, BulkStatus.Disconnected, QuiclyErrorCode.NoError);
+            ReleaseIfDone(record, ref state);
+            return;
         }
         else if (send.Phase == BulkPhase.Refused)
         {
@@ -893,10 +905,13 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
                 ReleaseStreamSlot(ref send, ref state);
             }
         }
-        else if (send.Phase is BulkPhase.Starting or BulkPhase.Open)
-        {
-            FinishSend(local, record, BulkStatus.Failed, QuiclyErrorCode.NoError);
-        }
+
+        // A piece canceled for any other reason means the stream is going away, but not yet *why*: a peer that stopped it
+        // with BulkCanceled ends the transfer Canceled, anything else Failed. The transport reports a canceled send before
+        // the stop that caused it just as often as after, so the verdict is left to the stream's close notice, which the
+        // peer delivers exactly once for every stream (docs/design/session-layer.md §4.3).
+
+        ReleaseIfDone(record, ref state);
 
         ReleaseIfDone(record, ref state);
     }

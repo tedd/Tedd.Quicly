@@ -58,6 +58,10 @@ public class BulkZeroAllocationTests
             {
                 BulkKit.Quiet(o);
                 o.BulkSendWindowBytes = 64 * 1024;
+
+                // A compressible object costs a fraction of its size on the wire, so the window alone would hand the whole
+                // 16 MiB over in a couple of passes; the rate cap is what keeps the object running past every window.
+                o.BulkMaxBytesPerSecond = compress ? 512 * 1024 : 0;
             },
             server: BulkKit.Receiver(router));
 

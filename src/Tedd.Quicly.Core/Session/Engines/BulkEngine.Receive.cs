@@ -61,6 +61,14 @@ internal sealed unsafe partial class BulkEngine
 
     private NativeArray<BulkRecv> _recv = null!;
     private IBulkSink?[] _sinks = [];
+
+    /// <summary>
+    /// The code <see cref="QuiclyPeer.CancelBulk"/> stopped a transfer with, or 0. Written by the game thread and read by
+    /// the transport thread when the stream ends: stopping the peer's sending side with STOP_SENDING comes back as an
+    /// ordinary shutdown (<c>aborted: false</c>), so without this the transfer we cancelled ourselves would end
+    /// <see cref="BulkStatus.Failed"/>.
+    /// </summary>
+    private int[] _recvCancelCode = [];
     private IncrementalHash?[] _hashers = [];
     private byte[] _recvHashes = [];
     private int[] _openStreams = [];
@@ -85,6 +93,7 @@ internal sealed unsafe partial class BulkEngine
         _idealSendBuffer = new long[transfers];
         _recv = new NativeArray<BulkRecv>(transfers);
         _sinks = new IBulkSink?[transfers];
+        _recvCancelCode = new int[transfers];
         _hashers = new IncrementalHash?[transfers];
         _recvHashes = new byte[transfers * StreamFraming.BulkHashLength];
         _openStreams = new int[Math.Max(channelCount, 1)];
@@ -440,9 +449,10 @@ internal sealed unsafe partial class BulkEngine
 
             if ((recv.Flags & RecvAccepted) != 0)
             {
-                QuiclyErrorCode code = (QuiclyErrorCode)errorCode;
-                BulkStatus status = !aborted ? BulkStatus.Failed
-                    : code == QuiclyErrorCode.BulkCanceled ? BulkStatus.Canceled
+                int cancelled = Volatile.Read(ref _recvCancelCode[record]);
+                QuiclyErrorCode code = cancelled != 0 ? (QuiclyErrorCode)cancelled : (QuiclyErrorCode)errorCode;
+                BulkStatus status = _core.IsTransportClosing ? BulkStatus.Disconnected
+                    : cancelled != 0 || (aborted && code == QuiclyErrorCode.BulkCanceled) ? BulkStatus.Canceled
                     : BulkStatus.Failed;
 
                 // A FIN before the last byte is already a parser error, so an unfinished transfer ends Failed either way.
@@ -490,6 +500,7 @@ internal sealed unsafe partial class BulkEngine
     {
         ref BulkRecv recv = ref _recv[record];
         _sinks[record] = null;
+        Volatile.Write(ref _recvCancelCode[record], 0);
         recv = default;
         recv.Lease = BufferLease.Empty;
         recv.Next = _freeRecv;
@@ -537,9 +548,17 @@ internal sealed unsafe partial class BulkEngine
         // A retired transfer's final progress goes first and is never dropped: its record is recycled only once it is out.
         while (true)
         {
-            if (_retiredPending < 0 && !_retired.TryDequeue(out _retiredPending))
+            if (_retiredPending < 0)
             {
-                break;
+                // Never pass the field itself: TryDequeue writes default(int) — a valid record index — when it fails, and
+                // the next pass would then "retire" that live transfer, null its sink and recycle it underneath the
+                // transport thread.
+                if (!_retired.TryDequeue(out int retired))
+                {
+                    break;
+                }
+
+                _retiredPending = retired;
             }
 
             int record = _retiredPending;
@@ -667,6 +686,8 @@ internal sealed unsafe partial class BulkEngine
                 continue;
             }
 
+            // Recorded before the abort: the shutdown it causes is what reads it.
+            Volatile.Write(ref _recvCancelCode[record], (int)(code == QuiclyErrorCode.NoError ? QuiclyErrorCode.BulkCanceled : code));
             TransportStreamId stream = recv.Stream;
             if (stream.IsValid)
             {
@@ -770,6 +791,7 @@ internal sealed unsafe partial class BulkEngine
         }
 
         Array.Clear(_openStreams);
+        Array.Clear(_recvCancelCode);
         Volatile.Write(ref _recvLive, 0);
         Volatile.Write(ref _resetReceive, 0);
         Array.Clear(_idealSendBuffer);
@@ -802,11 +824,13 @@ internal sealed unsafe partial class BulkEngine
     }
 
     /// <summary>
-    /// One transfer the peer is sending to this end. Two cache lines: the first is the transport thread's (it parses and
-    /// writes through to the application), the second the game thread's (it sends the progress frames), so the two never
-    /// share a line (ADR 0008 invariant 4).
+    /// One transfer the peer is sending to this end. The first two cache lines are the transport thread's (it parses and
+    /// writes through to the application); the third is the game thread's (it sends the progress frames), so the two
+    /// owners never share a line (ADR 0008 invariant 4). Every field is laid out at its natural alignment and inside
+    /// <c>Size</c>: an explicit layout that overflows its size, or misaligns an 8-byte field, fails to load the type at
+    /// all — and it would do so inside a transport callback.
     /// </summary>
-    [StructLayout(LayoutKind.Explicit, Size = 128)]
+    [StructLayout(LayoutKind.Explicit, Size = 192)]
     private struct BulkRecv
     {
         /// <summary>The peer's transfer id.</summary>
@@ -833,48 +857,48 @@ internal sealed unsafe partial class BulkEngine
         /// <summary>Wire bytes of it copied so far.</summary>
         [FieldOffset(60)] public int ChunkFilled;
 
-        /// <summary>Decoded size of the chunk being staged, or 0 when it is stored uncompressed.</summary>
-        [FieldOffset(64)] public int ChunkRawLength;
-
-        /// <summary>Engine-local index of the transfer's channel.</summary>
-        [FieldOffset(68)] public int Local;
-
-        /// <summary>Dense channel index (counters).</summary>
-        [FieldOffset(72)] public int ChannelIndex;
-
-        /// <summary>Next free record (-1 = none).</summary>
-        [FieldOffset(76)] public int Next;
-
         /// <summary>Declared size of the whole object.</summary>
-        [FieldOffset(80)] public long TotalLength;
+        [FieldOffset(64)] public long TotalLength;
 
         /// <summary>Object identity.</summary>
-        [FieldOffset(88)] public ulong ObjectId;
+        [FieldOffset(72)] public ulong ObjectId;
 
         /// <summary>Object version.</summary>
-        [FieldOffset(96)] public ulong ObjectVersion;
+        [FieldOffset(80)] public ulong ObjectVersion;
 
-        /// <summary>The channel id.</summary>
-        [FieldOffset(104)] public ushort Channel;
+        /// <summary>Decoded size of the chunk being staged, or 0 when it is stored uncompressed.</summary>
+        [FieldOffset(88)] public int ChunkRawLength;
 
-        /// <summary><see cref="RecvInUse"/>, <see cref="RecvAccepted"/>, <see cref="RecvChunked"/>, <see cref="RecvHasHash"/>, <see cref="RecvHashing"/>, <see cref="RecvStaging"/>, <see cref="RecvFinished"/>.</summary>
-        [FieldOffset(106)] public byte Flags;
+        /// <summary>Engine-local index of the transfer's channel.</summary>
+        [FieldOffset(92)] public int Local;
 
-        /// <summary>The <see cref="BulkStatus"/> the transfer ended with.</summary>
-        [FieldOffset(107)] public byte Status;
+        /// <summary>Dense channel index (counters).</summary>
+        [FieldOffset(96)] public int ChannelIndex;
 
-        /// <summary>The <see cref="BulkHashState"/> the transfer ended with.</summary>
-        [FieldOffset(108)] public byte Hash;
+        /// <summary>Next free record (-1 = none).</summary>
+        [FieldOffset(100)] public int Next;
 
         /// <summary>The error code the transfer ended with.</summary>
-        [FieldOffset(112)] public uint Code;
+        [FieldOffset(104)] public uint Code;
 
-        // ---- game thread from here (second cache line)
+        /// <summary>The channel id.</summary>
+        [FieldOffset(108)] public ushort Channel;
+
+        /// <summary><see cref="RecvInUse"/>, <see cref="RecvAccepted"/>, <see cref="RecvChunked"/>, <see cref="RecvHasHash"/>, <see cref="RecvHashing"/>, <see cref="RecvStaging"/>, <see cref="RecvFinished"/>.</summary>
+        [FieldOffset(110)] public byte Flags;
+
+        /// <summary>The <see cref="BulkStatus"/> the transfer ended with.</summary>
+        [FieldOffset(111)] public byte Status;
+
+        /// <summary>The <see cref="BulkHashState"/> the transfer ended with.</summary>
+        [FieldOffset(112)] public byte Hash;
+
+        // ---- game thread from here (its own cache line)
 
         /// <summary>Bytes the last <c>BulkProgress</c> reported.</summary>
-        [FieldOffset(116)] public long ReportedBytes;
+        [FieldOffset(128)] public long ReportedBytes;
 
         /// <summary>Clock micros of the last <c>BulkProgress</c> (or of the header, so the first window starts then).</summary>
-        [FieldOffset(124)] public long LastReportMicros;
+        [FieldOffset(136)] public long LastReportMicros;
     }
 }

@@ -235,7 +235,6 @@ public class BulkStreamTests
             ("reserved flag bit", BulkKit.RawBulkStream(5, [4, 1, 1, 1024, 0, 1024], 0x80, [])),
             ("range above the channel limit", BulkKit.RawBulkStream(7, [5, 1, 1, 5000, 0, 5000], 0, [])),
             ("hostile total length", BulkKit.RawBulkStream(5, [6, 1, 1, VarInt.MaxValue, 0, VarInt.MaxValue], 0, [])),
-            ("hostile range on a whole object", BulkKit.RawBulkStream(5, [7, 1, 1, VarInt.MaxValue, VarInt.MaxValue - 1, 1], 0, [])),
         ];
 
         long resets = h.Statistics().StreamsReset;
@@ -259,6 +258,37 @@ public class BulkStreamTests
         Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(BulkKit.BulkStream(5, in header, body), out _, fin: true));
         Assert.True(h.RunUntil(() => router.Accepted.Count == 1), "a valid transfer was refused after the hostile ones");
         Assert.Equal(BulkStatus.Completed, router.Sink<MemorySink>().Result!.Value.Status);
+    }
+
+    [Fact]
+    public void A_Huge_Declared_Object_Size_Never_Becomes_An_Allocation()
+    {
+        // A one-byte range at the end of a 2^62-1 byte object is perfectly well formed: TotalLength, Offset and Length are
+        // untrusted (PROTOCOL.md §3.3), so what matters is that the receiver sizes nothing from them. The transfer is
+        // accepted and costs one byte, not four exabytes.
+        CountingSink sink = new();
+        AcceptRouter router = new(_ => sink);
+        using ServerHarness h = new(link: new LinkOptions { DelayMicros = 1_000 }, table: BulkTables.Main, server: BulkKit.Receiver(router));
+        Assert.True(h.Admit(), "the raw client was not admitted");
+
+        BulkHeader header = new()
+        {
+            TransferId = 1,
+            ObjectId = 1,
+            ObjectVersion = 1,
+            TotalLength = VarInt.MaxValue,
+            Offset = VarInt.MaxValue - 1,
+            Length = 1,
+        };
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(BulkKit.BulkStream(5, in header, new byte[1]), out _, fin: true));
+        Assert.True(h.RunUntil(() => sink.Result is not null), "the one-byte range did not complete");
+
+        Assert.Equal(1, sink.BytesWritten);
+        Assert.Equal(BulkStatus.Completed, sink.Result!.Value.Status);
+        Assert.Equal((long)VarInt.MaxValue, router.Accepted[0].TotalLength);
+        Assert.False(router.Accepted[0].IsWholeObject);
+        Assert.Equal(0, h.Statistics().ReceiveBytesOutstanding);
+        Assert.Equal(PeerState.Connected, h.Server!.State);
     }
 
     [Fact]

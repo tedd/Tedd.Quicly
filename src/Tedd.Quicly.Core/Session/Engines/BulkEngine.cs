@@ -155,6 +155,12 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     internal long ProgressOverClaims { get; private set; }
 
     /// <summary>
+    /// The rate the bulk bucket runs at in bytes per second as of the last pass, or 0 when no rate could be derived and the
+    /// gate is off (tests; see <see cref="RefillBudget"/>).
+    /// </summary>
+    internal long RatePerSecond => _rate;
+
+    /// <summary>
     /// Checks the sizes of the explicit-layout bulk structs (game thread, at construction). A <c>Size</c> that cuts off the
     /// last field, or an 8-byte field at a misaligned offset, makes the type fail to load at all — and the first touch would
     /// otherwise be inside a transport callback, where a <see cref="TypeLoadException"/> is hardest to diagnose. The expected

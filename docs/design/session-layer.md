@@ -1261,8 +1261,18 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   authorised request served from a provider, a resumable request asked again after an epoch change, a disconnected object
   resumed byte-exact as a new transfer for the remaining range, hostile and malformed headers creating no state, a huge
   declared object size that never becomes an allocation, a duplicate transfer id, the receive-side `MaxGroups` reset, a
-  chunk this peer could never stage, and the session closing under a running transfer) and `BulkZeroAllocationTests` (the
-  raw and the chunked streaming paths, measured in the middle of one transfer).
+  chunk this peer could never stage, and the session closing under a running transfer), `BulkZeroAllocationTests` (the
+  raw and the chunked streaming paths, measured in the middle of one transfer), `BulkLimitTests` (what bounds a transfer and
+  what happens when a bound bites: a chunked object over a lossy, reordered, jittery link with its whole-object hash
+  verified; a cancellation from each side racing that loss; the pass's send cap holding a pass back and setting the refill
+  deadline; an exhausted send table and an exhausted send budget only *delaying* a transfer; a chunk pended because the
+  receive budget is held by another transfer's half-arrived one, and a chunk whose decode block cannot be rented resetting
+  its stream `LimitExceeded`; the rate rule — an explicit cap taken as it is, a derived estimate floored at 16 KiB/s, and no
+  gate at all without rate information — and a cap really pacing a transfer; a range request the transfer limit answers
+  `BulkReject`; an over-claimed progress frame counted while an early honest one is not; the structs' declared layout; and a
+  tracked send's wait released on `Dispose`) and `ReviewBulkTests` (the wave's review findings: a forged progress claim
+  completing nothing, a sender's cancel leaving the peer's own outbound transfer alone, and a disposed peer finishing the
+  transfer it was sending).
 * **Follow-up, recorded rather than done.** A ring's `out` value is now undefined when `TryDequeue` returns false
   (ADR 0008 invariant 5), which is what removed the one live instance of this class of bug — a failed dequeue writing
   `default(int)`, a perfectly valid record index, into the field that then "retired" a live transfer. The stronger form,

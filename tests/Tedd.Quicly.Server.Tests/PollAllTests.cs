@@ -162,6 +162,38 @@ public class PollAllTests
         Assert.All(received, length => Assert.Equal(1000, length));
     }
 
+    /// <summary>
+    /// The naive measurement loop (<see cref="QuiclyServer.PollEveryPeer"/>) polls every live peer and, unlike
+    /// <see cref="QuiclyServer.PollAll"/>, raises nothing and releases no slot: a peer that closes there is marked, so the next
+    /// PollAll finds it closed and finalizes it without polling it again.
+    /// </summary>
+    [Fact]
+    public async Task PollEveryPeer_Marks_A_Peer_That_Closed_For_The_Next_PollAll()
+    {
+        await using ServerFixture f = new();
+        QuiclyPeer client = f.ConnectAdmitted();
+        QuiclyPeer serverPeer = f.ServerPeerOf(client);
+        int slot = serverPeer.Index;
+        client.Close();
+        for (int i = 0; i < 200 && serverPeer.State != PeerState.Closed; i++)
+        {
+            f.Network.Advance(1_000);
+            f.Server.PollEveryPeer();
+            f.Server.FlushAll();
+            f.PumpClients();
+        }
+
+        Assert.Equal(PeerState.Closed, serverPeer.State);
+        Assert.Empty(f.Closed);
+        Assert.Equal(1, f.Server.PeerCount);
+        Assert.True(IsMarked(f.Server, slot));
+
+        f.Server.PollAll();
+        Assert.Single(f.Closed);
+        Assert.Equal(0, f.Server.PeerCount);
+        Assert.Null(f.Server.GetPeer(slot));
+    }
+
     /// <summary>A peer the application disposed itself is skipped, not polled (no <see cref="ObjectDisposedException"/>), and its slot goes back.</summary>
     [Fact]
     public async Task A_Peer_The_Application_Disposed_Releases_Its_Slot()

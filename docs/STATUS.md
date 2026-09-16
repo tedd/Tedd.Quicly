@@ -14,7 +14,7 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 | Core · State | native arrays, send-entry table, key tables, mailboxes, channel state | in Core | 99.8 % | [state](benchmarks/state.md) |
 | Core · Channels / Framing | channel table + canonical hash, datagram/container/stream framing, incremental stream parser | in Core | 99.9 % | [framing](benchmarks/framing.md) |
 | Core · Control | control-protocol codec, session tokens, auth-failure limiter | in Core | 100 % | control numbers in the module notes |
-| Core · Session | `QuiclyPeer`, handshake and admission, control stream, ping and clock sync, scheduler and packer, unreliable / sequenced / ordered engines, async completion APIs, thread-safe send, Poll/Drain, per-stream idle timeout | in Core | 96.4 % | [session](benchmarks/session.md) |
+| Core · Session | `QuiclyPeer`, handshake and admission, control stream, ping and clock sync, scheduler and packer, unreliable / sequenced / ordered engines, async completion APIs, thread-safe send, Poll/Drain, per-stream idle timeout, host hooks (work signal + `HasPendingWork`, peer-level `SendShared`, split poll/flush deadlines, in-place resume, `PeerOptions.Clone`/`Validate`, `IsDisposed`) | in Core | 96.4 % | [session](benchmarks/session.md) |
 | **Core total** | | **3 154** | | |
 | Http3 | HTTP/3 frames, QPACK (static + Huffman), HTTP datagrams, WebTransport framing and capsules | 504 | 100 % | [http3](benchmarks/http3.md) |
 | Transport.MsQuic | layout-validated MsQuic interop and wrappers; MsQuic-backed `ITransport`, connector, listener with reference-counted certificate hot swap | 722 (4 skipped off-Windows) | 98.4 % bindings, 93.5 % transport | [msquic-transport](benchmarks/msquic-transport.md) |
@@ -29,8 +29,7 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 
 | Module | Content |
 |---|---|
-| Core · Session hooks | host-facing additions the server and client asked for: work signal, peer-level shared send, split poll/flush deadlines, in-place resume with session resumption, options clone and validate, `IsDisposed` |
-| Server / Client (wave C3) | `QuiclyServer` and `QuiclyClient` implemented and reviewed; the fix pass for eight blocking findings (including a kicked-session resume hole) is in verification |
+| Server / Client (wave C3) | `QuiclyServer` and `QuiclyClient` implemented, reviewed and fixed, with the session-layer host hooks adopted: the peers' `PeerOptions.WorkSignal` feeds `PollAll`'s work queue and `HasPendingWork` gates it, `QuiclyPeer.SendShared` owns the fan-out references, `PeerOptions.Clone`/`Validate` derive and check the peer template, the split poll/flush deadlines drive the loop, `IsDisposed` replaces catching disposal, and a client resumes its session on the same peer (`QuiclyPeer.Reconnect`). Session-token replay is the registry's epoch plus a grace-period cache that evicts instead of failing closed. Server 662 tests at 99.6 % lines, client 84 at 100 %, both per TFM; ready to merge |
 
 ## Remaining
 

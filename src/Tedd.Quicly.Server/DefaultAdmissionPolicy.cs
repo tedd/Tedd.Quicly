@@ -298,12 +298,15 @@ public sealed class DefaultAdmissionPolicy : IAdmissionPolicy
         return AdmissionResult.Reject(status);
     }
 
-    /// <summary>The failure behind a token status; the server's own replay cache reports replays, so only the authority's checks are mapped here.</summary>
+    /// <summary>
+    /// The failure behind a token status. Only the authority's own checks appear here: the server never consumes its replay
+    /// cache (<see cref="SessionTokenAuthority.TryInspect"/> alone), so a replay is reported by
+    /// <see cref="SessionReplayCache"/> instead and <see cref="SessionTokenStatus.Replayed"/> cannot arrive.
+    /// </summary>
     private static AdmissionFailureReason ReasonOf(SessionTokenStatus status) => status switch
     {
         SessionTokenStatus.BadSignature => AdmissionFailureReason.SessionTokenBadSignature,
         SessionTokenStatus.Expired => AdmissionFailureReason.SessionTokenExpired,
-        SessionTokenStatus.Replayed => AdmissionFailureReason.SessionTokenReplayed,
         _ => AdmissionFailureReason.SessionTokenMalformed,
     };
 

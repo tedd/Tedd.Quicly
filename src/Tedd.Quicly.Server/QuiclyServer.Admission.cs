@@ -291,11 +291,8 @@ public sealed partial class QuiclyServer
         int slot = peer.Index;
         if (to == PeerState.Connected)
         {
-            if (info.Admitted)
-            {
-                return; // re-raised after an earlier handler threw
-            }
-
+            // A peer raises every transition exactly once — it takes the transition out of its queue before the handlers run,
+            // and a handler that throws is recorded as a callback fault — so Connected cannot arrive twice for one connection.
             if (info.AwaitingDecision)
             {
                 // QuiclyPeer.CompleteAdmission was called on this server peer directly, which bypassed MaxPeers and the session

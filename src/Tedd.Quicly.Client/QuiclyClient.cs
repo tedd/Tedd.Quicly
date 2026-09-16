@@ -25,8 +25,10 @@ namespace Tedd.Quicly.Client;
 /// server refuses the resume and <see cref="ReconnectPolicy.FallBackToNewSession"/> is set (or
 /// <see cref="ReconnectPolicy.ResumeSession"/> is off), the attempt starts a fresh session with a <em>new</em> peer instead
 /// — <see cref="ClientOptions.PeerCreated"/> runs for it and <see cref="ReconnectedInfo.PreviousPeer"/> is the peer it
-/// replaced. While reconnecting, <see cref="State"/> is <see cref="PeerState.Reconnecting"/> and <see cref="Peer"/> is the
-/// peer being resumed (sends answer <see cref="SendStatus.NotConnected"/> until it is connected again).</para>
+/// replaced. The same happens when the <see cref="ITransportConnector"/> itself fails while the peer is being re-armed: that
+/// peer cannot take another in-place resume, so the next attempt presents its session token on a new peer (the session is
+/// still resumed). While reconnecting, <see cref="State"/> is <see cref="PeerState.Reconnecting"/> and <see cref="Peer"/> is
+/// the peer being resumed (sends answer <see cref="SendStatus.NotConnected"/> until it is connected again).</para>
 /// <para><b>Threads.</b> Not thread-safe: one thread at a time (the game thread, or <see cref="ConnectAsync"/>'s continuation
 /// while it runs). Events are raised on that thread. <see cref="Dispose"/> is the exception: it may be called while
 /// <see cref="ConnectAsync"/> waits (from another thread too), which ends that connect with an
@@ -53,8 +55,9 @@ public sealed class QuiclyClient : IDisposable
     private ReadOnlyMemory<byte> _authToken;
     private IClock _clock = MonotonicClock.Instance;
     private QuiclyPeer? _peer;
-    private QuiclyPeer? _attempt;   // a fresh-session attempt's own peer; null while a resume reconnects _peer in place
-    private bool _attemptInPlace;   // the attempt is _peer itself (QuiclyPeer.Reconnect)
+    private QuiclyPeer? _attempt;     // an attempt's own peer; null while a resume reconnects _peer in place
+    private bool _attemptInPlace;     // the attempt is _peer itself (QuiclyPeer.Reconnect)
+    private bool _inPlaceUnusable;    // that peer cannot take another in-place resume (a connector failure left it reset)
     private bool _attemptResumes;
     private ReadOnlyMemory<byte> _resumeToken;
     private uint _resumeEpoch;
@@ -180,6 +183,7 @@ public sealed class QuiclyClient : IDisposable
         _authToken = options.AuthToken.ToArray();
         _closeRequested = false;
         _attemptNumber = 0;
+        _inPlaceUnusable = false;
         _connecting = true;
         SetState(PeerState.Connecting);
         QuiclyPeer peer;
@@ -503,15 +507,28 @@ public sealed class QuiclyClient : IDisposable
     private QuiclyPeer StartAttempt()
     {
         _attemptResumes = !_resumeToken.IsEmpty;
-        if (_attemptResumes)
+        if (_attemptResumes && !_inPlaceUnusable)
         {
             QuiclyPeer peer = _peer!;
-            peer.Reconnect(_connector, _endpoint!, _serverName, _authToken.Span);
+            try
+            {
+                peer.Reconnect(_connector, _endpoint!, _serverName, _authToken.Span);
+            }
+            catch
+            {
+                // The connector failed while the peer was being re-armed, which leaves that peer unable to take another
+                // in-place resume: the attempts that follow present the session token on a new peer instead, so the session
+                // can still be resumed.
+                _inPlaceUnusable = true;
+                throw;
+            }
+
             _attemptInPlace = true;
             return peer;
         }
 
-        _attempt = CreatePeer(default, 0);
+        // A fresh session (no resume token), or a resume the current peer can no longer make in place.
+        _attempt = CreatePeer(_resumeToken, _resumeEpoch);
         return _attempt;
     }
 
@@ -551,6 +568,7 @@ public sealed class QuiclyClient : IDisposable
         _peer = attempt;
         _attempt = null;
         _attemptInPlace = false;
+        _inPlaceUnusable = false; // whichever peer is current now can be resumed in place again
         bool resumed = _attemptResumes && attempt.SessionId == _resumeSessionId;
         int attempts = _attemptNumber;
         _attemptNumber = 0;

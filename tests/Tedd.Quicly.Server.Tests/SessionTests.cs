@@ -382,6 +382,47 @@ public class SessionTests
         Assert.Equal(2u, second.Epoch);
     }
 
+    /// <summary>
+    /// The token is verified once more when the resume commits, so a token that expired while its auth validation was pending
+    /// is refused then — and the capacity that admission had reserved goes back to the server.
+    /// </summary>
+    [Fact]
+    public async Task Pending_Resume_Whose_Token_Expired_Meanwhile_Is_Refused_And_Gives_Its_Reservation_Back()
+    {
+        QuiclyPeer? pending = null;
+        await using ServerFixture f = new(o =>
+        {
+            o.MaxPeers = 2;
+            o.Sessions.Grace = TimeSpan.FromMilliseconds(100);
+            o.Sessions.TokenLifetime = TimeSpan.FromMilliseconds(200);
+            o.Admission.AuthTokenValidator = (in AuthTokenContext c) =>
+            {
+                if (!c.IsResume)
+                {
+                    return AuthTokenDecision.Accept;
+                }
+
+                pending = c.Peer;
+                return AuthTokenDecision.Pending;
+            };
+        });
+        QuiclyPeer first = f.ConnectAdmitted();
+        QuiclyPeer resuming = f.Resume(first);
+        Assert.True(f.RunUntil(() => pending is not null));
+
+        f.Run(300_000, step: 10_000); // the token's maximum age passes while the decision is pending
+        f.Server.CompleteAdmission(pending!, accepted: true);
+
+        Assert.True(f.RunUntil(() => resuming.State == PeerState.Closed));
+        Assert.Equal(HelloStatus.Rejected, resuming.HandshakeStatus);
+        Assert.Single(f.FailuresOf(AdmissionFailureReason.SessionTokenExpired));
+        Assert.Equal(PeerState.Connected, first.State); // the session kept its live connection
+
+        // The reservation the refused resume held was released: a second session still fits under MaxPeers.
+        f.ConnectAdmitted();
+        Assert.Equal(2, f.Server.AdmittedCount);
+    }
+
     [Fact]
     public async Task Pending_Resume_Whose_Session_Ended_Meanwhile_Is_Rejected()
     {

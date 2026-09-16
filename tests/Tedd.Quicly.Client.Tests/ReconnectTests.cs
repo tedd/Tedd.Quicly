@@ -248,20 +248,79 @@ public class ReconnectTests
         Assert.Equal(2, connector.Connects);
     }
 
+    /// <summary>
+    /// A connector that throws counts as a failed attempt, and it also leaves that peer unable to take another in-place
+    /// resume (the peer was already re-armed when the connector failed): the next attempt presents the same session token on a
+    /// new peer, so the session is still resumed.
+    /// </summary>
+    /// <summary>
+    /// <see cref="QuiclyClient.Close"/> also abandons an attempt that runs on its own peer (a fresh session), not just one
+    /// that resumes the current peer in place.
+    /// </summary>
     [Fact]
-    public async Task A_Connector_That_Throws_Counts_As_A_Failed_Attempt()
+    public async Task Close_Abandons_A_Fresh_Session_Attempt()
+    {
+        await using ClientFixture f = new();
+        SimulatedConnector slow = new(f.Network, new LinkOptions { DelayMicros = 500_000 });
+        ScriptedConnector connector = new ScriptedConnector(slow, f.Clock).Then(f.Connector);
+        QuiclyClient client = f.CreateClient(connector);
+        ReconnectPolicy policy = Policy(attempts: 10);
+        policy.ResumeSession = false; // every attempt starts a fresh session, so it gets a peer of its own
+        List<CloseReason> disconnected = [];
+        client.Disconnected += (_, reason) => disconnected.Add(reason);
+        QuiclyPeer peer = await client.ConnectAsync(f.EndPoint, f.Options(reconnect: policy), TestContext.Current.CancellationToken);
+
+        f.ServerPeerOf(peer).Close(new CloseReason(QuiclyErrorCode.Timeout));
+        Assert.True(f.RunUntil(client, () => connector.Connects == 2)); // the attempt's own peer is handshaking over the slow link
+        client.Close(new CloseReason(QuiclyErrorCode.NoError, "quit"));
+
+        Assert.Equal(PeerState.Closed, client.State);
+        Assert.Equal("quit", Assert.Single(disconnected).Reason);
+        Assert.Same(peer, client.Peer); // the abandoned attempt's peer was disposed, the application's peer was not
+        Assert.False(peer.IsDisposed);
+        f.Run(client, 2_000_000, step: 10_000);
+        Assert.Equal(2, connector.Connects);
+    }
+
+    /// <summary>
+    /// A connector that throws counts as a failed attempt, and it also leaves that peer unable to take another in-place
+    /// resume (the peer was already re-armed when the connector failed): the next attempt presents the same session token on a
+    /// new peer, so the session is still resumed.
+    /// </summary>
+    [Fact]
+    public async Task A_Connector_That_Throws_Counts_As_A_Failed_Attempt_And_The_Next_One_Uses_A_New_Peer()
     {
         await using ClientFixture f = new();
         ScriptedConnector connector = new ScriptedConnector(f.Connector, f.Clock).Then(f.Cutting(100_000));
         QuiclyClient client = f.CreateClient(connector);
         List<ReconnectingInfo> reconnecting = [];
+        List<ReconnectedInfo> reconnected = [];
+        List<QuiclyPeer> created = [];
+        List<string> log = [];
         client.Reconnecting += (_, info) => reconnecting.Add(info);
-        await client.ConnectAsync(f.EndPoint, f.Options(reconnect: Policy()), TestContext.Current.CancellationToken);
+        client.Reconnected += (_, info) => reconnected.Add(info);
+        client.StateChanged += (_, from, to) => log.Add(from + "->" + to);
+        client.Disconnected += (_, reason) => log.Add("disconnected " + reason.Code);
+        ClientOptions options = f.Options(reconnect: Policy());
+        options.PeerCreated = created.Add;
+        QuiclyPeer first = await client.ConnectAsync(f.EndPoint, options, TestContext.Current.CancellationToken);
         connector.ThrowNext = new SocketException((int)SocketError.HostNotFound);
-        Assert.True(f.RunUntil(client, () => reconnecting.Count == 2, maxMicros: 5_000_000),
-            $"state={client.State}, connects={connector.Connects}, scheduled={reconnecting.Count}, attempt={client.ReconnectAttempt}, peer={client.Peer?.State}, reason={client.Peer?.CloseReason.Code}");
+        if (!f.RunUntil(client, () => reconnecting.Count == 2, maxMicros: 5_000_000))
+        {
+            Assert.Fail($"state={client.State}, connects={connector.Connects}, scheduled={reconnecting.Count}, attempt={client.ReconnectAttempt}, "
+                + $"peer={client.Peer?.State}, reason={client.Peer?.CloseReason.Code}, log={string.Join(" | ", log)}");
+        }
         Assert.Equal(QuiclyErrorCode.InternalError, reconnecting[1].LastReason.Code);
         Assert.True(f.RunUntil(client, () => client.State == PeerState.Connected, maxMicros: 5_000_000));
+
+        ReconnectedInfo info = Assert.Single(reconnected);
+        Assert.True(info.Resumed);
+        Assert.Equal(first.SessionId, info.Peer.SessionId);
+        Assert.Equal(2u, info.Peer.Epoch);
+        Assert.NotSame(first, info.Peer); // the peer the connector failed on could not be resumed in place again
+        Assert.Same(first, info.PreviousPeer);
+        Assert.Equal(2, created.Count);
+        Assert.True(first.IsDisposed);
     }
 
     [Fact]

@@ -228,6 +228,35 @@ public class SendSharedTests
         Assert.True(f.Server.SharedLeases.Release(in lease));
     }
 
+    /// <summary>Every payload in flight is tracked on its own, so many at once grow the tracking table past its initial size.</summary>
+    [Fact]
+    public async Task Many_Payloads_In_Flight_Are_Tracked_Side_By_Side()
+    {
+        await using ServerFixture f = new();
+        QuiclyPeer peer = f.ServerPeerOf(f.ConnectAdmitted());
+        f.Clients[0].RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => { });
+        PeerSet set = f.Server.CreateSet();
+        set.Add(peer);
+        SharedLease[] leases = new SharedLease[20];
+        for (int i = 0; i < leases.Length; i++)
+        {
+            leases[i] = Share(f.Server, 64, out _);
+            Assert.Equal(1, f.Server.SendShared(set, new SendHeader(2), leases[i], 64).AdmittedCount);
+        }
+
+        f.Server.GetStatistics(out ServerStatistics sent);
+        Assert.Equal(20, sent.SharedSendsOutstanding);
+        Assert.Equal(20, sent.SharedSendsAdmitted);
+
+        Assert.True(f.RunUntil(() => Array.TrueForAll(leases, lease => f.Server.SharedLeases.GetReferenceCount(in lease) == 1)));
+        f.Server.GetStatistics(out ServerStatistics done);
+        Assert.Equal(0, done.SharedSendsOutstanding);
+        foreach (SharedLease lease in leases)
+        {
+            Assert.True(f.Server.SharedLeases.Release(in lease));
+        }
+    }
+
     [Fact]
     public async Task Steady_State_Does_Not_Allocate()
     {

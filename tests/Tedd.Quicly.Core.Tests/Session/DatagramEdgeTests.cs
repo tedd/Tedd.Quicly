@@ -66,7 +66,7 @@ public class DatagramEdgeTests
     }
 
     [Fact]
-    public void Fragments_Are_Dropped_And_Counted_Until_Fragmentation_Arrives()
+    public void A_Lone_Fragment_Waits_For_Its_Message_Instead_Of_Being_Delivered()
     {
         using ServerHarness h = new(table: Table, server: DatagramKit.Quiet);
         Assert.True(h.Admit());
@@ -81,9 +81,14 @@ public class DatagramEdgeTests
         h.Raw.SendDatagram(frame.AsSpan(0, written + 10));
         h.Raw.SendDatagram(DatagramKit.Frame(Table, 13, 2, 0, [9]));
         h.Run(10_000);
+
+        // Since wave C2d the fragment starts a partial message instead of being dropped (docs/design/session-layer.md §7.8);
+        // only the whole message that follows it is delivered.
         Assert.Single(got);
         Assert.Equal(9, got[0].Payload[0]);
-        Assert.Equal(1, DatagramKit.ChannelStats(h.Server, 13).Dropped);
+        Assert.Equal(0, DatagramKit.ChannelStats(h.Server, 13).Dropped);
+        Assert.Equal(1, FragmentKit.Reassemblies(h.Server, 13));
+        Assert.Equal(1, DatagramKit.Statistics(h.Server).FragmentsReceived);
     }
 
     [Fact]

@@ -181,10 +181,11 @@ public class OrderedDeliveryTests
     }
 
     [Fact]
-    public void Request_And_Response_Ids_Reach_The_Handler_On_A_RequestResponse_Channel()
+    public void Request_Ids_Reach_The_Handler_And_A_Response_Nothing_Awaits_Is_Dropped()
     {
         // The receive side of PROTOCOL.md §3.1 RequestId: 0 = plain, odd = request, even ≥ 2 = response to RequestId − 1.
-        // The send side is a wave C2 hook (SendRequestAsync / Respond), so the frames are written by hand here.
+        // The frames are written by hand, so the response belongs to no request of this end: since wave C2d a response is
+        // offered to the channel's engine instead of the handler, and one nothing awaits is dropped and counted (§7.8).
         using ServerHarness h = new(table: OrderedTables.Main);
         Assert.True(h.Admit(), "The raw client was not admitted.");
         ChannelDefinition rpc = h.Table[10]!;
@@ -197,21 +198,19 @@ public class OrderedDeliveryTests
         written += WriteMessage(frames.AsSpan(written), rpc, 2, 0xB2);
         written += WriteMessage(frames.AsSpan(written), rpc, 0, 0xC3);
         Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(frames.AsSpan(0, written), out TransportStreamId _));
-        Assert.True(h.RunUntil(() => got.Count == 3), $"{got.Count} of 3 frames were delivered.");
+        Assert.True(h.RunUntil(() => got.Count == 2), $"{got.Count} of 2 frames were delivered.");
 
         Assert.Equal(1u, got[0].Header.RequestId);
         Assert.True(got[0].Header.Flags.HasFlag(ReceiveFlags.IsRequest));
         Assert.False(got[0].Header.Flags.HasFlag(ReceiveFlags.IsResponse));
         Assert.Equal(new byte[] { 0xA1 }, got[0].Payload);
 
-        Assert.Equal(2u, got[1].Header.RequestId);
-        Assert.True(got[1].Header.Flags.HasFlag(ReceiveFlags.IsResponse));
-        Assert.False(got[1].Header.Flags.HasFlag(ReceiveFlags.IsRequest));
-        Assert.Equal(new byte[] { 0xB2 }, got[1].Payload);
+        // The response (RequestId 2) never reaches the handler; it is counted and its lease returned.
+        Assert.Equal(1, h.Statistics().ResponsesUnmatched);
 
-        Assert.Equal(0u, got[2].Header.RequestId);
-        Assert.Equal(ReceiveFlags.None, got[2].Header.Flags);
-        Assert.Equal(new byte[] { 0xC3 }, got[2].Payload);
+        Assert.Equal(0u, got[1].Header.RequestId);
+        Assert.Equal(ReceiveFlags.None, got[1].Header.Flags);
+        Assert.Equal(new byte[] { 0xC3 }, got[1].Payload);
 
         static int WriteMessage(Span<byte> destination, ChannelDefinition channel, uint requestId, byte payload)
         {

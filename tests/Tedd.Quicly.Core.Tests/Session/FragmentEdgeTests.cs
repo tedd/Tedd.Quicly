@@ -202,8 +202,17 @@ public unsafe class FragmentEdgeTests
     [Fact]
     public void Every_Send_Path_Can_Fragment()
     {
-        using SessionHarness h = new(table: Table, client: DatagramKit.Quiet, server: DatagramKit.Quiet);
+        // A shared block is resolved through the peer's own allocator (ARCHITECTURE.md §4.1), so the host's pool is the
+        // peer's pool: that is what `SendShared` means for a server that serialises once and sends to many peers.
         using SharedPool pool = new();
+        using SessionHarness h = new(
+            table: Table,
+            client: o =>
+            {
+                DatagramKit.Quiet(o);
+                o.Allocator = pool.Allocator;
+            },
+            server: DatagramKit.Quiet);
         QuiclyPeer client = h.Client;
         List<(ReceiveHeader Header, byte[] Payload)> got = [];
         h.Server!.RegisterHandler(2, Handlers.Collect(got));
@@ -235,21 +244,22 @@ public unsafe class FragmentEdgeTests
         Assert.Equal(SendStatus.Admitted, client.SendBorrowed(new SendHeader(2), borrowed).Status);
         Assert.Equal(SendStatus.Admitted, client.SendOwned(new SendHeader(2), owned, Length).Status);
         Assert.Equal(SendStatus.Admitted, client.SendGather(new SendHeader(2), [left, right]).Status);
-        Assert.Equal(2, pool.Count(in shared));
+        Assert.Equal(1, pool.Count(in shared));
         Assert.Equal(SendStatus.Admitted, client.SendShared(new SendHeader(2), pool.Table, in shared, Length).Status);
-        Assert.Equal(3, pool.Count(in shared));
+        Assert.Equal(2, pool.Count(in shared));
 
         Assert.True(h.RunUntil(() => got.Count == 6), $"{got.Count} of 6 messages arrived");
         Assert.Equal(copy, got[0].Payload);
         Assert.Equal(pinned, got[1].Payload);
         Assert.Equal(borrowed, got[2].Payload);
         Assert.Equal(DatagramKit.Payload(4, Length), got[3].Payload);
-        Assert.Equal(gathered.AsSpan(0, left.Length + right.Length).ToArray(), got[4].Payload.AsSpan(0, left.Length + right.Length).ToArray());
+        // A gather sends each page's whole block, so the message is as long as the two leases and starts with the pattern.
+        Assert.Equal(left.Length + right.Length, got[4].Payload.Length);
+        Assert.Equal(gathered, got[4].Payload.AsSpan(0, gathered.Length).ToArray());
         Assert.Equal(expectedShared, got[5].Payload);
         // The shared block's reference is taken once by the message and given back exactly once (session-layer.md §4.1).
-        Assert.Equal(2, pool.Count(in shared));
-        pool.Table.Release(in shared);
         Assert.Equal(1, pool.Count(in shared));
+        pool.Table.Release(in shared);
         Assert.Equal(6, DatagramKit.Statistics(client).FragmentedMessagesSent);
     }
 

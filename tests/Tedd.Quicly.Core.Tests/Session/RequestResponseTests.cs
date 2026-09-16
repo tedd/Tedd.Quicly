@@ -165,7 +165,10 @@ public class RequestResponseTests
         ValueTask<ReceiveLease> polled = client.SendRequestAsync(new SendHeader(10), new byte[] { 1 }, TimeSpan.FromMilliseconds(50));
         long deadline = OrderedKit.Engine(client).RequestDeadlineMicros;
         Assert.True(deadline > h.Clock.NowMicros, "the deadline is in the future");
+        // The peer publishes deadlines from its timer pass, so the request's shows up at the next Poll or Flush.
+        client.Flush();
         Assert.Equal(deadline, client.NextPollDeadlineMicros);
+        Assert.True(client.NextPollDeadlineMicros > h.Clock.NowMicros, "a deadline at or before now would make a sleeping host spin");
 
         h.Network.Advance(60_000);
         client.Poll();

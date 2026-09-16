@@ -506,17 +506,14 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
     private void ReleaseIfDone(int group, ref GroupSendState send)
     {
         ref GroupState state = ref _groups[group];
-        if ((state.Flags & GroupFreed) != 0)
-        {
-            return;
-        }
 
-        if (state.Phase == GroupPhase.Filling || state.Count > 0 || state.CarriersOutstanding > 0)
-        {
-            return;
-        }
-
-        if (state.Phase is GroupPhase.Starting or GroupPhase.Refused)
+        // Either not finished (still filling, still holding messages, a carrier outstanding, a start unconfirmed) or finished
+        // and already returned: a record on the free list is left alone, so the second close notice of one stream — the shutdown
+        // that always follows a stop — can never release it twice.
+        if ((state.Flags & GroupFreed) != 0
+            || state.Phase is GroupPhase.Filling or GroupPhase.Starting or GroupPhase.Refused
+            || state.Count > 0
+            || state.CarriersOutstanding > 0)
         {
             return;
         }
@@ -763,25 +760,27 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         {
         }
 
+        // Every group record goes back, whatever state it was in (the messages of the lost connection completed Disconnected
+        // before this call), and every serial is bumped so a notice of a lost stream is ignored if one still arrives. The free
+        // list is rebuilt outright, exactly as the receive records are below: that cannot leave a record off it, and it does not
+        // depend on the channel lists having been emptied by OnPeerClosed first.
+        _freeGroup = -1;
+        for (int record = _groups.Length - 1; record >= 0; record--)
+        {
+            ref GroupState state = ref _groups[record];
+            uint serial = (state.Serial + 1) & PeerCore.EngineStreamSerialMask;
+            state = default;
+            state.Serial = serial;
+            state.Phase = GroupPhase.Closed;
+            state.Flags = GroupFreed;
+            state.Prev = -1;
+            state.Next = _freeGroup;
+            _freeGroup = record;
+        }
+
         for (int local = 0; local < _channels.Length; local++)
         {
             ref GroupSendState send = ref _send[local];
-            int group = send.ListHead;
-            while (group >= 0)
-            {
-                ref GroupState state = ref _groups[group];
-                int next = state.Next;
-                uint serial = (state.Serial + 1) & PeerCore.EngineStreamSerialMask;
-                state = default;
-                state.Serial = serial;
-                state.Phase = GroupPhase.Closed;
-                state.Flags = GroupFreed;
-                state.Prev = -1;
-                state.Next = _freeGroup;
-                _freeGroup = group;
-                group = next;
-            }
-
             send.ListHead = -1;
             send.ListTail = -1;
             send.FillingGroup = -1;

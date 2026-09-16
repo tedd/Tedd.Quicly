@@ -1,5 +1,6 @@
 using BenchmarkDotNet.Attributes;
 using Tedd.Quicly.Core.Channels;
+using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Time;
 using Tedd.Quicly.Core.Transport;
@@ -41,10 +42,33 @@ public class LatestBench
             Latest1000Keys();
             Latest64Keys();
         }
+
+        Check();
     }
 
     [GlobalCleanup]
-    public void Cleanup() => _fixture.Dispose();
+    public void Cleanup()
+    {
+        Check();
+        _fixture.Dispose();
+    }
+
+    /// <summary>
+    /// A closed session would make every cycle trivially cheap, so the measurement is only valid while both peers are
+    /// connected and no value had to be retransmitted.
+    /// </summary>
+    private void Check()
+    {
+        if (_client.State != PeerState.Connected || _server.State != PeerState.Connected)
+        {
+            throw new InvalidOperationException($"The benchmark session closed ({_client.State}/{_server.State}, {_client.CloseReason}).");
+        }
+
+        if (_client.GetChannelStatistics(2, out ChannelStatistics statistics) && statistics.Retries > 0)
+        {
+            throw new InvalidOperationException($"{statistics.Retries} retransmissions: the cycle is not a steady state.");
+        }
+    }
 
     [Benchmark(OperationsPerInvoke = ManyKeys)]
     public void Latest1000Keys() => Cycle(ManyKeys);
@@ -59,11 +83,11 @@ public class LatestBench
             _client.SendCopy(new SendHeader(2, key), _value);
         }
 
+        // One 60 Hz tick of virtual time per cycle, so the peer's acks arrive within the next cycle and no retry timer fires.
         _client.Flush(++_tick);
-        _network.Advance(1);
+        _network.Advance(16_667);
         _server.Poll();
         _server.Flush();
-        _network.Advance(1);
         _client.Poll();
     }
 
@@ -83,6 +107,11 @@ public class LatestBench
             Listener = new SimulatedListener(Network);
             PeerOptions serverOptions = SessionFixture.Options(Clock, compact: false);
             PeerOptions clientOptions = SessionFixture.Options(Clock, compact: false);
+
+            // One coalesced LatestAck datagram carries about 170 keys, so 1 000 keys at 60 Hz need roughly 360 control
+            // messages per second — above the 200/s default of PROTOCOL.md §7 (a per-peer limit, so hosts raise it).
+            serverOptions.ControlMessagesPerSecond = 8000;
+            clientOptions.ControlMessagesPerSecond = 8000;
             QuiclyPeer? accepted = null;
             Listener.Start(static (in NewConnectionInfo _) => PreHandshakeDecision.Accept, (ITransport transport, in NewConnectionInfo info) =>
             {

@@ -46,7 +46,7 @@ internal sealed unsafe partial class ReliableLatestEngine
         _mailboxes = new ReceiveMailbox[count];
         _activeGroups = new int[count];
         _ackSweep = new int[count];
-        long ackSlots = 64;
+        long ackSlots = 16;
         int streams = 0;
         for (int local = 0; local < count; local++)
         {
@@ -66,7 +66,9 @@ internal sealed unsafe partial class ReliableLatestEngine
         }
 
         _streamFreeCount = _streamCapacity;
-        _ackQueue = new SpscRing<AckRequest>((int)Math.Min(ackSlots, 8192));
+        // One entry per key with an ack outstanding, bounded: beyond this many keys the per-channel sweep finds the rest, so
+        // the ring stays small (1 024 × 8 B) whatever MaxKeys is.
+        _ackQueue = new SpscRing<AckRequest>((int)Math.Min(ackSlots, MaxAckRingSlots));
         _rejectQueue = new SpscRing<RejectRequest>(256);
         _notices = new SpscRing<LatestNotice>(1024);
         _heldAck.Local = -1;
@@ -683,19 +685,70 @@ internal sealed unsafe partial class ReliableLatestEngine
             return;
         }
 
-        if (carrier == ControlCarrier.Datagram && _core.SendControlFrame(buffer.Slice(0, length), ControlCarrier.Datagram))
+        if (carrier == ControlCarrier.Stream)
         {
-            return;
-        }
-
-        if (carrier == ControlCarrier.Datagram)
-        {
-            // No datagram could carry it: the control stream is the fallback (PROTOCOL.md §2.3).
             _core.SendControlFrame(buffer.Slice(0, length), ControlCarrier.Stream);
             return;
         }
 
-        _core.SendControlFrame(buffer.Slice(0, length), ControlCarrier.Stream);
+        if (!_core.SendControlFrame(buffer.Slice(0, length), ControlCarrier.Datagram))
+        {
+            // No datagram could carry it, so the batch is re-encoded for the control stream (PROTOCOL.md §2.3): the two
+            // carriers frame a control message differently, so the datagram's bytes cannot simply be written to the stream.
+            ResendOnStream(buffer.Slice(0, length));
+        }
+    }
+
+    private void ResendOnStream(ReadOnlySpan<byte> frame)
+    {
+        if (ControlCodec.TryReadDatagram(frame, out ControlType type, out ReadOnlySpan<byte> body, out _) != ControlParseStatus.Ok)
+        {
+            return;
+        }
+
+        Span<byte> stream = stackalloc byte[AckFrameBytes + 8];
+        int written;
+        if (type == ControlType.LatestAck)
+        {
+            if (ControlCodec.TryParse(body, out LatestAckBatchReader acks) != ControlParseStatus.Ok)
+            {
+                return;
+            }
+
+            LatestAckBatchWriter writer = new(stream, ControlCarrier.Stream);
+            foreach (LatestAckEntry entry in acks)
+            {
+                if (!writer.TryAdd(in entry))
+                {
+                    break;
+                }
+            }
+
+            written = writer.Finish();
+        }
+        else
+        {
+            if (ControlCodec.TryParse(body, out LatestRejectBatchReader rejects) != ControlParseStatus.Ok)
+            {
+                return;
+            }
+
+            LatestRejectBatchWriter writer = new(stream, ControlCarrier.Stream);
+            foreach (LatestRejectEntry entry in rejects)
+            {
+                if (!writer.TryAdd(in entry))
+                {
+                    break;
+                }
+            }
+
+            written = writer.Finish();
+        }
+
+        if (written > 0)
+        {
+            _core.SendControlFrame(stream.Slice(0, written), ControlCarrier.Stream);
+        }
     }
 
     /// <summary>Takes the next key whose ack is due: the held one, then the ring, then a sweep after a ring overflow.</summary>

@@ -26,6 +26,7 @@ internal static class LatestTables
         .Add(7, "urgent", ChannelMode.ReliableLatest, o => o.Priority = 250)
         .Add(8, "one-group", ChannelMode.ReliableLatest, o => o.MaxGroups = 1)
         .Add(9, "chat", ChannelMode.ReliableOrdered)
+        .Add(10, "limited", ChannelMode.ReliableLatest, o => o.QueueLimitBytes = 200)
         .Build();
 
     /// <summary>One latest channel whose values are tiny; used where a test wants the whole link to itself.</summary>
@@ -46,12 +47,18 @@ internal static class LatestKit
         options.HeartbeatTimeout = TimeSpan.Zero;
     }
 
-    /// <summary>Budgets and a pool with room for many large values in flight.</summary>
+    /// <summary>
+    /// Budgets and a pool with room for many large values in flight, and a control-message allowance that matches the ack
+    /// traffic of a many-key channel: one coalesced LatestAck datagram carries about 170 keys, so 1 000 keys at 60 Hz need
+    /// roughly 360 control messages per second in each direction — well above the 200/s default of PROTOCOL.md §7, which the
+    /// receiving peer would otherwise answer with <c>LimitExceeded</c> (every §7 limit is configurable per peer).
+    /// </summary>
     public static void Roomy(PeerOptions options)
     {
         options.SendBudgetBytes = 4 * 1024 * 1024;
         options.ReceiveBudgetBytes = 4 * 1024 * 1024;
         options.SendTableCapacity = 4096;
+        options.ControlMessagesPerSecond = 8000;
         options.AllocatorOptions = new SlabAllocatorOptions
         {
             FreeListShards = 2,

@@ -65,6 +65,13 @@ public class LatestZeroAllocationTests
         });
         Assert.True(received > delivered + (5 * 60 * 900), $"{received - delivered} values in the measured windows");
         Assert.Equal(PeerState.Connected, client.State);
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 4).Retries);
+
+        // At 60 Hz the application replaces most keys before their ack arrives, so the values complete Superseded rather
+        // than Delivered (PROTOCOL.md §4.3) — every one of them still reached the peer. Once the traffic stops, the last
+        // acks arrive and no key is live any more.
+        Assert.True(DatagramKit.ChannelStats(client, 4).SendSuperseded > 0);
+        h.Run(200_000);
         Assert.Equal(0, LatestKit.LiveKeys(client, 4));
     }
 

@@ -67,6 +67,9 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     private const int AckFrameBytes = 1200;
     private const int InitialKeySlots = 64;
 
+    /// <summary>Keys the ack hand-off ring holds; beyond that the per-channel sweep finds the versions still waiting.</summary>
+    private const int MaxAckRingSlots = 1024;
+
     // Aux1 of a value entry: the marker, its key slot, its outstanding transmissions, its flags and a pending status.
     private const long ValueMarker = 1L << 48;
     private const int OutstandingShift = 32;
@@ -108,11 +111,8 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         /// <summary>A terminal status is known and waits for the last transmission to complete.</summary>
         Finish = 8,
 
-        /// <summary>The value travels on a group stream (it does not fit one datagram).</summary>
-        Large = 16,
-
         /// <summary>The value was handed to the transport at least once (it counts as in flight).</summary>
-        Transmitted = 32,
+        Transmitted = 16,
     }
 
     /// <inheritdoc/>
@@ -609,8 +609,15 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
                 {
                     if (!TryFailExpiredVersion(local, keys, keySlot, ref key, value, nowMicros))
                     {
-                        key.Flags &= ~KeySendFlags.RetryArmed;
+                        // The value goes back into the retry queue and its timer is re-armed rather than cleared: a retry the
+                        // per-peer byte budget holds back must stay visible here, or its 30-second version budget would never
+                        // be checked again (PROTOCOL.md §4.4).
                         EnqueueRetry(local, ref send, value);
+                        ArmRetry(local, ref send, ref key, nowMicros);
+                        if (key.RetryDeadline < earliest)
+                        {
+                            earliest = key.RetryDeadline;
+                        }
                     }
                 }
                 else if (value >= 0 && (key.Flags & KeySendFlags.RetryArmed) != 0 && key.RetryDeadline < earliest)
@@ -677,14 +684,8 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
                 return;
             }
 
+            // A finished value is unlinked where it is finished (MarkValueFinished), so a queue only holds live values.
             ref SendEntry entry = ref entries[value];
-            if ((FlagsOf(entry.Aux1) & ValueFlags.Finish) != 0)
-            {
-                // Defensive: a finished value is unlinked where it is finished, so this cannot normally happen.
-                Dequeue(ref send, retries, value);
-                continue;
-            }
-
             if (flush.BudgetBytes <= 0)
             {
                 flush.BudgetExhausted = true;
@@ -740,7 +741,9 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
         ChannelDefinition channel = _channels[local];
         long size = entries[value].HeaderLength + entries[value].Payload.Length;
-        bool large = (FlagsOf(entries[value].Aux1) & ValueFlags.Large) != 0 || !_core.DatagramsEnabled || size > _core.MaxDatagramPayload;
+        // The pass's own snapshot of the datagram limit — the one the packer was started with (§7.1) — decides datagram or
+        // group stream, so the packer can never answer TooLarge for a value this pass already measured.
+        bool large = !flush.DatagramsEnabled || size > flush.MaxDatagramPayload;
         if (!_core.TryAllocateEntry(channel.Id, SendEntryFlags.None, out int transmission))
         {
             return false;
@@ -801,13 +804,8 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             return true;
         }
 
+        // Blocked by the send cap, or datagrams are not available in this pass: the value keeps its place in the queue.
         _core.DiscardEntry(transmission);
-        if (result == PackResult.TooLarge)
-        {
-            // The path's datagram limit shrank below the value after admission: it goes out on a group stream instead.
-            valueEntry.Aux1 = WithFlags(valueEntry.Aux1, FlagsOf(valueEntry.Aux1) | ValueFlags.Large);
-        }
-
         return false;
     }
 
@@ -1064,8 +1062,10 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         }
 
         ref LatestSendState send = ref _send[local];
-        keys[keySlot].Flags &= ~KeySendFlags.RetryArmed;
         EnqueueRetry(local, ref send, value);
+
+        // The timer stays armed while the retry waits for its turn, so the version budget keeps being checked.
+        ArmRetry(local, ref send, ref keys[keySlot], _core.CurrentPassMicros);
     }
 
     /// <inheritdoc/>
@@ -1348,9 +1348,6 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
         /// <summary>First key with a live value, or -1.</summary>
         public int ArmedHead { get; private set; } = -1;
-
-        /// <summary>Keys held by the table.</summary>
-        public int Count => _table.Count;
 
         public ref KeySendSlot this[int slot] => ref _slots[slot];
 

@@ -150,5 +150,6 @@ public class LatestReceiveTests
             $"status {h.Server.GetDeliveryStatus(result.Token)}");
         Assert.Single(received);
         Assert.True(connector.Transport.Refused > 0, "no datagram was refused");
+        Assert.True(DatagramKit.Statistics(h.Client).ControlSendFailures > 0, "the ack datagram was not refused, so no fallback ran");
     }
 }

@@ -17,14 +17,21 @@ public class LatestDeliveryTests
 {
     private static readonly ChannelTable Table = LatestTables.Main;
 
-    private static SessionHarness Harness(LinkOptions? link = null, Action<PeerOptions>? client = null) =>
-        new(link: link ?? new LinkOptions { DelayMicros = 5_000 }, table: Table,
+    private static SessionHarness Harness(LinkOptions? link = null, Action<PeerOptions>? client = null)
+    {
+        SessionHarness harness = new(link: link ?? new LinkOptions { DelayMicros = 5_000 }, table: Table,
             client: o =>
             {
                 LatestKit.Quiet(o);
                 client?.Invoke(o);
             },
             server: LatestKit.Quiet);
+
+        // The session's first Ping and its Pong are datagrams too: let them pass before a test arms a targeted drop, so
+        // the drop hits the value or the ack it means to hit.
+        harness.Run(50_000);
+        return harness;
+    }
 
     [Fact]
     public void A_Value_Is_Delivered_Once_And_Acknowledged()
@@ -73,11 +80,11 @@ public class LatestDeliveryTests
         using SessionHarness h = Harness();
         List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
         h.Server!.RegisterHandler(2, LatestKit.Collect(received));
-        SendResult result = h.Client.SendCopy(new SendHeader(2, 11), LatestKit.Payload(2, 32), SendOptions.Tracked);
 
-        // The value arrives; the ack that would complete it is lost, so the sender retransmits and the receiver re-acks.
-        Assert.True(h.RunUntil(() => received.Count == 1), "the value did not arrive");
+        // The value arrives, but the ack that would complete it is lost: the sender retransmits and the receiver re-acks.
         DatagramKit.TransportOf(h.Server).DropNextDatagrams(1);
+        SendResult result = h.Client.SendCopy(new SendHeader(2, 11), LatestKit.Payload(2, 32), SendOptions.Tracked);
+        Assert.True(h.RunUntil(() => received.Count == 1), "the value did not arrive");
         Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(result.Token) == DeliveryStatus.Delivered, 2_000_000),
             $"status {h.Client.GetDeliveryStatus(result.Token)} after the lost ack");
 
@@ -154,8 +161,9 @@ public class LatestDeliveryTests
         List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
         h.Server!.RegisterHandler(2, LatestKit.Collect(received));
 
-        // Every transmission is lost, so the version exhausts the 16-transmission budget of PROTOCOL.md §4.4.
-        DatagramKit.TransportOf(h.Client).DropNextDatagrams(64);
+        // Exactly the 16 transmissions of PROTOCOL.md §4.4 are lost, so the version uses up its budget and the next value
+        // (after the drops are spent) still gets through.
+        DatagramKit.TransportOf(h.Client).DropNextDatagrams(ReliableLatestBudget.Transmissions);
         SendResult result = h.Client.SendCopy(new SendHeader(2, 6), LatestKit.Payload(4, 64), SendOptions.Tracked);
         Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(result.Token) is not DeliveryStatus.Pending, 40_000_000),
             "the version never finished");
@@ -217,7 +225,9 @@ public class LatestDeliveryTests
         // A new epoch (PROTOCOL.md §4.1): the send side re-queues the live key, the receive side forgets its keys.
         LatestKit.Engine(h.Client).OnEpochReset(resumed: true);
         LatestKit.Engine(h.Server).OnEpochReset(resumed: true);
-        Assert.Equal(1u, LatestKit.NextVersion(h.Client, 2));
+
+        // The counter restarted and the live key took version 1 of the new epoch, so the next value would be version 2.
+        Assert.Equal(2u, LatestKit.NextVersion(h.Client, 2));
         Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(result.Token) == DeliveryStatus.Delivered, 5_000_000),
             "the re-queued value was not delivered");
         Assert.Single(received);
@@ -242,8 +252,8 @@ public class LatestDeliveryTests
 
         // The same key id can be used again in this epoch: both sides start from a fresh slot.
         SendResult again = h.Client.SendCopy(new SendHeader(2, 33), LatestKit.Payload(2, 16), SendOptions.Tracked);
-        Assert.True(h.RunUntil(() => received.Count == 3), "the reused key was not delivered");
-        Assert.Equal(DeliveryStatus.Delivered, h.Client.GetDeliveryStatus(again.Token));
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(again.Token) == DeliveryStatus.Delivered), "the reused key was not delivered");
+        Assert.Equal(3, received.Count);
         Assert.True(LatestKit.Matches(received[2].Payload, 2, 16));
     }
 

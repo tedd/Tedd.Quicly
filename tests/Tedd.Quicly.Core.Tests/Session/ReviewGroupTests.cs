@@ -1,3 +1,6 @@
+using System.Runtime.CompilerServices;
+using Tedd.Quicly.Core.Channels;
+using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Core.Transport;
@@ -86,4 +89,95 @@ public class ReviewGroupTests
             "a group admitted after the stopped one never went out");
         Assert.Equal(PeerState.Connected, h.Client.State);
     }
+
+    /// <summary>
+    /// The peer side of the same finding (docs/design/session-layer.md §4.3): an engine hears a stream's close <em>once</em>,
+    /// locally opened streams included. The stop and the shutdown that always follows a started stream are two transport events;
+    /// the peer collapses them with the same <c>Discard</c> record it uses for peer streams, so every engine — group, bulk, large
+    /// ReliableLatest — may release a stream's resources on the first notice.
+    /// </summary>
+    [Fact]
+    public void A_Locally_Opened_Stream_The_Peer_Stops_Is_Reported_To_The_Engines_Once()
+    {
+        using SessionHarness h = TestEngines.Create(out TestEngine client, out _, ChannelMode.ReliableOrdered);
+        h.Client.SendCopy(new SendHeader(10), [1]);
+        h.Run(5_000);
+
+        // The engine's own stream, as the server sees it.
+        QuiclyPeer server = h.Server!;
+        TransportStreamId peerStream = default;
+        Assert.True(h.RunUntil(() => server.Core.Streams.Count > 0));
+        for (int slot = 0; slot < 64 && !peerStream.IsValid; slot++)
+        {
+            for (uint generation = 1; generation < 4 && !peerStream.IsValid; generation++)
+            {
+                TransportStreamId candidate = new(slot, generation);
+                if (!Unsafe.IsNullRef(ref server.Core.Streams.Find(candidate)) && server.Core.Streams.Find(candidate).Tag == StreamTag.Engine)
+                {
+                    peerStream = candidate;
+                }
+            }
+        }
+
+        Assert.True(peerStream.IsValid);
+        server.Core.Transport!.AbortStream(peerStream, 0x44, StreamAbortDirection.Receive);
+        Assert.True(h.RunUntil(() => client.LocalStreamEvents > 0), "the stop never reached the engine");
+
+        // The shutdown follows the stop for every started stream; it must not be a second notice for the same stream.
+        h.Run(200_000);
+        Assert.Equal(1, client.LocalStreamEvents);
+        Assert.Equal(PeerState.Connected, h.Client.State);
+        Assert.Equal(0, DatagramKit.Statistics(h.Client).CallbackFaults);
+    }
+
+    /// <summary>
+    /// A shared lease (<see cref="QuiclyPeer.SendShared"/>, ARCHITECTURE.md §4.1) on a group channel: the group engine commits
+    /// every payload through <c>EnginePayload.Commit</c>, which is what takes the reference (<c>PeerCore.AttachShared</c>) and
+    /// records a borrowed pin handle, so one serialisation carried on group streams is retained exactly once per peer and
+    /// released exactly once when that peer's carrier is acknowledged. A hand-rolled commit would skip the retain silently —
+    /// this test is the guard against that.
+    /// </summary>
+    [Fact]
+    public void A_Shared_Lease_On_A_Group_Channel_Is_Retained_And_Released_Once_Per_Peer()
+    {
+        using SharedPool pool = new();
+        SharedLease shared = pool.Share(64, seed: 7);
+        Assert.Equal(1, pool.Count(in shared));
+
+        using SessionHarness first = NewGroupPair(pool);
+        using SessionHarness second = NewGroupPair(pool);
+        List<(ReceiveHeader Header, byte[] Payload)> here = [];
+        List<(ReceiveHeader Header, byte[] Payload)> there = [];
+        first.Server!.RegisterHandler(5, Handlers.Collect(here));
+        second.Server!.RegisterHandler(5, Handlers.Collect(there));
+
+        // One serialisation, two peers: one reference each on top of the host's own.
+        SendResult a = first.Client.SendShared(new SendHeader(5), pool.Table, in shared, 64, SendOptions.Tracked);
+        SendResult b = second.Client.SendShared(new SendHeader(5), pool.Table, in shared, 64, SendOptions.Tracked);
+        Assert.True(a.IsAdmitted);
+        Assert.True(b.IsAdmitted);
+        Assert.Equal(3, pool.Count(in shared));
+
+        Assert.True(first.RunUntil(() => here.Count == 1 && first.Client.GetDeliveryStatus(a.Token) == DeliveryStatus.Delivered));
+        Assert.True(second.RunUntil(() => there.Count == 1 && second.Client.GetDeliveryStatus(b.Token) == DeliveryStatus.Delivered));
+
+        // The bytes travelled uncompressed and unchanged on each peer's own group stream (SendShared is never compressed).
+        Assert.Equal(64, here[0].Payload.Length);
+        Assert.Equal(7, here[0].Payload[0]);
+        Assert.Equal(0, here[0].Header.RawLength);
+        Assert.Equal(here[0].Payload, there[0].Payload);
+
+        // Exactly one release per peer: the host's own reference is all that is left, and it returns the block.
+        Assert.Equal(1, pool.Count(in shared));
+        Assert.True(pool.Table.Release(in shared));
+    }
+
+    private static SessionHarness NewGroupPair(SharedPool pool) =>
+        new(table: GroupTables.Main,
+            client: o =>
+            {
+                GroupKit.Prompt(o);
+                o.Allocator = pool.Allocator;
+            },
+            server: GroupKit.Prompt);
 }

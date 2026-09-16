@@ -127,6 +127,37 @@ public class GroupStreamTests
         }
     }
 
+    /// <summary>
+    /// A start that fails for a reason other than the peer's stream limit (docs/design/session-layer.md §7.5): the open
+    /// succeeded, so the stream is released, but nothing refused the group — it must not be parked on the current credit
+    /// generation, because no <c>OnStreamsAvailable</c> is coming (the stream never started, so no credit was ever taken). The
+    /// next pass opens a new stream for it.
+    /// </summary>
+    [Fact]
+    public void A_Start_That_Fails_For_Another_Reason_Is_Retried_At_The_Next_Pass()
+    {
+        StartSendFailureConnector? failing = null;
+        using SessionHarness h = new(table: Table, client: GroupKit.Prompt, server: GroupKit.Prompt,
+            connector: c => failing = new StartSendFailureConnector(c));
+        StartSendFailureTransport transport = failing!.Transport!;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(5, Handlers.Collect(got));
+        transport.FailStarts = 1;
+        Assert.True(h.Client.SendCopy(new SendHeader(5), [7, 8]).IsAdmitted);
+
+        h.Client.Flush();
+        Assert.Equal(1, transport.Failed);
+
+        // The group kept its messages and its place, and no stream limit was involved.
+        Assert.Equal(GroupStreamEngine.GroupPhase.Waiting, Assert.Single(GroupKit.Phases(h.Client, 5)));
+        Assert.Equal(0, GroupKit.Engine(h.Client).StreamsRefused);
+        Assert.Equal(1, GroupKit.Stats(h.Client, 5).QueuedMessages);
+
+        Assert.True(h.RunUntil(() => got.Count == 1), "the group never went out after a send that failed with the start");
+        Assert.Equal(new byte[] { 7, 8 }, got[0].Payload);
+        Assert.Equal(PeerState.Connected, h.Client.State);
+    }
+
     [Fact]
     public void The_Receive_Limit_Resets_Peer_Group_Streams_Beyond_MaxGroups()
     {

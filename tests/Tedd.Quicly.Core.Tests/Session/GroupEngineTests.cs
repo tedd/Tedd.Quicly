@@ -322,6 +322,34 @@ public class GroupEngineTests
         context.Phase = StreamMessagePhase.BulkHeader;
         Assert.Equal(StreamConsumeAction.ResetStream, engine.OnStreamMessage(ref context).Action);
 
+        // Payload bytes the parser would never produce: a Chunk with no staged message (no Start reserved a lease), and one
+        // longer than the frame header promised. Neither may be written through the record's lease pointer.
+        TransportStreamId stream = new(11, 1);
+        StreamAccept opened = engine.OnStreamOpened(stream, 5, 0);
+        Assert.True(opened.Accepted);
+        long record = opened.Cookie;
+        scoped StreamMessageContext chunk = default;
+        chunk.Cookie = ref record;
+        chunk.Channel = 5;
+        chunk.ChannelIndex = h.Client.Core.ChannelIndexOf(5);
+        chunk.Phase = StreamMessagePhase.Chunk;
+        chunk.Chunk = [1, 2];
+        Assert.Equal(StreamConsumeAction.ResetStream, engine.OnStreamMessage(ref chunk).Action);
+        Assert.Equal(QuiclyErrorCode.ProtocolViolation, engine.OnStreamMessage(ref chunk).Code);
+
+        chunk.Phase = StreamMessagePhase.Start;
+        chunk.Header = new StreamMessageHeader { Length = 1 };
+        Assert.Equal(StreamConsumeAction.Continue, engine.OnStreamMessage(ref chunk).Action);
+        chunk.Phase = StreamMessagePhase.Chunk;
+        Assert.Equal(StreamConsumeAction.ResetStream, engine.OnStreamMessage(ref chunk).Action);
+
+        // One byte does fit, and the reset that follows gives the staging lease and the reservation back.
+        chunk.Chunk = [1];
+        Assert.Equal(StreamConsumeAction.Continue, engine.OnStreamMessage(ref chunk).Action);
+        engine.OnStreamClosed(stream, aborted: true, (ulong)QuiclyErrorCode.ProtocolViolation);
+        Assert.Equal(0, GroupKit.OpenPeerGroups(h.Client, 5));
+        Assert.Equal(0, DatagramKit.Statistics(h.Client).ReceiveBytesOutstanding);
+
         // Neither an invalid stream id nor one this engine never opened matches anything.
         engine.OnStreamClosed(default, aborted: false, 0);
         engine.OnStreamClosed(new TransportStreamId(77, 3), aborted: true, 5);

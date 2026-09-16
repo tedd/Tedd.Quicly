@@ -1,8 +1,10 @@
+using System.Net;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Primitives;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Session.Engines;
+using Tedd.Quicly.Core.Transport;
 
 namespace Tedd.Quicly.Core.Tests.Session;
 
@@ -138,4 +140,85 @@ internal static class GroupKit
 
         return total;
     }
+}
+
+/// <summary>
+/// Fails the send that carries <see cref="TransportSendFlags.Start"/> of an engine stream with a status <em>other</em> than
+/// <see cref="TransportStatus.StreamLimitReached"/>, after the open itself succeeded (a transport out of memory, one going away).
+/// No completion follows a failed send call (the <c>ITransport</c> contract), and nothing was refused by the peer's stream limit,
+/// so the group must release the stream and open a new one at the next pass rather than wait for stream credit.
+/// </summary>
+internal sealed unsafe class StartSendFailureTransport(ITransport inner) : ITransport
+{
+    private readonly Dictionary<TransportStreamId, ulong> _openContexts = [];
+
+    public ITransport Inner => inner;
+
+    /// <summary>Engine-stream starts still to fail.</summary>
+    public int FailStarts { get; set; }
+
+    /// <summary>What the refused send returns.</summary>
+    public TransportStatus Status { get; set; } = TransportStatus.OutOfMemory;
+
+    public int Failed { get; private set; }
+
+    public TransportCapabilities Capabilities => inner.Capabilities;
+
+    public TransportState State => inner.State;
+
+    public TransportStatus SendDatagram(TransportSegment* segments, int count, ulong context, TransportSendFlags flags) =>
+        inner.SendDatagram(segments, count, context, flags);
+
+    public TransportStatus OpenStream(StreamKind kind, ulong context, ushort priority, out TransportStreamId id)
+    {
+        TransportStatus status = inner.OpenStream(kind, context, priority, out id);
+        if (status == TransportStatus.Success)
+        {
+            _openContexts[id] = context;
+        }
+
+        return status;
+    }
+
+    public TransportStatus StartStream(TransportStreamId id) => inner.StartStream(id);
+
+    public TransportStatus SendStream(TransportStreamId id, TransportSegment* segments, int count, ulong context, TransportSendFlags flags)
+    {
+        if (FailStarts > 0 && (flags & TransportSendFlags.Start) != 0 && _openContexts.TryGetValue(id, out ulong open)
+            && PeerCore.TryDecodeEngineStreamContext(open, out ChannelMode mode, out _, out _) && mode == ChannelMode.ReliableUnordered)
+        {
+            FailStarts--;
+            Failed++;
+            return Status;
+        }
+
+        return inner.SendStream(id, segments, count, context, flags);
+    }
+
+    public void AbortStream(TransportStreamId id, ulong errorCode, StreamAbortDirection direction) => inner.AbortStream(id, errorCode, direction);
+
+    public void SetStreamPriority(TransportStreamId id, ushort priority) => inner.SetStreamPriority(id, priority);
+
+    public long GetQuicStreamId(TransportStreamId id) => inner.GetQuicStreamId(id);
+
+    public void ResumeStreamReceive(TransportStreamId id, int bytesConsumed) => inner.ResumeStreamReceive(id, bytesConsumed);
+
+    public void CloseStream(TransportStreamId id) => inner.CloseStream(id);
+
+    public void UpdatePeerStreamLimits(ushort bidirectional, ushort unidirectional) => inner.UpdatePeerStreamLimits(bidirectional, unidirectional);
+
+    public void Close(ulong errorCode, ReadOnlySpan<byte> reason) => inner.Close(errorCode, reason);
+
+    public void GetStatistics(out TransportStatistics statistics) => inner.GetStatistics(out statistics);
+
+    public void Dispose() => inner.Dispose();
+}
+
+/// <summary>Wraps the transport of a connector in <see cref="StartSendFailureTransport"/>.</summary>
+internal sealed class StartSendFailureConnector(ITransportConnector inner) : ITransportConnector
+{
+    public StartSendFailureTransport? Transport { get; private set; }
+
+    public ITransport Connect(EndPoint endpoint, string? serverName, ITransportSink sink) =>
+        Transport = new StartSendFailureTransport(inner.Connect(endpoint, serverName, sink));
 }

@@ -10,8 +10,10 @@ namespace Tedd.Quicly.Benchmarks.Session;
 /// <summary>
 /// ReliableUnordered (group stream) delivery end to end over a zero-delay <see cref="SimulatedTransport"/> link: admission,
 /// sealing the group, opening its unidirectional stream, the gathered carriers, the progressive receive, dispatch to a handler
-/// and the completions — per message. <c>Group64</c> hands 100 × 64 B to one group, <c>Group4K</c> 16 × 4 KiB; every batch is
-/// one group on one stream, opened and closed inside the measured cycle, so each row includes a stream's whole lifetime.
+/// and the completions — per message. <c>Group64</c> hands 100 × 64 B to one group, <c>Group4K</c> 16 × 4 KiB; every batch is one
+/// group on one stream, so each row includes a stream's whole lifetime — though not the same stream's: <see cref="Deliver"/>
+/// stops at the server's dispatch, so a batch's carrier completions and its stream's shutdown fall into the next iteration's
+/// window (docs/benchmarks/session.md). In steady state each row still pays one stream per batch.
 /// </summary>
 /// <remarks>
 /// The peers run with <see cref="PeerOptions.GroupMinInterval"/> = 0 because the benchmark's virtual clock does not advance
@@ -109,7 +111,10 @@ public class GroupStreamBench
         Deliver(LargeBatch);
     }
 
-    /// <summary>Runs passes until the batch's group has been delivered (one group needs a few: its start is confirmed first).</summary>
+    /// <summary>
+    /// Runs passes until the server has dispatched the batch (one group needs a few: its start is confirmed first). It stops
+    /// there, before the group's carrier completions and its stream's shutdown, which the next iteration's passes pick up.
+    /// </summary>
     private void Deliver(int expected)
     {
         long target = _received + expected;

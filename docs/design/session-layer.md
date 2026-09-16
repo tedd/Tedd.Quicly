@@ -225,9 +225,16 @@ is back in `Filling` and still owned by the caller.
     The context (`Chunk`, `Header`, `Bulk` and the `Cookie` ref) is valid only during the call (the peer declares it `scoped`);
     copy what you keep.
   * A parser error or a FIN inside a message: ordered stream ⇒ connection `ProtocolViolation`; group/bulk ⇒ reset `ProtocolViolation`.
-    The owning engine gets `OnStreamClosed` exactly once per accepted stream (reset by either side, error, or shutdown complete);
-    events of locally opened streams (peer STOP_SENDING, shutdown complete) are broadcast to every engine. `CloseStream` follows
-    shutdown complete.
+    The owning engine gets `OnStreamClosed` **exactly once per stream**, peer-opened or locally opened (reset by either side,
+    error, or shutdown complete); events of locally opened streams (peer STOP_SENDING, shutdown complete) are broadcast to every
+    engine. `CloseStream` follows shutdown complete.
+  * **One close notice per stream, local streams included.** A started stream the peer stops raises *two* transport events — the
+    STOP_SENDING and the shutdown that always follows it, because MsQuic completes every started stream with SHUTDOWN_COMPLETE
+    and the simulator does the same. A peer stream's own `StreamRecord` collapses them (the tag flips to `Discard` on the first),
+    and `HandleStreamAborted` now leaves the same `Discard` record behind for a **locally opened** stream, so the shutdown tells
+    no engine a second time. Every engine may therefore release a stream's resources — its group record, its staging lease, its
+    stream slot — on the first notice, which is what ADR 0008 ("released exactly once on every path") requires of it. An engine
+    that also keys its own state by a serial per stream (the ordered and group engines do) is then protected twice over.
   * Receive results: the peer consumes a whole indication (`Consumed(all)`) or returns `PendingAfter(n)`; it never returns a partial
     `Consumed` and never `Consumed(0)` for a non-empty indication, because both mean back-pressure in the `ReceiveResult` contract.
     `ResumeStreamReceive` is called only from Poll on the game thread, never from inside the receive callback; a resume that races
@@ -825,8 +832,11 @@ free list of `Σ max(MaxGroups, 1)` records. The peer's files are untouched; the
 * **`FlushChannel`.** The open group is sealed unless `GroupMinIntervalMicros` (default 1 ms) has not passed since the channel
   last opened a stream — then it keeps filling and `NextDeadline` drops to the moment the next stream may open, which is what
   bounds stream churn; a message sent `Immediate` seals its group at once. Then every group of the channel is offered a stream,
-  oldest first: expired messages of a group that has no stream yet are dropped (`Expired`, PROTOCOL.md §4.5 — once a group's
-  stream is open its messages are committed to it), and a group opens one `OpenStream(Unidirectional,
+  oldest first: expired messages at the **head** of a group that has no stream yet are dropped (`Expired`, PROTOCOL.md §4.5 —
+  once a group's stream is open its messages are committed to it). The drop stops at the first message whose expiry has not
+  passed, because a group is a FIFO and its messages must reach the peer in admission order: a message given a shorter per-send
+  `ExpiryMicros` behind a longer-lived one is therefore dropped only once it reaches the head (it goes out if its group's stream
+  opens first). Then a group opens one `OpenStream(Unidirectional,
   MakeEngineStreamContext(ReliableUnordered, **group slot**, serial), priority × 257)`. The context carries the engine's group
   slot where the ordered engine carries a channel index: the peer routes `OnStreamStarted` by the context's mode only. Carriers
   are the ordered engine's (a run of `PeerCore.Segments`, at most 64 segments, the batch list naming the members in admission
@@ -838,7 +848,16 @@ free list of `Σ max(MaxGroups, 1)` records. The peer's files are untouched; the
   the carrier's canceled completion, then the shutdown the peer's handling closes) never reached the peer, so the group's
   messages return to its head in admission order and go out on a **new** stream (a new serial, the same group id) once
   `StreamCreditGeneration` changes. A group never fails for want of credit, and the first refusal in a pass stops the pass from
-  opening more streams on that channel.
+  opening more streams on that channel. A `SubmitStream` that fails for any *other* reason after the open succeeded leaves the
+  group unrefused (no stream limit turned it away), so the next pass opens a new stream for it at once instead of waiting for a
+  credit generation that may never change.
+* **Transport requirement: a refusal is reported no later than the carrier's completion.** The engine decides what happens to a
+  Start carrier's messages when that carrier's completion arrives — re-queue them (the start was refused) or fail the group
+  (anything else) — so `OnStreamStarted(StreamLimitReached)` must reach the sink **before** the canceled completion of the send
+  that carried `Start`, which is the order the `ITransport` contract states (refusal, canceled sends, shutdown complete). A
+  transport that reported the refusal afterwards would make this engine fail a group the peer never even saw. Together with the
+  deferred-`CloseStream` rule of §4.3 (the transport must not close a stream inline from a callback or a pass) these are the two
+  things a new transport has to get right for the stream engines.
 * **`MaxGroups` bounds both directions.** Both ends hold the same table, so the sender keeps at most `max(MaxGroups, 1)` streams
   open per channel: exceeding it would have the receiver reset its own live groups. The slot (like the peer's stream credit)
   returns only when the stream **shuts down**, not when its last carrier completes — the receiver frees its group slot at that
@@ -851,6 +870,14 @@ free list of `Σ max(MaxGroups, 1)` records. The peer's files are untouched; the
   `Failed`, its record is released and the channel keeps admitting and sending — groups are independent, so nothing here closes
   a channel (unlike §7.2). `TryCancel` unlinks a message that is still queued in its group. Local-stream events reach the game
   thread through an SPSC ring of notices keyed by group slot and serial, drained before every decision that depends on them.
+  A record is returned to the free list **exactly once**: the release is idempotent, and it bumps the record's serial as it frees
+  it, so no notice and no carrier tag of the stream that record just had can match its next occupant (the serial also rises on
+  every open). The peer reports each stream's close once (§4.3), so the two rules are belt and braces — and they are what keeps a
+  stopped group from freeing its record twice, which would underflow the channel's group count and hand every later group of
+  every channel the same record. A carrier's completion resolves its channel from the carrier's own entry rather than from the
+  record, so even a stale carrier could only ever touch its own channel's counters. The channel's list of live groups is doubly
+  linked, so a finished group leaves it in one step: a pass that finishes many groups of a channel with a large `MaxGroups` costs
+  no walk per release.
 * **Receive** (transport thread). `OnStreamOpened` accepts at most `MaxGroups` concurrent peer streams per channel and resets
   the rest with `LimitExceeded` (PROTOCOL.md §7); each accepted stream gets a `GroupRecv` record whose index is the stream's
   cookie. `Start` reserves a receive-ring slot and rents a lease of the frame's `Length` (either failing ⇒ `Pend`), `Chunk`

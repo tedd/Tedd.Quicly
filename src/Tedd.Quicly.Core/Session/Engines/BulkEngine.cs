@@ -477,7 +477,10 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             return _records[record].Phase == BulkPhase.Finished;
         }
 
+        // The stream is reset as well as announced: the peer's receive side ends the transfer on the reset (its code says
+        // it was cancelled), and a BulkCancel alone would leave it waiting for bytes that will never come.
         SendBulkCancel(_records[record].TransferId, QuiclyErrorCode.BulkCanceled);
+        AbortSendStream(ref _records[record], QuiclyErrorCode.BulkCanceled);
         FinishSend(local, record, BulkStatus.Canceled, QuiclyErrorCode.BulkCanceled);
         return true;
     }

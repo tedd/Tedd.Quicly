@@ -581,8 +581,19 @@ public class SessionSupportTests
         Assert.False(default(ReceiveLease).IsValid);
         Assert.True(default(ReceiveLease).Payload.IsEmpty);
         Assert.Equal(new SendHeader(3, 0), new SendHeader(3));
-        BulkTransfer transfer = new(new BulkDescriptor(7, 1, 2, 3));
+        BulkTransfer transfer = new(new BulkDescriptor(7, 1, 2, 3), transferId: 4, length: 3);
         Assert.Equal((ushort)7, transfer.Descriptor.Channel);
+        Assert.Equal(4UL, transfer.TransferId);
+        Assert.Equal(BulkStatus.Running, transfer.Status);
+        Assert.False(transfer.IsFinished);
+        Assert.False(transfer.CancelRequested);
+        Assert.Equal(0, transfer.Progress);
+        Assert.False(transfer.Completion.IsCompleted);
+        transfer.Cancel();
+        Assert.True(transfer.CancelRequested);
+        Assert.Equal(3, new BulkDescriptor(7, 1, 2, 3).EffectiveLength);
+        Assert.True(new BulkDescriptor(7, 1, 2, 3).IsWholeObject);
+        Assert.False(new BulkDescriptor(7, 1, 2, 3, Offset: 1, Length: 2).IsWholeObject);
         Assert.Equal(0, new EmptySource().Read(0, new byte[1]));
     }
 

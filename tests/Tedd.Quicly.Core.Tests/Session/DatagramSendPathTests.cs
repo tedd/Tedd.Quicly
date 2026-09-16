@@ -382,7 +382,8 @@ public class DatagramSendPathTests
         }
 
         Assert.Equal(SendStatus.QueueFull, last);
-        Assert.InRange(admitted, 10, 16);
+        // The fragmented message above holds one entry per fragment plus its owner, so fewer slots are left for the loop.
+        Assert.InRange(admitted, 8, 16);
         Assert.True(h.RunUntil(() => DatagramKit.Statistics(client).SendEntriesInUse == 0));
         Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(2), [1]).Status);
     }

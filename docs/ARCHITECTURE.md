@@ -284,7 +284,8 @@ public sealed class QuiclyPeer : IDisposable
     public bool TryCancel(SendToken t);              // best effort; never releases the payload by itself
 
     public void Close(CloseReason reason);           // graceful; completes through Poll with PeerState.Closed
-    public void Reconnect(ITransportConnector connector, EndPoint endpoint, string? serverName, ReadOnlySpan<byte> authToken); // client: resume this session over a new transport (PROTOCOL §4.1)
+    public void Reconnect(ITransportConnector connector, EndPoint endpoint, string? serverName, ReadOnlySpan<byte> authToken); // client: resume this session over a new transport (PROTOCOL §4.1). An attempt that never reaches a transport (the connector throws or returns none) restores the peer to the state the lost connection left it in — closed with its transport close observed — and rethrows, so the same peer can be re-armed again
+    public bool CanReconnect { get; }                    // whether an in-place resume is permitted right now: a client peer, closed with its transport close observed, alive, and no Poll/Flush running. Allocation-free; a server peer is always false (its accept callback must return a sink before the Hello is read, so a resumed connection gets a new peer)
     public event Action<QuiclyPeer, PeerState, PeerState>? StateChanged;   // raised from Poll; a throwing handler never sees the same transition twice
 }
 

@@ -381,11 +381,31 @@ Preconditions: client role, not inside `Poll`/`Flush`, and the lost transport ha
    `Connecting`, so `Reconnecting → Handshaking` opens a control stream and sends Hello with the session token and `LastEpoch`; the
    admission deadline covers `Reconnecting` too. On acceptance the engines get `OnEpochReset(resumed: epoch > 1)` and the
    PROTOCOL.md §4.1 channel rules apply (`UnreliableSequenced` tables reset, in-flight `ReliableOrdered` sends already completed
-   `Disconnected`, live `ReliableLatest` keys re-queued and resumable `Bulk` transfers re-requested by their engines in wave C2). A
-   connector that throws leaves the peer `Closed` — no transport means no close callback — and the exception propagates.
+   `Disconnected`, live `ReliableLatest` keys re-queued and resumable `Bulk` transfers re-requested by their engines in wave C2).
 
 Kept across the resume: the registered handlers, `Index`, `Tag`, the `StateChanged` subscribers, the channel table and every
 statistic.
+
+**A failed attempt leaves the peer re-armable.** When the connector throws, returns no transport (`InvalidOperationException`) or
+the attempt fails for any other reason *before* a new transport is attached, `RestoreLostConnection` puts the peer back where the
+lost connection left it and the exception reaches the caller — the peer is never left half re-armed, and never left waiting in
+`Reconnecting` for a close callback that cannot come. Restored: the state and the queued transitions, `CloseReason`,
+`HandshakeStatus`, the remote table, `RemoteEndPoint`, the ping clock `GetStatistics` publishes, the deadlines, the connection
+start and the session fields step 2 replaced. `PeerCore.MarkTransportClosed` and the lifetime word's ClosedSeen bit are set again
+— the mirror of what step 4 cleared for a transport that never arrived, so `Dispose` still frees at the end of the call — and the
+close is replayed through `OnTransportClosed`, the routine the transport's own close signal runs, so a host that had not polled
+the loss yet still gets its `Closed` transition exactly once and a host that had polled it gets no second one. Not restored,
+because a closed peer no longer uses them and the next attempt would clear them again: the lost transport (disposed), the
+per-connection tables of step 3, and the signals, handshake bodies and pong samples of the lost connection. What step 1 finished
+stays finished.
+
+**`bool CanReconnect`** is the cheap probe for that state: `true` for a **client** peer whose connection is closed with its
+transport close observed (`PeerCore.IsTransportClosed`), whose native state is alive (not disposed, not freed) and with no
+`Poll`/`Flush` on the stack — exactly the preconditions above, so a host asks instead of catching. Allocation-free (field reads
+only, nothing touched), so a reconnect policy may ask it every pass. It stays `true` after a failed attempt. It says nothing about
+whether the *session* is still resumable: the server's registry decides that from the presented token (grace period, replay,
+resume rate), and the host's policy decides whether the close is worth retrying. A **server** peer always answers `false`, for the
+protocol reason below.
 
 **The server cannot do this, and that is a protocol consequence, not an omission.** A listener's `AcceptCallback` must return an
 `ITransportSink` synchronously, before a single QUICLY byte was read, so the server does not yet know which session the connection

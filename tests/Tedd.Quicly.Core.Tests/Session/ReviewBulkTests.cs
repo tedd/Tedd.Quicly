@@ -147,4 +147,57 @@ public class ReviewBulkTests
         Assert.NotEqual(BulkStatus.Canceled, fromServer.Status);
         Assert.Equal(PeerState.Connected, h.Server!.State);
     }
+
+    /// <summary>
+    /// ADR 0008 ("everything disposable disposed"; resources released exactly once on <em>every</em> path) and
+    /// PROTOCOL.md §4.3, which gives a bulk transfer terminal states — <see cref="BulkStatus.Disconnected"/> among them —
+    /// so that a caller awaiting it is always released.
+    /// <para>
+    /// The engine finishes its live transfers from <c>OnPeerClosed</c>, but that is dispatched only by
+    /// <c>QuiclyPeer.FinishClosed</c> inside <see cref="QuiclyPeer.Poll"/> (and by the reconnect path).
+    /// <see cref="QuiclyPeer.Dispose"/> takes neither route: it calls <c>FailWaitersOnDispose</c>, which covers the send
+    /// and flush waiters only, and then frees the peer's memory. <c>BulkEngine.Dispose</c> disposes the native tables and
+    /// the rings but never touches <c>_transfers</c>, so every outstanding <see cref="BulkTransfer"/> keeps its
+    /// <c>TaskCompletionSource</c> unresolved for good: <see cref="BulkTransfer.Status"/> stays
+    /// <see cref="BulkStatus.Running"/> and anyone who wrote <c>await transfer.Completion</c> — the documented way to wait
+    /// for an object — hangs forever on a peer that was disposed rather than closed.
+    /// </para>
+    /// <para>
+    /// Disposing without closing first is ordinary teardown (a host shutting down, a <c>using</c> block leaving on an
+    /// exception), and every other await on the peer is released on that path, so bulk is the one promise that escapes it.
+    /// </para>
+    /// <para>
+    /// The existing tests miss it because no bulk test ever awaits <c>Completion</c>: the suites poll
+    /// <c>IsFinished</c>/<c>Status</c> instead, and
+    /// <c>BulkEngineTests.Disposing_A_Peer_Mid_Transfer_Releases_What_It_Was_Staging</c> disposes the <em>receiving</em>
+    /// peer and then cancels the sender's transfer by hand, which hides exactly this.
+    /// </para>
+    /// <para>
+    /// Fix: finish the engine's live transfers <see cref="BulkStatus.Disconnected"/> from <c>BulkEngine.Dispose</c> (or
+    /// dispatch <c>OnPeerClosed</c> from <c>QuiclyPeer.Dispose</c> before freeing), so the terminal state is reported on
+    /// the dispose path as it is on the close path.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Disposing_A_Peer_Mid_Transfer_Must_Finish_The_Transfer_It_Was_Sending()
+    {
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 5_000, BandwidthBitsPerSecond = 4_000_000 },
+            table: BulkTables.Main,
+            client: BulkKit.Quiet,
+            server: BulkKit.Receiver(AcceptRouter.Pattern()));
+
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, 4 * Mib), new PatternSource(4 * Mib));
+        Assert.True(h.RunUntil(() => transfer.BytesTransferred > 0), "the transfer never started moving");
+        Assert.False(transfer.IsFinished);
+
+        // Ordinary teardown of a peer that is still sending: no Close, so no Poll ever runs FinishClosed.
+        h.DisposeClient();
+        h.Run(20_000);
+
+        Assert.True(transfer.IsFinished, $"the sending peer was disposed and the transfer stayed {transfer.Status}");
+        Assert.True(
+            transfer.Completion.IsCompleted,
+            "BulkTransfer.Completion never completed, so a caller awaiting the object hangs for good");
+    }
 }

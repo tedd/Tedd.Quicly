@@ -335,8 +335,9 @@ public sealed class QuiclyClient
     public int Poll(int maxItems = int.MaxValue);     // polls the current peer and drives the reconnect attempts
     public void Flush(uint tick = 0);
     // ReconnectPolicy: attempts, back-off, browser-suspend awareness. A resume reconnects the same peer in place
-    // (QuiclyPeer.Reconnect: Closed → Reconnecting → Handshaking → Connected, epoch + 1); a refused resume falls back to a
-    // fresh session on a new peer.
+    // (QuiclyPeer.Reconnect: Closed → Reconnecting → Handshaking → Connected, epoch + 1), chosen by asking that peer's
+    // CanReconnect when the attempt starts — an attempt whose connector failed leaves the peer re-armable, so the next one
+    // resumes it in place again; only a refused resume falls back to a fresh session on a new peer.
 }
 ```
 

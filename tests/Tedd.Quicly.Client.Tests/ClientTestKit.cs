@@ -175,16 +175,16 @@ internal sealed class ClientFixture : IAsyncDisposable
     }
 }
 
-/// <summary>Uses a queue of connectors for successive connections, then a fallback; can throw once.</summary>
+/// <summary>Uses a queue of connectors for successive connections, then a fallback; can throw for a run of connects.</summary>
 internal sealed class ScriptedConnector(ITransportConnector fallback, IClock clock) : ITransportConnector
 {
     private readonly Queue<ITransportConnector> _next = new();
+    private Exception? _failure;
+    private int _failuresLeft;
 
     public int Connects { get; private set; }
 
     public List<long> ConnectTimes { get; } = [];
-
-    public Exception? ThrowNext { get; set; }
 
     public ScriptedConnector Then(ITransportConnector connector)
     {
@@ -192,14 +192,21 @@ internal sealed class ScriptedConnector(ITransportConnector fallback, IClock clo
         return this;
     }
 
+    /// <summary>The next <paramref name="times"/> connects throw <paramref name="failure"/> instead of connecting.</summary>
+    public void Throwing(Exception failure, int times = 1)
+    {
+        _failure = failure;
+        _failuresLeft = times;
+    }
+
     public ITransport Connect(EndPoint endpoint, string? serverName, ITransportSink sink)
     {
         Connects++;
         ConnectTimes.Add(clock.NowMicros);
-        if (ThrowNext is { } exception)
+        if (_failuresLeft > 0)
         {
-            ThrowNext = null;
-            throw exception;
+            _failuresLeft--;
+            throw _failure!;
         }
 
         return (_next.Count > 0 ? _next.Dequeue() : fallback).Connect(endpoint, serverName, sink);

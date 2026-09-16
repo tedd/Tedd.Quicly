@@ -47,8 +47,10 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     private readonly PeerCore _core;
     private readonly PeerRole _role;
     private readonly IPeerAdmission? _admission;
-    private readonly byte[] _authToken;
-    private readonly byte[] _resumeToken;
+    private readonly IPeerWorkSignal? _workSignal;
+    // Replaced by Reconnect, which resumes the session over a new transport with the token of the last HelloAck.
+    private byte[] _authToken;
+    private byte[] _resumeToken;
     private readonly Sink _sink;
     private readonly IClock _clock;
     private readonly long _admissionTimeoutMicros;
@@ -62,7 +64,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     private readonly int _maxMessageSizeOption;
     private readonly ushort _maxReceiveDatagram;
     private readonly bool _requestTable;
-    private readonly uint _lastEpoch;
+    private uint _lastEpoch;
     private readonly bool _failFast;
     private readonly bool _needsDatagrams;
     private ITransport? _transport;
@@ -102,6 +104,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         _requestTable = options.RequestChannelTable;
         _lastEpoch = options.LastEpoch;
         _failFast = options.FailFastOnCallbackException;
+        _workSignal = options.WorkSignal;
         foreach (ChannelDefinition channel in table.All)
         {
             _needsDatagrams |= channel.IsDatagramMode;
@@ -212,6 +215,14 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     /// <summary>The lifecycle state as last observed by the game thread.</summary>
     public PeerState State => _state;
 
+    /// <summary>
+    /// True once <see cref="Dispose"/> has been called: every member that changes the peer then throws
+    /// <see cref="ObjectDisposedException"/>, and <see cref="Release(in ReceiveLease)"/>, <see cref="GetStatistics"/> and
+    /// <see cref="Capabilities"/> answer as documented for a disposed peer. Lets a host skip a peer it disposed from a
+    /// handler without catching.
+    /// </summary>
+    public bool IsDisposed => _disposed;
+
     /// <summary>The session epoch: 0 before admission, then ≥ 1 (PROTOCOL.md §4.1).</summary>
     public uint Epoch => _core.Epoch;
 
@@ -256,9 +267,13 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
 
     internal bool IsFreed => Volatile.Read(ref _freed) != 0;
 
-    /// <summary>Sets a transport-to-game-thread signal bit (any thread).</summary>
+    /// <summary>Sets a transport-to-game-thread signal bit and tells the host there is work (any thread).</summary>
     /// <param name="bit">The signal.</param>
-    internal void Signal(int bit) => Interlocked.Or(ref _signals, bit);
+    internal void Signal(int bit)
+    {
+        Interlocked.Or(ref _signals, bit);
+        NoteWork();
+    }
 
     /// <summary>Copies the peer's statistics into <paramref name="statistics"/>. Allocation-free; game thread. Zero once disposed.</summary>
     /// <param name="statistics">Receives the snapshot.</param>
@@ -386,8 +401,29 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         }
     }
 
-    /// <summary>The next deadline in clock micros (<see cref="PeerOptions.Clock"/>), or <see cref="long.MaxValue"/>.</summary>
+    /// <summary>
+    /// The next deadline in clock micros (<see cref="PeerOptions.Clock"/>), or <see cref="long.MaxValue"/>: the minimum of
+    /// <see cref="NextPollDeadlineMicros"/> and <see cref="NextFlushDeadlineMicros"/>, for a host with one loop that both
+    /// polls and flushes.
+    /// </summary>
     public long NextDeadlineMicros => _nextDeadlineMicros;
+
+    /// <summary>
+    /// Clock micros of the next deadline a <see cref="Poll"/> serves: the peer's own timers only — the ping schedule, the
+    /// heartbeat, the admission timeout, the close linger and the mid-message stream idle sweep — or
+    /// <see cref="long.MaxValue"/> when none is scheduled. A host whose polling loop is separate from its flush loop (a
+    /// server that polls on network wake-ups and flushes on its simulation tick) sleeps the polling loop on this one.
+    /// </summary>
+    public long NextPollDeadlineMicros => _timerDeadline;
+
+    /// <summary>
+    /// Clock micros of the next deadline only a <see cref="Flush"/> can serve: engine work as the last scheduler pass
+    /// computed it (retries, expiry, the refill time of the <see cref="PeerOptions.MaxSendBytesPerSecond"/> cap that held a
+    /// pass back), or <see cref="long.MaxValue"/> when nothing is held back or the session is not
+    /// <see cref="PeerState.Connected"/>. <see cref="Poll"/> never serves it, because Poll does not run the scheduler: a
+    /// host that flushes on its own tick brings the next flush forward to this time instead of waiting out its tick.
+    /// </summary>
+    public long NextFlushDeadlineMicros => _state == PeerState.Connected ? _engineDeadline : long.MaxValue;
 
     /// <summary>
     /// Closes the transport if it is still open (error code 0, no linger) and releases the peer. Native memory is freed as

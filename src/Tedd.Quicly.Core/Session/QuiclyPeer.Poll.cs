@@ -48,6 +48,8 @@ public sealed unsafe partial class QuiclyPeer
         _inPoll = true;
         EnterCall();
         NoteGameThread();
+        // The host is here now: the next work published raises a fresh signal (IPeerWorkSignal is an edge).
+        ClearWorkSignal();
         int dispatched = 0;
         try
         {

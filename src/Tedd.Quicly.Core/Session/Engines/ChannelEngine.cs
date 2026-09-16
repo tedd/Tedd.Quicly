@@ -204,6 +204,25 @@ internal abstract class ChannelEngine : IDisposable
     /// <returns><see langword="false"/> when the message violates the session rules (a protocol violation on the stream, a counted drop for a datagram).</returns>
     public virtual bool OnControl(ControlType type, ReadOnlySpan<byte> body, bool onStream, long nowMicros) => true;
 
+    // ------------------------------------------------------------------ reconnect (game thread)
+
+    /// <summary>
+    /// The connection was lost and the peer is about to attach a new transport for the same session
+    /// (<see cref="QuiclyPeer.Reconnect"/>, PROTOCOL.md §4.1). Drop everything bound to the old transport — stream ids,
+    /// stream phases, half-received messages, queued notices — so the resumed connection starts from scratch. The session's
+    /// own channel rules (sequence tables reset, live <c>ReliableLatest</c> keys re-queued, resumable Bulk transfers
+    /// re-requested) belong to <see cref="OnEpochReset"/>, which runs when the resume is accepted and the new epoch is known.
+    /// </summary>
+    /// <remarks>
+    /// Game thread, called while no transport callback can arrive (the old transport reported its close, the new one is not
+    /// attached yet) and after every send entry of the lost connection completed
+    /// <see cref="Threading.DeliveryStatus.Disconnected"/>, so an engine only clears its own bookkeeping here and must not
+    /// queue completions or touch the transport. Default: nothing.
+    /// </remarks>
+    public virtual void OnReconnecting()
+    {
+    }
+
     /// <summary>Releases engine resources (called once, after the transport can no longer call back).</summary>
     public virtual void Dispose()
     {

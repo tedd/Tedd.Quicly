@@ -169,6 +169,26 @@ public sealed unsafe class Mailboxes : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int Take(int keySlot) => Interlocked.Exchange(ref _mailbox[keySlot], Empty);
 
+    /// <summary>
+    /// Whether any key slot is dirty right now (any thread; <see cref="Session.QuiclyPeer.HasPendingWork"/>). One acquire
+    /// read per bitset word, so a post that lands during the scan is simply reported by the next call.
+    /// </summary>
+    internal bool HasDirty
+    {
+        get
+        {
+            ulong* words = _dirty.Pointer;
+            int wordCount = _dirty.Length;
+            for (int w = 0; w < wordCount; w++)
+            {
+                if (Volatile.Read(ref words[w]) != 0)
+                    return true;
+            }
+
+            return false;
+        }
+    }
+
     /// <summary>Current mailbox value without taking it. Diagnostics; any thread.</summary>
     internal int Peek(int keySlot) => Volatile.Read(ref _mailbox[keySlot]);
 

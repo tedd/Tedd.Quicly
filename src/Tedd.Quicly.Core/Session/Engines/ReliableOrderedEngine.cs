@@ -450,11 +450,49 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
 
     /// <inheritdoc/>
     /// <remarks>
-    /// A peer is one connection and one epoch: its streams start with the session, so nothing needs resetting here. A new
-    /// connection gets a new peer with new streams (PROTOCOL.md §4.1).
+    /// Streams start with the connection, and <see cref="OnReconnecting"/> has already dropped the lost connection's, so a
+    /// new epoch needs nothing here: the first pass with queued messages opens a fresh stream. In-flight
+    /// <c>ReliableOrdered</c> sends completed <see cref="DeliveryStatus.Disconnected"/> and are the application's
+    /// responsibility (PROTOCOL.md §4.1).
     /// </remarks>
     public override void OnEpochReset(bool resumed)
     {
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Every channel goes back to <see cref="StreamPhase.NoStream"/> with a fresh serial (so a notice of the lost
+    /// connection's stream is ignored if one still arrives), the send and receive bookkeeping is zeroed, and a
+    /// half-received message's staging lease and ring reservation are given back. A channel that the lost connection had
+    /// closed (<see cref="StreamPhase.Closed"/>) opens again: the close was scoped to that connection, not to the session.
+    /// </remarks>
+    public override void OnReconnecting()
+    {
+        while (_notices.TryDequeue(out _))
+        {
+        }
+
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            ref OrderedSendState send = ref _send[local];
+            send.QueueHead = -1;
+            send.QueueTail = -1;
+            send.QueueCount = 0;
+            send.QueueBytes = 0;
+            send.InFlightCount = 0;
+            send.InFlightBytes = 0;
+            send.Stream = default;
+            send.StreamSerial = (send.StreamSerial + 1) & PeerCore.EngineStreamSerialMask;
+            send.CreditGeneration = _core.StreamCreditGeneration;
+            send.CarriersOutstanding = 0;
+            send.StartCarrier = -1;
+            send.Phase = StreamPhase.NoStream;
+            _txStreams[local] = default;
+            _txSerials[local] = 0;
+            ref OrderedRecvState recv = ref _recv[local];
+            ReleaseReceive(ref recv);
+            recv = default;
+        }
     }
 
     private void DropExpiredHead(ref OrderedSendState send, ref ChannelSendCounters counters, long now)

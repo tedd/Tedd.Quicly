@@ -469,6 +469,28 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
         Volatile.Write(ref _resetReceive, 1);
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The queues were completed <see cref="DeliveryStatus.Disconnected"/> before this call, so only the FIFO bookkeeping and
+    /// the epoch-scoped state are left. No transport callback can arrive here, so the receive tables are cleared directly
+    /// instead of through the flag <see cref="OnEpochReset"/> has to use.
+    /// </remarks>
+    public override void OnReconnecting()
+    {
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            ref ChannelSendState send = ref _send[local];
+            send.QueueHead = -1;
+            send.QueueTail = -1;
+            send.QueueCount = 0;
+            send.QueueBytes = 0;
+            send.NextSequence = 0;
+        }
+
+        Volatile.Write(ref _resetReceive, 0);
+        ResetReceiveState();
+    }
+
     // ------------------------------------------------------------------ receive (transport thread)
 
     /// <inheritdoc/>
@@ -531,6 +553,9 @@ internal abstract unsafe class DatagramEngine : ChannelEngine
                 _core.ReturnReceive(in displaced);
                 counters.Superseded++;
             }
+
+            // A mailbox bypasses the receive ring, so the peer's work signal is raised here instead (ADR 0008 §6).
+            _core.NoteWork();
         }
         else if (!_core.TryEnqueueReceive(in entry))
         {

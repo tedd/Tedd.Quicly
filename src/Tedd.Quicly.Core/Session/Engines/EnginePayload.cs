@@ -29,6 +29,12 @@ internal unsafe struct PreparedPayload
 
     /// <summary>The GC handle pinning a borrowed array, or 0.</summary>
     public nint Pin;
+
+    /// <summary>The table whose shared lease the entry takes one reference on, or <see langword="null"/>.</summary>
+    public SharedLeaseTable? SharedTable;
+
+    /// <summary>The shared payload (valid when <see cref="SharedTable"/> is set).</summary>
+    public SharedLease Shared;
 }
 
 /// <summary>
@@ -121,6 +127,20 @@ internal static unsafe class EnginePayload
                 return TryCopyIn(core, memory.Span, channel, compress: false, ref payload);
             }
 
+            case SendPayloadKind.Shared:
+                // Zero copy and never compressed: a shared lease is one serialisation broadcast to many peers, so
+                // compressing it per peer would undo exactly what SendShared exists for. An empty payload takes no
+                // reference, so nothing has to be released for it.
+                if (request.Shared.IsValid)
+                {
+                    BufferLease block = request.Shared.Lease;
+                    payload.SharedTable = request.SharedTable;
+                    payload.Shared = request.Shared;
+                    payload.Pointer = core.GetPointer(in block);
+                }
+
+                payload.Length = length;
+                return true;
             default:
             {
                 ReadOnlySpan<BufferLease> pages = request.Gather;
@@ -138,7 +158,10 @@ internal static unsafe class EnginePayload
         }
     }
 
-    /// <summary>Gives back what <see cref="TryPrepare"/> took after admission failed (the caller keeps its own lease or pages).</summary>
+    /// <summary>
+    /// Gives back what <see cref="TryPrepare"/> took after admission failed (the caller keeps its own lease or pages; a
+    /// shared lease was never retained, so its reference count is untouched).
+    /// </summary>
     /// <param name="core">The peer's shared state.</param>
     /// <param name="payload">The prepared payload.</param>
     public static void Release(PeerCore core, in PreparedPayload payload)
@@ -176,6 +199,11 @@ internal static unsafe class EnginePayload
         {
             entries.PinHandles[slot] = payload.Pin;
             entries[slot].Flags |= SendEntryFlags.Pinned;
+        }
+
+        if (payload.SharedTable is { } shared)
+        {
+            core.AttachShared(slot, shared, in payload.Shared);
         }
 
         if (request.Kind == SendPayloadKind.Owned && payload.Rented)

@@ -176,7 +176,8 @@ public sealed unsafe partial class QuiclyPeer
 
     private void OnTransportConnected(long now)
     {
-        if (_state != PeerState.Connecting)
+        // Reconnecting is the resumed session's Connecting (PROTOCOL.md §4.1): the same peer, a new transport.
+        if (_state is not (PeerState.Connecting or PeerState.Reconnecting))
         {
             return;
         }
@@ -598,6 +599,7 @@ public sealed unsafe partial class QuiclyPeer
         switch (_state)
         {
             case PeerState.Connecting:
+            case PeerState.Reconnecting:
             case PeerState.Handshaking:
                 if (now >= _admissionDeadline)
                 {
@@ -934,28 +936,56 @@ public sealed unsafe partial class QuiclyPeer
             // Unreachable (at most five changes per connection); keep the newest.
             _transitions[_transitions.Length - 1] = new StateTransition(previous, next);
         }
+
+        // A queued transition is game-thread work: Poll must run to raise it, even when nothing arrived from the network.
+        NoteWork();
     }
 
-    /// <summary>Raises queued <see cref="StateChanged"/> events in order (game thread). With <paramref name="holdClosed"/> the change to Closed stays queued.</summary>
+    /// <summary>
+    /// Raises queued <see cref="StateChanged"/> events in order (game thread). With <paramref name="holdClosed"/> the change
+    /// to Closed stays queued. A transition leaves the queue <em>before</em> its handlers run, so a handler that throws can
+    /// never have the same transition raised again by the next <see cref="Poll"/> (the peer would otherwise report the same
+    /// change for ever); the exception is recorded like a callback fault and the remaining transitions still go out.
+    /// </summary>
     private void RaiseTransitions(bool holdClosed)
     {
-        int raised = 0;
-        while (raised < _transitionCount)
+        while (_transitionCount > 0)
         {
-            StateTransition transition = _transitions[raised];
+            StateTransition transition = _transitions[0];
             if (holdClosed && transition.To == PeerState.Closed)
             {
-                break;
+                return;
             }
 
-            raised++;
-            StateChanged?.Invoke(this, transition.From, transition.To);
-        }
+            // Delivered before the handler runs; a handler may itself queue further transitions (Close, Dispose).
+            _transitionCount--;
+            Array.Copy(_transitions, 1, _transitions, 0, _transitionCount);
+            Action<QuiclyPeer, PeerState, PeerState>? handler = StateChanged;
+            if (handler is null)
+            {
+                continue;
+            }
 
-        if (raised > 0)
-        {
-            Array.Copy(_transitions, raised, _transitions, 0, _transitionCount - raised);
-            _transitionCount -= raised;
+            try
+            {
+                handler(this, transition.From, transition.To);
+            }
+            catch (Exception exception)
+            {
+                NoteHandlerFault(exception);
+            }
         }
+    }
+
+    /// <summary>
+    /// Records an exception from application code the peer called on the game thread (a <see cref="StateChanged"/> handler):
+    /// counted as <see cref="PeerStatistics.CallbackFaults"/> and kept in <see cref="LastCallbackFault"/>, never rethrown, so
+    /// one broken handler cannot stall the peer's own state machine or hide the transitions that follow it.
+    /// </summary>
+    /// <param name="exception">What the handler threw.</param>
+    private void NoteHandlerFault(Exception exception)
+    {
+        Interlocked.Increment(ref _core.Counters.CallbackFaults);
+        Interlocked.CompareExchange(ref _lastFault, exception, null);
     }
 }

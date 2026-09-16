@@ -175,7 +175,7 @@ target selection for datagrams completes inline.
 | `RentBuffer(size)` + `SendOwned(header, lease, length)` | none | after the transport is done (datagram: sent; stream: acknowledged) | serialise directly into library memory — the true zero-copy path |
 | `SendPinned(header, byte* ptr, int length)` / `SendPinned(header, PinnedMemory)` | none, no handle | `BufferReleased` completion | native memory or `GC.AllocateArray(pinned: true)` |
 | `SendBorrowed(header, ReadOnlyMemory<byte>)` | none, but pins (`MemoryHandle` stored as `nint` in a side table) | `BufferReleased` completion | convenience path for ordinary arrays |
-| `SendShared(peerSet, header, sharedLease)` | none | when every peer's send completed | broadcast one serialisation to many peers |
+| `SendShared(header, table, sharedLease, length)` | none | this peer's reference is dropped when its own send completed (or was discarded); the block returns to the pool when the last peer released it | broadcast one serialisation to many peers — never compressed, so the caller compresses once instead of once per peer |
 | `SendGather(header, ReadOnlySpan<BufferLease>)` / `(header, TransportSegment*, count)` | none | `BufferReleased` | header + existing payload pages (≤ 8 segments) |
 
 The library never promises "no copy anywhere": it promises **at most one application-level copy**. MsQuic
@@ -252,6 +252,11 @@ public sealed class QuiclyPeer : IDisposable
     public void GetStatistics(out PeerStatistics stats);          // fixed-layout struct: RTT (smoothed/min/max/variance, transport + application), one-way jitter, datagram loss %, bytes/packets per second each way, cwnd, bytes in flight, max datagram payload, ring occupancy high-water marks, per-channel counters (sent, received, dropped, superseded, expired, out-of-buffers, queue-full, too-large, ring-drops, retries, key-table-full)
     public long EstimatedRemoteMicros();
     public TimeSpan NextDeadline { get; }
+    public long NextDeadlineMicros { get; }            // = min(poll, flush), for a host with one loop
+    public long NextPollDeadlineMicros { get; }         // the peer's own timers: ping, heartbeat, admission, close linger, stream idle
+    public long NextFlushDeadlineMicros { get; }        // engine work only a Flush can serve (retries, expiry, send-cap refill)
+    public bool HasPendingWork { get; }                 // anything waiting for Poll: rings, mailboxes, transitions, a due timer
+    public bool IsDisposed { get; }
 
     public BufferLease RentBuffer(int size);
     public SendResult SendCopy(in SendHeader h, ReadOnlySpan<byte> payload, SendOptions o = default);
@@ -259,6 +264,7 @@ public sealed class QuiclyPeer : IDisposable
     public unsafe SendResult SendPinned(in SendHeader h, byte* payload, int length, SendOptions o = default);
     public SendResult SendBorrowed(in SendHeader h, ReadOnlyMemory<byte> payload, SendOptions o = default);
     public SendResult SendGather(in SendHeader h, ReadOnlySpan<BufferLease> segments, SendOptions o = default);
+    public SendResult SendShared(in SendHeader h, SharedLeaseTable table, in SharedLease lease, int length, SendOptions o = default); // fan-out: retains on admission, releases exactly once
     public ValueTask<SendResult> SendAsync(in SendHeader h, ReadOnlyMemory<byte> payload, SendOptions o, CancellationToken ct); // waits for admission when a reliable queue is full
     public ValueTask<ReceiveLease> SendRequestAsync(in SendHeader h, ReadOnlyMemory<byte> payload, TimeSpan timeout, CancellationToken ct);
     public SendResult Respond(in ReceiveHeader request, ReadOnlySpan<byte> payload);
@@ -278,7 +284,8 @@ public sealed class QuiclyPeer : IDisposable
     public bool TryCancel(SendToken t);              // best effort; never releases the payload by itself
 
     public void Close(CloseReason reason);           // graceful; completes through Poll with PeerState.Closed
-    public event Action<QuiclyPeer, PeerState, PeerState>? StateChanged;   // raised from Poll
+    public void Reconnect(ITransportConnector connector, EndPoint endpoint, string? serverName, ReadOnlySpan<byte> authToken); // client: resume this session over a new transport (PROTOCOL §4.1)
+    public event Action<QuiclyPeer, PeerState, PeerState>? StateChanged;   // raised from Poll; a throwing handler never sees the same transition twice
 }
 
 public readonly record struct SendHeader(ushort Channel, ulong Key = 0);
@@ -286,6 +293,13 @@ public readonly struct SendOptions { public SendMode Mode; /* Buffered | Immedia
 public readonly record struct SendResult(SendStatus Status, SendToken Token);
 public enum SendStatus { Admitted, QueueFull, TooLarge, OutOfBuffers, ChannelClosed, NotConnected, KeyTableFull, InvalidChannel, NotSupported }
 public enum DeliveryStatus { Pending, Delivered, Superseded, Failed, Canceled, Expired, Lost, Disconnected, Sent }
+
+// PeerOptions.WorkSignal: told once per Poll that the peer has game-thread work, so a host wakes instead of polling idle peers.
+// Non-blocking, allocation-free, must not re-enter the peer; HasPendingWork is the level behind this edge.
+public interface IPeerWorkSignal { void OnWork(QuiclyPeer peer); }
+
+// PeerOptions also exposes Clone() (an independent copy sharing the clock, pool and signal) and Validate() (the same checks the
+// peer constructors run), so hosts neither copy options by reflection nor build a throw-away peer to check them.
 ```
 
 ### 6.1 Server and client

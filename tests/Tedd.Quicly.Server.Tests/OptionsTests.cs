@@ -46,6 +46,7 @@ public sealed class OptionsTests
             o.TlsAlpnEndpoint = null!;
         },
         ["redirect-port"] = o => o.RedirectHttpsPort = 0,
+        ["tls-handshake-timeout"] = o => o.TlsHandshakeTimeout = TimeSpan.Zero,
         ["health-path"] = o =>
         {
             o.EnableHealthEndpoint = true;

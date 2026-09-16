@@ -67,8 +67,6 @@ public sealed class HttpTlsOptions
         return cert;
     }
 
-    internal List<SslApplicationProtocol> ProtocolList => _protocols;
-
     internal ServerCertificateSelectionCallback SelectionCallback => _callback ??= SelectForSslStream;
 
     /// <summary>The per-handshake options of a regular connection: the certificate for the client's SNI host with its built credential.</summary>

@@ -14,8 +14,8 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 | Core · State | native arrays, send-entry table, key tables, mailboxes, channel state, segment arena | in Core | 99.8 % | [state](benchmarks/state.md) |
 | Core · Channels / Framing | channel table + canonical hash, datagram/container/stream framing, incremental stream parser | in Core | 99.9 % | [framing](benchmarks/framing.md) |
 | Core · Control | control-protocol codec, session tokens, auth-failure limiter | in Core | 100 % | control numbers in the module notes |
-| Core · Session | `QuiclyPeer`, handshake and admission, control stream, ping and clock sync, scheduler and packer, unreliable / sequenced / ordered engines, async completion APIs, thread-safe send, Poll/Drain, per-stream idle timeout, plus the host hooks (work signal and `HasPendingWork`, peer-level `SendShared`, split poll/flush deadlines, in-place reconnect with session resume, `PeerOptions.Clone`/`Validate`, `IsDisposed`) | in Core | 96.8 % | [session](benchmarks/session.md) |
-| **Core total** | | **3 222** | | |
+| Core · Session | `QuiclyPeer`, handshake and admission, control stream, ping and clock sync, scheduler and packer, unreliable / sequenced / ordered / group-stream engines, async completion APIs, thread-safe send, Poll/Drain, per-stream idle timeout, plus the host hooks (work signal and `HasPendingWork`, peer-level `SendShared`, split poll/flush deadlines, in-place reconnect with session resume, `PeerOptions.Clone`/`Validate`, `IsDisposed`) | in Core | 96.6 % | [session](benchmarks/session.md) |
+| **Core total** | | **3 298** | | |
 | Http3 | HTTP/3 frames, QPACK (static + Huffman), HTTP datagrams, WebTransport framing and capsules | 504 | 100 % | [http3](benchmarks/http3.md) |
 | Transport.MsQuic | layout-validated MsQuic interop and wrappers; MsQuic-backed `ITransport`, connector, listener with reference-counted certificate hot swap | 722 (4 skipped off-Windows) | 98.4 % bindings, 93.5 % transport | [msquic-transport](benchmarks/msquic-transport.md) |
 | Testing | deterministic simulated network and transport, recording sink, test certificates, in-process fake ACME CA, transport conformance suite (24 scenarios, run against the simulator and MsQuic) | 366 | 97.6 % | [simulation](benchmarks/simulation.md) |
@@ -31,7 +31,6 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 | Module | Content |
 |---|---|
 | Core · ReliableLatest (wave C2) | versioned per-key state, loss- and timer-driven retransmission, acks and rejects, large values on group streams, key retirement. Implemented and reviewed; the fix pass is in flight (a shared broadcast buffer took no reference, and a large value of a resumed epoch was reported delivered when it had been dropped) |
-| Core · ReliableUnordered (wave C2) | group streams: one stream per flush group, independent loss, stream-credit waiting, receive-side group limits. Implemented and reviewed; the fix pass is in flight (a stopped stream released its pooled group record twice) |
 
 ## Remaining
 

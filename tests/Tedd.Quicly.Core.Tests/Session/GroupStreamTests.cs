@@ -44,7 +44,9 @@ public class GroupStreamTests
         Assert.Equal(3ul, GroupKit.GroupsFormed(h.Client, 5));
         Assert.True(GroupKit.Engine(h.Client).StreamsRefused >= 1, "the peer's stream limit refused no start");
         Assert.True(h.RunUntil(() => got.Count == 3), $"{got.Count} of 3 messages arrived");
-        Assert.All(tokens, token => Assert.Equal(DeliveryStatus.Delivered, h.Client.GetDeliveryStatus(token)));
+
+        // The last group's bytes are acknowledged one one-way delay after they were dispatched.
+        Assert.True(h.RunUntil(() => tokens.TrueForAll(token => h.Client.GetDeliveryStatus(token) == DeliveryStatus.Delivered)));
         Assert.Equal(0, GroupKit.Stats(h.Client, 5).Expired);
         Assert.Equal(3, GroupKit.Stats(h.Client, 5).Sent);
         Assert.True(h.RunUntil(() => GroupKit.Groups(h.Client, 5) == 0), "a group was left behind");
@@ -258,18 +260,29 @@ public class GroupStreamTests
     [Fact]
     public void A_Group_The_Peer_Stops_Fails_Without_Closing_The_Channel()
     {
-        using ClientHarness h = new(link: new LinkOptions { DelayMicros = 5_000, PeerUnidiStreams = 8 }, table: Table);
+        // A bandwidth-capped link keeps the group's later carriers in flight while the peer's STOP_SENDING travels, so the
+        // reset really does catch the group half sent.
+        LinkOptions link = new() { DelayMicros = 5_000, BandwidthBitsPerSecond = 8_000_000, PeerUnidiStreams = 8 };
+        using ClientHarness h = new(link: link, table: Table, client: GroupKit.Roomy);
         Assert.True(h.Accept());
-        SendToken token = h.Client.SendCopy(new SendHeader(5), [1], SendOptions.Tracked).Token;
+        List<SendToken> tokens = [];
+        for (int i = 0; i < 200; i++)
+        {
+            SendResult result = h.Client.SendCopy(new SendHeader(5), DatagramKit.Payload(i, 200), SendOptions.Tracked);
+            Assert.True(result.IsAdmitted);
+            tokens.Add(result.Token);
+        }
+
         h.Client.Flush();
         Assert.True(h.RunUntil(() => h.Sink.CountOf(RecordedEventKind.PeerStreamStarted) >= 2));
         TransportStreamId group = h.Sink.OfKind(RecordedEventKind.PeerStreamStarted)[1].StreamId;
         h.ServerTransport!.AbortStream(group, 77, StreamAbortDirection.Receive);
-        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(token) != DeliveryStatus.Pending));
-        Assert.Equal(DeliveryStatus.Failed, h.Client.GetDeliveryStatus(token));
+        Assert.True(h.RunUntil(() => tokens.TrueForAll(token => h.Client.GetDeliveryStatus(token) != DeliveryStatus.Pending)));
+        Assert.Contains(DeliveryStatus.Failed, tokens.Select(token => h.Client.GetDeliveryStatus(token)));
 
         // Only that group failed: the channel still admits and sends (PROTOCOL.md §3.2, groups are independent).
         Assert.Equal(PeerState.Connected, h.Client.State);
+        Assert.Equal(0, GroupKit.Stats(h.Client, 5).QueuedMessages);
         SendToken next = h.Client.SendCopy(new SendHeader(5), [2], SendOptions.Tracked).Token;
         Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(next) == DeliveryStatus.Delivered));
         Assert.Equal(PeerState.Connected, h.Client.State);

@@ -692,15 +692,87 @@ channel owned by the transport thread (the peer's stream, the lease and header f
   send paths; carriers over `Segments` runs for stream gathers; `PeerCore.MakeEngineStreamContext` for every stream it opens (the
   peer routes their `OnStreamStarted` by the context's mode); an SPSC ring of notices for local-stream events; `QueueLocalCompletion`
   inside passes; `StampAdmission` at commit with `OldestQueuedStamp` for `FlushAsync`; `AddStatistics`.
-* Group streams (`ReliableUnordered`, large `ReliableLatest` values): one stream per group, and the refusal handling above applies
-  per stream (a refused group waits for credit and goes out on a new stream: PROTOCOL.md §3.2, "the group waits, it never fails").
-  The peer grants Σ max(MaxGroups, 1) unidirectional streams.
+* Group streams (`ReliableUnordered`: §7.5, as built; large `ReliableLatest` values): one stream per group, and the refusal
+  handling above applies per stream (a refused group waits for credit and goes out on a new stream: PROTOCOL.md §3.2, "the group
+  waits, it never fails"). The peer grants Σ max(MaxGroups, 1) unidirectional streams.
 * Request/response (ordered channels with `RequestResponse`): the frame's RequestId is written from `SendRequest.RequestId` and
   parsed into `ReceiveEntry.RequestId` with `IsRequest`/`IsResponse`; `SendRequestAsync`/`Respond` are the engine hooks
   (`NotSupported` until C2).
 * Fragmentation: `DatagramEngine.AdmitFragmented`/`OnFragment` (§7.1).
 * Bulk: `PeerOptions.BulkShareOfEstimatedBandwidth`/`BulkMaxBytesPerSecond` and `OnIdealSendBufferSize` are not used yet; bulk
   streams share the send cap and the budget rule of `FlushChannel`.
+
+### 7.5 Reliable unordered delivery: group streams (as built: wave C2b)
+
+**Engine** (`Engines/GroupStreamEngine.cs`, registered in `ChannelEngines.Create`). One instance per peer owns every
+`ReliableUnordered` channel. Three native, 64-byte, reference-free structs: a `GroupSendState` per channel (the channel's list of
+live groups, the group being filled, queued/in-flight counts and bytes, the group-id counter, the churn deadline, the number of
+groups holding a stream), a `GroupState` per group (its message FIFO over `Entries.Next`, its byte count, its group id, its
+stream with serial and credit generation, its carriers outstanding, its phase) taken from a free list of
+`Σ (3 × max(MaxGroups, 1) + 4)` records, and a `GroupRecv` per accepted peer stream (staging lease, message header fields) from a
+free list of `Σ max(MaxGroups, 1)` records. The peer's files are untouched; the only new shared seam is the churn bound
+(`PeerOptions.GroupMinInterval` → `PeerCore.GroupMinIntervalMicros`).
+
+* **Groups.** The messages a channel admits between two scheduler passes form one group (PROTOCOL.md §3.2). `Admit` appends to
+  the channel's open group and seals it as soon as one more message would pass `GroupMaxBytes` (default 64 KiB), opening the
+  next one — so a group fills without waiting for a flush, like a container (PROTOCOL.md §4.5). A message larger than the bound
+  is a group of its own. With no free group record the open group simply keeps growing (a send is never failed for that), and a
+  channel that has no group at all answers `QueueFull`. Checks and commit are the ordered engine's (`EnginePayload` for every
+  send path, `EffectiveMaxMessageSize`, `QueueLimitBytes` over queued plus in-flight bytes, the carrier reserve in the entry
+  table, `CurrentPassMicros` for the expiry deadline, `StampAdmission`), with the §3.1 frame header written **without** a request
+  id.
+* **`FlushChannel`.** The open group is sealed unless `GroupMinIntervalMicros` (default 1 ms) has not passed since the channel
+  last opened a stream — then it keeps filling and `NextDeadline` drops to the moment the next stream may open, which is what
+  bounds stream churn; a message sent `Immediate` seals its group at once. Then every group of the channel is offered a stream,
+  oldest first: expired messages of a group that has no stream yet are dropped (`Expired`, PROTOCOL.md §4.5 — once a group's
+  stream is open its messages are committed to it), and a group opens one `OpenStream(Unidirectional,
+  MakeEngineStreamContext(ReliableUnordered, **group slot**, serial), priority × 257)`. The context carries the engine's group
+  slot where the ordered engine carries a channel index: the peer routes `OnStreamStarted` by the context's mode only. Carriers
+  are the ordered engine's (a run of `PeerCore.Segments`, at most 64 segments, the batch list naming the members in admission
+  order, `DatagramPacker.SubmitPending` first, the §7.1 budget rule); the first carries the preamble `ChannelId, GroupId` and
+  `Start`, the one that takes the group's last message carries `Fin`.
+* **Waiting, never failing.** Phases: `Filling` → `Waiting` → `Starting` → `Open`, with `Refused` while a refused start's
+  carrier comes back and `Closed` when the group is finished. A start the peer's stream limit refuses (synchronously: the call
+  returns `StreamLimitReached` and the stream is released with `CloseStream`; asynchronously: `OnStreamStarted(StreamLimitReached)`,
+  the carrier's canceled completion, then the shutdown the peer's handling closes) never reached the peer, so the group's
+  messages return to its head in admission order and go out on a **new** stream (a new serial, the same group id) once
+  `StreamCreditGeneration` changes. A group never fails for want of credit, and the first refusal in a pass stops the pass from
+  opening more streams on that channel.
+* **`MaxGroups` bounds both directions.** Both ends hold the same table, so the sender keeps at most `max(MaxGroups, 1)` streams
+  open per channel: exceeding it would have the receiver reset its own live groups. The slot (like the peer's stream credit)
+  returns only when the stream **shuts down**, not when its last carrier completes — the receiver frees its group slot at that
+  same event, so this end can never open the stream that would push the peer past the limit. A group therefore keeps its record
+  until its stream is gone; `OnPeerClosed` hands the slots back itself, since nothing shuts a stream down after the connection
+  is.
+* **Completions.** A carrier's completion completes both stages of every member `Delivered` (PROTOCOL.md §4.3),
+  `Disconnected` while the connection closes, and re-queues them after a refusal. Anything else fails **that group**
+  (`Failed`), and so does a stream the peer stops (STOP_SENDING) or one that fails to start: its queued messages complete
+  `Failed`, its record is released and the channel keeps admitting and sending — groups are independent, so nothing here closes
+  a channel (unlike §7.2). `TryCancel` unlinks a message that is still queued in its group. Local-stream events reach the game
+  thread through an SPSC ring of notices keyed by group slot and serial, drained before every decision that depends on them.
+* **Receive** (transport thread). `OnStreamOpened` accepts at most `MaxGroups` concurrent peer streams per channel and resets
+  the rest with `LimitExceeded` (PROTOCOL.md §7); each accepted stream gets a `GroupRecv` record whose index is the stream's
+  cookie. `Start` reserves a receive-ring slot and rents a lease of the frame's `Length` (either failing ⇒ `Pend`), `Chunk`
+  copies, `End` publishes — so a group's messages are delivered as they complete, not at its FIN. A message within
+  `MaxMessageSize` but above `min(ReceiveBudgetBytes, largest pool block)` resets **its** stream with `LimitExceeded` (the
+  §7.2 sizing rule applies, but a group never closes the connection for it). A malformed group is reset
+  `ProtocolViolation` by the peer's parser and a stalled one `Timeout` by the peer's mid-message idle sweep (§4.3);
+  both reach `OnStreamClosed`, which returns the staging lease and cancels the reservation on the transport thread.
+* **Statistics.** Per channel: `Sent`/`BytesSent` at hand-off (taken back after a refusal), `Received`/`BytesReceived` at the
+  end of a message, `Expired`, `QueueFull`, `TooLarge`, `ReceiveTooLarge`, and `QueuedMessages`/`QueuedBytes`/
+  `InFlightMessages`/`InFlightBytes`. Per peer: `StreamSends`, `StreamBytesSent`, `StreamReceivePends`, `StreamIdleTimeouts`,
+  `StreamsReset`.
+* **Tests** (`Session/GroupTestKit.cs` — `GroupTables.Main`, `OneStream`/`FourGroups` (the same hash with different
+  `MaxGroups`, which the hash does not cover, so one end grants one stream while the other tries four), hand-written group
+  streams): `GroupDeliveryTests` (loss in one group never delays another, through the simulator's targeted
+  `LoseNextStreamPackets`; 3 000 messages of 4 B … 64 KiB byte-exact under 5 % datagram loss, 3 % stream loss, reordering,
+  jitter and a bandwidth cap; a group's messages delivered while its stream is still open; one flush of a hundred messages as
+  one group in four stream sends; the `GroupMaxBytes` seal; keys, LZ4 and empty payloads), `GroupStreamTests` (a refused group
+  waiting for credit and going out on a new stream, asynchronous and synchronous refusals, the receive-side `MaxGroups` reset,
+  a malformed group reset while other groups keep flowing, the mid-message idle timeout, the churn bound with and without an
+  interval, a message the receiver could never buffer resetting only its group, a group the peer stops, the queue limit, the
+  size limit, cancellation, expiry before the stream opens, close, and a full receive ring holding a group back) and
+  `GroupZeroAllocationTests` (a stream opened and closed every tick on a clean link, 0 B per window).
 
 Waves:
 
@@ -709,7 +781,7 @@ Waves:
 | C1 step 1 (done) | `PeerCore`, `QuiclyPeer` public API, handshake/control/ping/close, `ChannelEngine` base + registry + placeholder, stream table, completions, Poll/Drain/handlers, statistics | State, Framing, Channels, Control, SimulatedTransport |
 | C1 step 2 (done) | packer + scheduler (§7.1), engines for `UnreliableUnordered`, `UnreliableSequenced` (incl. coalescing mailboxes and LRU key tables), all send paths, tracked sends, compression on send, send cap, `Immediate` sends | step 1 |
 | C1 step 3 (done) | `ReliableOrdered` engine (persistent stream, carrier gathers, refused-start retry, progressive receive, back-pressure), `SendAsync`/`FlushAsync`/`ThreadSafeSend`, simulator flow control, benchmarks (§7.2, §7.3) | steps 1–2 |
-| C2 (parallel) | `ReliableLatestEngine`; `GroupStreamEngine` (`ReliableUnordered`); `BulkEngine`; fragmentation in the unreliable engines; request/response in the ordered engine | C1 |
+| C2 (parallel) | `GroupStreamEngine` (`ReliableUnordered`, done: §7.5); `ReliableLatestEngine`; `BulkEngine`; fragmentation in the unreliable engines; request/response in the ordered engine | C1 |
 | C3 | `MsQuicTransport` (ITransport over the MsQuic wrappers) + listener/connector; `QuiclyServer` / `QuiclyClient`; admission; reconnect | C1, msquic bindings |
 | C4 | WebTransport-over-HTTP/3 carrier (opt-in), HTTP/3 static responder | C3, Http3 |
 | C5 | End-to-end tests (MsQuic loopback, ACME mock CA + HTTP server + QUIC listener cert swap), samples, E2E benchmarks | all |

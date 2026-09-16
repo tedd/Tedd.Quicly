@@ -14,7 +14,8 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 | Core · State | native arrays, send-entry table, key tables, mailboxes, channel state | in Core | 99.8 % | [state](benchmarks/state.md) |
 | Core · Channels / Framing | channel table + canonical hash, datagram/container/stream framing, incremental stream parser | in Core | 99.9 % | [framing](benchmarks/framing.md) |
 | Core · Control | control-protocol codec, session tokens, auth-failure limiter | in Core | 100 % | control numbers in the module notes |
-| **Core total** | | **2 492** | | |
+| Core · Session | `QuiclyPeer`, handshake and admission, control stream, ping and clock sync, scheduler and packer, unreliable / sequenced / ordered engines, async completion APIs, thread-safe send, Poll/Drain, per-stream idle timeout | in Core | 96.4 % | [session](benchmarks/session.md) |
+| **Core total** | | **3 154** | | |
 | Http3 | HTTP/3 frames, QPACK (static + Huffman), HTTP datagrams, WebTransport framing and capsules | 504 | 100 % | [http3](benchmarks/http3.md) |
 | Transport.MsQuic | layout-validated MsQuic interop and wrappers; MsQuic-backed `ITransport`, connector, listener with reference-counted certificate hot swap | 722 (4 skipped off-Windows) | 98.4 % bindings, 93.5 % transport | [msquic-transport](benchmarks/msquic-transport.md) |
 | Testing | deterministic simulated network and transport, recording sink, test certificates, in-process fake ACME CA, transport conformance suite (24 scenarios, run against the simulator and MsQuic) | 360 | 97.6 % | [simulation](benchmarks/simulation.md) |
@@ -28,14 +29,14 @@ Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.
 
 | Module | Content |
 |---|---|
-| Core · Session (wave C1) | Steps 1–3 done on `quicly/c1-session`, awaiting review: `QuiclyPeer`, handshake and admission, control stream, ping/clock sync, scheduler and packer, `UnreliableUnordered` / `UnreliableSequenced` / `ReliableOrdered` engines, `SendAsync` / `FlushAsync` / `WaitAsync` / `TryCancel`, `ThreadSafeSend`, Poll/Drain, completions; stream flow control in the simulator. On the branch: Core 3 140 tests, Testing 366; Session line coverage 96.4 %; [session](benchmarks/session.md) benchmarks |
+| Core · Session hooks | host-facing additions the server and client asked for: work signal, peer-level shared send, split poll/flush deadlines, in-place resume with session resumption, options clone and validate, `IsDisposed` |
+| Server / Client (wave C3) | `QuiclyServer` and `QuiclyClient` implemented and reviewed; the fix pass for eight blocking findings (including a kicked-session resume hole) is in verification |
 
 ## Remaining
 
 | Wave | Content |
 |---|---|
 | C2 | `ReliableLatest`, `ReliableUnordered` (group streams), `Bulk`, fragmentation, request/response engines |
-| C3 | `QuiclyServer` and `QuiclyClient` (admission, peer sets and broadcast, reconnect) |
 | C4 | WebTransport-over-HTTP/3 carrier (opt-in) |
 | C5 | End-to-end tests over real MsQuic loopback, samples, end-to-end benchmarks |
 | later | Browser (WebAssembly) transport — optional, waits for .NET 11 browser tooling to mature |

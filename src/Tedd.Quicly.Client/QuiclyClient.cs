@@ -25,10 +25,11 @@ namespace Tedd.Quicly.Client;
 /// server refuses the resume and <see cref="ReconnectPolicy.FallBackToNewSession"/> is set (or
 /// <see cref="ReconnectPolicy.ResumeSession"/> is off), the attempt starts a fresh session with a <em>new</em> peer instead
 /// — <see cref="ClientOptions.PeerCreated"/> runs for it and <see cref="ReconnectedInfo.PreviousPeer"/> is the peer it
-/// replaced. The same happens when the <see cref="ITransportConnector"/> itself fails while the peer is being re-armed: that
-/// peer cannot take another in-place resume, so the next attempt presents its session token on a new peer (the session is
-/// still resumed). While reconnecting, <see cref="State"/> is <see cref="PeerState.Reconnecting"/> and <see cref="Peer"/> is
-/// the peer being resumed (sends answer <see cref="SendStatus.NotConnected"/> until it is connected again).</para>
+/// replaced. An attempt whose <see cref="ITransportConnector"/> fails is not that case: it leaves the peer exactly where the
+/// lost connection left it, so <see cref="QuiclyPeer.CanReconnect"/> stays <see langword="true"/> and the attempt after it
+/// resumes that same peer in place again. While reconnecting, <see cref="State"/> is <see cref="PeerState.Reconnecting"/> and
+/// <see cref="Peer"/> is the peer being resumed (sends answer <see cref="SendStatus.NotConnected"/> until it is connected
+/// again).</para>
 /// <para><b>Threads.</b> Not thread-safe: one thread at a time (the game thread, or <see cref="ConnectAsync"/>'s continuation
 /// while it runs). Events are raised on that thread. <see cref="Dispose"/> is the exception: it may be called while
 /// <see cref="ConnectAsync"/> waits (from another thread too), which ends that connect with an
@@ -57,7 +58,6 @@ public sealed class QuiclyClient : IDisposable
     private QuiclyPeer? _peer;
     private QuiclyPeer? _attempt;     // an attempt's own peer; null while a resume reconnects _peer in place
     private bool _attemptInPlace;     // the attempt is _peer itself (QuiclyPeer.Reconnect)
-    private bool _inPlaceUnusable;    // that peer cannot take another in-place resume (a connector failure left it reset)
     private bool _attemptResumes;
     private ReadOnlyMemory<byte> _resumeToken;
     private uint _resumeEpoch;
@@ -183,7 +183,6 @@ public sealed class QuiclyClient : IDisposable
         _authToken = options.AuthToken.ToArray();
         _closeRequested = false;
         _attemptNumber = 0;
-        _inPlaceUnusable = false;
         _connecting = true;
         SetState(PeerState.Connecting);
         QuiclyPeer peer;
@@ -426,6 +425,9 @@ public sealed class QuiclyClient : IDisposable
             return;
         }
 
+        // The token locates the session for the attempts that follow. Whether an attempt can present it on this very peer —
+        // an in-place resume — is not decided or remembered here: QuiclyPeer.CanReconnect answers it when the attempt starts
+        // (see StartAttempt), so a transport close reported after this point still resumes in place.
         _resumeToken = _policy.ResumeSession ? peer.SessionToken : default;
         _resumeEpoch = peer.Epoch;
         _resumeSessionId = peer.SessionId;
@@ -459,7 +461,8 @@ public sealed class QuiclyClient : IDisposable
             }
             catch (Exception exception)
             {
-                // The connector failed synchronously (no transport): count it like a failed attempt.
+                // The connector failed synchronously (no transport): count it like a failed attempt. An attempt that never
+                // reached a transport leaves the peer it was to resume untouched, so the next one resumes it in place again.
                 _lastReason = new CloseReason(QuiclyErrorCode.InternalError, Truncate(exception.Message)) { Source = CloseSource.Transport };
                 AttemptFailed(now, HelloStatus.Accepted);
                 return 0;
@@ -483,8 +486,8 @@ public sealed class QuiclyClient : IDisposable
         _lastReason = attempt.CloseReason;
         if (_attemptInPlace)
         {
-            // The peer stays (its handlers and statistics are the application's): the next attempt reconnects it again, or a
-            // fresh session replaces it.
+            // The peer stays (its handlers and statistics are the application's): the next attempt asks its CanReconnect
+            // again and reconnects it in place, or a fresh session replaces it.
             _attemptInPlace = false;
         }
         else
@@ -503,31 +506,27 @@ public sealed class QuiclyClient : IDisposable
     /// <see cref="QuiclyPeer.Tag"/> and statistics and presents the session token of its last HelloAck), while a fresh
     /// session gets a new peer through <see cref="ClientOptions.PeerCreated"/>.
     /// </summary>
+    /// <remarks>
+    /// Which of the two it is, is the peer's own answer: <see cref="QuiclyPeer.CanReconnect"/>, the allocation-free probe for
+    /// the preconditions of an in-place resume (a client peer, closed with its transport close observed, alive, and no
+    /// <see cref="QuiclyPeer.Poll"/> or <see cref="QuiclyPeer.Flush"/> on the stack), so the client asks instead of calling
+    /// <see cref="QuiclyPeer.Reconnect"/> to see what it throws. It is asked when the attempt starts rather than remembered
+    /// from the loss: a close the transport reported late is still resumed in place, and an attempt whose connector failed
+    /// leaves the peer where the lost connection left it, so the attempt after it resumes that same peer again. When the
+    /// probe says no, the session token goes to a new peer instead and the session is still resumed.
+    /// </remarks>
     /// <returns>The peer the attempt runs on.</returns>
     private QuiclyPeer StartAttempt()
     {
         _attemptResumes = !_resumeToken.IsEmpty;
-        if (_attemptResumes && !_inPlaceUnusable)
+        if (_attemptResumes && _peer is { CanReconnect: true } peer)
         {
-            QuiclyPeer peer = _peer!;
-            try
-            {
-                peer.Reconnect(_connector, _endpoint!, _serverName, _authToken.Span);
-            }
-            catch
-            {
-                // The connector failed while the peer was being re-armed, which leaves that peer unable to take another
-                // in-place resume: the attempts that follow present the session token on a new peer instead, so the session
-                // can still be resumed.
-                _inPlaceUnusable = true;
-                throw;
-            }
-
+            peer.Reconnect(_connector, _endpoint!, _serverName, _authToken.Span);
             _attemptInPlace = true;
             return peer;
         }
 
-        // A fresh session (no resume token), or a resume the current peer can no longer make in place.
+        // A fresh session (no resume token), or a resume this peer cannot make in place.
         _attempt = CreatePeer(_resumeToken, _resumeEpoch);
         return _attempt;
     }
@@ -568,7 +567,6 @@ public sealed class QuiclyClient : IDisposable
         _peer = attempt;
         _attempt = null;
         _attemptInPlace = false;
-        _inPlaceUnusable = false; // whichever peer is current now can be resumed in place again
         bool resumed = _attemptResumes && attempt.SessionId == _resumeSessionId;
         int attempts = _attemptNumber;
         _attemptNumber = 0;

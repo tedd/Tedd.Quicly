@@ -599,10 +599,10 @@ public class SessionSupportTests
         Assert.IsType<UnreliableSequencedEngine>(ChannelEngines.Create(ChannelMode.UnreliableSequenced));
 
         Assert.IsType<ReliableOrderedEngine>(ChannelEngines.Create(ChannelMode.ReliableOrdered));
+        Assert.IsType<ReliableLatestEngine>(ChannelEngines.Create(ChannelMode.ReliableLatest));
 
-        // Wave C2 modes stay placeholders until their engines land.
+        // The remaining wave C2 modes stay placeholders until their engines land.
         Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.ReliableUnordered));
-        Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.ReliableLatest));
         Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.Bulk));
         Assert.Throws<ArgumentOutOfRangeException>(() => ChannelEngines.Create((ChannelMode)6));
         Assert.Equal(6, ChannelEngines.ModeCount);

@@ -702,6 +702,90 @@ channel owned by the transport thread (the peer's stream, the lease and header f
 * Bulk: `PeerOptions.BulkShareOfEstimatedBandwidth`/`BulkMaxBytesPerSecond` and `OnIdealSendBufferSize` are not used yet; bulk
   streams share the send cap and the budget rule of `FlushChannel`.
 
+### 7.5 ReliableLatest delivery (as built: wave C2a)
+
+**Engine** (`Engines/ReliableLatestEngine.cs` + `.Receive.cs`, registered in `ChannelEngines.Create`). One instance per peer
+owns every `ReliableLatest` channel: a 64-byte `LatestSendState` per channel in native memory (the 32-bit version counter, the
+fresh queue, the retry queue, the queued/in-flight counts and bytes, the earliest armed retry deadline, the large-value stream
+serial and the credit generation), a `KeySendSlot` per key plus an intrusive list of the keys with a live value (so the retry
+sweep visits only those), and on the receive side a `KeyRecvSlot` per key, the channel's coalescing mailbox and the staging
+state of the peer's group streams. Every per-key array grows with the slots in use up to `MaxKeys`.
+
+* **Values and transmissions.** A key has at most one *live value*: a send entry that is **never submitted** and owns the
+  value's payload lease, its datagram header block, its tracking token, its version (`Sequences`), its key (`Keys`), its raw
+  length (`BatchCount`) and its 30-second budget deadline (`Deadlines`). Each *transmission* is a separate untracked entry
+  whose payload segment points at the value's bytes (`Aux0` = the value's slot, `Aux1` = the version), so a retry costs no
+  copy (ADR 0008 invariant 1). The value's `Aux1` packs its key slot, its outstanding transmissions, its flags
+  (`Queued`, `Retrying`, `Superseded`, `Finish`, `Large`, `Transmitted`) and, once known, the terminal status it still owes.
+  Because caller memory is only promised until BufferReleased while a version may live for 30 s, `Admit` always takes the
+  bytes into memory the engine owns: a copy (or its LZ4 block) in a send lease, or the caller's owned lease; pinned, borrowed
+  and gathered payloads are copied.
+* **Admission.** Key slot (`KeyTableFull`, never an eviction — PROTOCOL.md §7), size against
+  `EffectiveMaxMessageSize` (`TooLarge`), the channel's `QueueLimitBytes` over queued + in-flight bytes (`QueueFull`), one
+  entry reserved per channel for the transmissions (`QueueFull`), the payload (`OutOfBuffers`), tracking (`QueueFull`). The
+  version comes from the channel's counter; 0 is skipped on the wrap, so 0 always means "no version".
+* **Supersede.** `Admit` replaces the key's live value: with no transmission outstanding the old value completes
+  `Superseded` at once (a local completion, so no continuation runs inside a pass); with one still in flight it is marked and
+  completed when its last transmission completes, because the transport may still be reading those bytes. A still-open
+  large-value stream of that key is aborted (`AbortStream`, send direction).
+* **Retransmission** (PROTOCOL.md §4.4). `DeliveryStatus.Sent` and a transport acknowledgement both mean only "the datagram
+  left this host": the `LatestAck` is the sole source of `Delivered`. A transmission reported `Lost`, `Expired`, `Canceled`
+  or refused queues an immediate retry; the backstop is `clamp(1.5 × RTT, MinRetry 20 ms, MaxRetry 1 s)` doubled per attempt
+  (`PeerCore.ApplicationRttMicros`, 0 before the first Pong ⇒ `MinRetry`). 16 transmissions or 30 s per version ⇒ `Failed`.
+  Retries are handed over in the engine's `Flush`, after every channel's `FlushChannel` (PROTOCOL.md §4.5: after fresh
+  real-time traffic), bounded by a per-peer `TokenBucket` of `PeerOptions.MaxRetryBytesPerSecond`, or
+  `RetryShareOfEstimatedBandwidth` × (congestion window ÷ RTT) when the transport reports one; with neither, only the
+  per-version budget applies. `Tick` moves due keys to the retry queue and keeps each channel's earliest deadline, so a pass
+  that is not due costs one comparison per channel.
+* **Large values.** A value whose header + payload exceeds the current `MaxDatagramPayload` goes out as one group stream
+  (PROTOCOL.md §3.2, §8 item 8): `WriteGroupPreamble(channel, version)` + the frame `Length, Sequence = version, Key,
+  RawLength` in the transmission's own header block, the value's payload as the second segment of the entry's own pair, one
+  `SubmitStream` with `Start | Fin`. The packer's pending container is handed over first, as on ordered channels. A refused
+  start (`StreamLimitReached`) releases the stream with `CloseStream` and the value waits until `StreamCreditGeneration`
+  changes; a newer version aborts the older stream of the same key.
+* **Receive** (transport thread). Only a version newer than the key's last accepted one is accepted (serial arithmetic, 32
+  bits), into the key's mailbox — ReliableLatest always coalesces, so it uses **no receive-ring entry and no reservation**
+  (PROTOCOL.md §7, ADR 0008 invariant 6) and the `TryReserveReceive`/`PublishReserved` protocol does not apply. An older or
+  duplicate version re-acks the current one, so a lost ack cannot stall completion. Local drops answer `LatestReject`:
+  1 (`RingFull`) when no receive lease was available or the mailbox had no record, 2 (`TooLarge`) for a group-stream value
+  above `min(ReceiveBudgetBytes, largest pool block)`, 3 (`DecodeError`) for a compressed value whose *decoded* size is above
+  that same limit (the receiver could never produce those bytes; the wire-format rules themselves are enforced by the framing
+  layer), 4 (`KeyTableFull`). At most `MaxGroups` (default 4) peer group streams are accepted per channel; further ones are
+  reset `LimitExceeded`. A stream that stops mid-value is reset by the peer's idle sweep (§4.3) and its staging lease is
+  released in `OnStreamClosed`.
+* **Acks this end owes.** The version to acknowledge lives in the key's `PendingAckVersion` word, exchanged atomically: a
+  non-zero previous value means the key is already queued, so the SPSC ring of (channel, key slot) holds at most one entry per
+  key; if the ring overflows, a per-channel sweep flag makes the game thread walk that channel's slots instead, so no ack is
+  stranded. The game thread sends them in the engine's `Flush`: at most one coalesced transmission per peer per
+  `PeerOptions.AckDelay` (default 5 ms), LatestAck first and then LatestReject, as high-priority control datagrams with the
+  control stream as the fallback, de-duplicated per key by construction (one pending version per key, the highest). A
+  transmission whose batch does not fit one datagram continues in further datagrams, at most
+  `MaxAckDatagramsPerPass` = 8 per transmission (about 1 300 keys), which is what a 1 000-key channel needs; `NextDeadline`
+  is lowered to the next ack time so a host that sleeps still acks in time.
+* **Acks the peer sent.** `OnControl` validates that every entry names a ReliableLatest channel of this engine (otherwise the
+  message is a violation on the control stream and a counted drop as a datagram) and hands the entries to the game thread
+  through an SPSC ring, drained before every send-side decision (`Admit`, `FlushChannel`, `Flush`, `Tick`). An ack is
+  cumulative per key: one covering the current version completes the value `Delivered` and frees the key; a `LatestReject`
+  re-arms the timer (back off, then retry).
+* **Key retirement.** `RetireKey(channel, key)` completes the key's live value `Canceled`, stops its retries, aborts its
+  stream, frees the send slot and sends `KeyRetired` (0x17) on the control stream. A received `KeyRetired` posts a message
+  with `ReceiveFlags.KeyRetired` (empty payload, the last accepted version) into the key's mailbox and frees the receive
+  slot, so the same key id can be used again in this epoch — its first value is then newer than anything remembered.
+* **Epoch reset.** A resumed session (`OnEpochReset(resumed: true)`) restarts the channel counter (PROTOCOL.md §1: counters
+  are scoped to the epoch) and re-queues every live key at its current *value* under a fresh version — the free full-state
+  resync of §4.1 — and asks the transport thread to forget its receive keys before the next value, so the lower versions are
+  accepted again.
+* **Statistics.** Per channel: `Sent`/`BytesSent` per transmission, `Retries` (retransmissions), `SendSuperseded`,
+  `Received`/`BytesReceived`, `Dropped` (stale or duplicate), `ReceiveSuperseded` (mailbox replacements), `RingDrops`,
+  `ReceiveKeyTableFull`, `ReceiveTooLarge`, `OutOfBuffers`, and the engine's `QueuedMessages`/`QueuedBytes`/
+  `InFlightMessages`/`InFlightBytes`.
+* **Shared seams added for it** (one region in each file): `PeerCore.SendControlFrame(frame, carrier)` →
+  `QuiclyPeer.SendEngineControl` (a coalesced ack batch as a high-priority control datagram — `SendControlDatagram` now rents
+  a lease for a frame that does not fit the entry's 32-byte header block — or any control message on the control stream),
+  `PeerCore.ApplicationRttMicros` → `QuiclyPeer.ApplicationRttMicros` (the retry timer's input), and
+  `PeerCore.AckDelayMicros`/`RetryShareOfEstimatedBandwidth`/`MaxRetryBytesPerSecond` (option values). `PeerOptions` gained
+  `RetryShareOfEstimatedBandwidth` and `MaxRetryBytesPerSecond`.
+
 Waves:
 
 | Wave | Content | Depends on |

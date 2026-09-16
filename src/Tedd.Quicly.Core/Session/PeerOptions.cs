@@ -119,6 +119,19 @@ public sealed class PeerOptions
     public long BulkMaxBytesPerSecond { get; set; }
 
     /// <summary>
+    /// ReliableLatest retransmissions' share of the estimated bandwidth (PROTOCOL.md §4.4: "an aggregate per-peer retry
+    /// budget, default 10 % of the estimated bandwidth"). The estimate is the transport's congestion window divided by its
+    /// RTT, or <see cref="MaxSendBytesPerSecond"/> when the transport reports none. Default 0.1.
+    /// </summary>
+    public double RetryShareOfEstimatedBandwidth { get; set; } = 0.1;
+
+    /// <summary>
+    /// Absolute cap on ReliableLatest retransmission bytes per second; 0 (the default) derives the cap from
+    /// <see cref="RetryShareOfEstimatedBandwidth"/>. Retries held back by it wait for the next pass.
+    /// </summary>
+    public long MaxRetryBytesPerSecond { get; set; }
+
+    /// <summary>
     /// Timer-driven flush period for hosts without a tick (PROTOCOL.md §4.5). Only <see cref="TimeSpan.Zero"/> (off, the
     /// default) is supported by the peer itself; client and server hosts implement the timer.
     /// </summary>
@@ -193,7 +206,7 @@ public sealed class PeerOptions
         CheckNonNegative(StreamIdleTimeout, nameof(StreamIdleTimeout));
         CheckNonNegative(CloseLinger, nameof(CloseLinger));
         CheckNonNegative(SessionGrace, nameof(SessionGrace));
-        if (MaxSendBytesPerSecond < 0 || BulkMaxBytesPerSecond < 0)
+        if (MaxSendBytesPerSecond < 0 || BulkMaxBytesPerSecond < 0 || MaxRetryBytesPerSecond < 0)
         {
             throw new ArgumentException("Bandwidth caps must not be negative.", nameof(MaxSendBytesPerSecond));
         }
@@ -201,6 +214,11 @@ public sealed class PeerOptions
         if (!(BulkShareOfEstimatedBandwidth > 0 && BulkShareOfEstimatedBandwidth <= 1))
         {
             throw new ArgumentException("BulkShareOfEstimatedBandwidth must be in (0, 1].", nameof(BulkShareOfEstimatedBandwidth));
+        }
+
+        if (!(RetryShareOfEstimatedBandwidth > 0 && RetryShareOfEstimatedBandwidth <= 1))
+        {
+            throw new ArgumentException("RetryShareOfEstimatedBandwidth must be in (0, 1].", nameof(RetryShareOfEstimatedBandwidth));
         }
 
         if (SessionToken.Length > ControlCodec.MaxTokenLength)

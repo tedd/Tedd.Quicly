@@ -158,6 +158,9 @@ internal sealed unsafe class PeerCore : IDisposable
         _scheduleOrder = ComputeScheduleOrder(_channels);
         _localCompletions = new CompletionEntry[capacity];
         _passMicros = Clock.NowMicros;
+        AckDelayMicros = Math.Max(0, PeerOptions.ToMicros(options.AckDelay));
+        RetryShareOfEstimatedBandwidth = options.RetryShareOfEstimatedBandwidth;
+        MaxRetryBytesPerSecond = options.MaxRetryBytesPerSecond;
         Packer = new DatagramPacker(this);
     }
 
@@ -232,6 +235,32 @@ internal sealed unsafe class PeerCore : IDisposable
         serial = (uint)(context >> 32) & EngineStreamSerialMask;
         return true;
     }
+
+    // ------------------------------------------------------------------ wave C2 engine seams (one region, see session-layer.md §7.5)
+
+    /// <summary>
+    /// Sends a control message an engine built (game thread): a coalesced LatestAck/LatestReject batch as a high-priority
+    /// control datagram, or any control message on the control stream when no datagram fits (PROTOCOL.md §2.3, §3.4).
+    /// </summary>
+    /// <param name="frame">The encoded frame, framed for <paramref name="carrier"/>.</param>
+    /// <param name="carrier">Datagram or control stream.</param>
+    /// <returns><see langword="false"/> when the frame could not be handed to the transport.</returns>
+    public bool SendControlFrame(ReadOnlySpan<byte> frame, ControlCarrier carrier) => Peer.SendEngineControl(frame, carrier);
+
+    /// <summary>
+    /// Application-level smoothed RTT in micros (PROTOCOL.md §4.6; 0 before the first Pong), the input of the ReliableLatest
+    /// retry timer <c>clamp(1.5 × RTT, MinRetry, MaxRetry)</c>. Game thread.
+    /// </summary>
+    public long ApplicationRttMicros => Peer.ApplicationRttMicros;
+
+    /// <summary>Longest delay before a coalesced LatestAck/LatestReject goes out (<see cref="PeerOptions.AckDelay"/>, PROTOCOL.md §2.3).</summary>
+    public long AckDelayMicros { get; }
+
+    /// <summary>ReliableLatest retransmissions' share of the estimated bandwidth (<see cref="PeerOptions.RetryShareOfEstimatedBandwidth"/>).</summary>
+    public double RetryShareOfEstimatedBandwidth { get; }
+
+    /// <summary>Absolute cap on ReliableLatest retransmission bytes per second (<see cref="PeerOptions.MaxRetryBytesPerSecond"/>; 0 = derive).</summary>
+    public long MaxRetryBytesPerSecond { get; }
 
     /// <summary>Completions queued with <see cref="QueueLocalCompletion"/> and not yet routed.</summary>
     public int LocalCompletionsQueued => _localCount;

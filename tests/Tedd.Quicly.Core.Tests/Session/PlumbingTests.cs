@@ -502,12 +502,14 @@ public class SendPlumbingTests
         using SessionHarness h = new(table: TestTables.AllModes);
         byte[] data = [1];
 
-        // Channels 2 … 4 (the unreliable modes and ReliableOrdered) have their engines; 5 … 7 are placeholders until wave C2.
+        // Channels 2 … 4 (the unreliable modes and ReliableOrdered) and 6 (ReliableLatest) have their engines;
+        // 5 (ReliableUnordered) and 7 (Bulk) are placeholders until the rest of wave C2 lands.
         Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2, 1), data).Status);
         Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(3, 1), data).Status);
         Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(4, 1), data).Status);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(6, 1), data).Status);
         Assert.Equal(SendStatus.Admitted, (await h.Client.SendAsync(new SendHeader(4, 1), data)).Status);
-        for (ushort channel = 5; channel <= 7; channel++)
+        foreach (ushort channel in (ushort[])[5, 7])
         {
             Assert.Equal(SendStatus.NotSupported, h.Client.SendCopy(new SendHeader(channel, 1), data).Status);
             Assert.Equal(SendStatus.NotSupported, h.Client.SendBorrowed(new SendHeader(channel, 1), data).Status);
@@ -519,7 +521,7 @@ public class SendPlumbingTests
         Assert.Equal(SendStatus.NotSupported, h.Client.SendOwned(new SendHeader(5), lease, 1).Status);
         h.Client.ReturnBuffer(in lease);
         Assert.Equal(SendStatus.NotSupported, SendPinned(h.Client));
-        Assert.Equal(SendStatus.NotSupported, h.Client.RetireKey(6, 1));
+        Assert.Equal(SendStatus.Admitted, h.Client.RetireKey(6, 1));
         Assert.Equal(SendStatus.NotSupported, h.Client.Respond(new ReceiveHeader { Channel = 4, RequestId = 1 }, data).Status);
         await Assert.ThrowsAsync<NotSupportedException>(async () => await h.Client.SendRequestAsync(new SendHeader(4), data, TimeSpan.FromSeconds(1)));
         await Assert.ThrowsAsync<NotSupportedException>(async () => await h.Client.BeginBulkSendAsync(new BulkDescriptor(7, 1, 1, 10), new EmptySource()));

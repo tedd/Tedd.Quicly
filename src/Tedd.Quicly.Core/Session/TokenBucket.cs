@@ -32,6 +32,33 @@ internal struct TokenBucket
         _last = nowMicros;
     }
 
+    /// <summary>
+    /// Changes the rate and burst of a running bucket without refilling it: the level earned so far is carried over (a
+    /// <see cref="Consume"/> debt included) and clamped to the new burst. A rate derived from a moving estimate — the
+    /// ReliableLatest retry budget follows the congestion window — would otherwise hand out a full bucket again on every
+    /// change, so the cap would never bind.
+    /// </summary>
+    /// <param name="ratePerSecond">Tokens added per second.</param>
+    /// <param name="burst">Bucket size in tokens.</param>
+    /// <param name="nowMicros">Current clock micros.</param>
+    public void SetRate(long ratePerSecond, long burst, long nowMicros)
+    {
+        if (_rate == 0 && _capacity == 0)
+        {
+            Initialize(ratePerSecond, burst, nowMicros);
+            return;
+        }
+
+        Refill(nowMicros);
+        _rate = ratePerSecond;
+        _capacity = burst * Scale;
+        _last = nowMicros;
+        if (_units > _capacity)
+        {
+            _units = _capacity;
+        }
+    }
+
     /// <summary>Takes <paramref name="count"/> tokens if available.</summary>
     /// <param name="nowMicros">Current clock micros.</param>
     /// <param name="count">Tokens to take.</param>

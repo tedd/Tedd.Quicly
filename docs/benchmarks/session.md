@@ -62,6 +62,8 @@ real client or server where the transport worker and the game thread are differe
 | `GroupStreamBench.Group4K` | 16 × 4 KiB as one group, same cycle (64 KiB on one stream), likewise ending at the server's dispatch | message |
 | `SessionPassBench.Flush100Buffered` | one `Flush` of a peer holding 100 buffered 64-byte messages: the scheduler pass alone (packing into containers, or gathering into stream sends); four pairs, the queues filled in the iteration setup, delivery in the iteration cleanup | flush |
 | `SessionPassBench.SendCopy` | the admission of one 64-byte message (channel lookup, entry, lease, copy, header, queue); 4 × 100 per invocation, delivery in the iteration cleanup | message |
+| `LatestBench.Latest1000Keys` | 1 000 keys of a `ReliableLatest` channel updated once per 60 Hz tick: `SendCopy` per key, client `Flush`, one tick of virtual time, server `Poll` (dispatch) + `Flush` (the coalesced `LatestAck` batch), client `Poll` (the acks and the completions) | value |
+| `LatestBench.Latest64Keys` | the same cycle with 64 keys, so the per-value cost can be separated from the per-pass cost | value |
 | `StreamReceiveLoopBench` | the ADR 0007 loop below | message |
 
 `SessionPassBench` times one invocation per iteration (its setup and cleanup must stay outside the measurement), so
@@ -248,6 +250,63 @@ End to end the saving (15–20 ns of the ~260 ns an ordered 64-byte message cost
 machine: `Ordered64` measured 331 / 398 ns (out of process / in process) with V0, 280 / 293 ns with the refuted V1 and
 258 / 263 ns with the kept one, but `Unreliable64Packed`, which never enters the stream loop, moved from 283 / 334 ns to
 256 / 252 ns between the same runs.
+
+## ReliableLatest: what a keyed value costs (wave C2a)
+
+`LatestBench` (added with the `ReliableLatest` engine, docs/design/session-layer.md §7.6) measures the mode's own cycle on
+the same machine and with the same `InProcessShortRunConfig` as the tables above, on net10.0 (measured 2026-09-16, re-run
+after the session hooks were merged). One
+operation is one *value*: the key's slot lookup, the version from the channel's counter, the value entry with its payload
+lease, one transmission handed to the packer (packed with the other keys' values into containers), the transport, the
+receiving side's per-key acceptance and mailbox post, dispatch to the handler, the peer's coalesced `LatestAck` batch and the
+completion it produces. Channel 2 is a `ReliableLatest` channel with a dense key space; both peers leave
+`ControlMessagesPerSecond` at its 2 000/s default, which covers this workload's ack traffic (see the caveat below).
+
+| Method         | Toolchain              | Mean     | Error     | StdDev   | Values/s (derived) | Allocated |
+|--------------- |----------------------- |---------:|----------:|---------:|-------------------:|----------:|
+| Latest1000Keys | Default                | 606.4 ns | 186.69 ns | 10.23 ns |             1.65 M |         - |
+| Latest64Keys   | Default                | 560.9 ns | 295.61 ns | 16.20 ns |             1.78 M |         - |
+| Latest1000Keys | InProcessEmitToolchain | 479.8 ns |  85.52 ns |  4.69 ns |             2.08 M |         - |
+| Latest64Keys   | InProcessEmitToolchain | 463.8 ns | 176.42 ns |  9.67 ns |             2.16 M |         - |
+
+An earlier valid run of the same benchmark — before the session hooks were merged and before the engine started limiting
+its own large-value streams — reported 471.8 / 470.9 ns out of process and 610.4 / 564.4 ns in process: the two runs
+straddle each other and the toolchains swapped places, with error bars of ±86 … ±633 ns. A **third** run, after the wave C2a
+review fixes (the shared payload committed through `EnginePayload.Commit`, the ack measured against the highest version
+transmitted, the epoch reset consumed on every receive path, the counted stream slots), reported 495.4 / 442.1 ns out of
+process and 558.5 / 491.0 ns in process — inside the band of the first two, with the toolchains swapping places for the third
+time. **The honest reading is therefore 0.46 … 0.61 µs per value, about 1.6 … 2.2 M values per second on one core, with no
+allocation** — not a figure to quote to three digits, and unchanged by the fixes: the table above is kept as measured rather
+than replaced, because no run separates the three. What they all agree on is the shape of the cost, below.
+
+### Reading
+
+* **No allocation per value, end to end**, in both jobs and both runs: admission with the per-key slot, the transmission, the
+  mailbox receive, the ack batch and the completions. `LatestZeroAllocationTests` asserts the same thing over five windows of
+  60 ticks with 1 000 keys (and a second workload that supersedes and retires 32 keys every tick).
+* **The per-value cost dominates**: 1 000 keys cost within 8 % of 64 keys per value in every row of both runs, so the
+  per-pass work (the scheduler pass, the container submissions, the ack batches) is already amortised at 64 keys.
+* **About 2 × a packed unreliable datagram** (0.46–0.61 µs vs 239.8 ns for `Unreliable64Packed`). The extra work per value is the
+  key slot and version bookkeeping, the second send entry (the value keeps its payload for retransmission while the
+  transmission carries it), the receiver's per-key version check and mailbox post instead of a ring entry, and the ack: one
+  entry written into the peer's batch, one control datagram per ~170 keys, and the completion it decides.
+* **At 60 Hz most values complete `Superseded`, not `Delivered`** — and that is the mode working as specified (PROTOCOL.md
+  §4.3). The ack of a value written in tick *t* arrives during tick *t+1*, by which time the application has already written
+  the next value for that key; every value still reached the peer (the receive counter matches) and no retransmission fires
+  (the 20 ms `MinRetry` backstop is longer than the 16.7 ms tick). The benchmark asserts both in its setup and cleanup, so a
+  cycle that stopped delivering could not produce numbers.
+* **Caveat: the control-message limit is part of this workload.** One `LatestAck` datagram carries about 170 keys, so 1 000
+  keys at 60 Hz make the peer receive ~360 control messages per second. Against the **200/s** default this benchmark
+  originally ran with, that closed the session: the first run was **discarded** because the peers closed with
+  `LimitExceeded` part-way through and the remaining cycles measured a closed session (413.6 / 388.9 ns, i.e. ~13 % too
+  fast); the kept run raised the limit to 8 000/s on both ends. That measurement is exactly what made PROTOCOL.md §7 raise
+  the default to **2 000/s with a sizing rule**, so the benchmark now runs at the default and raises nothing. Its `Check()`
+  fails the run if either peer is not connected, if any value was retransmitted, or if fewer values reached the peer's
+  handler than the cycles sent — so a run that started refusing admission or closing the session cannot produce numbers.
+  Hosts running channels with more keys or a higher rate than this still size the limit themselves (session-layer.md §7.6).
+* The single-core caveat of the tables above applies unchanged: both peers and the simulator run on one thread, so the
+  transport-thread → game-thread hand-offs (mailboxes, the ack ring, the completion ring) cost no cross-core coherence here.
+  Another agent was building and testing on the machine during the run.
 
 ## Allocation
 

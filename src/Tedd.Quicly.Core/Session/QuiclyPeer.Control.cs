@@ -767,16 +767,34 @@ public sealed unsafe partial class QuiclyPeer
 
     // ------------------------------------------------------------------ control sends
 
-    /// <summary>Sends one control datagram from a send entry's header block (game thread; Priority flag, PROTOCOL.md §2.3).</summary>
+    /// <summary>
+    /// Sends one control datagram (game thread; Priority flag, PROTOCOL.md §2.3). A frame that fits the entry's 32-byte
+    /// header block needs no lease; a longer one (a coalesced LatestAck/LatestReject batch) is copied into a send lease.
+    /// </summary>
     private bool SendControlDatagram(ReadOnlySpan<byte> frame)
     {
-        if (!_core.TryAllocateEntry(PeerCore.ControlChannelId, SendEntryFlags.None, out int slot))
+        if (!_core.DatagramsEnabled || !_core.TryAllocateEntry(PeerCore.ControlChannelId, SendEntryFlags.None, out int slot))
         {
             _core.Counters.ControlSendFailures++;
             return false;
         }
 
-        _core.Entries.SetHeader(slot, frame);
+        if (frame.Length <= SendEntryTable.HeaderBlockSize)
+        {
+            _core.Entries.SetHeader(slot, frame);
+        }
+        else if (_core.TryRentSend(frame.Length, out BufferLease lease))
+        {
+            frame.CopyTo(_core.GetSpan(in lease));
+            _core.AttachLease(slot, in lease, frame.Length);
+        }
+        else
+        {
+            _core.DiscardEntry(slot);
+            _core.Counters.ControlSendFailures++;
+            return false;
+        }
+
         if (_core.SubmitDatagram(slot, TransportSendFlags.Priority) != TransportStatus.Success)
         {
             _core.DiscardEntry(slot);
@@ -786,6 +804,23 @@ public sealed unsafe partial class QuiclyPeer
 
         return true;
     }
+
+    // ------------------------------------------------------------------ wave C2 engine seams (one region, see session-layer.md §7.5)
+
+    /// <summary>
+    /// Sends one control message an engine built (game thread): a coalesced LatestAck/LatestReject batch as a high-priority
+    /// control datagram (PROTOCOL.md §2.3) or, when no datagram can carry it, as a control-stream message (§3.4) — the
+    /// KeyRetired message (0x17) is always a stream message. The entry is the peer's own control traffic, so its completion
+    /// only frees the slot.
+    /// </summary>
+    /// <param name="frame">The encoded frame (including its carrier's framing).</param>
+    /// <param name="carrier">Datagram or control stream.</param>
+    /// <returns><see langword="false"/> when the frame could not be handed to the transport (counted as a control-send failure).</returns>
+    internal bool SendEngineControl(ReadOnlySpan<byte> frame, ControlCarrier carrier) =>
+        carrier == ControlCarrier.Datagram ? SendControlDatagram(frame) : SendControlStream(frame, out _);
+
+    /// <summary>The application-level smoothed RTT in micros (PROTOCOL.md §4.6), or 0 before the first Pong. Game thread.</summary>
+    internal long ApplicationRttMicros => _ping.SmoothedRtt;
 
     /// <summary>
     /// Sends one framed control message on the control stream (game thread). The first send in each direction carries the

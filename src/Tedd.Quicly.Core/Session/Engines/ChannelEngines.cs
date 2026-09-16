@@ -20,8 +20,8 @@ internal static class ChannelEngines
         ChannelMode.UnreliableSequenced => new UnreliableSequencedEngine(),
         ChannelMode.ReliableOrdered => new ReliableOrderedEngine(),
         ChannelMode.ReliableUnordered => new GroupStreamEngine(),
-        // Wave C2: ReliableLatestEngine, BulkEngine.
-        ChannelMode.ReliableLatest => new PlaceholderEngine(mode),
+        ChannelMode.ReliableLatest => new ReliableLatestEngine(),
+        // Wave C2: BulkEngine.
         ChannelMode.Bulk => new PlaceholderEngine(mode),
         _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Undefined channel mode."),
     };

@@ -502,15 +502,16 @@ public class SendPlumbingTests
         using SessionHarness h = new(table: TestTables.AllModes);
         byte[] data = [1];
 
-        // Channels 2 … 5 (the unreliable modes, ReliableOrdered and ReliableUnordered) have their engines; 6 and 7 are
-        // placeholders until the rest of wave C2.
+        // Channels 2 … 6 (the unreliable modes, ReliableOrdered, ReliableUnordered and ReliableLatest) have their engines;
+        // 7 (Bulk) is a placeholder until the rest of wave C2 lands.
         Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2, 1), data).Status);
         Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(3, 1), data).Status);
         Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(4, 1), data).Status);
         Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(5, 1), data).Status);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(6, 1), data).Status);
         Assert.Equal(SendStatus.Admitted, (await h.Client.SendAsync(new SendHeader(4, 1), data)).Status);
         Assert.Equal(SendStatus.Admitted, (await h.Client.SendAsync(new SendHeader(5, 1), data)).Status);
-        for (ushort channel = 6; channel <= 7; channel++)
+        foreach (ushort channel in (ushort[])[7])
         {
             Assert.Equal(SendStatus.NotSupported, h.Client.SendCopy(new SendHeader(channel, 1), data).Status);
             Assert.Equal(SendStatus.NotSupported, h.Client.SendBorrowed(new SendHeader(channel, 1), data).Status);
@@ -519,10 +520,10 @@ public class SendPlumbingTests
         }
 
         BufferLease lease = h.Client.RentBuffer(8);
-        Assert.Equal(SendStatus.NotSupported, h.Client.SendOwned(new SendHeader(6), lease, 1).Status);
+        Assert.Equal(SendStatus.NotSupported, h.Client.SendOwned(new SendHeader(7), lease, 1).Status);
         h.Client.ReturnBuffer(in lease);
         Assert.Equal(SendStatus.NotSupported, SendPinned(h.Client));
-        Assert.Equal(SendStatus.NotSupported, h.Client.RetireKey(6, 1));
+        Assert.Equal(SendStatus.Admitted, h.Client.RetireKey(6, 1));
         Assert.Equal(SendStatus.NotSupported, h.Client.Respond(new ReceiveHeader { Channel = 4, RequestId = 1 }, data).Status);
         await Assert.ThrowsAsync<NotSupportedException>(async () => await h.Client.SendRequestAsync(new SendHeader(4), data, TimeSpan.FromSeconds(1)));
         await Assert.ThrowsAsync<NotSupportedException>(async () => await h.Client.BeginBulkSendAsync(new BulkDescriptor(7, 1, 1, 10), new EmptySource()));
@@ -534,7 +535,7 @@ public class SendPlumbingTests
     private static unsafe SendStatus SendPinned(QuiclyPeer peer)
     {
         byte value = 1;
-        return peer.SendPinned(new SendHeader(6), &value, 1).Status;
+        return peer.SendPinned(new SendHeader(7), &value, 1).Status;
     }
 
     [Fact]

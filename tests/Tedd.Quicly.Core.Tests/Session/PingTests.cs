@@ -133,7 +133,9 @@ public class PingTests
     [Fact]
     public void A_Control_Message_Flood_Closes_With_LimitExceeded()
     {
-        using ServerHarness h = new();
+        // The limit is pinned here rather than taken from the default, so this covers the mechanism of PROTOCOL.md §7 (a
+        // flood beyond the configured rate closes the connection) whatever the default is sized at for keyed latest traffic.
+        using ServerHarness h = new(server: o => o.ControlMessagesPerSecond = 200);
         Assert.True(h.Admit());
         byte[] pong = Frames.PongFrame(5, 6, 7, ControlCarrier.Datagram);
         for (int i = 0; i < 250; i++)

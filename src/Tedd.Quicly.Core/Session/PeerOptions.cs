@@ -132,6 +132,19 @@ public sealed class PeerOptions
     public long BulkMaxBytesPerSecond { get; set; }
 
     /// <summary>
+    /// ReliableLatest retransmissions' share of the estimated bandwidth (PROTOCOL.md §4.4: "an aggregate per-peer retry
+    /// budget, default 10 % of the estimated bandwidth"). The estimate is the transport's congestion window divided by its
+    /// RTT, or <see cref="MaxSendBytesPerSecond"/> when the transport reports none. Default 0.1.
+    /// </summary>
+    public double RetryShareOfEstimatedBandwidth { get; set; } = 0.1;
+
+    /// <summary>
+    /// Absolute cap on ReliableLatest retransmission bytes per second; 0 (the default) derives the cap from
+    /// <see cref="RetryShareOfEstimatedBandwidth"/>. Retries held back by it wait for the next pass.
+    /// </summary>
+    public long MaxRetryBytesPerSecond { get; set; }
+
+    /// <summary>
     /// Timer-driven flush period for hosts without a tick (PROTOCOL.md §4.5). Only <see cref="TimeSpan.Zero"/> (off, the
     /// default) is supported by the peer itself; client and server hosts implement the timer.
     /// </summary>
@@ -146,8 +159,14 @@ public sealed class PeerOptions
     /// <summary>Largest datagram payload this end will process, announced in Hello/HelloAck (0 = no cap beyond the transport's).</summary>
     public ushort MaxReceiveDatagram { get; set; }
 
-    /// <summary>Control messages (datagram and stream) accepted per second before the connection is closed with <see cref="QuiclyErrorCode.LimitExceeded"/>. Default 200.</summary>
-    public int ControlMessagesPerSecond { get; set; } = 200;
+    /// <summary>
+    /// Control messages (datagram and stream) accepted per second before the connection is closed with
+    /// <see cref="QuiclyErrorCode.LimitExceeded"/>. Default 2 000 (PROTOCOL.md §7). Size it from the channel table: the
+    /// coalesced LatestAck traffic of keyed <see cref="Channels.ChannelMode.ReliableLatest"/> channels dominates it, and one
+    /// ack datagram carries about 170 keys, so a channel of <i>N</i> keys updated at <i>F</i> Hz makes the peer receive
+    /// roughly <c>N·F / 170</c> control messages per second (about 360/s for 1 000 keys at 60 Hz).
+    /// </summary>
+    public int ControlMessagesPerSecond { get; set; } = 2_000;
 
     /// <summary>Sustained Pong rate (PROTOCOL.md §2.3); excess Pings are ignored and counted. Default 4 per second.</summary>
     public int PongsPerSecond { get; set; } = 4;
@@ -229,7 +248,7 @@ public sealed class PeerOptions
         CheckNonNegative(GroupMinInterval, nameof(GroupMinInterval));
         CheckNonNegative(CloseLinger, nameof(CloseLinger));
         CheckNonNegative(SessionGrace, nameof(SessionGrace));
-        if (MaxSendBytesPerSecond < 0 || BulkMaxBytesPerSecond < 0)
+        if (MaxSendBytesPerSecond < 0 || BulkMaxBytesPerSecond < 0 || MaxRetryBytesPerSecond < 0)
         {
             throw new ArgumentException("Bandwidth caps must not be negative.", nameof(MaxSendBytesPerSecond));
         }
@@ -237,6 +256,11 @@ public sealed class PeerOptions
         if (!(BulkShareOfEstimatedBandwidth > 0 && BulkShareOfEstimatedBandwidth <= 1))
         {
             throw new ArgumentException("BulkShareOfEstimatedBandwidth must be in (0, 1].", nameof(BulkShareOfEstimatedBandwidth));
+        }
+
+        if (!(RetryShareOfEstimatedBandwidth > 0 && RetryShareOfEstimatedBandwidth <= 1))
+        {
+            throw new ArgumentException("RetryShareOfEstimatedBandwidth must be in (0, 1].", nameof(RetryShareOfEstimatedBandwidth));
         }
 
         if (SessionToken.Length > ControlCodec.MaxTokenLength)

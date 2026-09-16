@@ -12,7 +12,10 @@ namespace Tedd.Quicly.Core.Tests.Session;
 /// </summary>
 public class RequestResponseTests
 {
-    /// <summary>2 movement datagrams · 4 plain ordered · 10 ordered request/response · 11 the same, keyed · 12 the same, LZ4.</summary>
+    /// <summary>
+    /// 2 movement datagrams · 4 plain ordered · 10 ordered request/response · 11 the same, keyed · 12 the same, LZ4 ·
+    /// 13 the same with a 256-byte queue limit.
+    /// </summary>
     private static readonly ChannelTable Table = ChannelTable.Create()
         .Add(2, "moves", ChannelMode.UnreliableUnordered)
         .Add(4, "chat", ChannelMode.ReliableOrdered)
@@ -23,6 +26,11 @@ public class RequestResponseTests
             o.RequestResponse = true;
             o.Compression = ChannelCompression.Lz4;
             o.MinCompressSize = 16;
+        })
+        .Add(13, "rpc-limited", ChannelMode.ReliableOrdered, o =>
+        {
+            o.RequestResponse = true;
+            o.QueueLimitBytes = 256;
         })
         .Build();
 
@@ -400,6 +408,126 @@ public class RequestResponseTests
         {
             Assert.Throws<InvalidOperationException>(() => _ = request.Result);
         }
+    }
+
+    [Fact]
+    public void A_Request_The_Channel_Cannot_Take_Fails_Without_Holding_A_Slot()
+    {
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        // Channel 13 admits 256 bytes of unacknowledged traffic, so the second message does not fit.
+        Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(13), new byte[300]).Status);
+
+        ValueTask<ReceiveLease> refused = client.SendRequestAsync(new SendHeader(13), new byte[300], TimeSpan.FromSeconds(1));
+        Assert.True(refused.IsCompleted);
+        InvalidOperationException failure = Assert.Throws<InvalidOperationException>(() => _ = refused.Result);
+        Assert.Contains("QueueFull", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(0, OrderedKit.Engine(client).OutstandingRequests);
+        Assert.Equal(0, DatagramKit.Statistics(client).RequestsSent);
+
+        // The slot it took is back: a request on a channel that can take one still works.
+        Echo(h.Server!, 10);
+        ValueTask<ReceiveLease> ok = client.SendRequestAsync(new SendHeader(10), new byte[] { 1, 2 }, TimeSpan.FromSeconds(1));
+        Assert.True(h.RunUntil(() => ok.IsCompleted), "the later request was not answered");
+        ReceiveLease response = ok.Result;
+        Assert.Equal(new byte[] { 2, 1 }, response.Payload.ToArray());
+        client.Release(in response);
+    }
+
+    [Fact]
+    public void A_Response_For_Another_Id_Is_Counted_While_A_Request_Waits()
+    {
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        List<(ReceiveHeader Header, byte[] Payload)> requests = [];
+        server.RegisterHandler(10, Handlers.Collect(requests));
+
+        ValueTask<ReceiveLease> pending = client.SendRequestAsync(new SendHeader(10), new byte[] { 1 }, TimeSpan.Zero);
+        Assert.True(h.RunUntil(() => requests.Count == 1), "the request did not arrive");
+
+        // A response whose id matches no outstanding request is dropped, even while one is waiting.
+        ReceiveHeader invented = new() { Channel = 10, RequestId = 4242 * 2 - 1 };
+        Assert.Equal(SendStatus.Admitted, server.Respond(in invented, [7]).Status);
+        Assert.True(h.RunUntil(() => DatagramKit.Statistics(client).ResponsesUnmatched == 1), "the stray response was not counted");
+        Assert.False(pending.IsCompleted, "the waiting request was not disturbed");
+
+        ReceiveHeader mine = requests[0].Header;
+        Assert.Equal(SendStatus.Admitted, server.Respond(in mine, [8]).Status);
+        Assert.True(h.RunUntil(() => pending.IsCompleted), "the real response did not arrive");
+        ReceiveLease response = pending.Result;
+        Assert.Equal(new byte[] { 8 }, response.Payload.ToArray());
+        client.Release(in response);
+    }
+
+    [Fact]
+    public void A_Canceled_Slot_Is_Reclaimed_When_Another_Response_Walks_Past_It()
+    {
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        List<(ReceiveHeader Header, byte[] Payload)> requests = [];
+        server.RegisterHandler(10, Handlers.Collect(requests));
+        using CancellationTokenSource cts = new();
+
+        ValueTask<ReceiveLease> canceled = client.SendRequestAsync(new SendHeader(10), new byte[] { 1 }, TimeSpan.Zero, cts.Token);
+        ValueTask<ReceiveLease> kept = client.SendRequestAsync(new SendHeader(10), new byte[] { 2 }, TimeSpan.Zero);
+        Assert.True(h.RunUntil(() => requests.Count == 2), "the requests did not arrive");
+        cts.Cancel();
+        Assert.Throws<OperationCanceledException>(() => _ = canceled.Result);
+
+        // Answering the second request walks past the canceled slot, which leaves the live set on the way.
+        ReceiveHeader second = requests[1].Header;
+        Assert.Equal(SendStatus.Admitted, server.Respond(in second, [9]).Status);
+        Assert.True(h.RunUntil(() => kept.IsCompleted), "the second response did not arrive");
+        ReceiveLease response = kept.Result;
+        Assert.Equal(new byte[] { 9 }, response.Payload.ToArray());
+        client.Release(in response);
+        Assert.Equal(0, OrderedKit.Engine(client).OutstandingRequests);
+    }
+
+    [Fact]
+    public void A_Request_Without_A_Timeout_Outlives_One_That_Has_It()
+    {
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        List<(ReceiveHeader Header, byte[] Payload)> requests = [];
+        server.RegisterHandler(10, Handlers.Collect(requests));
+
+        ValueTask<ReceiveLease> patient = client.SendRequestAsync(new SendHeader(10), new byte[] { 1 }, TimeSpan.Zero);
+        ValueTask<ReceiveLease> impatient = client.SendRequestAsync(new SendHeader(10), new byte[] { 2 }, TimeSpan.FromMilliseconds(50));
+        Assert.True(h.RunUntil(() => requests.Count == 2), "the requests did not arrive");
+
+        h.Network.Advance(60_000);
+        client.Poll();
+        Assert.Throws<TimeoutException>(() => _ = impatient.Result);
+        Assert.False(patient.IsCompleted, "a request without a timeout keeps waiting");
+        Assert.Equal(1, OrderedKit.Engine(client).OutstandingRequests);
+        Assert.Equal(long.MaxValue, OrderedKit.Engine(client).RequestDeadlineMicros);
+
+        ReceiveHeader first = requests[0].Header;
+        Assert.Equal(SendStatus.Admitted, server.Respond(in first, [3]).Status);
+        Assert.True(h.RunUntil(() => patient.IsCompleted), "the patient request was never answered");
+        ReceiveLease response = patient.Result;
+        Assert.Equal(new byte[] { 3 }, response.Payload.ToArray());
+        client.Release(in response);
+    }
+
+    [Fact]
+    public void A_Continuation_Attached_Before_The_Response_Runs_When_It_Arrives()
+    {
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        Echo(h.Server!, 10);
+
+        // AsTask attaches a continuation to the pooled source before the response exists (IValueTaskSource.OnCompleted).
+        Task<ReceiveLease> task = client.SendRequestAsync(new SendHeader(10), new byte[] { 4, 5, 6 }, TimeSpan.FromSeconds(1)).AsTask();
+        Assert.True(h.RunUntil(() => task.IsCompleted), "the continuation never ran");
+        ReceiveLease response = task.Result;
+        Assert.Equal(new byte[] { 6, 5, 4 }, response.Payload.ToArray());
+        client.Release(in response);
+        Assert.Equal(0, OrderedKit.Engine(client).OutstandingRequests);
     }
 
     [Fact]

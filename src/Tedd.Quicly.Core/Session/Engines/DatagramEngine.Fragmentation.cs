@@ -180,25 +180,13 @@ internal abstract unsafe partial class DatagramEngine
         int lastSize = wire - (size * (count - 1));
         Debug.Assert(count >= 2 && size <= capacity && lastSize >= 1 && lastSize <= size, "fragment layout");
 
+        // The reserve above was checked against the worst case and nothing between it and here takes an entry, so every one
+        // of these allocations succeeds.
         int* slots = stackalloc int[MaxFragments + 1];
-        int allocated = 0;
-        bool reserved = true;
-        for (; allocated <= count && reserved; allocated++)
+        for (int i = 0; i <= count; i++)
         {
-            reserved = _core.TryAllocateEntry(channel.Id, SendEntryFlags.None, out slots[allocated]);
-        }
-
-        if (!reserved)
-        {
-            // The last attempt failed: give back what the loop took (its own slot was never allocated).
-            for (int i = 0; i < allocated - 1; i++)
-            {
-                _core.DiscardEntry(slots[i]);
-            }
-
-            EnginePayload.Release(_core, in payload);
-            counters.QueueFull++;
-            return SendStatus.QueueFull;
+            bool reserved = _core.TryAllocateEntry(channel.Id, SendEntryFlags.None, out slots[i]);
+            Debug.Assert(reserved, "the entry reserve of a fragmented message");
         }
 
         int owner = slots[0];

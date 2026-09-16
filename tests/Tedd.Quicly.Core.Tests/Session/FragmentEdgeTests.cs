@@ -354,6 +354,210 @@ public unsafe class FragmentEdgeTests
     }
 
     [Fact]
+    public void A_Fragmented_Message_Needs_Its_Owner_And_Every_Fragment_In_The_Send_Table()
+    {
+        // The reserve is checked for the worst case (an owner plus eight fragments), so a nearly full table refuses a
+        // fragmented message while it would still take a single-datagram one.
+        using SessionHarness h = new(
+            table: Table,
+            client: o =>
+            {
+                DatagramKit.Quiet(o);
+                o.SendTableCapacity = 16;
+            },
+            server: DatagramKit.Quiet);
+        QuiclyPeer client = h.Client;
+        int admitted = 0;
+        SendStatus last = SendStatus.Admitted;
+        while (admitted < 8 && last == SendStatus.Admitted)
+        {
+            last = client.SendCopy(new SendHeader(2), DatagramKit.Payload(admitted, 3_000)).Status;
+            admitted += last == SendStatus.Admitted ? 1 : 0;
+        }
+
+        Assert.Equal(SendStatus.QueueFull, last);
+        Assert.InRange(admitted, 1, 3);
+        Assert.Equal(1, DatagramKit.ChannelStats(client, 2).QueueFull);
+        // A message that fits one datagram still gets in.
+        Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(7), DatagramKit.Payload(9, 64)).Status);
+    }
+
+    [Fact]
+    public void A_Fragmented_Message_Needs_A_Payload_Buffer()
+    {
+        using SessionHarness h = new(
+            table: Table,
+            client: o =>
+            {
+                DatagramKit.Quiet(o);
+                o.SendBudgetBytes = 2_048;
+            },
+            server: DatagramKit.Quiet);
+        Assert.Equal(SendStatus.OutOfBuffers, h.Client.SendCopy(new SendHeader(2), DatagramKit.Payload(1, 3_000)).Status);
+        Assert.Equal(0, DatagramKit.Statistics(h.Client).FragmentedMessagesSent);
+    }
+
+    [Fact]
+    public void An_Immediate_Fragmented_Message_Goes_Out_Without_A_Flush()
+    {
+        using SessionHarness h = new(table: Table, client: DatagramKit.Quiet, server: DatagramKit.Quiet);
+        QuiclyPeer client = h.Client;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(2, Handlers.Collect(got));
+        byte[] payload = DatagramKit.Payload(1, 3_000);
+
+        // PROTOCOL.md §4.5: an Immediate send runs a scheduler pass before it returns, fragments included.
+        Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(2), payload, SendOptions.Immediate).Status);
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 2).QueuedMessages);
+        h.Network.Advance(50_000);
+        h.Server.Poll();
+        Assert.Single(got);
+        Assert.Equal(payload, got[0].Payload);
+    }
+
+    [Fact]
+    public void A_Fragmented_Message_The_Transport_Refuses_Fails_And_Is_Not_Counted_As_Sent()
+    {
+        FlagRecordingConnector? recorder = null;
+        using SessionHarness h = new(
+            table: Table,
+            client: DatagramKit.Quiet,
+            server: DatagramKit.Quiet,
+            connector: inner => recorder = new FlagRecordingConnector(inner));
+        QuiclyPeer client = h.Client;
+        SendResult result = client.SendCopy(new SendHeader(2), DatagramKit.Payload(1, 3_000), SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, result.Status);
+
+        recorder!.Transport!.RefuseDatagrams = TransportStatus.OutOfMemory;
+        client.Flush();
+        client.Poll();
+
+        Assert.Equal(DeliveryStatus.Failed, client.GetDeliveryStatus(result.Token));
+        // The packer had counted the fragments; a refused submission takes that back.
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 2).Sent);
+        Assert.Equal(0, DatagramKit.Statistics(client).SendBytesOutstanding);
+    }
+
+    [Fact]
+    public void Cancelling_A_Fragmented_Message_Leaves_Its_Neighbours_In_The_Queue()
+    {
+        using SessionHarness h = new(table: Table, client: DatagramKit.Quiet, server: DatagramKit.Quiet);
+        QuiclyPeer client = h.Client;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(2, Handlers.Collect(got));
+        byte[] before = DatagramKit.Payload(1, 64);
+        byte[] after = DatagramKit.Payload(2, 64);
+
+        Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(2), before).Status);
+        SendResult big = client.SendCopy(new SendHeader(2), DatagramKit.Payload(3, 4_000), SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, big.Status);
+        Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(2), after).Status);
+
+        // The fragments are unlinked from the middle of the channel's FIFO; the plain messages keep their order.
+        Assert.True(client.TryCancel(big.Token));
+        client.Poll();
+        Assert.Equal(DeliveryStatus.Canceled, client.GetDeliveryStatus(big.Token));
+        Assert.Equal(2, DatagramKit.ChannelStats(client, 2).QueuedMessages);
+        Assert.True(h.RunUntil(() => got.Count == 2), $"{got.Count} of 2 messages arrived");
+        Assert.Equal(before, got[0].Payload);
+        Assert.Equal(after, got[1].Payload);
+    }
+
+    [Fact]
+    public void A_Fragment_Of_An_Older_Message_Does_Not_Disturb_The_Partial_Of_A_Newer_One()
+    {
+        using ServerHarness h = new(table: Table);
+        Assert.True(h.Admit(), "the raw client was not admitted");
+        QuiclyPeer server = h.Server!;
+        ChannelDefinition channel = Table[2]!;
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(FragmentKit.Split(channel, 5, 0, DatagramKit.Payload(1, 2_000), 2)[0]));
+        h.Run(10_000);
+        Assert.Equal(1, FragmentKit.Reassemblies(server, 2));
+
+        // A fragment of a message the key has already moved past is dropped without touching the live partial.
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(FragmentKit.Split(channel, 4, 0, DatagramKit.Payload(2, 2_000), 2)[0]));
+        h.Run(10_000);
+        Assert.Equal(1, FragmentKit.Reassemblies(server, 2));
+        Assert.Equal(1, h.Statistics().FragmentsDropped);
+        Assert.Equal(0, h.Statistics().ReassembliesAbandoned);
+    }
+
+    [Fact]
+    public void A_Partial_That_Finds_No_Receive_Buffer_Is_Dropped_And_Counted()
+    {
+        // The bound fits the budget, but another partial already holds most of it.
+        using ServerHarness h = new(table: Table, server: o => o.ReceiveBudgetBytes = 4_096);
+        Assert.True(h.Admit(), "the raw client was not admitted");
+        QuiclyPeer server = h.Server!;
+        // 1 000-byte fragments, so each datagram fits the link; the first partial's buffer takes the whole 4 KiB budget.
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(FragmentKit.Split(Table[3]!, 1, 1, DatagramKit.Payload(1, 2_000), 2)[0]));
+        h.Run(10_000);
+        Assert.Equal(1, FragmentKit.Reassemblies(server, 3));
+
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(FragmentKit.Split(Table[2]!, 1, 0, DatagramKit.Payload(2, 2_000), 2)[0]));
+        h.Run(10_000);
+        Assert.Equal(0, FragmentKit.Reassemblies(server, 2));
+        Assert.Equal(1, DatagramKit.ChannelStats(server, 2).OutOfBuffers);
+        Assert.True(h.Statistics().OutOfReceiveBuffers > 0, "the peer counted the exhausted budget");
+        Assert.Equal(PeerState.Connected, server.State);
+    }
+
+    [Fact]
+    public void A_Reassembled_Message_That_Is_Stale_Is_Dropped_Like_Any_Other()
+    {
+        using ServerHarness h = new(table: Table);
+        Assert.True(h.Admit(), "the raw client was not admitted");
+        QuiclyPeer server = h.Server!;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        server.RegisterHandler(3, Handlers.Collect(got));
+        ChannelDefinition channel = Table[3]!;
+
+        foreach (byte[] fragment in FragmentKit.Split(channel, 10, 4, DatagramKit.Payload(1, 2_000), 2))
+        {
+            Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(fragment));
+        }
+
+        Assert.True(h.RunUntil(() => got.Count == 1), "the first message did not arrive");
+
+        // A whole message of an older sequence reassembles and is then dropped by the mode's own acceptance.
+        foreach (byte[] fragment in FragmentKit.Split(channel, 5, 4, DatagramKit.Payload(2, 2_000), 2))
+        {
+            Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(fragment));
+        }
+
+        h.Run(20_000);
+        Assert.Single(got);
+        Assert.Equal(1, DatagramKit.ChannelStats(server, 3).Dropped);
+        Assert.Equal(0, FragmentKit.Reassemblies(server, 3));
+        Assert.Equal(0, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void A_Reassembled_Message_Is_Dropped_When_The_Receive_Ring_Is_Full()
+    {
+        using ServerHarness h = new(table: Table, server: o => o.ReceiveRingCapacity = 2);
+        Assert.True(h.Admit(), "the raw client was not admitted");
+        QuiclyPeer server = h.Server!;
+        ChannelDefinition channel = Table[2]!;
+
+        // Nothing is polled, so the ring fills with whole messages and the reassembled one finds no slot.
+        for (int i = 0; i < 2; i++)
+        {
+            Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(DatagramKit.Frame(Table, 2, (uint)i, 0, [(byte)i])));
+            h.Network.Advance(5_000);
+        }
+
+        foreach (byte[] fragment in FragmentKit.Split(channel, 7, 0, DatagramKit.Payload(3, 2_000), 2))
+        {
+            Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(fragment));
+            h.Network.Advance(5_000);
+        }
+
+        Assert.True(DatagramKit.ChannelStats(server, 2).RingDrops > 0, "the reassembled message was not counted as a ring drop");
+        Assert.Equal(0, FragmentKit.Reassemblies(server, 2));
+    }
+
+    [Fact]
     public void A_New_Epoch_Gives_Up_The_Partials_Of_The_Closed_One()
     {
         using ServerHarness h = new(table: Table);

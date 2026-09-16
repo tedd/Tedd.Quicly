@@ -1123,10 +1123,15 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   a single buffer rather than a gather.
 * **Three gates, and what they bound.** A piece goes out only while the pass's send cap (`FlushContext.BudgetBytes`), a
   per-peer rate bucket and the transfer's send window all allow it. The rate is
-  `BulkMaxBytesPerSecond`, or `BulkShareOfEstimatedBandwidth` × (congestion window ÷ RTT, falling back to
-  `MaxSendBytesPerSecond`), with a 16 KiB/s floor so a transfer always progresses; a rate derived from a moving window
-  carries the bucket's **level** across a change (`TokenBucket.SetRate`) instead of refilling it, or the cap would never
-  bind. The window is `min(IdealSendBufferSize for that stream when the transport reports it, else
+  `BulkMaxBytesPerSecond` — an explicit cap, taken as it is — or `BulkShareOfEstimatedBandwidth` × (congestion window ÷
+  RTT, falling back to `MaxSendBytesPerSecond`) with a **16 KiB/s floor**, so a tiny estimate still moves a transfer. The
+  floor floors an *estimate*; it is not a cap applied in the absence of one. When the transport reports no congestion
+  window or an RTT below a microsecond (a loopback or in-memory carrier) **and** no send cap is set, there is nothing to
+  derive a rate from, the bucket stays off, and the pass's send cap plus the transfer's send window are what bound the
+  traffic — flooring an unmetered link at 16 KiB/s would be orders of magnitude slower than the link itself. A rate
+  derived from a moving window carries the bucket's **level** across a change (`TokenBucket.SetRate`) instead of refilling
+  it, or the cap would never bind. The congestion window and the RTT are read from the transport **once per pass** and
+  shared by the window and the rate. The window is `min(IdealSendBufferSize for that stream when the transport reports it, else
   PeerOptions.BulkSendWindowBytes, BulkShareOfCongestionWindow × the congestion window)` — ARCHITECTURE.md §7: stream
   priority alone cannot protect datagram latency, because datagrams and streams share one congestion window. The gates
   count **wire** bytes and the piece is sized from the **object** (`min(remaining, BulkChunkBytes − 128)`): sizing the
@@ -1140,14 +1145,29 @@ direction). Cold side arrays carry the managed references a transfer needs — i
 * **The channel's stream cap binds the sender too**, as on group and large-latest streams: both ends read the same table,
   so opening more than `max(MaxGroups, 1)` streams on a Bulk channel would make the *receiver* reset a live transfer of
   ours (PROTOCOL.md §7). The slot belongs to the transfer whose stream it is and is returned on that stream's **one**
-  close notice (§4.3), which is also when the peer frees its own slot and returns credit. A start the peer's stream limit
+  close notice (§4.3), which is also when the peer frees its own slot and returns credit — never earlier, because a
+  transfer that gave its slot back while its stream was still alive would let the next pass open one stream too many.
+  Every terminal path of a send transfer therefore goes through **one** function (`TerminateSend`): it resets the stream
+  when this end never sent FIN on it, finishes the application's transfer exactly once, and returns the record and the
+  slot exactly once. A path that released the slot without ending the stream would leak that stream for the life of the
+  connection while the engine's own accounting said the channel was free. A start the peer's stream limit
   refused never reached the peer, so the transfer rewinds to its last completed byte, forgets that its header went out and
   opens a **new** stream once `StreamCreditGeneration` changes; a `SubmitStream` that fails for any *other* reason after
   the open succeeded does **not** park the transfer on the current generation — nothing took credit, so no credit event is
   coming — and the next pass simply opens a new stream.
 * **Completions.** A piece's completion returns its pooled block (PROTOCOL.md §4.3 releases a bulk buffer per chunk) and
-  frees that much window. `Delivered` is **not** a transport acknowledgement: the transfer completes when the peer's
-  `BulkProgress` reaches the range's length, which is what §4.3 defines for the mode. A piece canceled while the transport
+  frees that much window. `Delivered` is **not** a transport acknowledgement: §4.3 defines it for this mode as the peer's
+  `BulkProgress` reaching the range's length. That is a *claim* by the peer, so the transfer completes only when **both**
+  ends are done with it — the peer confirmed the whole range *and* this end read the range, put every byte on the wire
+  with FIN and saw every piece complete; whichever arrives last completes it. The claim is bounded twice, for two
+  different questions (ADR 0009: a client parses hostile servers too). What is *reported* is clamped to the bytes whose
+  sends completed, which are the bytes the peer can have seen, so `BulkTransfer.BytesTransferred` never counts a byte this
+  end did not send. What counts as a *violation* is a claim above the bytes handed to the transport at all: a peer cannot
+  have accepted bytes that were never submitted, while a claim running ahead of a completion still in flight is ordinary
+  (both are triggered by the same round trip). A violation increments `PeerStatistics.BulkProgressOverClaims` and nothing
+  else — the frame is well formed, and it arrives on the datagram carrier, which §6 drops and counts rather than closes.
+  Without both halves of this a peer could report an object as delivered, with its full byte count, before one body byte
+  had left the host and while the application's `IBulkSource` had never been read. A piece canceled while the transport
   is closing ends the transfer `Disconnected`; one canceled after a refused start re-queues; a piece canceled for any
   *other* reason decides nothing, because the transport reports a canceled send before the stop that caused it as often as
   after — the stream's close notice is the verdict (`BulkCanceled` → `Canceled`, anything else → `Failed`), and the peer
@@ -1156,7 +1176,9 @@ direction). Cold side arrays carry the managed references a transfer needs — i
 * **Receive** (transport thread). A peer stream is accepted while a record is free and neither the per-direction limit nor
   the channel's `MaxGroups` is reached; the rest are reset `LimitExceeded` (PROTOCOL.md §7). The header is validated by
   the framing layer before the engine sees it, and the engine then checks its own two rules **before any state is
-  created**: the transfer id must be free (unique per peer and direction) and the application's receive router
+  created**: the transfer id must be free (unique per peer and direction for the whole epoch — a transfer that finished
+  but whose record has not travelled back through the retire/recycle rings yet still holds its id, so the id is free only
+  once the record is) and the application's receive router
   (`PeerOptions.BulkRouter`) must accept the descriptor — with no router every peer-initiated transfer is refused, which
   is the §3.3 default. Bytes are then written **progressively** into the application's `IBulkSink` as they arrive:
   a bulk transfer never becomes a `ReceiveEntry`, so it takes **no receive-ring entry and no reservation** (ADR 0008
@@ -1186,16 +1208,25 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   the next frame a transfer owes and never to a time at or before `now`, which would make a sleeping host spin. The final
   frame is exact: the transport thread hands a finished record to the game thread through a ring and the record is
   recycled only once its last frame is out, while the periodic frames read a live record's byte count advisorily (the
-  transfer id is read on both sides of it, and progress is cumulative, so a stale read is skipped or harmless).
-* **Cancelling.** `BulkTransfer.Cancel()` may be called from any thread: it sets the flag the application's own transfer
-  object holds and wakes the host, and the next pass resets the stream, sends `BulkCancel` (0x14) and completes the
-  transfer `Canceled` — the reset matters, because a `BulkCancel` alone would leave the peer waiting for bytes that never
-  come. `QuiclyPeer.CancelBulk(channel, transferId)` is the receiving end's counterpart: it stops the peer's sending side
-  with STOP_SENDING and sends the same `BulkCancel`. Stopping a peer's stream comes back to *this* end as an ordinary
-  shutdown rather than an abort, so the record remembers the code we cancelled with; without that the transfer we
-  cancelled ourselves would end `Failed`.
-* **Requests and authorisation.** `RequestBulk` sends `BulkRequest` (0x13) and keeps the range in a small table
-  (`BulkTransfersPerDirection + 1` entries, PROTOCOL.md §7's "+ 1 pending request"). An incoming request is validated on
+  transfer id is read on both sides of it, and progress is cumulative, so a stale read is skipped or harmless). The
+  window's timestamp has **one owner**, the game thread (ADR 0008 invariant 4): the transport thread stamps nothing when
+  the header arrives, and the first pass that sees the record starts its 100 ms window.
+* **Cancelling, and why only one end emits the frame.** `BulkCancel` (0x14) is **receiver-to-sender only**
+  (PROTOCOL.md §3.4): it means "stop sending the transfer you are sending to me", so it always resolves against the
+  recipient's *send* records — which is what the engine does with it. Transfer ids are scoped per (peer, direction), so id
+  1 exists in both directions of one session and the frame has no direction field; a sender that emitted one would name
+  the peer's own unrelated outbound transfer and cancel it. `QuiclyPeer.CancelBulk(channel, transferId)` is therefore the
+  **only** emitter: the receiving end stops the peer's sending side with STOP_SENDING and sends the frame so the peer also
+  stops reading its source. Stopping a peer's stream comes back to *this* end as an ordinary shutdown rather than an abort,
+  so the record remembers the code we cancelled with; without that the transfer we cancelled ourselves would end `Failed`.
+  `BulkTransfer.Cancel()` (the **sending** end, any thread) sets the flag the application's own transfer object holds and
+  wakes the host; the next pass resets the stream with `BulkCanceled` and completes the transfer `Canceled`, and the reset
+  *is* the signal — the receiver turns it into a cancelled transfer through that stream's single close notice, and no
+  control frame is needed or sent. A sender that abandons a peer-requested transfer before any stream exists answers
+  `BulkReject` (0x15) instead, so no case is left needing a direction bit in the frame.
+* **Requests and authorisation.** `RequestBulk` sends `BulkRequest` (0x13) and keeps the range in a small table of
+  `BulkTransfersPerDirection + 1` entries — three by default, which is what PROTOCOL.md §7's limit row spells out, so a
+  further range can be asked for while both transfers are still running. An incoming request is validated on
   the transport thread and applied on the game thread, where `IBulkAuthorizer` decides and `IBulkProvider` supplies the
   object: **both default to deny**, so serving bulk objects is opt-in (ADR 0009), and a refusal — no authorizer, no
   provider, an invalid descriptor or no free transfer slot — is answered `BulkReject` (0x15). A `BulkReject` for a range
@@ -1215,7 +1246,9 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   `BulkTransfersPerDirection`/`BulkSendWindowBytes`/`BulkShareOfCongestionWindow`/`BulkChunkBytes`/`BulkMaxChunk` with
   their `PeerCore` accessors (next to the existing `BulkShareOfEstimatedBandwidth` and `BulkMaxBytesPerSecond`),
   `ChannelEngine.OnIdealSendBufferSize` (broadcast like the other local-stream events, so an engine ignores ids it does
-  not own) wired from the peer's sink, and `QuiclyPeer.Bulk.cs` with `CancelBulk`. `QuiclyPeer.BeginBulkSendAsync` and
+  not own — and an **invalid** id is refused before the match, because a cleared slot of the engine's stream table holds
+  exactly that and would otherwise "match" record zero) wired from the peer's sink, and `QuiclyPeer.Bulk.cs` with
+  `CancelBulk`. `QuiclyPeer.BeginBulkSendAsync` and
   `RequestBulk` already routed to the engine.
 * **Tests** (`Session/BulkTestKit.cs` — tables, an object generated from a pattern so a 64 MiB transfer costs no memory
   and is still checked byte for byte, memory sources and sinks, accepting and denying routers, authorizers, a provider and
@@ -1230,6 +1263,13 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   declared object size that never becomes an allocation, a duplicate transfer id, the receive-side `MaxGroups` reset, a
   chunk this peer could never stage, and the session closing under a running transfer) and `BulkZeroAllocationTests` (the
   raw and the chunked streaming paths, measured in the middle of one transfer).
+* **Follow-up, recorded rather than done.** A ring's `out` value is now undefined when `TryDequeue` returns false
+  (ADR 0008 invariant 5), which is what removed the one live instance of this class of bug — a failed dequeue writing
+  `default(int)`, a perfectly valid record index, into the field that then "retired" a live transfer. The stronger form,
+  storing an integer ring's elements **offset by one** so that no value a failed dequeue can leave behind is a valid index,
+  was deliberately not applied: it touches every engine that hands record indices between threads, another branch is in
+  flight over those files, and an audit of the current engines found no surviving instance that needs it. This is the next
+  step if one is ever found.
 
 Waves:
 

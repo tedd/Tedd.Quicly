@@ -36,6 +36,10 @@
    checks room with `SpscRing.HasRoomFor`/`TryEnqueueReserving`, which read the consumer's index only when the
    producer's private snapshot says the ring is full, and occupancy high-water marks are refreshed only when a
    new maximum is suspected — so a received message costs no coherence traffic.
+   **A ring's `out` value is undefined when `TryDequeue` returns false**: the failure path does not write it
+   (`Unsafe.SkipInit`, annotated `[MaybeNullWhen(false)]`), because writing `default` there produces a
+   *plausible* value — for an index-typed element a valid index — and a caller that read it anyway once
+   recycled a live record.
 6. **Keyed coalescing channels use mailboxes, not ring entries**: the transport thread writes into a fresh
    lease and `Interlocked.Exchange`s it into the key's mailbox; a non-negative previous value is a lease the
    game thread never saw and is freed immediately by the transport thread; the game thread claims with

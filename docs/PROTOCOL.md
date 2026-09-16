@@ -229,11 +229,21 @@ negotiates `max_datagram_frame_size` and path MTU discovery grows and shrinks th
 session, so senders read the transport's current maximum at pack time and never cache it from the handshake.
 | 0x12 | Close | both | `code u32 LE`, `reason (len varint + utf8, ≤ 512)` |
 | 0x13 | BulkRequest | both | `requestId varint, channel varint, objectId varint, objectVersion varint, offset varint, length varint` |
-| 0x14 | BulkCancel | both | `transferId varint, code u32 LE` |
+| 0x14 | BulkCancel | R→S | `transferId varint, code u32 LE` — the id of a transfer the **recipient is sending** |
 | 0x15 | BulkReject | both | `requestId varint, code u32 LE` |
 | 0x16 | ChannelTableRequest | C→S | (empty) — server answers with a HelloAck-shaped table (status 0xFF = informational) |
 | 0x17 | KeyRetired | both | `channel varint, key varint` — the sender will not use this key again in this epoch; the receiver frees its per-key state and reports `KeyRetired` to the application |
 | 0x01–0x05 | as §2.3 | both | control-datagram fallbacks |
+
+`BulkCancel` travels **receiver to sender only**. It means "stop sending the transfer you are sending to me", so it always
+names a transfer of the *recipient's* own send side, and that is what the recipient resolves it against. A `TransferId` is
+unique per (peer, **direction**) (§3.3), so id 1 exists in both directions of one session and the frame carries no
+direction field: one sent the other way would name the peer's unrelated transfer and cancel it. A **sender** that abandons
+a transfer therefore signals on the wire by resetting its stream with `BulkCanceled` (§6) — which the receiver turns into
+a cancelled transfer through that stream's single close notice, and which is also what makes the receiver's own
+`BulkCancel` complete: a `BulkCancel` alone would leave the peer waiting for bytes that never come. A sender that
+abandons a *peer-requested* transfer before any stream exists answers `BulkReject` (0x15) instead. A `BulkCancel` naming a
+transfer the recipient is not sending is ignored and counted.
 
 `flags` bit0 = request the channel table in the ack. `caps` bit0 = datagrams supported, bit1 = datagram
 send-state (transport loss/ack) available, bit2 = LZ4. Datagrams are **required**: if either side lacks
@@ -459,7 +469,7 @@ logging.
 | fragmented message size | ≤ 255 × (maxDatagram − header) and ≤ `MaxMessageSize` | drop before any buffer is chosen |
 | control messages per second | 2 000 (per peer, configurable; size it from the channel table, because acks scale with keyed `ReliableLatest` traffic and one ack datagram carries about 170 keys) | connection close `LimitExceeded` |
 | decoded (decompressed) bytes per second per peer | 8 MiB/s | further compressed messages dropped + counted |
-| bulk transfers per direction per peer | 2 (+ 1 pending request) | `BulkReject` |
+| bulk transfers per direction per peer | 2 transfers, and an outbound range-request table of one more than that (3), so a further range can be asked for while both transfers run | `BulkReject` |
 | receive ring depth per peer | 4 096 entries | see byte budget row; latest/coalescing channels use per-key mailboxes instead of ring entries |
 
 The **stream idle mid-message** rule is per receiving stream and applies to every stream mode: a stream that has

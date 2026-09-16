@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Tedd.Quicly.Core.State;
 
@@ -111,19 +112,24 @@ public sealed unsafe class MpscRing<T> : IDisposable where T : unmanaged
     }
 
     /// <summary>Removes the oldest element. Consumer thread only.</summary>
-    /// <param name="item">Receives the element, or <see langword="default"/> when the ring is empty.</param>
+    /// <param name="item">
+    /// Receives the element. <b>Undefined when the call returns <see langword="false"/></b> (ADR 0008 invariant 5): the
+    /// failure path does not write it at all, so it never holds a plausible value — a <see langword="default"/> there is a
+    /// valid index for an index-typed element.
+    /// </param>
     /// <returns>
     /// <see langword="false"/> when the ring is empty, or when the oldest claimed slot has not yet been written
     /// by its producer (it will be readable a few instructions later).
     /// </returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool TryDequeue(out T item)
+    public bool TryDequeue([MaybeNullWhen(false)] out T item)
     {
         long pos = _pos.Dequeue;
         ref Slot slot = ref _slots[(int)(pos & _mask)];
         if (Volatile.Read(ref slot.Sequence) != pos + 1)
         {
-            item = default;
+            // Deliberately left uninitialised; see the parameter's documentation.
+            Unsafe.SkipInit(out item);
             return false;
         }
 

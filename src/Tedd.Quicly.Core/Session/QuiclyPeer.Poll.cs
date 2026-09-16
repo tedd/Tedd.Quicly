@@ -523,6 +523,31 @@ public sealed unsafe partial class QuiclyPeer
         RaiseTransitions(holdClosed: false);
     }
 
+    /// <summary>
+    /// Releases the promises a <see cref="Dispose"/> would otherwise leave outstanding for good (ADR 0008). Disposing
+    /// without closing first is ordinary teardown — a host shutting down, a <c>using</c> block left on an exception — and no
+    /// <see cref="Poll"/> will ever run <see cref="FinishClosed"/> afterwards, so the engines finish their live work here
+    /// (a bulk transfer ends <see cref="BulkStatus.Disconnected"/> and its application sink is told) and every outstanding
+    /// <see cref="WaitAsync"/> on a tracked send completes, because nothing drains the completion ring after this either.
+    /// <see cref="SendAsync"/> and <see cref="FlushAsync"/> waiters were failed by <c>FailWaitersOnDispose</c> just before.
+    /// </summary>
+    private void FinishEnginesOnDispose()
+    {
+        if (_closedRaised)
+        {
+            // The host polled the peer to Closed already: FinishClosed did all of this.
+            return;
+        }
+
+        ReadOnlySpan<ChannelEngine> engines = _core.ActiveEngines;
+        for (int i = 0; i < engines.Length; i++)
+        {
+            engines[i].OnPeerClosed();
+        }
+
+        _core.Completions.CompleteAll(Tedd.Quicly.Core.Threading.DeliveryStatus.Disconnected);
+    }
+
     private void ReleaseAllReceived()
     {
         while (_core.ReceiveRing.TryDequeue(out ReceiveEntry entry))

@@ -103,6 +103,13 @@ public struct PeerStatistics
     /// <summary>Compressed messages dropped because decoding failed or exceeded the decode budget.</summary>
     public long DecodeFailures;
 
+    /// <summary>
+    /// Peer <c>BulkProgress</c> frames that claimed more bytes than this end handed to the transport (PROTOCOL.md §2.3):
+    /// each was clamped to the bytes really sent, and a transfer completes only when this end's own send side is finished
+    /// too, so an over-claim costs the peer nothing but this counter.
+    /// </summary>
+    public long BulkProgressOverClaims;
+
     /// <summary>Control messages (Ping, Pong, Hello, HelloAck, Close) that could not be handed to the transport.</summary>
     public long ControlSendFailures;
 

@@ -322,6 +322,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.OutOfReceiveBuffers = Volatile.Read(ref c.OutOfReceiveBuffers);
         statistics.CallbackFaults = Volatile.Read(ref c.CallbackFaults);
         statistics.DecodeFailures = c.DecodeFailures;
+        statistics.BulkProgressOverClaims = c.BulkProgressOverClaims;
         statistics.ControlSendFailures = c.ControlSendFailures + Volatile.Read(ref c.PongSendFailures);
         statistics.DatagramsSent = c.DatagramsSent;
         statistics.DatagramBytesSent = c.DatagramBytesSent;
@@ -439,6 +440,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
 
         _disposed = true;
         FailWaitersOnDispose();
+        FinishEnginesOnDispose();
         ITransport? transport = _transport;
         if (transport is not null)
         {

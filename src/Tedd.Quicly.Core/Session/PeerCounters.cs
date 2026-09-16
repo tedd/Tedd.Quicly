@@ -89,6 +89,12 @@ internal sealed class PeerCounters
     /// <summary>Compressed messages dropped in <c>Poll</c> (decode failure or decode budget).</summary>
     public long DecodeFailures;
 
+    /// <summary>
+    /// Peer <c>BulkProgress</c> frames claiming more bytes than this end handed to the transport (PROTOCOL.md §2.3,
+    /// ADR 0009): the claim is clamped to what was really sent and counted, never a close — the frame is well formed.
+    /// </summary>
+    public long BulkProgressOverClaims;
+
     /// <summary>Control messages (Ping, Pong, Hello, HelloAck, Close) the game thread could not hand to the transport.</summary>
     public long ControlSendFailures;
 

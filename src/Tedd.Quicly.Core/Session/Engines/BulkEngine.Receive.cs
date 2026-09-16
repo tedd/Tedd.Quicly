@@ -250,8 +250,8 @@ internal sealed unsafe partial class BulkEngine
             }
         }
 
-        // The first progress window starts now, so a transfer that stalls part-way still reports what it accepted.
-        recv.LastReportMicros = message.NowMicros;
+        // LastReportMicros has one owner, the game thread (ADR 0008 invariant 4), so the window is not started here: the
+        // first pass that sees the record stamps it (see FlushProgress).
         return StreamConsume.Continue;
     }
 
@@ -521,13 +521,21 @@ internal sealed unsafe partial class BulkEngine
         }
     }
 
-    /// <summary>The record holding <paramref name="transferId"/>, ignoring <paramref name="except"/> (transport thread).</summary>
+    /// <summary>
+    /// The record holding <paramref name="transferId"/>, ignoring <paramref name="except"/> (transport thread). A transfer
+    /// that has <em>finished</em> but whose record is still on its way back through the retire/recycle rings counts: a
+    /// transfer id is unique per peer and direction for the whole epoch (PROTOCOL.md §3.3), so an id may not be used again
+    /// while any trace of it is live — the record's recycle is what frees the id.
+    /// </summary>
+    /// <param name="transferId">The id to look for.</param>
+    /// <param name="except">A record to ignore (the one being opened).</param>
+    /// <returns>The record, or −1.</returns>
     private int FindReceive(ulong transferId, int except)
     {
         for (int record = 0; record < _recv.Length; record++)
         {
             ref BulkRecv recv = ref _recv[record];
-            if (record != except && (recv.Flags & RecvAccepted) != 0 && (recv.Flags & RecvFinished) == 0 && recv.TransferId == transferId)
+            if (record != except && (recv.Flags & RecvAccepted) != 0 && recv.TransferId == transferId)
             {
                 return record;
             }
@@ -550,9 +558,9 @@ internal sealed unsafe partial class BulkEngine
         {
             if (_retiredPending < 0)
             {
-                // Never pass the field itself: TryDequeue writes default(int) — a valid record index — when it fails, and
-                // the next pass would then "retire" that live transfer, null its sink and recycle it underneath the
-                // transport thread.
+                // Never pass the field itself: a ring's out value is undefined when TryDequeue returns false (ADR 0008
+                // invariant 5), and the next pass would then "retire" whatever record that turned out to name, null its
+                // sink and recycle it underneath the transport thread.
                 if (!_retired.TryDequeue(out int retired))
                 {
                     break;
@@ -582,6 +590,13 @@ internal sealed unsafe partial class BulkEngine
             if (!TryReadProgress(ref recv, out ulong transferId, out long accepted))
             {
                 continue;
+            }
+
+            if (recv.LastReportMicros == 0)
+            {
+                // First pass that sees this transfer: the game thread owns the field, so this is where its 100 ms window
+                // starts (the transport thread stamped nothing when the header arrived).
+                recv.LastReportMicros = flush.NowMicros;
             }
 
             long unreported = accepted - recv.ReportedBytes;
@@ -646,7 +661,9 @@ internal sealed unsafe partial class BulkEngine
             ref BulkRecv recv = ref _recv[record];
             if (TryReadProgress(ref recv, out _, out long accepted) && accepted > recv.ReportedBytes)
             {
-                LowerDeadline(nowMicros, recv.LastReportMicros + ProgressMicros, ref nextDeadline);
+                // A record the game thread has not stamped yet is due at the next pass, which is where its window starts.
+                long stamped = recv.LastReportMicros;
+                LowerDeadline(nowMicros, stamped == 0 ? nowMicros : stamped + ProgressMicros, ref nextDeadline);
             }
         }
     }

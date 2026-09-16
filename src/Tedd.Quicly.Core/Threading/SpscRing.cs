@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using Tedd.Quicly.Core.State;
@@ -157,10 +158,14 @@ public sealed unsafe class SpscRing<T> : IDisposable where T : unmanaged
     }
 
     /// <summary>Removes the oldest element. Consumer thread only.</summary>
-    /// <param name="item">Receives the element, or <see langword="default"/> when the ring is empty.</param>
+    /// <param name="item">
+    /// Receives the element. <b>Undefined when the call returns <see langword="false"/></b> (ADR 0008 invariant 5): the
+    /// failure path does not write it at all, so it never holds a plausible value — a <see langword="default"/> there is a
+    /// valid index for an index-typed element, which is how a live record once got recycled.
+    /// </param>
     /// <returns><see langword="false"/> when the ring is empty.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool TryDequeue(out T item)
+    public bool TryDequeue([MaybeNullWhen(false)] out T item)
     {
         long head = _idx.Head;
         if (head == _idx.CachedTail)
@@ -168,7 +173,8 @@ public sealed unsafe class SpscRing<T> : IDisposable where T : unmanaged
             _idx.CachedTail = Volatile.Read(ref _idx.Tail);
             if (head == _idx.CachedTail)
             {
-                item = default;
+                // Deliberately left uninitialised; see the parameter's documentation.
+                Unsafe.SkipInit(out item);
                 return false;
             }
         }

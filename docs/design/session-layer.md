@@ -873,7 +873,12 @@ free list of `Σ max(MaxGroups, 1)` records. The peer's files are untouched; the
   a malformed group reset while other groups keep flowing, the mid-message idle timeout, the churn bound with and without an
   interval, a message the receiver could never buffer resetting only its group, a group the peer stops, the queue limit, the
   size limit, cancellation, expiry before the stream opens, close, and a full receive ring holding a group back) and
-  `GroupZeroAllocationTests` (a stream opened and closed every tick on a clean link, 0 B per window).
+  `GroupZeroAllocationTests` (a stream opened and closed every tick on a clean link, 0 B per window), and `GroupEngineTests`
+  (the `FlushAsync` watermark over a group whose start is still unconfirmed, in-place reconnect dropping the lost connection's
+  groups, a segment arena too small for a whole group, an immediate send sealing its group inside the call, the send cap handing
+  a group over in pieces, the entry-table reserve, a channel whose group records all wait answering `QueueFull`, receive-budget
+  back-pressure, cancelling inside a group, closing with carriers in flight, and the transport-thread paths peer input cannot
+  reach).
 
 Waves:
 

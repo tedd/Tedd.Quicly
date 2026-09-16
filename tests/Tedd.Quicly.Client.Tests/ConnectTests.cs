@@ -283,4 +283,24 @@ public class ConnectTests
 
         Assert.Equal(PeerState.Connected, client.State);
     }
+
+    [Fact]
+    public async Task Disposing_The_Client_While_The_Connect_Sleeps_In_The_Work_Signal_Ends_It()
+    {
+        await using ClientFixture f = new();
+        QuiclyClient client = new(f.Unreachable()); // the network is never advanced, so no callback wakes the connect
+        try
+        {
+            Task<QuiclyPeer> connecting = client.ConnectAsync(f.EndPoint, f.Options(), TestContext.Current.CancellationToken).AsTask();
+            Assert.False(connecting.IsCompleted);
+            client.Dispose(); // cancels the wait at once instead of letting it sleep out its timeout
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => connecting);
+            Assert.Equal(PeerState.Closed, client.State);
+            Assert.Null(client.Peer);
+        }
+        finally
+        {
+            client.Dispose();
+        }
+    }
 }

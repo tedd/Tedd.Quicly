@@ -715,11 +715,80 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
 
     /// <inheritdoc/>
     /// <remarks>
-    /// A peer is one connection and one epoch: its groups and streams start with the session, so nothing needs resetting
-    /// here. A new connection gets a new peer with new streams (PROTOCOL.md §4.1).
+    /// Group ids are per-channel counters, and every counter restarts in a new epoch (PROTOCOL.md §1, §4.1), so a resumed
+    /// session hands out group ids from 0 again. Nothing else is epoch-scoped: the lost connection's groups were dropped by
+    /// <see cref="OnReconnecting"/>, and a fresh session starts with empty state.
     /// </remarks>
     public override void OnEpochReset(bool resumed)
     {
+        if (!resumed)
+        {
+            return;
+        }
+
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            _send[local].NextGroupId = 0;
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The lost connection's streams are gone, so every group record goes back to the free list (its messages have already
+    /// completed <see cref="DeliveryStatus.Disconnected"/>), the per-channel bookkeeping — including the streams this end held
+    /// open and the churn deadline — is zeroed, each record's serial is bumped so a notice of a lost stream is ignored if one
+    /// still arrives, and a half-received group's staging lease and ring reservation are given back.
+    /// </remarks>
+    public override void OnReconnecting()
+    {
+        while (_notices.TryDequeue(out _))
+        {
+        }
+
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            ref GroupSendState send = ref _send[local];
+            int group = send.ListHead;
+            while (group >= 0)
+            {
+                ref GroupState state = ref _groups[group];
+                int next = state.Next;
+                uint serial = (state.Serial + 1) & PeerCore.EngineStreamSerialMask;
+                state = default;
+                state.Serial = serial;
+                state.Next = _freeGroup;
+                _freeGroup = group;
+                group = next;
+            }
+
+            send.ListHead = -1;
+            send.ListTail = -1;
+            send.FillingGroup = -1;
+            send.QueueCount = 0;
+            send.QueueBytes = 0;
+            send.InFlightCount = 0;
+            send.InFlightBytes = 0;
+            send.GroupCount = 0;
+            send.StreamedGroups = 0;
+            send.NextGroupAllowedMicros = 0;
+            _openGroups[local] = 0;
+        }
+
+        for (int group = 0; group < _txStreams.Length; group++)
+        {
+            _txStreams[group] = default;
+            _txSerials[group] = 0;
+        }
+
+        _freeRecv = -1;
+        for (int record = _recv.Length - 1; record >= 0; record--)
+        {
+            ref GroupRecv recv = ref _recv[record];
+            ReleaseReceive(ref recv);
+            recv = default;
+            recv.Next = _freeRecv;
+            _freeRecv = record;
+        }
     }
 
     /// <summary>Drops messages at the head of a group whose expiry has passed (only while the group has no stream yet).</summary>

@@ -118,34 +118,37 @@ public class ServerEdgeTests
         Assert.Equal(PeerState.Connected, second.State);
     }
 
+    /// <summary>
+    /// Several payloads in flight at once: each one's peer references are tracked separately, and a payload is forgotten as
+    /// soon as its last reference is gone (the peers release without telling the server, so the tracking is pruned from the
+    /// leases' reference counts).
+    /// </summary>
     [Fact]
-    public async Task Released_Shared_Sends_Are_Unlinked_Anywhere_In_A_Peers_List()
+    public async Task Shared_Payloads_Are_Tracked_Per_Payload_And_Pruned_When_Free()
     {
         await using ServerFixture f = new();
         QuiclyPeer peer = f.ServerPeerOf(f.ConnectAdmitted());
-        SelectivePort port = new();
-        f.Server.SharedPort = port;
+        f.Clients[0].RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => { });
         PeerSet set = f.Server.CreateSet();
         set.Add(peer);
-        Assert.True(f.Server.Allocator.TryRent(64, out BufferLease block));
-        SharedLease lease = f.Server.SharedLeases.Share(in block, 1);
-        for (int i = 0; i < 4; i++)
-        {
-            f.Server.SendShared(set, new SendHeader(2), lease, 64);
-        }
+        Assert.True(f.Server.Allocator.TryRent(64, out BufferLease firstBlock));
+        Assert.True(f.Server.Allocator.TryRent(1536, out BufferLease secondBlock));
+        SharedLease datagram = f.Server.SharedLeases.Share(in firstBlock, 1);
+        SharedLease ordered = f.Server.SharedLeases.Share(in secondBlock, 1);
 
-        Assert.Equal(5, f.Server.SharedLeases.GetReferenceCount(in lease));
+        Assert.Equal(1, f.Server.SendShared(set, new SendHeader(2), datagram, 64).AdmittedCount);
+        Assert.Equal(1, f.Server.SendShared(set, new SendHeader(4), ordered, 1536).AdmittedCount);
+        f.Server.GetStatistics(out ServerStatistics both);
+        Assert.Equal(2, both.SharedSendsOutstanding);
 
-        // The peer's list runs newest first (tokens 4, 3, 2, 1): releasing the odd ones unlinks entries behind the head.
-        port.ReleaseOdd = true;
-        f.Server.MarkWork(peer.Index);
-        f.Server.PollAll();
-        Assert.Equal(3, f.Server.SharedLeases.GetReferenceCount(in lease));
-        port.ReleaseAll = true;
-        f.Server.MarkWork(peer.Index);
-        f.Server.PollAll();
-        Assert.Equal(1, f.Server.SharedLeases.GetReferenceCount(in lease));
-        f.Server.SharedLeases.Release(in lease);
+        // The datagram's reference goes at its Sent notice, the ordered one's at the acknowledgement.
+        Assert.True(f.RunUntil(() => f.Server.SharedLeases.GetReferenceCount(in datagram) == 1
+            && f.Server.SharedLeases.GetReferenceCount(in ordered) == 1));
+        f.Server.GetStatistics(out ServerStatistics released);
+        Assert.Equal(0, released.SharedSendsOutstanding);
+        Assert.Equal(2, released.SharedSendsAdmitted);
+        Assert.True(f.Server.SharedLeases.Release(in datagram));
+        Assert.True(f.Server.SharedLeases.Release(in ordered));
     }
 
     [Fact]
@@ -189,24 +192,6 @@ public class ServerEdgeTests
         GC.Collect();
         GC.WaitForPendingFinalizers();
         GC.Collect();
-    }
-
-    private sealed unsafe class SelectivePort : ISharedSendPort
-    {
-        private int _sends;
-
-        public bool ReleaseOdd { get; set; }
-
-        public bool ReleaseAll { get; set; }
-
-        public SendResult Send(QuiclyPeer peer, in SendHeader header, byte* payload, int length, SendOptions options) =>
-            new(SendStatus.Admitted, new SendToken(++_sends, 1));
-
-        public bool TryRelease(QuiclyPeer peer, ref SharedEntry entry) => ReleaseAll || (ReleaseOdd && (entry.Token.Slot & 1) == 1);
-
-        public void Abandon(QuiclyPeer peer, ref SharedEntry entry)
-        {
-        }
     }
 
     private sealed class ThrowingListener : ITransportListener

@@ -1,49 +1,47 @@
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Threading;
 
 namespace Tedd.Quicly.Server;
 
-// Game thread: SendShared and the per-peer tracking of the shared references it hands out.
+// Game thread: SendShared (one serialisation to many peers) and the tracking behind ServerStatistics.SharedSendsOutstanding.
 public sealed partial class QuiclyServer
 {
     private readonly PeerSet _sharedAdmitted;
     private readonly PeerSet _sharedRejected;
     private readonly byte[] _sharedStatus;
-    private readonly int[] _sharedHead;
-    private SharedEntry[] _sharedEntries = new SharedEntry[64];
-    private int _sharedFree = -1;
-    private int _sharedNext;
-    private int _sharedOutstanding;
-    private int _sharedHeld; // references sinks keep for force-closed peers until their transport closed (Interlocked)
-
-    /// <summary>How <see cref="SendShared"/> reaches the peers (a test seam; the default uses the peers' public API).</summary>
-    internal ISharedSendPort SharedPort { get; set; } = PeerSharedSendPort.Instance;
+    private SharedTracking[] _sharedTracked = new SharedTracking[16];
+    private int _sharedTrackedCount;
+    private long _sharedAdmittedTotal;
 
     /// <summary>
-    /// Sends one serialisation to every peer of <paramref name="set"/> without copying it (game thread): each peer gets the
-    /// same pinned payload (<see cref="QuiclyPeer.SendPinned"/>) and holds one reference to <paramref name="lease"/> until
-    /// its transport released the payload, so the block returns to <see cref="Allocator"/> when the last peer is done and the
-    /// caller released its own reference.
+    /// Sends one serialisation to every peer of <paramref name="set"/> without copying it (game thread): each peer takes one
+    /// reference to <paramref name="lease"/> when it admits the message (<see cref="QuiclyPeer.SendShared"/>) and releases it
+    /// exactly once — when its transport released the payload, when the send is discarded (expired, canceled, refused), or
+    /// when its session closes — so the block returns to <see cref="Allocator"/> when the last peer is done and the caller
+    /// released its own reference. A peer that refuses the message takes no reference at all.
     /// </summary>
     /// <remarks>
     /// <para>Usage: rent a block from <see cref="Allocator"/>, serialise into it, <c>SharedLeases.Share(block, 1)</c>, call
     /// <see cref="SendShared"/>, then <c>SharedLeases.Release(lease)</c>. Do not modify the block until its reference count
     /// dropped to zero.</para>
-    /// <para>Each admitted send is tracked (<see cref="SendOptions.Track"/> is forced on; the per-peer tokens are internal) so
-    /// the server learns when to drop that peer's reference: it checks the BufferReleased stage of the peers it polls, so
-    /// releases happen inside <see cref="PollAll"/>. A peer that closes drops its references at once. Allocation-free in
-    /// steady state.</para>
+    /// <para>The payload is <b>never compressed</b>, even on an LZ4 channel: the point of a shared lease is that the bytes
+    /// are serialised (and, if wanted, compressed) once by the caller instead of once per peer, so the message must fit each
+    /// channel's limits as it is (ARCHITECTURE.md §4.1). <see cref="SendOptions.Track"/> is the caller's choice — the peers
+    /// release their own references, so the server needs no token of its own — and a tracked send's per-peer tokens are not
+    /// reported: use <see cref="QuiclyPeer.SendShared"/> directly when a single peer's completion matters.</para>
+    /// <para>A peer the application disposed itself, and a free slot, are reported <see cref="SendStatus.NotConnected"/>.
+    /// Allocation-free in steady state.</para>
     /// </remarks>
-    /// <param name="set">The target peers (indices of this server's slot table; free slots are reported as <see cref="SendStatus.NotConnected"/>).</param>
+    /// <param name="set">The target peers (indices of this server's slot table).</param>
     /// <param name="header">Channel and key.</param>
     /// <param name="lease">A live shared lease of <see cref="SharedLeases"/>; the caller keeps its own reference during the call.</param>
     /// <param name="length">Payload bytes at the start of the block.</param>
-    /// <param name="options">Mode and expiry; tracking is always on.</param>
+    /// <param name="options">Mode, tracking, expiry.</param>
     /// <returns>Admitted and rejected masks with per-peer statuses (valid until the next call).</returns>
     /// <exception cref="ArgumentException">The set is larger than this server's slot table, or the lease is not a live shared lease of <see cref="SharedLeases"/>.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="length"/> is negative or exceeds the block.</exception>
-    public unsafe SharedSendResult SendShared(PeerSet set, in SendHeader header, SharedLease lease, int length, SendOptions options = default)
+    /// <exception cref="ObjectDisposedException">The server is disposed.</exception>
+    public SharedSendResult SendShared(PeerSet set, in SendHeader header, SharedLease lease, int length, SendOptions options = default)
     {
         ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(set);
@@ -60,170 +58,122 @@ public sealed partial class QuiclyServer
         ArgumentOutOfRangeException.ThrowIfNegative(length);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(length, lease.Lease.Length);
 
-        byte* payload = _allocator.GetPointer(lease.Lease);
-        SendOptions tracked = options with { Track = true };
-        ISharedSendPort port = SharedPort;
         _sharedAdmitted.ClearCore();
         _sharedRejected.ClearCore();
         int admitted = 0;
         int rejected = 0;
-        foreach (int slot in set)
+        try
         {
-            QuiclyPeer? peer = _slots[slot].Peer;
-            if (peer is null)
+            foreach (int slot in set)
             {
-                _sharedRejected.AddCore(slot);
-                _sharedStatus[slot] = (byte)SendStatus.NotConnected;
-                rejected++;
-                continue;
-            }
+                QuiclyPeer? peer = _slots[slot].Peer;
+                if (peer is null || peer.IsDisposed)
+                {
+                    _sharedRejected.AddCore(slot);
+                    _sharedStatus[slot] = (byte)SendStatus.NotConnected;
+                    rejected++;
+                    continue;
+                }
 
-            _sharedLeases.Retain(in lease);
-            SendResult result;
-            try
-            {
-                result = port.Send(peer, in header, payload, length, tracked);
+                SendResult result = peer.SendShared(in header, _sharedLeases, in lease, length, options);
+                if (result.IsAdmitted)
+                {
+                    _sharedAdmitted.AddCore(slot);
+                    _sharedStatus[slot] = (byte)SendStatus.Admitted;
+                    admitted++;
+                }
+                else
+                {
+                    _sharedRejected.AddCore(slot);
+                    _sharedStatus[slot] = (byte)result.Status;
+                    rejected++;
+                }
             }
-            catch
+        }
+        finally
+        {
+            if (admitted != 0)
             {
-                _sharedLeases.Release(in lease);
-                throw;
-            }
-
-            if (result.IsAdmitted)
-            {
-                Track(slot, result.Token, in lease);
-                _sharedAdmitted.AddCore(slot);
-                _sharedStatus[slot] = (byte)SendStatus.Admitted;
-                admitted++;
-            }
-            else
-            {
-                _sharedLeases.Release(in lease);
-                _sharedRejected.AddCore(slot);
-                _sharedStatus[slot] = (byte)result.Status;
-                rejected++;
+                _sharedAdmittedTotal += admitted;
+                Track(in lease, admitted);
             }
         }
 
         return new SharedSendResult(admitted, rejected, _sharedAdmitted, _sharedRejected, _sharedStatus);
     }
 
-    private void Track(int slot, SendToken token, in SharedLease lease)
+    /// <summary>
+    /// References handed to peers that are not released yet, read from the leases' reference counts now: the peers release on
+    /// their own (in a Poll, a Flush, a close or a transport callback) without telling the server, so this is recomputed on
+    /// demand. Exact while the caller keeps the references it held when it sent; a caller that releases its own reference
+    /// earlier makes it a lower bound (never an over-count).
+    /// </summary>
+    private int SharedReferencesOutstanding()
     {
-        int entry = _sharedFree;
-        if (entry >= 0)
+        PruneShared();
+        int outstanding = 0;
+        for (int i = 0; i < _sharedTrackedCount; i++)
         {
-            _sharedFree = _sharedEntries[entry].Next;
-        }
-        else
-        {
-            if (_sharedNext == _sharedEntries.Length)
-            {
-                Array.Resize(ref _sharedEntries, _sharedEntries.Length * 2);
-            }
-
-            entry = _sharedNext++;
+            outstanding += Outstanding(in _sharedTracked[i]);
         }
 
-        ref SharedEntry tracked = ref _sharedEntries[entry];
-        tracked.Token = token;
-        tracked.Lease = lease;
-        tracked.Wait = default;
-        tracked.Armed = false;
-        tracked.Next = _sharedHead[slot];
-        _sharedHead[slot] = entry;
-        _sharedOutstanding++;
+        return outstanding;
     }
 
-    /// <summary>Drops the references of <paramref name="peer"/>'s shared sends whose payload the transport released.</summary>
-    private void ProcessShared(int slot, QuiclyPeer peer)
+    /// <summary>Forgets the payloads no peer holds a reference to any more. Allocation-free.</summary>
+    private void PruneShared()
     {
-        ISharedSendPort port = SharedPort;
-        int previous = -1;
-        int entry = _sharedHead[slot];
-        while (entry >= 0)
+        for (int i = _sharedTrackedCount - 1; i >= 0; i--)
         {
-            ref SharedEntry tracked = ref _sharedEntries[entry];
-            int next = tracked.Next;
-            if (port.TryRelease(peer, ref tracked))
+            if (Outstanding(in _sharedTracked[i]) == 0)
             {
-                if (previous < 0)
-                {
-                    _sharedHead[slot] = next;
-                }
-                else
-                {
-                    _sharedEntries[previous].Next = next;
-                }
-
-                FreeShared(entry);
+                _sharedTracked[i] = _sharedTracked[--_sharedTrackedCount];
+                _sharedTracked[_sharedTrackedCount] = default;
             }
-            else
-            {
-                previous = entry;
-            }
-
-            entry = next;
         }
     }
 
     /// <summary>
-    /// The peer is closed or being force-closed: drops the tracking of every shared send it holds. Each reference goes at
-    /// once when the transport already reported its close, otherwise to <paramref name="sink"/>, which drops it when the
-    /// transport does (after a forced close the transport may still read the payload until then).
+    /// How many of one payload's peer references are still out: its reference count now, minus the references that were not
+    /// the server's when it sent (the caller's own), clamped to what the server handed out.
     /// </summary>
-    private void ReleaseAllShared(int slot, QuiclyPeer peer, WorkSignalSink? sink)
+    private int Outstanding(in SharedTracking tracked) =>
+        Math.Clamp(_sharedLeases.GetReferenceCount(in tracked.Lease) - tracked.Others, 0, tracked.Peers);
+
+    /// <summary>Records that <paramref name="peers"/> peers took a reference to <paramref name="lease"/> (merged with the newest entry of the same block).</summary>
+    private void Track(in SharedLease lease, int peers)
     {
-        ISharedSendPort port = SharedPort;
-        int entry = _sharedHead[slot];
-        _sharedHead[slot] = -1;
-        while (entry >= 0)
+        if (_sharedTrackedCount != 0)
         {
-            ref SharedEntry tracked = ref _sharedEntries[entry];
-            int next = tracked.Next;
-            port.Abandon(peer, ref tracked);
-            SharedLease lease = tracked.Lease;
-            tracked = default;
-            tracked.Next = _sharedFree;
-            _sharedFree = entry;
-            _sharedOutstanding--;
-            Interlocked.Increment(ref _sharedHeld);
-            if (sink is null || !sink.HoldUntilClosed(in lease))
+            ref SharedTracking newest = ref _sharedTracked[_sharedTrackedCount - 1];
+            if (newest.Lease == lease)
             {
-                Interlocked.Decrement(ref _sharedHeld);
-                _sharedLeases.Release(in lease);
+                newest.Peers += peers;
+                return;
             }
-
-            entry = next;
         }
+
+        if (_sharedTrackedCount == _sharedTracked.Length)
+        {
+            PruneShared();
+            if (_sharedTrackedCount == _sharedTracked.Length)
+            {
+                Array.Resize(ref _sharedTracked, _sharedTracked.Length * 2);
+            }
+        }
+
+        // Whatever the block was referenced by besides this send (the caller's own reference, by the documented usage).
+        int others = Math.Max(0, _sharedLeases.GetReferenceCount(in lease) - peers);
+        _sharedTracked[_sharedTrackedCount++] = new SharedTracking { Lease = lease, Peers = peers, Others = others };
     }
 
-    /// <summary>Drops a shared reference a sink kept for a force-closed peer (transport thread; never throws).</summary>
-    internal void ReleaseHeldShared(in SharedLease lease)
+    /// <summary>One shared payload the server handed out: how many peer references it gave it, and what else referenced it then.</summary>
+    private struct SharedTracking
     {
-        try
-        {
-            _sharedLeases.Release(in lease);
-        }
-        catch (ObjectDisposedException)
-        {
-            // The application disposed the pool it supplied (PeerOptions.Allocator) before the transport closed.
-        }
-        finally
-        {
-            Interlocked.Decrement(ref _sharedHeld);
-        }
-    }
+        public SharedLease Lease;
 
-    private void FreeShared(int entry)
-    {
-        ref SharedEntry tracked = ref _sharedEntries[entry];
-        SharedLease lease = tracked.Lease;
-        tracked = default;
-        tracked.Next = _sharedFree;
-        _sharedFree = entry;
-        _sharedOutstanding--;
-        _sharedLeases.Release(in lease);
+        public int Peers;
+
+        public int Others;
     }
 }

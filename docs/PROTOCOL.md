@@ -295,10 +295,15 @@ Control-message bounds (clarifications; they apply to both endpoints, and a viol
   (an old token is invalid once a resume succeeded or a newer token was issued), expires at its `expiry`,
   and is a *locator*, not a credential: a resume MUST also present an `authToken` that the admission policy
   accepts. Token comparison is constant-time; failed auth attempts are rate-limited per remote address.
-  Implementation policy: single use is enforced by a bounded replay cache of the random parts, each entry kept
-  until its token expires; when the cache is full of unexpired entries a presented token is rejected (fail
-  closed: status 3, the client starts a fresh session) rather than an entry evicted. "A newer token was issued"
-  is enforced by the session registry comparing the token's `epoch` with the session's current epoch. How long a
+  Implementation policy: the **session registry is the authority** on single use. It compares the token's
+  `epoch` with the session's current epoch, and a resume that commits advances that epoch, so a replayed token
+  can no longer match its session and is rejected (status 3) whatever any cache holds. A bounded replay cache
+  of spent tokens is a secondary guard that **never fails closed**: an entry is kept for the grace period —
+  the window in which a replayed token could still match a live record — not for the token's maximum age, and
+  when the cache is full its **oldest entry is evicted** and the new token stored rather than a resume being
+  refused, because refusing would let one authenticated client (one resume per minimum resume interval) fill
+  the cache and lock every other client out. Evictions are counted and reported in the server's statistics, so
+  a cache under pressure is visible and can be sized up. How long a
   session outlives its connection is the registry's decision, not the token's: a *live* session can be resumed at
   any time within its token's maximum age, and a session whose connection was lost only within `graceMicros` of
   that loss (the server starts the grace period when the connection is lost, not when the token was issued). A

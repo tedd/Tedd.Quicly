@@ -132,11 +132,13 @@ public enum AdmissionFailureReason : byte
     /// <summary>The session token expired.</summary>
     SessionTokenExpired,
 
-    /// <summary>The session token was already used.</summary>
+    /// <summary>
+    /// The session token was already spent by a resume that committed (<see cref="ServerSessionOptions.ReplayCacheCapacity"/>).
+    /// A full replay cache never refuses a resume — it evicts its oldest entry, counted in
+    /// <see cref="ServerStatistics.ReplayCacheEvictions"/> — because the session registry's epoch check already makes a token
+    /// single-use (PROTOCOL.md §4.1).
+    /// </summary>
     SessionTokenReplayed,
-
-    /// <summary>The token replay cache is full of unexpired entries (fail closed).</summary>
-    SessionTokenReplayCacheFull,
 
     /// <summary>The session named by the token no longer exists (it ended, or the server restarted with the same key).</summary>
     SessionUnknown,
@@ -186,7 +188,7 @@ public readonly record struct AdmissionFailure(
     public bool IsTokenFailure => Reason is AdmissionFailureReason.AuthTokenRejected
         or AdmissionFailureReason.SessionTokenMalformed or AdmissionFailureReason.SessionTokenBadSignature
         or AdmissionFailureReason.SessionTokenExpired or AdmissionFailureReason.SessionTokenReplayed
-        or AdmissionFailureReason.SessionTokenReplayCacheFull or AdmissionFailureReason.SessionUnknown
+        or AdmissionFailureReason.SessionUnknown
         or AdmissionFailureReason.SessionTokenSuperseded or AdmissionFailureReason.SessionExpired
         or AdmissionFailureReason.SessionEnded;
 }

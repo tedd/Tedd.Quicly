@@ -24,9 +24,14 @@ namespace Tedd.Quicly.Server;
 /// listener's callbacks run on transport threads; they reserve a slot and create the peer, which the next
 /// <see cref="PollAll"/> activates, and queue the failures they find. <see cref="CompleteAdmission(QuiclyPeer, bool, string?)"/>
 /// may be called from any thread; the decision is applied by the next <see cref="PollAll"/>.</para>
-/// <para><b>Work tracking.</b> The server hands each transport a sink that forwards to the peer and then sets the peer's
-/// bit in an atomic work bitset, and it keeps every peer's next deadline in a dense array. <see cref="PollAll"/> polls only
-/// peers with a set bit or a due deadline, so idle peers cost a bit test and a (vectorised) deadline comparison.</para>
+/// <para><b>Work tracking.</b> Every peer's <see cref="PeerOptions.WorkSignal"/> is the server's: a peer that publishes
+/// game-thread work sets its bit in an atomic work bitset (once per <see cref="QuiclyPeer.Poll"/> — the signal is an edge),
+/// and the server keeps each peer's poll deadline (<see cref="QuiclyPeer.NextPollDeadlineMicros"/>) in a dense array and the
+/// earliest flush deadline (<see cref="QuiclyPeer.NextFlushDeadlineMicros"/>) in one field. <see cref="PollAll"/> polls a
+/// peer with a set bit only when <see cref="QuiclyPeer.HasPendingWork"/> confirms it, polls the peers whose deadline is due,
+/// and brings its own <see cref="FlushAll"/> forward when engine work is waiting; idle peers cost a bit test and a
+/// (vectorised) deadline comparison. A host that sleeps between passes sleeps on
+/// <see cref="NextPollDeadlineMicros"/>.</para>
 /// <para><b>Ownership.</b> The server owns the listener (stopped by <see cref="StopAsync"/>, disposed by
 /// <see cref="DisposeAsync"/>), every peer it accepts (disposed right after <see cref="PeerClosed"/>: close peers with
 /// <see cref="QuiclyPeer.Close(CloseReason)"/>, never dispose them), and the shared buffer pool it created
@@ -43,8 +48,11 @@ public sealed partial class QuiclyServer : IAsyncDisposable
     /// <summary>Most <see cref="AdmissionFailed"/> or <see cref="CertificateConsumerFailed"/> events waiting for <see cref="PollAll"/>.</summary>
     internal const int MaxQueuedEvents = 4096;
 
-    /// <summary>Default replay-cache entries per expected peer (a consumed token is held until it expires).</summary>
+    /// <summary>Replay-cache entries per expected peer when <see cref="ServerSessionOptions.ReplayCacheCapacity"/> is 0.</summary>
     internal const int ReplayEntriesPerExpectedPeer = 32;
+
+    /// <summary>Smallest replay-cache capacity derived from <see cref="ServerOptions.ExpectedPeers"/>.</summary>
+    internal const int MinReplayCacheCapacity = 16_384;
 
     private readonly ITransportListener _listener;
     private readonly ChannelTable _table;
@@ -56,6 +64,7 @@ public sealed partial class QuiclyServer : IAsyncDisposable
     private readonly SessionTokenAuthority _tokens;
     private readonly AuthFailureRateLimiter _rateLimiter;
     private readonly SessionRegistry _sessions;
+    private readonly SessionReplayCache _replay;
     private readonly DefaultAdmissionPolicy _defaultPolicy;
     private readonly HelloAdmission _helloAdmission;
     private readonly Action<QuiclyPeer, PeerState, PeerState> _onStateChanged;
@@ -129,7 +138,7 @@ public sealed partial class QuiclyServer : IAsyncDisposable
 
         try
         {
-            _peerOptions = PeerOptionsCopier.Copy(template);
+            _peerOptions = template.Clone();
             _peerOptions.Allocator = _allocator;
             _peerOptions.AllocatorOptions = null;
             _peerOptions.SendTableCapacity = Sizing.SendTableCapacity;
@@ -142,16 +151,21 @@ public sealed partial class QuiclyServer : IAsyncDisposable
             _peerOptions.SessionToken = default;
             _peerOptions.LastEpoch = 0;
             _peerOptions.RequestChannelTable = false;
-            ProbeTransport.Validate(_peerOptions, _table);
+            _peerOptions.WorkSignal = new PeerWorkSignal(this);
+            _peerOptions.Validate(); // the peers' own checks, at start-up instead of on the first connection
 
             _sharedLeases = new SharedLeaseTable(_allocator);
             int replay = options.Sessions.ReplayCacheCapacity != 0
                 ? options.Sessions.ReplayCacheCapacity
-                : (int)Math.Clamp((long)options.ExpectedPeers * ReplayEntriesPerExpectedPeer, SessionTokenAuthority.DefaultReplayCacheCapacity, 1 << 22);
+                : (int)Math.Clamp((long)options.ExpectedPeers * ReplayEntriesPerExpectedPeer, MinReplayCacheCapacity, SessionReplayCache.MaxCapacity);
+            _replay = new SessionReplayCache(replay, _graceMicros);
             byte[] key = options.Sessions.Key.IsEmpty ? RandomNumberGenerator.GetBytes(SessionTokenAuthority.KeyLength) : options.Sessions.Key.ToArray();
             try
             {
-                _tokens = new SessionTokenAuthority(key, _clock, replay);
+                // The authority's own replay cache stays out of the way (capacity 1, never consumed): its entries would live
+                // for a token's maximum age and a full cache would refuse resumes, so the server spends tokens in _replay,
+                // which expires by the grace period and evicts instead of failing closed (PROTOCOL.md §4.1).
+                _tokens = new SessionTokenAuthority(key, _clock, replayCacheCapacity: 1);
             }
             finally
             {
@@ -186,8 +200,6 @@ public sealed partial class QuiclyServer : IAsyncDisposable
             _sharedRejected = new PeerSet(capacity);
             _sharedRejected.MakeReadOnly();
             _sharedStatus = new byte[capacity];
-            _sharedHead = new int[capacity];
-            Array.Fill(_sharedHead, -1);
 
             _defaultPolicy = new DefaultAdmissionPolicy(this, admission);
             _policy = _defaultPolicy;
@@ -207,7 +219,12 @@ public sealed partial class QuiclyServer : IAsyncDisposable
         }
     }
 
-    /// <summary>A peer's session was admitted (raised from <see cref="PollAll"/>, before any of its messages are dispatched, so handlers can be registered here).</summary>
+    /// <summary>
+    /// A peer's session was admitted (raised from <see cref="PollAll"/>, before any of its messages are dispatched, so
+    /// handlers can be registered here). It is raised inside the peer's own state change, so an exception a handler throws is
+    /// recorded as that peer's callback fault (<see cref="QuiclyPeer.LastCallbackFault"/>,
+    /// <see cref="PeerStatistics.CallbackFaults"/>) instead of leaving <see cref="PollAll"/>, and the admission itself stands.
+    /// </summary>
     public event Action<QuiclyPeer>? PeerAdmitted;
 
     /// <summary>
@@ -317,6 +334,9 @@ public sealed partial class QuiclyServer : IAsyncDisposable
 
     internal SessionRegistry Sessions => _sessions;
 
+    /// <summary>The tokens spent by committed resumes; the registry's epoch is the authority, this is the bounded guard.</summary>
+    internal SessionReplayCache Replay => _replay;
+
     internal bool IsAccepting => Volatile.Read(ref _accepting);
 
     /// <summary>The peer in slot <paramref name="index"/>, or <see langword="null"/>. Game thread.</summary>
@@ -371,7 +391,10 @@ public sealed partial class QuiclyServer : IAsyncDisposable
 
         statistics.AdmittedPeers = _admittedSet.Count;
         statistics.Sessions = _sessions.Count;
-        statistics.SharedSendsOutstanding = _sharedOutstanding + Volatile.Read(ref _sharedHeld);
+        statistics.SharedSendsOutstanding = SharedReferencesOutstanding();
+        statistics.SharedSendsAdmitted = _sharedAdmittedTotal;
+        statistics.ReplayCacheEntries = _replay.Count;
+        statistics.ReplayCacheEvictions = _replay.Evictions;
         statistics.ConnectionsAccepted = Interlocked.Read(ref _connectionsAccepted);
         statistics.ConnectionsRefused = Interlocked.Read(ref _connectionsRefused);
         statistics.SessionsCreated = _sessionsCreated;

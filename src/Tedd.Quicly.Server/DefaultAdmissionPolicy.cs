@@ -24,9 +24,12 @@ namespace Tedd.Quicly.Server;
 /// <see cref="ServerAdmissionOptions.AuthTokenValidator"/> (accept, reject, or pending until
 /// <see cref="QuiclyServer.CompleteAdmission(QuiclyPeer, bool, string?)"/>), then capacity is reserved
 /// (<see cref="ServerOptions.MaxPeers"/>, answered <see cref="HelloStatus.ServerFull"/>; a resume that replaces a live
-/// connection may exceed it by that connection). Only then is a resume committed: <see cref="SessionTokenAuthority.TryValidate"/>
-/// consumes the token, the epoch is incremented, a new token is minted and a live connection of the session is closed with
-/// <see cref="QuiclyErrorCode.SessionReplaced"/>. A refusal before the commit leaves the client's token usable.</para>
+/// connection may exceed it by that connection). Only then is a resume committed: the token is verified once more and spent
+/// in the server's replay cache (<see cref="ServerSessionOptions.ReplayCacheCapacity"/> — bounded, expiring by
+/// <see cref="ServerSessionOptions.Grace"/> and evicting its oldest entry rather than ever refusing a resume), the epoch is
+/// incremented — which is what makes a token single-use — a new token is minted and a live connection of the session is
+/// closed with <see cref="QuiclyErrorCode.SessionReplaced"/>. A refusal before the commit leaves the client's token
+/// usable.</para>
 /// <para>Every token failure, auth or session, is answered <see cref="HelloStatus.Rejected"/> with no reason text, charged
 /// to the per-address <see cref="AuthFailureRateLimiter"/> and reported with its real cause through
 /// <see cref="QuiclyServer.AdmissionFailed"/>. A resume refused for its rate (<see cref="AdmissionFailureReason.ResumeTooSoon"/>)
@@ -111,14 +114,21 @@ public sealed class DefaultAdmissionPolicy : IAdmissionPolicy
         ulong tag = 0;
         if (!hello.SessionToken.IsEmpty)
         {
+            long now = _server.Clock.NowMicros;
             SessionTokenStatus status = _server.Tokens.TryInspect(hello.SessionToken, out ulong sessionId, out uint epoch);
             if (status != SessionTokenStatus.Valid)
             {
                 return TokenFailure(ReasonOf(status), remote, 0);
             }
 
+            if (_server.Replay.Contains(hello.SessionToken, now))
+            {
+                // Already spent by a resume that committed (the registry's epoch check would refuse it as well).
+                return TokenFailure(AdmissionFailureReason.SessionTokenReplayed, remote, sessionId);
+            }
+
             SessionRecord? record = _server.Sessions.Find(sessionId);
-            if (CheckSession(record, epoch, _server.Clock.NowMicros, checkResumeRate: true) is { } problem)
+            if (CheckSession(record, epoch, now, checkResumeRate: true) is { } problem)
             {
                 return problem == AdmissionFailureReason.ResumeTooSoon
                     ? Refuse(problem, remote, sessionId, HelloStatus.Rejected)
@@ -214,11 +224,14 @@ public sealed class DefaultAdmissionPolicy : IAdmissionPolicy
             return Refuse(AdmissionFailureReason.ServerFull, remote, state.SessionId, HelloStatus.ServerFull);
         }
 
-        SessionTokenStatus status = _server.Tokens.TryValidate(state.Token, out _, out _);
-        if (status != SessionTokenStatus.Valid)
+        // The resume commits, so the token is spent now: verify it once more (the signing key may have rotated, or the token
+        // may have expired, while a validation was pending) and remember it for one grace period. A full cache evicts its
+        // oldest entry instead of refusing (PROTOCOL.md §4.1).
+        SessionTokenStatus status = _server.Tokens.TryInspect(state.Token, out _, out _);
+        if (status != SessionTokenStatus.Valid || !_server.Replay.TryConsume(state.Token, now))
         {
             _server.Unreserve(peer);
-            return TokenFailure(ReasonOf(status), remote, state.SessionId);
+            return TokenFailure(status == SessionTokenStatus.Valid ? AdmissionFailureReason.SessionTokenReplayed : ReasonOf(status), remote, state.SessionId);
         }
 
         uint epoch = record.Epoch + 1;
@@ -285,13 +298,13 @@ public sealed class DefaultAdmissionPolicy : IAdmissionPolicy
         return AdmissionResult.Reject(status);
     }
 
+    /// <summary>The failure behind a token status; the server's own replay cache reports replays, so only the authority's checks are mapped here.</summary>
     private static AdmissionFailureReason ReasonOf(SessionTokenStatus status) => status switch
     {
-        SessionTokenStatus.Malformed => AdmissionFailureReason.SessionTokenMalformed,
         SessionTokenStatus.BadSignature => AdmissionFailureReason.SessionTokenBadSignature,
         SessionTokenStatus.Expired => AdmissionFailureReason.SessionTokenExpired,
         SessionTokenStatus.Replayed => AdmissionFailureReason.SessionTokenReplayed,
-        _ => AdmissionFailureReason.SessionTokenReplayCacheFull,
+        _ => AdmissionFailureReason.SessionTokenMalformed,
     };
 
     private bool IsAlpnAllowed(in NewConnectionInfo info)

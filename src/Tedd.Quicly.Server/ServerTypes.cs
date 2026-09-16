@@ -122,8 +122,27 @@ public struct ServerStatistics
     /// <summary>Sessions in the registry: connected, or within their grace period.</summary>
     public int Sessions;
 
-    /// <summary>Per-peer shared sends whose buffer was not released yet (including those of force-closed peers whose transport has not reported its close).</summary>
+    /// <summary>
+    /// Shared payload references <see cref="QuiclyServer.SendShared"/> handed to peers that have not been released yet
+    /// (a peer releases its reference when the transport released the payload, when the send is discarded, or when its
+    /// session closes; a peer force-closed with a send in flight holds it until its transport reported the close, ADR 0008
+    /// invariant 1). A lower bound taken when the statistics are read: the peers release without telling the server, so the
+    /// count is refreshed from the leases' reference counts here and in <see cref="QuiclyServer.PollAll"/>.
+    /// </summary>
     public int SharedSendsOutstanding;
+
+    /// <summary>Per-peer sends admitted through <see cref="QuiclyServer.SendShared"/> (one serialisation reaching N peers counts N).</summary>
+    public long SharedSendsAdmitted;
+
+    /// <summary>Spent session tokens the replay cache still remembers (they expire one <see cref="ServerSessionOptions.Grace"/> after the resume).</summary>
+    public int ReplayCacheEntries;
+
+    /// <summary>
+    /// Spent tokens the replay cache dropped early because it was full (<see cref="ServerSessionOptions.ReplayCacheCapacity"/>).
+    /// A resume is never refused for a full cache, so this is a sizing signal, not an error count: while it grows, a replayed
+    /// token is caught by the session registry's epoch check alone (PROTOCOL.md §4.1).
+    /// </summary>
+    public long ReplayCacheEvictions;
 
     /// <summary>Connections accepted by the listener callbacks.</summary>
     public long ConnectionsAccepted;

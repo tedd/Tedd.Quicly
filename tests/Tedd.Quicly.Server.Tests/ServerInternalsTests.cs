@@ -8,11 +8,11 @@ namespace Tedd.Quicly.Server.Tests;
 public class ServerInternalsTests
 {
     [Fact]
-    public async Task Work_Signal_Sink_Forwards_Every_Callback()
+    public async Task The_Connection_Sink_Forwards_Every_Callback_And_Owns_The_Address_Accounting()
     {
         await using ServerFixture f = new();
         RecordingSink inner = new();
-        WorkSignalSink sink = new(f.Server, 3, inner);
+        ConnectionSink sink = new(f.Server, 3, inner);
         TransportStreamId stream = new(1, 1);
         TransportConnectedInfo info = default;
         sink.OnConnected(in info);
@@ -37,44 +37,49 @@ public class ServerInternalsTests
         Assert.True(sink.TakeLimitClose());
         Assert.False(sink.TakeLimitClose());
 
-        // A retired sink keeps forwarding but no longer marks its (reused) slot, nor moves address counts.
+        // A retired sink keeps forwarding but no longer moves address counts, nor marks its (reused) slot.
         sink.RetireLocked();
         Assert.True(sink.IsRetired);
         TransportConnectedInfo moved = default;
         moved.RemoteEndPoint = new IPEndPoint(IPAddress.Parse("192.0.2.1"), 1);
         sink.OnPeerAddressChanged(in moved);
         Assert.False(sink.HasAddress);
+        sink.RequestLimitClose();
+        Assert.True(sink.TakeLimitClose());
         sink.OnClosed(TransportCloseReason.Local, 0, 0);
         Assert.True(inner.IsClosed);
 
-        WorkSignalSink released = new(f.Server, 4, new RecordingSink());
+        ConnectionSink released = new(f.Server, 4, new RecordingSink());
         released.MarkReleased();
         released.MarkReleased(); // idempotent
         f.Server.MarkWork(-1);   // out of range: ignored
         f.Server.MarkWork(100_000);
     }
 
+    /// <summary>
+    /// The peers' <see cref="PeerOptions.WorkSignal"/> is the server's: work a peer publishes marks its slot, so a
+    /// <see cref="QuiclyServer.PollAll"/> that nothing else marked still polls it (the server interposes no sink of its own
+    /// for that any more).
+    /// </summary>
     [Fact]
-    public unsafe void Probe_Transport_Does_Nothing()
+    public async Task A_Peers_Work_Signal_Marks_Its_Slot()
     {
-        ProbeTransport probe = new();
-        Assert.Equal(TransportStatus.InvalidState, probe.SendDatagram(null, 0, 0, TransportSendFlags.None));
-        Assert.Equal(TransportStatus.InvalidState, probe.OpenStream(StreamKind.Bidirectional, 0, 0, out TransportStreamId id));
-        Assert.False(id.IsValid);
-        Assert.Equal(TransportStatus.InvalidState, probe.StartStream(default));
-        Assert.Equal(TransportStatus.InvalidState, probe.SendStream(default, null, 0, 0, TransportSendFlags.None));
-        Assert.Equal(-1, probe.GetQuicStreamId(default));
-        probe.AbortStream(default, 0, StreamAbortDirection.Both);
-        probe.SetStreamPriority(default, 1);
-        probe.ResumeStreamReceive(default, 0);
-        probe.CloseStream(default);
-        probe.UpdatePeerStreamLimits(1, 1);
-        probe.GetStatistics(out TransportStatistics statistics);
-        Assert.Equal(0u, statistics.RttMicros);
-        Assert.False(probe.Capabilities.Datagrams);
-        Assert.Equal(TransportState.Connecting, probe.State);
-        probe.Close(0, default); // no sink attached: nothing to report
-        probe.Dispose();
+        await using ServerFixture f = new();
+        List<byte[]> received = [];
+        f.Server.PeerAdmitted += peer => peer.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => received.Add(payload.ToArray()));
+        QuiclyPeer client = f.ConnectAdmitted();
+        f.Run(50_000);
+        f.Server.GetStatistics(out ServerStatistics idle);
+
+        // Nothing marks the slot but the peer itself: the message is published on a transport thread inside Advance.
+        Assert.True(client.SendCopy(new SendHeader(2), [1, 2, 3]).IsAdmitted);
+        client.Flush();
+        f.Network.Advance(1_000);
+        Assert.Equal(1, f.Server.PollAll());
+
+        f.Server.GetStatistics(out ServerStatistics polled);
+        Assert.True(polled.PeersPolled > idle.PeersPolled);
+        Assert.Equal([1, 2, 3], Assert.Single(received));
     }
 
     [Fact]

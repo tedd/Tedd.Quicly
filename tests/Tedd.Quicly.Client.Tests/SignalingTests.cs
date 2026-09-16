@@ -1,37 +1,35 @@
-using System.Net;
-using Tedd.Quicly.Core.Time;
-using Tedd.Quicly.Core.Transport;
-using Tedd.Quicly.Testing.Simulation;
+using Tedd.Quicly.Core.Session;
 
 namespace Tedd.Quicly.Client.Tests;
 
 public class SignalingTests
 {
+    /// <summary>
+    /// The client's signal is the peers' own <see cref="IPeerWorkSignal"/> (<see cref="PeerOptions.WorkSignal"/>): the peer
+    /// raises it when it publishes game-thread work, and the wait inside ConnectAsync wakes instead of sleeping its interval.
+    /// </summary>
     [Fact]
-    public void Signaling_Sink_Forwards_Every_Callback()
+    public async Task The_Work_Signal_Is_A_Peers_Work_Hook()
     {
+        await using ClientFixture f = new();
         using WorkSignal signal = new();
-        RecordingSink inner = new();
-        SignalingSink sink = new(inner, signal);
-        TransportStreamId stream = new(1, 1);
-        TransportConnectedInfo info = default;
-        sink.OnConnected(in info);
-        sink.OnDatagramReceived([1, 2]);
-        sink.OnPeerStreamStarted(stream, StreamKind.Unidirectional);
-        sink.OnStreamStarted(stream, 7, TransportStatus.Success);
-        sink.OnStreamReceived(stream, ReadOnlySpan<TransportSegment>.Empty, 0, false);
-        sink.OnStreamSendCompleted(stream, 7, false);
-        sink.OnDatagramSendStateChanged(7, DatagramSendState.Sent);
-        sink.OnStreamAborted(stream, 3, StreamAbortDirection.Both);
-        sink.OnStreamPeerSendShutdown(stream);
-        sink.OnStreamShutdownComplete(stream);
-        sink.OnDatagramCapabilityChanged(true, 1200);
-        sink.OnIdealSendBufferSize(stream, 4096);
-        sink.OnStreamsAvailable(1, 4);
-        sink.OnPeerAddressChanged(in info);
-        sink.OnClosed(TransportCloseReason.Local, 0, 0);
-        Assert.True(inner.Count >= 12, inner.Count + " callbacks recorded");
-        Assert.True(inner.IsClosed);
+        IPeerWorkSignal hook = signal;
+        PeerOptions options = new()
+        {
+            Clock = f.Clock,
+            AllocatorOptions = Pools.Small(),
+            SendTableCapacity = 32,
+            ReceiveRingCapacity = 32,
+            SegmentArenaCapacity = 32,
+            WorkSignal = signal,
+        };
+        using QuiclyPeer peer = QuiclyPeer.Connect(f.Connector, f.EndPoint, "game.test", Tables.Default, options);
+
+        hook.OnWork(peer); // as the peer does from the thread that published the work
+
+        await signal.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        Assert.True(signal.LastWaitSignaled);
+        f.Step(1_000);
     }
 
     [Fact]
@@ -51,32 +49,5 @@ public class SignalingTests
         signal.Dispose();
         signal.Set(); // a late transport callback after the client was disposed
         await Assert.ThrowsAsync<ObjectDisposedException>(async () => await signal.WaitAsync(TimeSpan.FromMilliseconds(5), TestContext.Current.CancellationToken));
-    }
-
-    [Fact]
-    public void Signaling_Connector_Wraps_The_Peer_Sink()
-    {
-        using SimulatedNetwork network = new(new VirtualClock(), 1);
-        CapturingConnector inner = new(new SimulatedConnector(network));
-        using WorkSignal signal = new();
-        SignalingConnector connector = new(inner, signal);
-        RecordingSink peerSink = new();
-        using ITransport transport = connector.Connect(new IPEndPoint(IPAddress.Loopback, 1), "game.test", peerSink);
-        Assert.IsType<SignalingSink>(inner.LastSink);
-        Assert.Equal("game.test", inner.LastServerName);
-    }
-
-    private sealed class CapturingConnector(ITransportConnector inner) : ITransportConnector
-    {
-        public ITransportSink? LastSink { get; private set; }
-
-        public string? LastServerName { get; private set; }
-
-        public ITransport Connect(EndPoint endpoint, string? serverName, ITransportSink sink)
-        {
-            LastSink = sink;
-            LastServerName = serverName;
-            return inner.Connect(endpoint, serverName, sink);
-        }
     }
 }

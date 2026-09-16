@@ -17,8 +17,13 @@ public class ReconnectTests
         Jitter = 0,
     };
 
+    /// <summary>
+    /// A resume reconnects the same peer in place (<see cref="QuiclyPeer.Reconnect"/>): the session, the handlers, the tag,
+    /// the peer's <see cref="QuiclyPeer.Index"/> and its statistics all survive the lost connection, the peer's own states run
+    /// Closed → Reconnecting → Handshaking → Connected, and <see cref="ClientOptions.PeerCreated"/> is not called again.
+    /// </summary>
     [Fact]
-    public async Task A_Lost_Connection_Is_Resumed_With_The_Same_Session()
+    public async Task A_Lost_Connection_Is_Resumed_On_The_Same_Peer()
     {
         await using ClientFixture f = new();
         ScriptedConnector connector = new ScriptedConnector(f.Connector, f.Clock).Then(f.Cutting(200_000));
@@ -30,9 +35,20 @@ public class ReconnectTests
         client.Reconnected += (_, info) => reconnected.Add(info);
         client.StateChanged += (_, from, to) => states.Add((from, to));
         List<QuiclyPeer> created = [];
+        List<PeerState> peerStates = [];
+        int handled = 0;
         ClientOptions options = f.Options("alice", Policy());
-        options.PeerCreated = created.Add;
+        options.PeerCreated = peer =>
+        {
+            created.Add(peer);
+            peer.Tag = 0x5EED;
+            peer.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => handled++);
+            peer.StateChanged += (_, _, to) => peerStates.Add(to);
+        };
         QuiclyPeer first = await client.ConnectAsync(f.EndPoint, options, TestContext.Current.CancellationToken);
+        f.ServerPeerOf(first).SendCopy(new SendHeader(2), [1]);
+        Assert.True(f.RunUntil(client, () => handled == 1));
+        first.GetStatistics(out PeerStatistics before);
 
         Assert.True(f.RunUntil(client, () => client.State == PeerState.Reconnecting));
         long lostAt = f.Clock.NowMicros;
@@ -46,18 +62,28 @@ public class ReconnectTests
         Assert.True(f.RunUntil(client, () => client.State == PeerState.Connected));
         Assert.True(connector.ConnectTimes[1] - lostAt >= 99_000, "The attempt did not wait for the back-off.");
         ReconnectedInfo info = Assert.Single(reconnected);
+        Assert.Same(first, info.Peer);          // the same peer, resumed in place
         Assert.Same(first, info.PreviousPeer);
-        Assert.Same(client.Peer, info.Peer);
+        Assert.Same(first, client.Peer);
+        Assert.False(first.IsDisposed);
         Assert.True(info.Resumed);
         Assert.Equal(1, info.Attempts);
-        Assert.Equal(first.SessionId, info.Peer.SessionId);
-        Assert.Equal(2u, info.Peer.Epoch);
+        Assert.Equal(2u, first.Epoch);
         Assert.Equal(0, client.ReconnectAttempt);
-        Assert.Equal(2, created.Count);
+        Assert.Same(first, Assert.Single(created)); // the peer was created once: its handlers survived
+        Assert.Equal(0x5EEDul, first.Tag);
         Assert.Equal((first.SessionId, 2u), f.ServerAdmitted[^1]);
         Assert.Contains((PeerState.Connected, PeerState.Reconnecting), states);
         Assert.Equal((PeerState.Reconnecting, PeerState.Connected), states[^1]);
-        Assert.Throws<ObjectDisposedException>(() => first.Poll());
+        Assert.Equal([PeerState.Closed, PeerState.Reconnecting, PeerState.Handshaking, PeerState.Connected], peerStates[^4..]);
+
+        // The statistics are the peer's, not the connection's.
+        first.GetStatistics(out PeerStatistics after);
+        Assert.True(after.DatagramsReceived >= before.DatagramsReceived);
+
+        // The handler registered before the loss still receives on the resumed connection.
+        f.ServerPeerOf(first).SendCopy(new SendHeader(2), [2]);
+        Assert.True(f.RunUntil(client, () => handled == 2));
     }
 
     [Fact]
@@ -91,13 +117,23 @@ public class ReconnectTests
         QuiclyClient client = f.CreateClient(connector);
         List<ReconnectedInfo> reconnected = [];
         client.Reconnected += (_, info) => reconnected.Add(info);
-        QuiclyPeer first = await client.ConnectAsync(f.EndPoint, f.Options(reconnect: Policy(initialMillis: 300)), TestContext.Current.CancellationToken);
+        List<QuiclyPeer> created = [];
+        ClientOptions options = f.Options(reconnect: Policy(initialMillis: 300));
+        options.PeerCreated = created.Add;
+        QuiclyPeer first = await client.ConnectAsync(f.EndPoint, options, TestContext.Current.CancellationToken);
         Assert.True(f.RunUntil(client, () => reconnected.Count == 1, maxMicros: 5_000_000));
         ReconnectedInfo info = reconnected[0];
         Assert.False(info.Resumed);
         Assert.NotEqual(first.SessionId, info.Peer.SessionId);
         Assert.Equal(1u, info.Peer.Epoch);
         Assert.Equal(2, info.Attempts);
+
+        // A fresh session cannot reuse the peer (its token names the gone session): a new one takes over and the old one goes.
+        Assert.NotSame(info.PreviousPeer, info.Peer);
+        Assert.Same(first, info.PreviousPeer);
+        Assert.Same(info.Peer, client.Peer);
+        Assert.Equal(2, created.Count);
+        Assert.True(first.IsDisposed);
     }
 
     [Fact]
@@ -222,7 +258,8 @@ public class ReconnectTests
         client.Reconnecting += (_, info) => reconnecting.Add(info);
         await client.ConnectAsync(f.EndPoint, f.Options(reconnect: Policy()), TestContext.Current.CancellationToken);
         connector.ThrowNext = new SocketException((int)SocketError.HostNotFound);
-        Assert.True(f.RunUntil(client, () => reconnecting.Count == 2, maxMicros: 5_000_000));
+        Assert.True(f.RunUntil(client, () => reconnecting.Count == 2, maxMicros: 5_000_000),
+            $"state={client.State}, connects={connector.Connects}, scheduled={reconnecting.Count}, attempt={client.ReconnectAttempt}, peer={client.Peer?.State}, reason={client.Peer?.CloseReason.Code}");
         Assert.Equal(QuiclyErrorCode.InternalError, reconnecting[1].LastReason.Code);
         Assert.True(f.RunUntil(client, () => client.State == PeerState.Connected, maxMicros: 5_000_000));
     }
@@ -306,21 +343,34 @@ public class ReconnectTests
         await Assert.ThrowsAsync<ArgumentException>(async () => await client.ConnectAsync(f.EndPoint, f.Options(reconnect: policy), TestContext.Current.CancellationToken));
     }
 
+    /// <summary>
+    /// The client hands every peer a clone of the application's template (<see cref="PeerOptions.Clone"/>) and validates it
+    /// before a transport is created: the template itself keeps its values, including the auto-flush interval the client
+    /// implements in <see cref="QuiclyClient.Poll"/> and the resume values the client manages per attempt.
+    /// </summary>
     [Fact]
-    public void Peer_Options_Copier_Copies_Every_Public_Property()
+    public async Task The_Peer_Template_Is_Cloned_And_Validated_Never_Modified()
     {
-        string[] settable = typeof(PeerOptions).GetProperties(BindingFlags.Public | BindingFlags.Instance)
-            .Where(p => p.CanWrite && p.SetMethod!.IsPublic)
-            .Select(p => p.Name)
-            .Order()
-            .ToArray();
-        Assert.Equal(settable, PeerOptionsCopier.CopiedProperties.Order().ToArray());
-        PeerOptions source = new() { SessionToken = new byte[] { 9 }, LastEpoch = 4, PingInterval = TimeSpan.FromMilliseconds(7), SendTableCapacity = 32 };
-        PeerOptions copy = PeerOptionsCopier.Copy(source);
-        Assert.Equal(4u, copy.LastEpoch);
-        Assert.Equal(TimeSpan.FromMilliseconds(7), copy.PingInterval);
-        Assert.Equal(32, copy.SendTableCapacity);
-        Assert.Equal(9, copy.SessionToken.Span[0]);
+        await using ClientFixture f = new();
+        QuiclyClient client = f.CreateClient();
+        ClientOptions options = f.Options();
+        PeerOptions template = options.PeerOptions;
+        template.AutoFlushInterval = TimeSpan.FromMilliseconds(10);
+        template.LastEpoch = 4; // no token: the client passes epoch 0 to the peer, and the template keeps its value
+
+        QuiclyPeer peer = await client.ConnectAsync(f.EndPoint, options, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1u, peer.Epoch);
+        Assert.Equal(TimeSpan.FromMilliseconds(10), template.AutoFlushInterval);
+        Assert.Equal(4u, template.LastEpoch);
+        Assert.True(template.SessionToken.IsEmpty); // the resume token of an attempt goes to the clone, not here
+        Assert.Null(template.WorkSignal);
+
+        ClientOptions invalid = f.Options();
+        invalid.PeerOptions.MaxMessageSize = 0; // PeerOptions.Validate refuses it before any transport is created
+        QuiclyClient second = f.CreateClient();
+        await Assert.ThrowsAnyAsync<ArgumentException>(async () => await second.ConnectAsync(f.EndPoint, invalid, TestContext.Current.CancellationToken));
+        Assert.Equal(PeerState.Closed, second.State);
     }
 
     [Fact]

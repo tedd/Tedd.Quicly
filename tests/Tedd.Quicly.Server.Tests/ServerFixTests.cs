@@ -136,21 +136,6 @@ public class ServerFixTests
     }
 
     [Fact]
-    public async Task A_Held_Shared_Reference_Whose_Pool_Is_Gone_Is_Dropped_Quietly()
-    {
-        SlabAllocator pool = new(Pools.Small());
-        await using ServerFixture f = new(o =>
-        {
-            o.PeerOptions.AllocatorOptions = null;
-            o.PeerOptions.Allocator = pool;
-        }, start: false);
-        Assert.True(f.Server.Allocator.TryRent(64, out BufferLease block));
-        SharedLease lease = f.Server.SharedLeases.Share(in block, 1);
-        pool.Dispose(); // the application disposed the pool it supplied while a transport still held the payload
-        f.Server.ReleaseHeldShared(in lease); // the transport's close drops the reference: nothing throws on its thread
-    }
-
-    [Fact]
     public async Task A_Listener_Whose_Stop_Throws_Still_Stops_The_Server_And_Its_Side_Services()
     {
         await using ServerFixture f = new(o => o.Http = new ServerHttpOptions { EndPoint = new IPEndPoint(IPAddress.Loopback, 0) }, listener: new StopThrowingListener());

@@ -289,19 +289,57 @@ public class SessionTests
         Assert.Equal(HelloStatus.ServerFull, third.HandshakeStatus);
     }
 
+    /// <summary>
+    /// The replay cache is a bounded guard, never a gate (PROTOCOL.md §4.1): when it is full the oldest entry is evicted
+    /// (counted in the statistics) and the resume is admitted. Refusing would let one client's resumes lock every other
+    /// client out, and the registry's epoch check already makes a token single-use.
+    /// </summary>
     [Fact]
-    public async Task A_Full_Replay_Cache_Fails_Closed()
+    public async Task A_Full_Replay_Cache_Evicts_Its_Oldest_Entry_And_Never_Refuses()
     {
         await using ServerFixture f = new(o => o.Sessions.ReplayCacheCapacity = 1);
         QuiclyPeer a = f.ConnectAdmitted();
         QuiclyPeer b = f.ConnectAdmitted();
+        byte[] spentByA = a.SessionToken.ToArray();
+
         QuiclyPeer resumedA = f.Resume(a);
         Assert.True(f.RunUntil(() => resumedA.State == PeerState.Connected));
+        f.Server.GetStatistics(out ServerStatistics afterFirst);
+        Assert.Equal(1, afterFirst.ReplayCacheEntries);
+        Assert.Equal(0, afterFirst.ReplayCacheEvictions);
+
         QuiclyPeer resumedB = f.Resume(b);
-        Assert.True(f.RunUntil(() => resumedB.State == PeerState.Closed));
-        Assert.Equal(HelloStatus.Rejected, resumedB.HandshakeStatus);
-        Assert.Single(f.FailuresOf(AdmissionFailureReason.SessionTokenReplayCacheFull));
-        Assert.Equal(PeerState.Connected, b.State);
+        Assert.True(f.RunUntil(() => resumedB.State == PeerState.Connected)); // not refused although the cache was full
+        f.Server.GetStatistics(out ServerStatistics afterSecond);
+        Assert.Equal(1, afterSecond.ReplayCacheEntries);
+        Assert.Equal(1, afterSecond.ReplayCacheEvictions);
+        Assert.Empty(f.FailuresOf(AdmissionFailureReason.SessionTokenReplayed));
+
+        // A's token was the evicted entry, and it is still refused: its resume advanced the session's epoch.
+        QuiclyPeer replay = f.Connect(sessionToken: spentByA, lastEpoch: 1);
+        Assert.True(f.RunUntil(() => replay.State == PeerState.Closed));
+        Assert.Equal(HelloStatus.Rejected, replay.HandshakeStatus);
+        Assert.Single(f.FailuresOf(AdmissionFailureReason.SessionTokenSuperseded));
+    }
+
+    /// <summary>A spent token leaves the replay cache one grace period later; the registry's epoch check takes over from there.</summary>
+    [Fact]
+    public async Task A_Spent_Token_Leaves_The_Replay_Cache_After_The_Grace_Period()
+    {
+        await using ServerFixture f = new(o => o.Sessions.Grace = TimeSpan.FromMilliseconds(200));
+        QuiclyPeer first = f.ConnectAdmitted();
+        QuiclyPeer second = f.Resume(first);
+        Assert.True(f.RunUntil(() => second.State == PeerState.Connected));
+        f.Server.GetStatistics(out ServerStatistics spent);
+        Assert.Equal(1, spent.ReplayCacheEntries);
+
+        f.Run(1_000_000, step: 10_000); // five grace periods: the entry has expired ...
+        QuiclyPeer third = f.Resume(second);
+        Assert.True(f.RunUntil(() => third.State == PeerState.Connected));
+        f.Server.GetStatistics(out ServerStatistics swept);
+        Assert.Equal(1, swept.ReplayCacheEntries); // ... and the next spend swept it out instead of piling up
+        Assert.Equal(0, swept.ReplayCacheEvictions);
+        Assert.Equal(3u, third.Epoch);
     }
 
     [Fact]

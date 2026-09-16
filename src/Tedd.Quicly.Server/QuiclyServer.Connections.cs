@@ -43,7 +43,12 @@ public sealed partial class QuiclyServer
     private long _connectionsRefused;
     private long _eventHandlerFaults;
 
-    /// <summary>Marks <paramref name="slot"/> as having work for the next <see cref="PollAll"/> (any thread, lock-free).</summary>
+    /// <summary>
+    /// Marks <paramref name="slot"/> as having work for the next <see cref="PollAll"/> (any thread, lock-free). Called by the
+    /// peers' <see cref="PeerOptions.WorkSignal"/> (<see cref="PeerWorkSignal"/>) on whichever thread published the work, and
+    /// by the server itself for work of its own (an accepted connection, an applied admission decision, a limit close, a peer
+    /// whose message budget ran out or whose <see cref="QuiclyPeer.HasPendingWork"/> is still set after its Poll).
+    /// </summary>
     internal void MarkWork(int slot)
     {
         if ((uint)slot >= (uint)_slots.Length)
@@ -77,7 +82,7 @@ public sealed partial class QuiclyServer
     }
 
     /// <summary>A peer's transport moved to another address: move its count and flag it when the new address is over the limit.</summary>
-    internal void OnAddressChanged(WorkSignalSink sink, IPEndPoint? endPoint)
+    internal void OnAddressChanged(ConnectionSink sink, IPEndPoint? endPoint)
     {
         bool hasAddress = AddressKey.TryCreate(endPoint, _ipv6PrefixLength, out AddressKey key);
         bool exceeded = false;
@@ -200,7 +205,7 @@ public sealed partial class QuiclyServer
 
         peer.Index = slot;
         peer.StateChanged += _onStateChanged;
-        WorkSignalSink sink = new(this, slot, peer.TransportSink);
+        ConnectionSink sink = new(this, slot, peer.TransportSink);
         lock (_gate)
         {
             sink.AddressKey = key;
@@ -272,13 +277,7 @@ public sealed partial class QuiclyServer
             info.Sink = activation.Sink;
             info.Unadmitted = true;
             _slots[slot] = new PeerSlot(activation.Peer, activation.Generation, PeerSlotState.Handshaking);
-            long deadline = activation.Peer.NextDeadlineMicros;
-            _deadlines[slot] = deadline;
-            if (deadline < _earliestDeadline)
-            {
-                _earliestDeadline = deadline;
-            }
-
+            UpdateDeadlines(slot, activation.Peer);
             if (slot >= _highWater)
             {
                 _highWater = slot + 1;
@@ -330,10 +329,9 @@ public sealed partial class QuiclyServer
             }
         }
 
-        // A forced close (the peer is not Closed yet) leaves the transport open until the Dispose below closes it, and the
-        // transport may read the payloads of its shared sends until it reported that close (ADR 0008 invariant 1): those
-        // references go to the sink, which drops them when OnClosed arrives.
-        ReleaseAllShared(slot, peer, info.Sink);
+        // The peer owns the references of its shared sends and releases each exactly once, so nothing is released here: a
+        // forced close (the peer is not Closed yet) leaves the transport open until the Dispose below closes it, and the peer
+        // holds those references until its transport reported that close (ADR 0008 invariant 1).
         try
         {
             if (admitted)
@@ -370,7 +368,7 @@ public sealed partial class QuiclyServer
             _reserved--;
         }
 
-        WorkSignalSink? sink = info.Sink;
+        ConnectionSink? sink = info.Sink;
         try
         {
             peer.Dispose();
@@ -433,12 +431,23 @@ public sealed partial class QuiclyServer
         }
     }
 
-    private readonly record struct Activation(int Slot, uint Generation, QuiclyPeer Peer, WorkSignalSink Sink);
+    private readonly record struct Activation(int Slot, uint Generation, QuiclyPeer Peer, ConnectionSink Sink);
+
+    /// <summary>
+    /// The <see cref="PeerOptions.WorkSignal"/> of every peer: marks the peer's slot, so <see cref="PollAll"/> visits only
+    /// the peers that published game-thread work. Called on whichever thread produced it (a transport thread for received
+    /// traffic and the handshake, the game thread for work an application call created); non-blocking, allocation-free and
+    /// never re-entering the peer, as <see cref="IPeerWorkSignal"/> requires.
+    /// </summary>
+    private sealed class PeerWorkSignal(QuiclyServer server) : IPeerWorkSignal
+    {
+        public void OnWork(QuiclyPeer peer) => server.MarkWork(peer.Index);
+    }
 
     /// <summary>Server-side state of one slot (reused across the connections the slot holds).</summary>
     private sealed class SlotInfo
     {
-        public WorkSignalSink? Sink;
+        public ConnectionSink? Sink;
         public SessionRecord? Session;
         public PendingAdmission? Pending;
         public bool Unadmitted;

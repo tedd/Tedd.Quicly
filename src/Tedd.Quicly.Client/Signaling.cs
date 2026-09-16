@@ -1,16 +1,24 @@
-using System.Net;
-using Tedd.Quicly.Core.Transport;
+using Tedd.Quicly.Core.Session;
 
 namespace Tedd.Quicly.Client;
 
 /// <summary>
-/// Wakes <see cref="QuiclyClient.ConnectAsync"/> when a transport callback arrives, so it polls the connecting peer promptly
-/// instead of on a fixed interval (the peer exposes no public "has work" signal). Any thread may set it.
+/// Wakes <see cref="QuiclyClient.ConnectAsync"/> when its peer publishes game-thread work, so the connect polls the peer
+/// promptly instead of on a fixed interval. It is the peer's <see cref="PeerOptions.WorkSignal"/>: the peer raises it once
+/// per <see cref="QuiclyPeer.Poll"/> (an edge) from whichever thread produced the work — a transport thread for the
+/// handshake, received traffic and completions, the client's own thread for work an application call created.
 /// </summary>
-internal sealed class WorkSignal : IDisposable
+internal sealed class WorkSignal : IPeerWorkSignal, IDisposable
 {
     private readonly SemaphoreSlim _semaphore = new(0);
     private int _pending;
+
+    /// <summary>Whether the last <see cref="WaitAsync"/> ended because of a <see cref="Set"/> rather than its timeout (tests).</summary>
+    internal bool LastWaitSignaled { get; private set; }
+
+    /// <summary>The peer published work (any thread): never blocks, never allocates, never re-enters the peer.</summary>
+    /// <param name="peer">The peer with work waiting (the client drives exactly one).</param>
+    public void OnWork(QuiclyPeer peer) => Set();
 
     /// <summary>Releases a waiter (or the next one) unless a release is already outstanding; never blocks.</summary>
     public void Set()
@@ -29,9 +37,6 @@ internal sealed class WorkSignal : IDisposable
             // A late callback after the client was disposed.
         }
     }
-
-    /// <summary>Whether the last <see cref="WaitAsync"/> ended because of a <see cref="Set"/> rather than its timeout (tests).</summary>
-    internal bool LastWaitSignaled { get; private set; }
 
     /// <summary>Waits until <see cref="Set"/> or <paramref name="timeout"/>; the caller then polls the peer.</summary>
     /// <remarks>
@@ -54,106 +59,4 @@ internal sealed class WorkSignal : IDisposable
     }
 
     public void Dispose() => _semaphore.Dispose();
-}
-
-/// <summary>Hands every connection a <see cref="SignalingSink"/> in front of the peer's own sink.</summary>
-internal sealed class SignalingConnector(ITransportConnector inner, WorkSignal signal) : ITransportConnector
-{
-    public ITransport Connect(EndPoint endpoint, string? serverName, ITransportSink sink) =>
-        inner.Connect(endpoint, serverName, new SignalingSink(sink, signal));
-}
-
-/// <summary>Forwards every callback to the peer's sink, then sets the client's <see cref="WorkSignal"/>.</summary>
-internal sealed class SignalingSink(ITransportSink inner, WorkSignal signal) : ITransportSink
-{
-    public void OnConnected(in TransportConnectedInfo info)
-    {
-        inner.OnConnected(in info);
-        signal.Set();
-    }
-
-    public void OnDatagramReceived(ReadOnlySpan<byte> payload)
-    {
-        inner.OnDatagramReceived(payload);
-        signal.Set();
-    }
-
-    public void OnPeerStreamStarted(TransportStreamId id, StreamKind kind)
-    {
-        inner.OnPeerStreamStarted(id, kind);
-        signal.Set();
-    }
-
-    public void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status)
-    {
-        inner.OnStreamStarted(id, context, status);
-        signal.Set();
-    }
-
-    public ReceiveResult OnStreamReceived(TransportStreamId id, ReadOnlySpan<TransportSegment> segments, ulong absoluteOffset, bool fin)
-    {
-        ReceiveResult result = inner.OnStreamReceived(id, segments, absoluteOffset, fin);
-        signal.Set();
-        return result;
-    }
-
-    public void OnStreamSendCompleted(TransportStreamId id, ulong context, bool canceled)
-    {
-        inner.OnStreamSendCompleted(id, context, canceled);
-        signal.Set();
-    }
-
-    public void OnDatagramSendStateChanged(ulong context, DatagramSendState state)
-    {
-        inner.OnDatagramSendStateChanged(context, state);
-        signal.Set();
-    }
-
-    public void OnStreamAborted(TransportStreamId id, ulong errorCode, StreamAbortDirection direction)
-    {
-        inner.OnStreamAborted(id, errorCode, direction);
-        signal.Set();
-    }
-
-    public void OnStreamPeerSendShutdown(TransportStreamId id)
-    {
-        inner.OnStreamPeerSendShutdown(id);
-        signal.Set();
-    }
-
-    public void OnStreamShutdownComplete(TransportStreamId id)
-    {
-        inner.OnStreamShutdownComplete(id);
-        signal.Set();
-    }
-
-    public void OnDatagramCapabilityChanged(bool enabled, int maxPayload)
-    {
-        inner.OnDatagramCapabilityChanged(enabled, maxPayload);
-        signal.Set();
-    }
-
-    public void OnIdealSendBufferSize(TransportStreamId id, ulong bytes)
-    {
-        inner.OnIdealSendBufferSize(id, bytes);
-        signal.Set();
-    }
-
-    public void OnStreamsAvailable(ushort bidirectional, ushort unidirectional)
-    {
-        inner.OnStreamsAvailable(bidirectional, unidirectional);
-        signal.Set();
-    }
-
-    public void OnPeerAddressChanged(in TransportConnectedInfo info)
-    {
-        inner.OnPeerAddressChanged(in info);
-        signal.Set();
-    }
-
-    public void OnClosed(TransportCloseReason reason, ulong errorCode, int transportStatus)
-    {
-        inner.OnClosed(reason, errorCode, transportStatus);
-        signal.Set();
-    }
 }

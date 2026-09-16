@@ -16,12 +16,17 @@ namespace Tedd.Quicly.Client;
 /// <para><b>Use.</b> <c>await ConnectAsync(endpoint, options)</c> returns the connected <see cref="QuiclyPeer"/>. From then
 /// on call <see cref="Poll"/> and <see cref="Flush"/> on the game thread instead of the peer's own methods: they poll the
 /// current peer and drive reconnects. Send through <see cref="Peer"/>.</para>
-/// <para><b>Reconnect.</b> A peer cannot take a new transport, so after a lost connection the client creates a new peer
-/// that presents the old one's session token; the server resumes the session (same <see cref="QuiclyPeer.SessionId"/>,
-/// epoch + 1) and <see cref="Reconnected"/> hands the new peer over (register handlers in
-/// <see cref="ClientOptions.PeerCreated"/> so every peer has them). While reconnecting, <see cref="State"/> is
-/// <see cref="PeerState.Reconnecting"/> and <see cref="Peer"/> is the closed old peer (sends answer
-/// <see cref="SendStatus.NotConnected"/>).</para>
+/// <para><b>Reconnect.</b> After a lost connection the client resumes the session on the <em>same</em> peer
+/// (<see cref="QuiclyPeer.Reconnect"/>): the peer keeps its message handlers, <see cref="QuiclyPeer.Index"/>,
+/// <see cref="QuiclyPeer.Tag"/>, <see cref="QuiclyPeer.StateChanged"/> subscribers, channel table and statistics, presents
+/// the session token of its last HelloAck, and the server answers with the same <see cref="QuiclyPeer.SessionId"/> and
+/// epoch + 1 (PROTOCOL.md §4.1). The peer's own states are <see cref="PeerState.Closed"/> →
+/// <see cref="PeerState.Reconnecting"/> → <see cref="PeerState.Handshaking"/> → <see cref="PeerState.Connected"/>. When the
+/// server refuses the resume and <see cref="ReconnectPolicy.FallBackToNewSession"/> is set (or
+/// <see cref="ReconnectPolicy.ResumeSession"/> is off), the attempt starts a fresh session with a <em>new</em> peer instead
+/// — <see cref="ClientOptions.PeerCreated"/> runs for it and <see cref="ReconnectedInfo.PreviousPeer"/> is the peer it
+/// replaced. While reconnecting, <see cref="State"/> is <see cref="PeerState.Reconnecting"/> and <see cref="Peer"/> is the
+/// peer being resumed (sends answer <see cref="SendStatus.NotConnected"/> until it is connected again).</para>
 /// <para><b>Threads.</b> Not thread-safe: one thread at a time (the game thread, or <see cref="ConnectAsync"/>'s continuation
 /// while it runs). Events are raised on that thread. <see cref="Dispose"/> is the exception: it may be called while
 /// <see cref="ConnectAsync"/> waits (from another thread too), which ends that connect with an
@@ -39,7 +44,6 @@ public sealed class QuiclyClient : IDisposable
     private readonly ITransportConnector _connector;
     private readonly WorkSignal _signal = new();
     private readonly CancellationTokenSource _disposeCts = new();
-    private readonly SignalingConnector _signaling;
     private ChannelTable? _table;
     private PeerOptions? _peerOptions;
     private ReconnectPolicy? _policy;
@@ -49,7 +53,8 @@ public sealed class QuiclyClient : IDisposable
     private ReadOnlyMemory<byte> _authToken;
     private IClock _clock = MonotonicClock.Instance;
     private QuiclyPeer? _peer;
-    private QuiclyPeer? _attempt;
+    private QuiclyPeer? _attempt;   // a fresh-session attempt's own peer; null while a resume reconnects _peer in place
+    private bool _attemptInPlace;   // the attempt is _peer itself (QuiclyPeer.Reconnect)
     private bool _attemptResumes;
     private ReadOnlyMemory<byte> _resumeToken;
     private uint _resumeEpoch;
@@ -71,7 +76,6 @@ public sealed class QuiclyClient : IDisposable
     {
         ArgumentNullException.ThrowIfNull(connector);
         _connector = connector;
-        _signaling = new SignalingConnector(connector, _signal);
     }
 
     /// <summary>
@@ -97,7 +101,11 @@ public sealed class QuiclyClient : IDisposable
     /// <summary>The connector.</summary>
     public ITransportConnector Connector => _connector;
 
-    /// <summary>The current peer: the connected one, or while reconnecting and after a disconnect the last one (closed).</summary>
+    /// <summary>
+    /// The current peer: the connected one, or while reconnecting and after a disconnect the last one. A resumed reconnect
+    /// keeps this object (handlers, <see cref="QuiclyPeer.Index"/>, <see cref="QuiclyPeer.Tag"/> and statistics survive);
+    /// only a fallback to a fresh session replaces it.
+    /// </summary>
     public QuiclyPeer? Peer => _peer;
 
     /// <summary>The client's state (see <see cref="StateChanged"/>).</summary>
@@ -158,9 +166,11 @@ public sealed class QuiclyClient : IDisposable
         _peer?.Dispose();
         _peer = null;
         _table = options.Channels;
-        PeerOptions peerOptions = PeerOptionsCopier.Copy(options.PeerOptions);
+        PeerOptions peerOptions = options.PeerOptions.Clone();
         _autoFlushMicros = peerOptions.AutoFlushInterval.Ticks / TimeSpan.TicksPerMicrosecond;
-        peerOptions.AutoFlushInterval = TimeSpan.Zero;
+        peerOptions.AutoFlushInterval = TimeSpan.Zero; // implemented by Poll, not by the peer
+        peerOptions.WorkSignal = _signal;              // a transport callback wakes the wait inside ConnectAsync
+        peerOptions.Validate();                        // the peer's own checks, before a transport is created
         _peerOptions = peerOptions;
         _clock = peerOptions.Clock ?? MonotonicClock.Instance;
         _policy = options.Reconnect?.Clone();
@@ -294,7 +304,7 @@ public sealed class QuiclyClient : IDisposable
         }
         else if (_state == PeerState.Reconnecting)
         {
-            _attempt?.Flush(tick);
+            (_attemptInPlace ? _peer : _attempt)?.Flush(tick);
         }
     }
 
@@ -324,8 +334,17 @@ public sealed class QuiclyClient : IDisposable
                 break;
             case PeerState.Reconnecting:
                 _closeRequested = true;
-                _attempt?.Dispose();
-                _attempt = null;
+                if (_attemptInPlace)
+                {
+                    _attemptInPlace = false;
+                    _peer!.Close(close); // the resume in progress gives up with the client; the peer stays the application's
+                }
+                else
+                {
+                    _attempt?.Dispose();
+                    _attempt = null;
+                }
+
                 _attemptNumber = 0;
                 SetState(PeerState.Closed);
                 Disconnected?.Invoke(this, close);
@@ -357,7 +376,7 @@ public sealed class QuiclyClient : IDisposable
         PeerOptions options = _peerOptions!;
         options.SessionToken = sessionToken;
         options.LastEpoch = sessionToken.IsEmpty ? 0 : lastEpoch;
-        QuiclyPeer peer = QuiclyPeer.Connect(_signaling, _endpoint!, _serverName, _table!, options, _authToken.Span);
+        QuiclyPeer peer = QuiclyPeer.Connect(_connector, _endpoint!, _serverName, _table!, options, _authToken.Span);
         try
         {
             _peerCreated?.Invoke(peer);
@@ -422,7 +441,8 @@ public sealed class QuiclyClient : IDisposable
 
     private int DriveReconnect(long now, int maxItems)
     {
-        if (_attempt is null)
+        QuiclyPeer? attempt = _attemptInPlace ? _peer : _attempt;
+        if (attempt is null)
         {
             if (now < _nextAttemptMicros)
             {
@@ -431,8 +451,7 @@ public sealed class QuiclyClient : IDisposable
 
             try
             {
-                _attemptResumes = !_resumeToken.IsEmpty;
-                _attempt = CreatePeer(_resumeToken, _resumeEpoch);
+                attempt = StartAttempt();
             }
             catch (Exception exception)
             {
@@ -443,7 +462,6 @@ public sealed class QuiclyClient : IDisposable
             }
         }
 
-        QuiclyPeer attempt = _attempt;
         int dispatched = attempt.Poll(maxItems);
         attempt.Flush();
         if (attempt.State == PeerState.Connected)
@@ -457,12 +475,44 @@ public sealed class QuiclyClient : IDisposable
             return dispatched;
         }
 
-        _attempt = null;
         HelloStatus status = attempt.HandshakeStatus;
         _lastReason = attempt.CloseReason;
-        attempt.Dispose();
+        if (_attemptInPlace)
+        {
+            // The peer stays (its handlers and statistics are the application's): the next attempt reconnects it again, or a
+            // fresh session replaces it.
+            _attemptInPlace = false;
+        }
+        else
+        {
+            _attempt = null;
+            attempt.Dispose();
+        }
+
         AttemptFailed(now, status);
         return dispatched;
+    }
+
+    /// <summary>
+    /// Starts the next attempt (game thread): a resume reconnects the current peer in place
+    /// (<see cref="QuiclyPeer.Reconnect"/>, which keeps its handlers, <see cref="QuiclyPeer.Index"/>,
+    /// <see cref="QuiclyPeer.Tag"/> and statistics and presents the session token of its last HelloAck), while a fresh
+    /// session gets a new peer through <see cref="ClientOptions.PeerCreated"/>.
+    /// </summary>
+    /// <returns>The peer the attempt runs on.</returns>
+    private QuiclyPeer StartAttempt()
+    {
+        _attemptResumes = !_resumeToken.IsEmpty;
+        if (_attemptResumes)
+        {
+            QuiclyPeer peer = _peer!;
+            peer.Reconnect(_connector, _endpoint!, _serverName, _authToken.Span);
+            _attemptInPlace = true;
+            return peer;
+        }
+
+        _attempt = CreatePeer(default, 0);
+        return _attempt;
     }
 
     private void AttemptFailed(long now, HelloStatus status)
@@ -497,8 +547,10 @@ public sealed class QuiclyClient : IDisposable
     private void CompleteReconnect(QuiclyPeer attempt)
     {
         QuiclyPeer previous = _peer!;
+        bool inPlace = _attemptInPlace;
         _peer = attempt;
         _attempt = null;
+        _attemptInPlace = false;
         bool resumed = _attemptResumes && attempt.SessionId == _resumeSessionId;
         int attempts = _attemptNumber;
         _attemptNumber = 0;
@@ -510,7 +562,10 @@ public sealed class QuiclyClient : IDisposable
         }
         finally
         {
-            previous.Dispose();
+            if (!inPlace)
+            {
+                previous.Dispose(); // a fresh session replaced the lost connection's peer
+            }
         }
     }
 

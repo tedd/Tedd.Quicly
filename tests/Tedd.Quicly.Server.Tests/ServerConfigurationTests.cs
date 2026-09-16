@@ -211,68 +211,53 @@ public class ServerConfigurationTests
         Assert.Equal(1, f.Server.AdmittedCount);
     }
 
+    /// <summary>
+    /// The server derives its peers' options from the application's template with <see cref="PeerOptions.Clone"/> and checks
+    /// them with <see cref="PeerOptions.Validate"/> in its constructor (instead of copying property by property and building a
+    /// throw-away peer to validate them): the template itself is never modified, and the peers run with the server's values.
+    /// </summary>
     [Fact]
-    public void Peer_Options_Copier_Copies_Every_Public_Property()
+    public async Task The_Peer_Template_Is_Cloned_And_Validated_Never_Modified()
     {
-        string[] settable = typeof(PeerOptions).GetProperties(BindingFlags.Public | BindingFlags.Instance)
-            .Where(p => p.CanWrite && p.SetMethod!.IsPublic)
-            .Select(p => p.Name)
-            .Order()
-            .ToArray();
-        Assert.Equal(settable, PeerOptionsCopier.CopiedProperties.Order().ToArray());
+        PeerOptions? template = null;
+        await using ServerFixture f = new(o =>
+        {
+            template = new PeerOptions
+            {
+                Clock = o.PeerOptions.Clock,
+                AllocatorOptions = Pools.Small(),
+                SendTableCapacity = 32,
+                ReceiveRingCapacity = 64,
+                SegmentArenaCapacity = 64,
+                AutoFlushInterval = TimeSpan.FromMilliseconds(10), // implemented by PollAll, not by the peers
+                SessionToken = new byte[] { 1, 2, 3 },             // a client-only value the server drops
+                LastEpoch = 21,
+                RequestChannelTable = true,
+                ThreadSafeSend = true,
+            };
+            o.PeerOptions = template;
+            o.Sessions.Grace = TimeSpan.FromSeconds(7);
+        });
 
-        using SlabAllocator pool = new(Pools.Small());
-        VirtualClock clock = new();
-        PeerOptions source = new()
-        {
-            Clock = clock,
-            Allocator = pool,
-            AllocatorOptions = Pools.Small(),
-            SendBudgetBytes = 11,
-            ReceiveBudgetBytes = 12,
-            SendTableCapacity = 32,
-            ReceiveRingCapacity = 33,
-            SegmentArenaCapacity = 34,
-            CompletionMode = CompletionMode.ThreadPool,
-            ThreadSafeSend = true,
-            AckDelay = TimeSpan.FromMilliseconds(3),
-            PingInterval = TimeSpan.FromMilliseconds(4),
-            FastPingInterval = TimeSpan.FromMilliseconds(5),
-            FastLockDuration = TimeSpan.FromMilliseconds(6),
-            AdmissionTimeout = TimeSpan.FromMilliseconds(7),
-            HeartbeatTimeout = TimeSpan.FromMilliseconds(8),
-            CloseLinger = TimeSpan.FromMilliseconds(9),
-            SessionGrace = TimeSpan.FromMilliseconds(10),
-            FlushInterval = TimeSpan.FromMilliseconds(11),
-            MaxSendBytesPerSecond = 13,
-            BulkShareOfEstimatedBandwidth = 0.25,
-            BulkMaxBytesPerSecond = 14,
-            AutoFlushInterval = TimeSpan.FromMilliseconds(12),
-            MaxMessageSize = 15,
-            MaxReceiveDatagram = 16,
-            ControlMessagesPerSecond = 17,
-            PongsPerSecond = 18,
-            PongBurst = 19,
-            DecodedBytesPerSecond = 20,
-            RequestChannelTable = true,
-            SessionToken = new byte[] { 1, 2, 3 },
-            LastEpoch = 21,
-            FailFastOnCallbackException = true,
-        };
-        PeerOptions copy = PeerOptionsCopier.Copy(source);
-        foreach (PropertyInfo property in typeof(PeerOptions).GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(p => p.CanWrite))
-        {
-            object? expected = property.GetValue(source);
-            object? actual = property.GetValue(copy);
-            if (expected is ReadOnlyMemory<byte> memory)
-            {
-                Assert.True(memory.Span.SequenceEqual(((ReadOnlyMemory<byte>)actual!).Span), property.Name);
-            }
-            else
-            {
-                Assert.True(Equals(expected, actual), property.Name);
-            }
-        }
+        Assert.NotNull(template);
+        Assert.Equal(TimeSpan.FromMilliseconds(10), template.AutoFlushInterval);
+        Assert.Equal(21u, template.LastEpoch);
+        Assert.Equal(3, template.SessionToken.Length);
+        Assert.True(template.RequestChannelTable);
+        Assert.True(template.ThreadSafeSend);
+        Assert.Equal(32, template.SendTableCapacity);
+        Assert.Null(template.Allocator);       // the server's own pool went to the copy
+        Assert.Null(template.WorkSignal);      // so did the work signal
+        Assert.NotNull(template.AllocatorOptions);
+        Assert.Equal(TimeSpan.FromSeconds(30), template.SessionGrace);
+
+        // The peers themselves: admitted normally, with the server's session grace and no session token of their own.
+        QuiclyPeer client = f.ConnectAdmitted();
+        QuiclyPeer serverPeer = f.ServerPeerOf(client);
+        Assert.Equal(1u, serverPeer.Epoch);
+        Assert.NotEqual(0UL, serverPeer.SessionId);
+        f.Run(50_000);
+        Assert.Equal(PeerState.Connected, client.State);
     }
 
     private static AcmeProvisioningOptions AcmeOptions()

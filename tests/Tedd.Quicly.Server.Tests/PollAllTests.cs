@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Testing.Simulation;
@@ -7,6 +8,13 @@ namespace Tedd.Quicly.Server.Tests;
 
 public class PollAllTests
 {
+    /// <summary>Whether the server still holds a work bit for <paramref name="slot"/>.</summary>
+    private static bool IsMarked(QuiclyServer server, int slot)
+    {
+        long[] words = (long[])typeof(QuiclyServer).GetField("_workBits", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(server)!;
+        return (Volatile.Read(ref words[slot >> 6]) & (1L << (slot & 63))) != 0;
+    }
+
     [Fact]
     public async Task Events_Come_From_PollAll_And_Released_Slots_Get_A_New_Generation()
     {
@@ -57,6 +65,8 @@ public class PollAllTests
     public async Task A_Zero_Message_Budget_Still_Runs_The_Control_Protocol_And_Keeps_Peers_Marked()
     {
         await using ServerFixture f = new();
+        List<byte[]> received = [];
+        f.Server.PeerAdmitted += peer => peer.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => received.Add(payload.ToArray()));
         QuiclyPeer client = f.Connect();
         for (int i = 0; i < 100 && client.State != PeerState.Connected; i++)
         {
@@ -67,53 +77,140 @@ public class PollAllTests
         }
 
         Assert.Equal(PeerState.Connected, client.State);
+        int slot = f.ServerPeerOf(client).Index;
+        Assert.True(client.SendCopy(new SendHeader(2), [1]).IsAdmitted);
+        client.Flush();
+        f.Network.Advance(1_000);
+
         f.Server.GetStatistics(out ServerStatistics before);
         f.Server.PollAll(0);
-        f.Server.PollAll(0);
         f.Server.GetStatistics(out ServerStatistics after);
-        Assert.Equal(before.PeersPolled + 2, after.PeersPolled); // a peer whose budget ran out stays marked
+        Assert.Equal(before.PeersPolled + 1, after.PeersPolled); // polled, but no message dispatched
+        Assert.Empty(received);
+        Assert.True(IsMarked(f.Server, slot), "a peer whose budget ran out stays marked");
+
+        Assert.Equal(1, f.Server.PollAll(1)); // with a budget the message reaches its handler
+        Assert.Single(received);
         Assert.Throws<ArgumentOutOfRangeException>(() => f.Server.PollAll(-1));
     }
 
+    /// <summary>
+    /// The work signal is an edge and <see cref="QuiclyPeer.HasPendingWork"/> the level behind it: a slot marked for a peer
+    /// with nothing waiting is not polled, and it keeps its bit — only a <see cref="QuiclyPeer.Poll"/> re-arms the peer's
+    /// signal, so clearing the bit without polling could miss the next publication.
+    /// </summary>
     [Fact]
-    public async Task PollAll_From_An_Event_Returns_Zero_And_A_Throwing_Handler_Keeps_The_Work()
+    public async Task A_Marked_Peer_With_Nothing_Pending_Is_Not_Polled_But_Stays_Marked()
     {
         await using ServerFixture f = new();
-        int nested = -1;
-        bool throwOnce = true;
-        f.Server.PeerAdmitted += _ =>
+        QuiclyPeer client = f.ConnectAdmitted();
+        int slot = f.ServerPeerOf(client).Index;
+        f.Run(4_000_000, step: 10_000); // let the fast-lock pings settle
+        f.Server.PollAll();
+        Assert.False(f.ServerPeerOf(client).HasPendingWork);
+
+        f.Server.MarkWork(slot);
+        f.Server.GetStatistics(out ServerStatistics before);
+        f.Server.PollAll();
+        f.Server.PollAll();
+        f.Server.GetStatistics(out ServerStatistics skipped);
+        Assert.Equal(before.PeersPolled, skipped.PeersPolled);
+        Assert.True(IsMarked(f.Server, slot));
+
+        // Work arrives, and the very next PollAll polls it (nothing else marked the slot).
+        Assert.True(client.SendCopy(new SendHeader(2), [7]).IsAdmitted);
+        client.Flush();
+        f.Network.Advance(1_000);
+        f.Server.PollAll();
+        f.Server.GetStatistics(out ServerStatistics polled);
+        Assert.True(polled.PeersPolled > skipped.PeersPolled);
+    }
+
+    /// <summary>
+    /// The split deadlines: a host sleeps its polling loop on <see cref="QuiclyServer.NextPollDeadlineMicros"/> (the peers'
+    /// own timers), and engine work that only a scheduler pass can serve brings a flush forward — a send the peer's bandwidth
+    /// cap held back still leaves although the host calls nothing but <see cref="QuiclyServer.PollAll"/> after its one tick.
+    /// </summary>
+    [Fact]
+    public async Task The_Poll_Deadline_Is_Separate_And_PollAll_Brings_A_Held_Back_Flush_Forward()
+    {
+        await using ServerFixture f = new(o => o.PeerOptions.MaxSendBytesPerSecond = 4_000);
+        QuiclyPeer client = f.ConnectAdmitted();
+        QuiclyPeer serverPeer = f.ServerPeerOf(client);
+        List<int> received = [];
+        client.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => received.Add(payload.Length));
+        Assert.True(f.Server.NextPollDeadlineMicros > f.Clock.NowMicros);
+        Assert.True(f.Server.NextPollDeadlineMicros < long.MaxValue);
+
+        for (int i = 0; i < 6; i++)
         {
-            nested = f.Server.PollAll();
-            if (throwOnce)
-            {
-                throwOnce = false;
-                throw new InvalidOperationException("handler");
-            }
-        };
-        QuiclyPeer client = f.Connect();
-        Exception? caught = null;
-        for (int i = 0; i < 100 && (caught is null || client.State != PeerState.Connected); i++)
+            Assert.True(serverPeer.SendCopy(new SendHeader(2), new byte[1000]).IsAdmitted);
+        }
+
+        f.Server.FlushAll(); // the host's one and only tick
+        Assert.True(f.Server.NextFlushDeadlineMicros < long.MaxValue, "the bandwidth cap held a pass back, so a flush is due");
+        Assert.True(f.Server.NextFlushDeadlineMicros > f.Clock.NowMicros);
+
+        for (int i = 0; i < 4_000 && received.Count < 6; i++)
         {
             f.Network.Advance(1_000);
-            try
-            {
-                f.Server.PollAll();
-            }
-            catch (InvalidOperationException exception)
-            {
-                caught = exception;
-            }
-
-            f.Server.FlushAll();
+            f.Server.PollAll(); // no FlushAll and no AutoFlushInterval: only the flush PollAll brings forward
             f.PumpClients();
         }
 
-        Assert.NotNull(caught);
+        Assert.Equal(6, received.Count);
+        Assert.All(received, length => Assert.Equal(1000, length));
+    }
+
+    /// <summary>A peer the application disposed itself is skipped, not polled (no <see cref="ObjectDisposedException"/>), and its slot goes back.</summary>
+    [Fact]
+    public async Task A_Peer_The_Application_Disposed_Releases_Its_Slot()
+    {
+        await using ServerFixture f = new();
+        QuiclyPeer client = f.ConnectAdmitted();
+        QuiclyPeer serverPeer = f.ServerPeerOf(client);
+        int slot = serverPeer.Index;
+        serverPeer.Dispose();
+
+        f.Server.MarkWork(slot);
+        f.Server.PollAll();
+        f.Server.FlushAll();
+
+        Assert.True(serverPeer.IsDisposed);
+        Assert.Single(f.Closed);
+        Assert.Null(f.Server.GetPeer(slot));
+        Assert.Equal(0, f.Server.PeerCount);
+        Assert.Single(f.Ended);
+    }
+
+    /// <summary>
+    /// A <see cref="QuiclyServer.PollAll"/> from inside one of its own events returns 0, and a throwing
+    /// <see cref="QuiclyServer.PeerAdmitted"/> handler no longer escapes it: that event is raised inside the peer's own state
+    /// change, so the peer records the exception as a callback fault and the admission stands (a
+    /// <see cref="QuiclyServer.PeerClosed"/> handler, which PollAll raises itself, still propagates — see the shutdown tests).
+    /// </summary>
+    [Fact]
+    public async Task PollAll_From_An_Event_Returns_Zero_And_A_Throwing_Admitted_Handler_Is_A_Callback_Fault()
+    {
+        await using ServerFixture f = new();
+        int nested = -1;
+        f.Server.PeerAdmitted += _ =>
+        {
+            nested = f.Server.PollAll();
+            throw new InvalidOperationException("handler");
+        };
+
+        QuiclyPeer client = f.ConnectAdmitted();
+
         Assert.Equal(0, nested);
-        Assert.Equal(PeerState.Connected, client.State);
-        f.Run(10_000);
+        QuiclyPeer serverPeer = f.ServerPeerOf(client);
+        Assert.IsType<InvalidOperationException>(serverPeer.LastCallbackFault);
+        serverPeer.GetStatistics(out PeerStatistics statistics);
+        Assert.Equal(1, statistics.CallbackFaults);
         Assert.Single(f.Admitted);
         Assert.Equal(1, f.Server.AdmittedCount);
+        f.Run(10_000);
+        Assert.Equal(PeerState.Connected, client.State);
     }
 
     [Fact]

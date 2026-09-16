@@ -9,9 +9,11 @@ namespace Tedd.Quicly.Client;
 /// increments its epoch (PROTOCOL.md §4.1).
 /// </summary>
 /// <remarks>
-/// A peer cannot take a new transport, so a reconnect is a new <see cref="QuiclyPeer"/> presenting the previous one's
-/// session token; <see cref="QuiclyClient.Reconnected"/> hands over the new peer. The attempts are driven by
-/// <see cref="QuiclyClient.Poll"/> on the clock of <see cref="PeerOptions.Clock"/>, so they need no timers.
+/// A resume reconnects the same <see cref="QuiclyPeer"/> in place (<see cref="QuiclyPeer.Reconnect"/>), so its handlers,
+/// <see cref="QuiclyPeer.Tag"/> and statistics survive the lost connection; a fresh session (<see cref="ResumeSession"/> off,
+/// or <see cref="FallBackToNewSession"/> after a refused resume) gets a new peer. <see cref="QuiclyClient.Reconnected"/>
+/// reports either case. The attempts are driven by <see cref="QuiclyClient.Poll"/> on the clock of
+/// <see cref="PeerOptions.Clock"/>, so they need no timers.
 /// </remarks>
 public sealed class ReconnectPolicy
 {
@@ -124,8 +126,11 @@ public sealed class ReconnectPolicy
 public readonly record struct ReconnectingInfo(int Attempt, TimeSpan Delay, CloseReason LastReason);
 
 /// <summary>The client is connected again (<see cref="QuiclyClient.Reconnected"/>).</summary>
-/// <param name="PreviousPeer">The lost connection's peer; closed, and disposed right after the event handlers return.</param>
-/// <param name="Peer">The new connection's peer (now <see cref="QuiclyClient.Peer"/>).</param>
+/// <param name="PreviousPeer">
+/// The lost connection's peer: the same object as <paramref name="Peer"/> when the session was resumed in place, or the peer
+/// a fresh session replaced (closed, and disposed right after the event handlers return).
+/// </param>
+/// <param name="Peer">The reconnected peer (now <see cref="QuiclyClient.Peer"/>).</param>
 /// <param name="Resumed">
 /// <see langword="true"/> when the server resumed the session (same <see cref="QuiclyPeer.SessionId"/>, higher
 /// <see cref="QuiclyPeer.Epoch"/>); <see langword="false"/> for a fresh session after the resume was refused.

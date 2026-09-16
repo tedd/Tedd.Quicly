@@ -30,8 +30,10 @@ public sealed class ClientOptions
     public ReconnectPolicy? Reconnect { get; set; }
 
     /// <summary>
-    /// Called with every peer the client creates (the first connection and each reconnect attempt), before its handshake
-    /// completes: register message handlers here so they exist on every connection. Runs on the thread driving the client.
+    /// Called with every peer the client creates — the first connection, and a reconnect attempt that starts a fresh session
+    /// — before its handshake completes: register message handlers here so they exist on every connection. A reconnect that
+    /// resumes the session keeps the peer (<see cref="QuiclyPeer.Reconnect"/>), so its handlers, <see cref="QuiclyPeer.Tag"/>
+    /// and statistics survive and this is <em>not</em> called again. Runs on the thread driving the client.
     /// </summary>
     public Action<QuiclyPeer>? PeerCreated { get; set; }
 

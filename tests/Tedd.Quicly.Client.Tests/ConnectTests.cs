@@ -136,29 +136,43 @@ public class ConnectTests
         Assert.Null(client.Peer);
     }
 
+    /// <summary>
+    /// The connect's own wait, with no <see cref="QuiclyClient.WaitOverride"/>: the peer's work signal wakes it as soon as a
+    /// transport callback arrives. The network is advanced from a dedicated thread rather than the thread pool, which a
+    /// saturated machine can starve, and the connect is bounded by its own token, so this test can never leave the assembly
+    /// waiting on real time.
+    /// </summary>
     [Fact]
     public async Task Connect_Without_A_Wait_Override_Waits_For_Transport_Callbacks()
     {
         await using ClientFixture f = new();
         QuiclyClient client = new(f.Connector);
+        using CancellationTokenSource stop = new();
+        using CancellationTokenSource connect = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        connect.CancelAfter(TimeSpan.FromSeconds(30));
+        Thread pump = new(() =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                f.Step(1_000);
+                Thread.Sleep(1);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "connect network pump",
+        };
+
         try
         {
-            using CancellationTokenSource stop = new();
-            Task pump = Task.Run(() =>
-            {
-                while (!stop.IsCancellationRequested)
-                {
-                    f.Step(1_000);
-                    Thread.Sleep(1);
-                }
-            }, TestContext.Current.CancellationToken);
-            QuiclyPeer peer = await client.ConnectAsync(f.EndPoint, f.Options(), TestContext.Current.CancellationToken);
-            stop.Cancel();
-            await pump;
+            pump.Start();
+            QuiclyPeer peer = await client.ConnectAsync(f.EndPoint, f.Options(), connect.Token);
             Assert.Equal(PeerState.Connected, peer.State);
         }
         finally
         {
+            stop.Cancel();
+            Assert.True(pump.Join(TimeSpan.FromSeconds(10)));
             client.Dispose();
         }
 

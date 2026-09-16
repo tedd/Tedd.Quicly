@@ -266,17 +266,30 @@ public sealed class ServerSessionOptions
     /// <summary>
     /// Maximum age of a session token, counted from the HelloAck that carried it: its <c>expiry</c> field (PROTOCOL.md §4.1).
     /// Tokens are only rotated in HelloAcks, so a connection older than this cannot be resumed even while it is live; how
-    /// long a lost session waits for a resume is <see cref="Grace"/>. Consumed tokens stay in the replay cache until they
-    /// expire, so size <see cref="ReplayCacheCapacity"/> for the resumes of one lifetime. At least <see cref="Grace"/>, at
-    /// most 30 days. Default 24 hours.
+    /// long a lost session waits for a resume is <see cref="Grace"/>. It does not size
+    /// <see cref="ReplayCacheCapacity"/>: a spent token is remembered for one <see cref="Grace"/>, not for its maximum age.
+    /// At least <see cref="Grace"/>, at most 30 days. Default 24 hours.
     /// </summary>
     public TimeSpan TokenLifetime { get; set; } = TimeSpan.FromHours(24);
 
     /// <summary>
-    /// Consumed, unexpired tokens remembered for single use (each until its token expires, one <see cref="TokenLifetime"/>
-    /// after issue); while it is full, resumes fail closed (the client starts a fresh session). 0 (the default) sizes it from
+    /// Spent session tokens remembered at once, so a token cannot be resumed twice. 0 (the default) sizes the cache from
     /// <see cref="ServerOptions.ExpectedPeers"/>: 32 per expected peer, at least 16 384, at most 4 194 304.
     /// </summary>
+    /// <remarks>
+    /// <para>The <b>session registry is the authority</b> on single use (PROTOCOL.md §4.1): a resume that commits advances
+    /// its session's epoch, so a replayed token no longer matches the session's record and is refused as
+    /// <see cref="AdmissionFailureReason.SessionTokenSuperseded"/> whatever the cache holds. The cache is a bounded,
+    /// time-expiring second guard, and it <b>never fails closed</b>:</para>
+    /// <para>· An entry is kept for one <see cref="Grace"/> — the window in which a replayed token could still match a live
+    /// record — not for the token's <see cref="TokenLifetime"/>, which would keep a day of resumes and make the cache, not
+    /// the session, the scarce resource.</para>
+    /// <para>· When the cache is full its oldest entry is evicted and the new token stored; a resume is never refused because
+    /// the cache is full, since that would let one authenticated client (one resume per
+    /// <see cref="ServerAdmissionOptions.MinResumeInterval"/>) lock every other client out. The evictions are counted in
+    /// <see cref="ServerStatistics.ReplayCacheEvictions"/>, and the entries held in
+    /// <see cref="ServerStatistics.ReplayCacheEntries"/>, so a cache under pressure is visible and can be raised.</para>
+    /// </remarks>
     public int ReplayCacheCapacity { get; set; }
 
     internal void Validate()

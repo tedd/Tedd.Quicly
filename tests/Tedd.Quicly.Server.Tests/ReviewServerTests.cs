@@ -178,37 +178,37 @@ public class ReviewServerTests
 
     /// <summary>
     /// ADR 0008 invariant 1: nothing the transport was given a pointer to may be reused before the matching completion.
-    /// When StopAsync (or DisposeAsync) force-closes a peer that did not close in time, the server drops the peer's
-    /// shared-lease reference before it has even closed the transport, so the block can return to the pool (and be
-    /// rented and overwritten) while the transport may still read it. The reference must be held until the transport
-    /// reported its close (the simulator delivers that at the next step).
+    /// When StopAsync (or DisposeAsync) force-closes a peer that did not close in time, the peer's shared-lease reference
+    /// must not be dropped before the transport reported its close — otherwise the block returns to the pool (and can be
+    /// rented and overwritten) while the transport may still read it. The peer itself owns that reference now (the server
+    /// interposes nothing), so this pins the behaviour end to end: disposed peer, transport still open, reference held.
     /// </summary>
     [Fact]
     public async Task A_Forced_Close_Keeps_The_Shared_Reference_Until_The_Transport_Reported_Its_Close()
     {
         await using ServerFixture f = new(o => o.ShutdownTimeout = TimeSpan.Zero);
         QuiclyPeer serverPeer = f.ServerPeerOf(f.ConnectAdmitted());
-        f.Server.SharedPort = new AdmittingPort();
         PeerSet set = f.Server.CreateSet();
         set.Add(serverPeer);
-        Assert.True(f.Server.Allocator.TryRent(64, out BufferLease block));
+        Assert.True(f.Server.Allocator.TryRent(1536, out BufferLease block));
         SharedLease lease = f.Server.SharedLeases.Share(in block, 1);
-        Assert.Equal(1, f.Server.SendShared(set, new SendHeader(2), lease, 64).AdmittedCount);
+        Assert.Equal(1, f.Server.SendShared(set, new SendHeader(4), lease, 1536).AdmittedCount);
+        f.Server.FlushAll(); // handed to the transport, no acknowledgement yet
         Assert.Equal(2, f.Server.SharedLeases.GetReferenceCount(in lease));
 
         await f.Server.StopAsync(TestContext.Current.CancellationToken); // the peer is disposed, its transport not yet closed
         Assert.Equal(2, f.Server.SharedLeases.GetReferenceCount(in lease));
 
         f.Network.RunUntilIdle(1_000_000); // the transport reports its close
-        f.Server.PollAll();
         Assert.Equal(1, f.Server.SharedLeases.GetReferenceCount(in lease));
         f.Server.SharedLeases.Release(in lease);
     }
 
     /// <summary>
     /// The work bit protocol has a lost wake-up on x86/x64 (TSO allows a store followed by a load of another location to
-    /// be reordered). WorkSignalSink publishes the peer's work with a release store (SpscRing.TryEnqueue for a
-    /// completion), then MarkWork reads the word with a plain load and skips the Interlocked.Or when the bit looks set.
+    /// be reordered). A peer publishes its work with a release store (SpscRing.TryEnqueue for a completion) and then raises
+    /// its work signal, which calls MarkWork; MarkWork reads the word with a plain load and skips the Interlocked.Or when the
+    /// bit looks set.
     /// That load can be satisfied before the publishing store is visible; PollMarked's Interlocked.Exchange then clears
     /// the bit and its poll misses the work, and nothing marks the slot again: the work waits for the peer's next
     /// deadline (up to a ping interval) or its next transport callback. This test replays exactly that producer and
@@ -250,7 +250,7 @@ public class ReviewServerTests
                 Spin(ref random);
 
                 // The transport thread writes the ring entry (lines the game thread read when it took the previous one),
-                // then publishes the tail with a release store (SpscRing.TryEnqueue), then WorkSignalSink.Signal marks.
+                // then publishes the tail with a release store (SpscRing.TryEnqueue), then the work signal marks the slot.
                 for (int i = 0; i < EntryLines; i++)
                 {
                     entry[i * 16] = r;
@@ -324,18 +324,4 @@ public class ReviewServerTests
         }
     }
 
-    /// <summary>A port whose peers admit every shared send (the step-1 placeholder engines refuse them).</summary>
-    private sealed unsafe class AdmittingPort : ISharedSendPort
-    {
-        private int _sends;
-
-        public SendResult Send(QuiclyPeer peer, in SendHeader header, byte* payload, int length, SendOptions options) =>
-            new(SendStatus.Admitted, new SendToken(++_sends & 0xFFFF, 1));
-
-        public bool TryRelease(QuiclyPeer peer, ref SharedEntry entry) => false;
-
-        public void Abandon(QuiclyPeer peer, ref SharedEntry entry)
-        {
-        }
-    }
 }

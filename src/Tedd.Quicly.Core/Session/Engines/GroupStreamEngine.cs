@@ -37,7 +37,9 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// (<see cref="DeliveryStatus.Delivered"/>; BufferReleased and Delivered are the same event for reliable streams,
 /// PROTOCOL.md §4.3), <see cref="DeliveryStatus.Disconnected"/> while the connection closes, and re-queues them after a
 /// refusal. A stream the peer stops, or one that fails to start, fails only <em>its</em> group
-/// (<see cref="DeliveryStatus.Failed"/>): the channel stays open and later groups keep flowing.</para>
+/// (<see cref="DeliveryStatus.Failed"/>): the channel stays open and later groups keep flowing. The peer reports a stream's
+/// close exactly once (<see cref="ChannelEngine.OnStreamClosed"/>), and a record's serial rises both when it opens a stream and
+/// when it is released, so a notice or a carrier tag of any earlier stream of that record is recognised as stale.</para>
 /// <para><b>Receive (transport thread).</b> At most <see cref="ChannelDefinition.MaxGroups"/> (default 8) concurrent peer
 /// group streams per channel; further streams are reset <see cref="QuiclyErrorCode.LimitExceeded"/> (PROTOCOL.md §7). Each
 /// accepted stream stages one message at a time into a pooled lease behind a receive-ring reservation and publishes it at its
@@ -67,6 +69,9 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
     private const byte GroupImmediate = 1;
     private const byte GroupFinSent = 2;
     private const byte GroupCounted = 4;
+
+    /// <summary>The record is on the free list: <see cref="ReleaseIfDone"/> already returned it and must not do so again.</summary>
+    private const byte GroupFreed = 8;
 
     /// <summary>A group whose stream was never refused: it may open one as soon as the pass reaches it.</summary>
     private const int CreditUnrefused = int.MinValue;
@@ -466,16 +471,18 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         _freeGroup = state.Next;
         uint serial = state.Serial;
         state = default;
-        state.Local = local;
+        state.Local = (ushort)local;
         state.Head = -1;
         state.Tail = -1;
         state.Next = -1;
+        state.Prev = -1;
         state.StartCarrier = -1;
         state.Phase = GroupPhase.Filling;
         state.CreditGeneration = CreditUnrefused;
         // Serials only ever rise for a record, so notices of an earlier occupant are recognised as stale.
         state.Serial = serial;
         state.GroupId = send.NextGroupId++;
+        state.Prev = send.ListTail;
         if (send.ListTail < 0)
         {
             send.ListHead = group;
@@ -491,10 +498,19 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         return group;
     }
 
-    /// <summary>Returns a group whose messages are all finished and whose carriers have all completed to the free list.</summary>
+    /// <summary>
+    /// Returns a group whose messages are all finished and whose carriers have all completed to the free list. Idempotent: a
+    /// record already on the free list is left alone, so the second close notice of one stream — the shutdown that always
+    /// follows a stop — can never release it twice (ADR 0008: every resource released exactly once on every path).
+    /// </summary>
     private void ReleaseIfDone(int group, ref GroupSendState send)
     {
         ref GroupState state = ref _groups[group];
+        if ((state.Flags & GroupFreed) != 0)
+        {
+            return;
+        }
+
         if (state.Phase == GroupPhase.Filling || state.Count > 0 || state.CarriersOutstanding > 0)
         {
             return;
@@ -513,30 +529,26 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             return;
         }
 
-        int previous = -1;
-        for (int current = send.ListHead; current >= 0; current = _groups[current].Next)
+        // One step, not a walk of the channel's list: a pass that finishes many groups of a channel with a large MaxGroups
+        // would otherwise cost a link traversal per live group per release.
+        int previous = state.Prev;
+        int after = state.Next;
+        if (previous < 0)
         {
-            if (current == group)
-            {
-                int after = state.Next;
-                if (previous < 0)
-                {
-                    send.ListHead = after;
-                }
-                else
-                {
-                    _groups[previous].Next = after;
-                }
+            send.ListHead = after;
+        }
+        else
+        {
+            _groups[previous].Next = after;
+        }
 
-                if (send.ListTail == group)
-                {
-                    send.ListTail = previous;
-                }
-
-                break;
-            }
-
-            previous = current;
+        if (after < 0)
+        {
+            send.ListTail = previous;
+        }
+        else
+        {
+            _groups[after].Prev = previous;
         }
 
         ReleaseStreamSlot(ref state, ref send);
@@ -544,6 +556,12 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         state.Stream = default;
         state.Head = -1;
         state.Tail = -1;
+        state.Prev = -1;
+
+        // Serials only ever rise for a record, so every notice and every carrier tag of the stream it just had is stale from
+        // here on: the shutdown that follows a stop, and any event of a stream this end abandoned, no longer match it.
+        state.Serial = (state.Serial + 1) & PeerCore.EngineStreamSerialMask;
+        state.Flags |= GroupFreed;
         state.Next = _freeGroup;
         _freeGroup = group;
         send.GroupCount--;
@@ -756,6 +774,9 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
                 uint serial = (state.Serial + 1) & PeerCore.EngineStreamSerialMask;
                 state = default;
                 state.Serial = serial;
+                state.Phase = GroupPhase.Closed;
+                state.Flags = GroupFreed;
+                state.Prev = -1;
                 state.Next = _freeGroup;
                 _freeGroup = group;
                 group = next;
@@ -987,6 +1008,12 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
                     state.CreditGeneration = credit;
                     StreamsRefused++;
                 }
+                else
+                {
+                    // The open succeeded and only the send failed (a transport going away, a resource shortage): no stream
+                    // limit refused this group, so it must not wait for credit it already has — the next pass tries again.
+                    state.CreditGeneration = CreditUnrefused;
+                }
             }
 
             return false;
@@ -1067,7 +1094,10 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         int group = (int)(tag >> SerialBits);
         uint serial = (uint)(tag & PeerCore.EngineStreamSerialMask);
         ref GroupState state = ref _groups[group];
-        int local = state.Local;
+
+        // The carrier's own channel, never the record's: a record that was released and taken again may belong to another
+        // channel by now, and it is this carrier's members whose counters must be decremented.
+        int local = _localOf[_core.ChannelIndexOf(carrierEntry.Channel)];
         ref GroupSendState send = ref _send[local];
         ref ChannelSendCounters counters = ref _core.SendCounters(_denseOf[local]);
         bool current = serial == state.Serial;
@@ -1377,6 +1407,14 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             case StreamMessagePhase.Chunk:
             {
                 ReadOnlySpan<byte> chunk = message.Chunk;
+                if ((recv.Flags & RecvReserved) == 0 || chunk.Length > recv.Length - recv.Filled)
+                {
+                    // Payload bytes outside a staged message: no Start reserved this record's lease, or the chunk is longer
+                    // than the frame header promised. The peer's parser produces neither, so this is defence in depth — the
+                    // engine never writes through a lease it does not hold.
+                    return StreamConsume.ResetStream(QuiclyErrorCode.ProtocolViolation);
+                }
+
                 chunk.CopyTo(new Span<byte>(_core.GetPointer(in recv.Lease) + recv.Filled, recv.Length - recv.Filled));
                 recv.Filled += chunk.Length;
                 return StreamConsume.Continue;
@@ -1434,11 +1472,11 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             if (_txStreams[group] == id)
             {
                 Post(group, _txSerials[group], aborted ? NoticeKind.Stopped : NoticeKind.ShutDown);
-                if (!aborted)
-                {
-                    _txStreams[group] = default;
-                }
 
+                // The stream is gone either way — a stop ends this end's sending and the peer's shutdown handling closes it —
+                // so the transport-side entries go with it and no later event of that id resolves to this group again.
+                _txStreams[group] = default;
+                _txSerials[group] = 0;
                 return;
             }
         }
@@ -1568,8 +1606,8 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
     [StructLayout(LayoutKind.Explicit, Size = 64)]
     private struct GroupState
     {
-        /// <summary>Engine-local index of the group's channel.</summary>
-        [FieldOffset(0)] public int Local;
+        /// <summary>Previous live group of the channel (-1 = none): the list is doubly linked, so a finished group leaves it in O(1).</summary>
+        [FieldOffset(0)] public int Prev;
 
         /// <summary>First message entry not yet handed to the transport (-1 = none).</summary>
         [FieldOffset(4)] public int Head;
@@ -1607,8 +1645,11 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         /// <summary>Lifecycle of the group.</summary>
         [FieldOffset(60)] public GroupPhase Phase;
 
-        /// <summary><see cref="GroupImmediate"/>, <see cref="GroupFinSent"/>.</summary>
+        /// <summary><see cref="GroupImmediate"/>, <see cref="GroupFinSent"/>, <see cref="GroupCounted"/>, <see cref="GroupFreed"/>.</summary>
         [FieldOffset(61)] public byte Flags;
+
+        /// <summary>Engine-local index of the group's channel (a channel count never needs more).</summary>
+        [FieldOffset(62)] public ushort Local;
     }
 
     /// <summary>Receive-side state of one peer group stream: one cache line, native memory, transport thread only.</summary>

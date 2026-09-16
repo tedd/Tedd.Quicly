@@ -1,3 +1,4 @@
+using System.Net;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Framing;
@@ -5,6 +6,7 @@ using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Primitives;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Session.Engines;
+using Tedd.Quicly.Core.Transport;
 
 namespace Tedd.Quicly.Core.Tests.Session;
 
@@ -359,6 +361,108 @@ internal sealed class DenyAll : IBulkAuthorizer
         Requests.Add(request);
         return false;
     }
+}
+
+/// <summary>
+/// Refuses a bulk stream the way a transport can refuse one, so the engine's two <em>synchronous</em> refusal paths run:
+/// <see cref="RefuseOpens"/> makes <see cref="OpenStream"/> itself answer
+/// <see cref="TransportStatus.StreamLimitReached"/> (the simulator only ever refuses a start asynchronously, the way
+/// MsQuic does), and <see cref="FailStarts"/> fails the send that carries <see cref="TransportSendFlags.Start"/>
+/// <em>after</em> the open succeeded — nothing took stream credit then, so no credit event is coming and the transfer
+/// must go out on a new stream at the next pass rather than wait.
+/// </summary>
+internal sealed unsafe class BulkRefusalTransport(ITransport inner, ITransportSink sink) : ITransport
+{
+    private readonly Dictionary<TransportStreamId, ulong> _openContexts = [];
+
+    public ITransport Inner => inner;
+
+    /// <summary>Opens of bulk streams still to refuse.</summary>
+    public int RefuseOpens { get; set; }
+
+    /// <summary>Start sends of bulk streams still to fail after their open succeeded.</summary>
+    public int FailStarts { get; set; }
+
+    /// <summary>What a failed Start send returns (anything but the stream limit).</summary>
+    public TransportStatus StartStatus { get; set; } = TransportStatus.OutOfMemory;
+
+    public int RefusedOpens { get; private set; }
+
+    public int FailedStarts { get; private set; }
+
+    public TransportCapabilities Capabilities => inner.Capabilities;
+
+    public TransportState State => inner.State;
+
+    /// <summary>Tells the peer it may open a stream again (what a shutdown elsewhere would have done).</summary>
+    public void GrantCredit() => sink.OnStreamsAvailable(0, 2);
+
+    public TransportStatus SendDatagram(TransportSegment* segments, int count, ulong context, TransportSendFlags flags) =>
+        inner.SendDatagram(segments, count, context, flags);
+
+    public TransportStatus OpenStream(StreamKind kind, ulong context, ushort priority, out TransportStreamId id)
+    {
+        if (RefuseOpens > 0 && IsBulk(context))
+        {
+            RefuseOpens--;
+            RefusedOpens++;
+            id = TransportStreamId.None;
+            return TransportStatus.StreamLimitReached;
+        }
+
+        TransportStatus status = inner.OpenStream(kind, context, priority, out id);
+        if (status == TransportStatus.Success)
+        {
+            _openContexts[id] = context;
+        }
+
+        return status;
+    }
+
+    public TransportStatus StartStream(TransportStreamId id) => inner.StartStream(id);
+
+    public TransportStatus SendStream(TransportStreamId id, TransportSegment* segments, int count, ulong context, TransportSendFlags flags)
+    {
+        if (FailStarts > 0 && (flags & TransportSendFlags.Start) != 0
+            && _openContexts.TryGetValue(id, out ulong open) && IsBulk(open))
+        {
+            FailStarts--;
+            FailedStarts++;
+            return StartStatus;
+        }
+
+        return inner.SendStream(id, segments, count, context, flags);
+    }
+
+    public void AbortStream(TransportStreamId id, ulong errorCode, StreamAbortDirection direction) => inner.AbortStream(id, errorCode, direction);
+
+    public void SetStreamPriority(TransportStreamId id, ushort priority) => inner.SetStreamPriority(id, priority);
+
+    public long GetQuicStreamId(TransportStreamId id) => inner.GetQuicStreamId(id);
+
+    public void ResumeStreamReceive(TransportStreamId id, int bytesConsumed) => inner.ResumeStreamReceive(id, bytesConsumed);
+
+    public void CloseStream(TransportStreamId id) => inner.CloseStream(id);
+
+    public void UpdatePeerStreamLimits(ushort bidirectional, ushort unidirectional) => inner.UpdatePeerStreamLimits(bidirectional, unidirectional);
+
+    public void Close(ulong errorCode, ReadOnlySpan<byte> reason) => inner.Close(errorCode, reason);
+
+    public void GetStatistics(out TransportStatistics statistics) => inner.GetStatistics(out statistics);
+
+    public void Dispose() => inner.Dispose();
+
+    private static bool IsBulk(ulong context) =>
+        PeerCore.TryDecodeEngineStreamContext(context, out ChannelMode mode, out _, out _) && mode == ChannelMode.Bulk;
+}
+
+/// <summary>Wraps a connector's transport in <see cref="BulkRefusalTransport"/>.</summary>
+internal sealed class BulkRefusalConnector(ITransportConnector inner) : ITransportConnector
+{
+    public BulkRefusalTransport? Transport { get; private set; }
+
+    public ITransport Connect(EndPoint endpoint, string? serverName, ITransportSink sink) =>
+        Transport = new BulkRefusalTransport(inner.Connect(endpoint, serverName, sink), sink);
 }
 
 /// <summary>Serves one in-memory object, honouring the range the peer asked for.</summary>

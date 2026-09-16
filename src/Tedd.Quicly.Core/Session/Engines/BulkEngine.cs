@@ -265,9 +265,13 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         long total = descriptor.TotalLength;
         long offset = descriptor.Offset;
         long length = descriptor.EffectiveLength;
-        if (total < 0 || total > (long)VarInt.MaxValue || offset < 0 || offset > total || length <= 0 || length > total - offset)
+
+        // Exactly 0 is the "to the end of the object" sentinel, so a negative Length is a caller's arithmetic error and is
+        // refused rather than quietly turned into a whole-object transfer.
+        if (total < 0 || total > (long)VarInt.MaxValue || offset < 0 || offset > total
+            || descriptor.Length < 0 || length <= 0 || length > total - offset)
         {
-            throw new ArgumentOutOfRangeException(nameof(descriptor), "A bulk range needs Length > 0 and Offset + Length <= TotalLength <= 2^62-1.");
+            throw new ArgumentOutOfRangeException(nameof(descriptor), "A bulk range needs Length >= 0 (0 = to the end) and Offset + Length <= TotalLength <= 2^62-1.");
         }
 
         int limit = _core.EffectiveMaxMessageSize(channel);
@@ -1429,7 +1433,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         ChannelDefinition channel = _channels[local];
         long length = descriptor.EffectiveLength;
         if (descriptor.Channel != channel.Id || descriptor.TotalLength < 0 || descriptor.TotalLength > (long)VarInt.MaxValue
-            || descriptor.Offset < 0 || descriptor.Offset > descriptor.TotalLength || length <= 0
+            || descriptor.Offset < 0 || descriptor.Offset > descriptor.TotalLength || descriptor.Length < 0 || length <= 0
             || length > descriptor.TotalLength - descriptor.Offset || length > _core.EffectiveMaxMessageSize(channel)
             || descriptor.Sha256.Length is not (0 or StreamFraming.BulkHashLength))
         {

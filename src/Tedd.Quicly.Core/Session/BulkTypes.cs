@@ -12,7 +12,10 @@ namespace Tedd.Quicly.Core.Session;
 /// <param name="ObjectVersion">Object version (identity is id + version).</param>
 /// <param name="TotalLength">Total object length in bytes (at most 2^62 − 1).</param>
 /// <param name="Offset">First byte of the range this transfer carries.</param>
-/// <param name="Length">Bytes this transfer carries; 0 means "to the end of the object". Bounded by the channel's <c>MaxMessageSize</c>.</param>
+/// <param name="Length">
+/// Bytes this transfer carries. Exactly 0 means "to the end of the object"; a negative value is an error, not a
+/// shorthand. Bounded by the channel's <c>MaxMessageSize</c> (PROTOCOL.md §8).
+/// </param>
 /// <param name="Compress">Send the body as independently LZ4-decodable chunks (PROTOCOL.md §3.3 <c>Chunked</c>).</param>
 /// <param name="Resumable">
 /// Re-request the remaining range after an epoch change (PROTOCOL.md §4.1). It is the <em>receiving</em> end that

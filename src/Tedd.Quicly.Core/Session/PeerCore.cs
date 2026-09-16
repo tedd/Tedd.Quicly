@@ -159,6 +159,7 @@ internal sealed unsafe class PeerCore : IDisposable
         Streams = new StreamTable();
         SessionMaxMessageSize = role == PeerRole.Server ? options.MaxMessageSize : 0;
         FlushIntervalMicros = Math.Max(1, PeerOptions.ToMicros(options.FlushInterval));
+        GroupMinIntervalMicros = PeerOptions.ToMicros(options.GroupMinInterval);
         _maxDatagramPayload = 0;
         _scheduleOrder = ComputeScheduleOrder(_channels);
         _localCompletions = new CompletionEntry[capacity];
@@ -372,6 +373,16 @@ internal sealed unsafe class PeerCore : IDisposable
 
     /// <summary>The flush interval in micros (resolves <see cref="ChannelDefinition.ExpiryTwiceFlushInterval"/>).</summary>
     public long FlushIntervalMicros { get; }
+
+    // ---- seam added by wave C2b (ReliableUnordered group streams)
+
+    /// <summary>
+    /// Shortest time between two group streams of one channel in micros (<see cref="PeerOptions.GroupMinInterval"/>,
+    /// PROTOCOL.md §3.2 <c>GroupMinIntervalMicros</c>); 0 = no bound.
+    /// </summary>
+    public long GroupMinIntervalMicros { get; }
+
+    // ---- end of the wave C2b seam
 
     /// <summary>The buffer pool (shared or private).</summary>
     public SlabAllocator Allocator => _allocator;

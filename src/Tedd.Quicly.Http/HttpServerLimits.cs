@@ -25,8 +25,21 @@ public sealed class HttpServerLimits
     /// <summary>Maximum number of simultaneously open connections from one remote address; further connections are closed immediately. Default 64.</summary>
     public int MaxConnectionsPerAddress { get; set; } = 64;
 
-    /// <summary>Maximum time from the first byte of a request (or from accept, for the TLS handshake) until the header section is complete. Exceeding it yields 408. Default 5 s.</summary>
+    /// <summary>
+    /// Maximum time from the first byte of a request until its header section is complete; for the first request on a
+    /// connection it starts at accept, or at the end of the TLS handshake (which has its own
+    /// <see cref="TlsHandshakeTimeout"/>). Exceeding it yields 408. Default 5 s.
+    /// </summary>
     public TimeSpan HeaderReadTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Maximum time from accept until the TLS handshake of a TLS endpoint is complete, the ClientHello peek included
+    /// (Kestrel's default too). Exceeding it drops the connection and counts in
+    /// <see cref="HttpServer.HandshakeTimeouts"/>. The server's own credential setup runs inside it (building a
+    /// certificate's chain the first time it is served costs milliseconds to seconds under load), so it is deliberately
+    /// more generous than <see cref="HeaderReadTimeout"/>. Default 10 s.
+    /// </summary>
+    public TimeSpan TlsHandshakeTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>Maximum time a persistent connection may sit idle between requests. Default 15 s.</summary>
     public TimeSpan KeepAliveTimeout { get; set; } = TimeSpan.FromSeconds(15);
@@ -66,6 +79,7 @@ public sealed class HttpServerLimits
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxConnectionsPerAddress, 1, nameof(MaxConnectionsPerAddress));
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxRequestsPerConnection, 1, nameof(MaxRequestsPerConnection));
         ValidateTimeout(HeaderReadTimeout, allowZero: false, nameof(HeaderReadTimeout));
+        ValidateTimeout(TlsHandshakeTimeout, allowZero: false, nameof(TlsHandshakeTimeout));
         ValidateTimeout(KeepAliveTimeout, allowZero: false, nameof(KeepAliveTimeout));
         ValidateTimeout(RequestBodyReadTimeout, allowZero: false, nameof(RequestBodyReadTimeout));
         ValidateTimeout(ResponseWriteTimeout, allowZero: false, nameof(ResponseWriteTimeout));

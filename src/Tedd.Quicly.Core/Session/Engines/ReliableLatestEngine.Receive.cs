@@ -11,7 +11,7 @@ using Tedd.Quicly.Core.Transport;
 namespace Tedd.Quicly.Core.Session.Engines;
 
 // The ReliableLatest engine's receive side (transport thread), the coalesced acks and rejects it owes (game thread), and
-// key retirement in both directions. PROTOCOL.md §2.1, §2.3, §3.2, §4.4 and §7; docs/design/session-layer.md §7.5.
+// key retirement in both directions. PROTOCOL.md §2.1, §2.3, §3.2, §4.4 and §7; docs/design/session-layer.md §7.6.
 internal sealed unsafe partial class ReliableLatestEngine
 {
     private int _epochs;
@@ -535,6 +535,13 @@ internal sealed unsafe partial class ReliableLatestEngine
     {
         int index = (int)message.Cookie;
         ref LatestRecvStream stream = ref _streams[index];
+        if (stream.InUse == 0 || stream.Stream != message.Id)
+        {
+            // The staging records are pooled, so a record is only ever read for the stream it was handed to: one that has
+            // been freed (its stream shut down) may already be serving another stream.
+            return StreamConsume.ResetStream(QuiclyErrorCode.ProtocolViolation);
+        }
+
         int local = stream.Local;
         ref ChannelRecvCounters counters = ref _core.RecvCounters(message.ChannelIndex);
         switch (message.Phase)

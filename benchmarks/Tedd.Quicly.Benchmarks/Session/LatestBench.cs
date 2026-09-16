@@ -10,7 +10,7 @@ namespace Tedd.Quicly.Benchmarks.Session;
 
 /// <summary>
 /// The ReliableLatest workload of a game: one value per key per tick, with the peer's coalesced acks completing them
-/// (PROTOCOL.md §4.4). <c>Latest1000Keys</c> is the 1 000-key, 60 Hz workload of docs/design/session-layer.md §7.5;
+/// (PROTOCOL.md §4.4). <c>Latest1000Keys</c> is the 1 000-key, 60 Hz workload of docs/design/session-layer.md §7.6;
 /// <c>Latest64Keys</c> is the same cycle with fewer keys, so the per-key cost can be separated from the per-pass cost.
 /// Reported per value: admission (key slot, version, value entry), the transmission through the packer, the transport, the
 /// mailbox receive, dispatch, the ack batch and the completion.

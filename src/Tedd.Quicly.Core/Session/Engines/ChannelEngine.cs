@@ -168,9 +168,15 @@ internal abstract class ChannelEngine : IDisposable
     /// <summary>
     /// An accepted peer stream ended (shutdown complete, reset by the peer, or reset by this end after a malformed frame),
     /// or a stream this end opened was stopped (STOP_SENDING, <paramref name="aborted"/>) or shut down. Every engine sees
-    /// the events of locally opened streams and ignores ids it does not own. Transport thread; called at most once per
-    /// accepted peer stream.
+    /// the events of locally opened streams and ignores ids it does not own. Transport thread.
     /// </summary>
+    /// <remarks>
+    /// Called <b>exactly once per stream</b>, peer-opened or locally opened. A started stream that the peer stops raises both
+    /// the stop and the shutdown that always follows it (MsQuic completes every started stream with SHUTDOWN_COMPLETE), and the
+    /// peer collapses the two into this one call — for a peer stream through its <c>StreamRecord</c>, for a locally opened one
+    /// through the <c>Discard</c> record the stop leaves behind. An engine may therefore release a stream's resources here
+    /// without a second notice arriving for the same stream (ADR 0008: released exactly once on every path).
+    /// </remarks>
     /// <param name="id">The stream.</param>
     /// <param name="aborted">True when the stream was reset or stopped rather than finished.</param>
     /// <param name="errorCode">The reset code.</param>

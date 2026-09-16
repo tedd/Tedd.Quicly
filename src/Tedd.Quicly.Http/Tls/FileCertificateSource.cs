@@ -14,13 +14,14 @@ namespace Tedd.Quicly.Http.Tls;
 /// session caches, handshakes in progress and <see cref="Changed"/> subscribers may still hold it, so it is left to
 /// finalization.
 /// </remarks>
-public sealed class FileCertificateSource : ICertificateSource, IDisposable
+public sealed class FileCertificateSource : ICertificateSource, ICertificateChainSource, IDisposable
 {
     private readonly string _path;
     private readonly string? _password;
     private readonly Timer? _timer;
     private readonly Lock _reloadLock = new();
     private X509Certificate2? _current;
+    private X509Certificate2Collection? _intermediates;
     private DateTime _lastWriteUtc;
     private bool _disposed;
 
@@ -35,7 +36,7 @@ public sealed class FileCertificateSource : ICertificateSource, IDisposable
             ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(interval, TimeSpan.Zero);
         _path = Path.GetFullPath(path);
         _password = password;
-        _current = Load(out _lastWriteUtc);
+        _current = Load(out _lastWriteUtc, out _intermediates);
         if (reloadInterval is { } iv)
             _timer = new Timer(static s => ((FileCertificateSource)s!).Poll(), this, iv, iv);
     }
@@ -45,6 +46,10 @@ public sealed class FileCertificateSource : ICertificateSource, IDisposable
 
     /// <inheritdoc/>
     public X509Certificate2? Current => Volatile.Read(ref _current);
+
+    /// <inheritdoc/>
+    public X509Certificate2Collection? GetIntermediates(X509Certificate2 certificate)
+        => ReferenceEquals(certificate, Volatile.Read(ref _current)) ? Volatile.Read(ref _intermediates) : null;
 
     /// <inheritdoc/>
     public event Action<X509Certificate2>? Changed;
@@ -59,26 +64,51 @@ public sealed class FileCertificateSource : ICertificateSource, IDisposable
         lock (_reloadLock)
         {
             var previous = _current!;
-            var loaded = Load(out var lastWrite);
+            var loaded = Load(out var lastWrite, out var intermediates);
             _lastWriteUtc = lastWrite;
             if (previous.RawDataMemory.Span.SequenceEqual(loaded.RawDataMemory.Span))
             {
                 loaded.Dispose(); // same certificate: keep the instance in use, release the duplicate key container
                 return false;
             }
+            Volatile.Write(ref _intermediates, intermediates);
             Volatile.Write(ref _current, loaded);
             Changed?.Invoke(loaded);
             return true;
         }
     }
 
-    private X509Certificate2 Load(out DateTime lastWriteUtc)
+    /// <summary>
+    /// Loads the whole PKCS#12: the certificate with the private key is served, the others are the intermediates a handshake
+    /// has to send (it never downloads them).
+    /// </summary>
+    private X509Certificate2 Load(out DateTime lastWriteUtc, out X509Certificate2Collection intermediates)
     {
         var info = new FileInfo(_path);
         if (!info.Exists)
             throw new FileNotFoundException("Certificate file not found.", _path);
         lastWriteUtc = info.LastWriteTimeUtc;
-        return X509CertificateLoader.LoadPkcs12FromFile(_path, _password, X509KeyStorageFlags.DefaultKeySet);
+        var all = X509CertificateLoader.LoadPkcs12CollectionFromFile(_path, _password, X509KeyStorageFlags.DefaultKeySet);
+        X509Certificate2? leaf = null;
+        foreach (var certificate in all)
+        {
+            if (certificate.HasPrivateKey)
+            {
+                leaf = certificate;
+                break;
+            }
+        }
+        if (leaf is null && all.Count > 0)
+            leaf = all[0];
+        if (leaf is null)
+            throw new System.Security.Cryptography.CryptographicException("The certificate file contains no certificate.");
+        intermediates = [];
+        foreach (var certificate in all)
+        {
+            if (!ReferenceEquals(certificate, leaf))
+                intermediates.Add(certificate);
+        }
+        return leaf;
     }
 
     internal void Poll()

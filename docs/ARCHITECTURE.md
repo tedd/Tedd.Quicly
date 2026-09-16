@@ -309,11 +309,14 @@ public sealed class QuiclyServer : IAsyncDisposable
 {
     public QuiclyServer(ServerOptions options, ITransportListenerFactory listener);
     public ValueTask StartAsync(CancellationToken ct);
-    public int PollAll(int maxItems = int.MaxValue);          // drains every peer with pending work (tracked by a work queue, idle peers cost nothing)
+    public int PollAll(int maxItems = int.MaxValue);          // polls the peers the work signal marked (gated on HasPendingWork) and those whose poll deadline is due; idle peers cost nothing
+    public void FlushAll(uint tick = 0);                       // PollAll also brings a flush forward to NextFlushDeadlineMicros
+    public long NextPollDeadlineMicros { get; }                // sleep the polling loop on this (peers' timers + session expiry)
+    public long NextFlushDeadlineMicros { get; }               // engine work and the auto-flush schedule
     public ReadOnlySpan<PeerSlot> Peers { get; }               // dense, generation-tagged
     public QuiclyPeer? GetPeer(int index);
     public PeerSet CreateSet();                                 // bitset over peer indices
-    public SharedSendResult SendShared(PeerSet set, in SendHeader h, SharedLease lease, int length, SendOptions o = default); // admitted/rejected masks
+    public SharedSendResult SendShared(PeerSet set, in SendHeader h, SharedLease lease, int length, SendOptions o = default); // admitted/rejected masks; each peer retains and releases its own reference
     public event Action<QuiclyPeer>? PeerAdmitted;             // raised from PollAll
     public event Action<QuiclyPeer, CloseReason>? PeerClosed;  // raised from PollAll
 }
@@ -327,7 +330,12 @@ public interface IAdmissionPolicy
 public sealed class QuiclyClient
 {
     public ValueTask<QuiclyPeer> ConnectAsync(EndPoint endpoint, ClientOptions options, CancellationToken ct);
-    // ReconnectPolicy: attempts, back-off, browser-suspend awareness; raises PeerState.Reconnecting → Connected with a new epoch
+    public QuiclyPeer? Peer { get; }                 // kept across a resumed reconnect: handlers, Index, Tag and statistics survive
+    public int Poll(int maxItems = int.MaxValue);     // polls the current peer and drives the reconnect attempts
+    public void Flush(uint tick = 0);
+    // ReconnectPolicy: attempts, back-off, browser-suspend awareness. A resume reconnects the same peer in place
+    // (QuiclyPeer.Reconnect: Closed → Reconnecting → Handshaking → Connected, epoch + 1); a refused resume falls back to a
+    // fresh session on a new peer.
 }
 ```
 
@@ -391,6 +399,7 @@ logs a warning per connection). Session/auth token rules, admission timeouts, re
 | drain queues | peer | min(receive ring, 1 024) × 68 B (68 KiB) | per-channel queues for `Drain` consumers: a 64 B node plus its link, native, built with the peer |
 | segment arena | peer | 1 024 × 16 B | per-submission gather arrays for stream sends |
 | channel state | peer × channel | 2 × 64 B | send + receive halves |
+| group records | peer × group channel | `(3 × max(MaxGroups, 1) + 4) × 64 B` send + `max(MaxGroups, 1) × 64 B` receive | `ReliableUnordered`: one record per live group (filling, waiting, or holding a stream) and one per accepted peer stream; the engine's notice ring adds `4 × its send records + 8` × 12 B |
 | key slots | peer × keyed channel | `MaxKeys` × 64 B (+ mailbox) | dense or hashed |
 
 With the defaults a peer's fixed native tables are therefore about **560 KiB**: 256 KiB receive ring, 32 KiB
@@ -399,7 +408,11 @@ queues and 16 KiB segment arena. The 256 KiB receive and 256 KiB send figures ab
 from the shared slab reserve, not additional per-peer allocations. `ServerOptions.ExpectedPeers` scales all of
 it — 1 000 peers at the defaults would be ~550 MiB of tables alone, so a server with many peers lowers
 `ReceiveRingCapacity`, `SendTableCapacity` and the byte budgets (the defaults target tens to a few hundred peers
-per process). The numbers are published from the benchmark in `docs/benchmarks/memory.md`.
+per process). `MaxGroups` is the one channel option that can dominate this: at its default of 8 a group channel costs about
+1.8 KiB of send records, 0.5 KiB of receive records and 1.4 KiB of notice ring, but a channel raised to `MaxGroups = 1024` costs
+about **192 KiB** of send records (3 076 of them), 64 KiB of receive records and ~144 KiB of ring — roughly 400 KiB for that one
+channel, per peer — so raise it only for a channel that really needs that many groups in flight at once. The numbers are
+published from the benchmark in `docs/benchmarks/memory.md`.
 
 ## 10. Testing & measurement
 

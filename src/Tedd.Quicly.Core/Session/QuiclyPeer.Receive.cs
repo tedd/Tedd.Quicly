@@ -932,6 +932,14 @@ public sealed unsafe partial class QuiclyPeer
         {
             engines[i].OnStreamClosed(id, aborted: true, errorCode);
         }
+
+        if (id.IsValid)
+        {
+            // An engine hears a stream's close exactly once, locally opened streams included. A started stream always ends with
+            // shutdown complete as well (MsQuic and the simulator both do), so the stop leaves the same `Discard` record behind
+            // that a peer stream's own record becomes: the shutdown then tells no engine a second time.
+            _core.Streams.Add(id, StreamTag.Discard);
+        }
     }
 
     private void HandleStreamShutdownComplete(TransportStreamId id)
@@ -939,6 +947,8 @@ public sealed unsafe partial class QuiclyPeer
         ref StreamRecord record = ref _core.Streams.Find(id);
         if (!Unsafe.IsNullRef(ref record))
         {
+            // Either a peer stream's record, or the Discard marker a stop of a locally opened stream left behind: both are
+            // already-reported streams unless the tag is still Engine, and NotifyEngineClosed answers that.
             NotifyEngineClosed(ref record, id, aborted: false, 0);
             _core.Streams.Remove(id);
         }

@@ -15,6 +15,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Tedd.Quicly.Acme.Tests/Tedd.Quicly.Acme.Tests.csproj" />
+    <Project Path="tests/Tedd.Quicly.Client.Tests/Tedd.Quicly.Client.Tests.csproj" />
     <Project Path="tests/Tedd.Quicly.Core.Tests/Tedd.Quicly.Core.Tests.csproj" />
     <Project Path="tests/Tedd.Quicly.EndToEnd.Tests/Tedd.Quicly.EndToEnd.Tests.csproj" />
     <Project Path="tests/Tedd.Quicly.Http.Tests/Tedd.Quicly.Http.Tests.csproj" />

@@ -58,6 +58,8 @@ real client or server where the transport worker and the game thread are differe
 | `SessionEndToEndBench.Sequenced64Keyed` | 100 keyed sequenced messages of 64 B (keys 0..99), one cycle (per-key acceptance on receive) | message |
 | `SessionEndToEndBench.Ordered64` | 100 × 64 B on the persistent ordered stream, one cycle: four stream sends (carrier gathers), progressive receive into pooled leases, dispatch, the carriers' completions | message |
 | `SessionEndToEndBench.Ordered4K` | 16 × 4 KiB on the ordered stream, one cycle (64 KiB of stream data, about 55 packets) | message |
+| `GroupStreamBench.Group64` | 100 × `SendCopy` of 64 B on a `ReliableUnordered` channel, then passes until the **server has dispatched all 100** — the group's stream has opened, been confirmed and carried every message with FIN, but its carrier completions and its shutdown are still outstanding when the measurement stops, so each iteration also pays the previous one's teardown | message |
+| `GroupStreamBench.Group4K` | 16 × 4 KiB as one group, same cycle (64 KiB on one stream), likewise ending at the server's dispatch | message |
 | `SessionPassBench.Flush100Buffered` | one `Flush` of a peer holding 100 buffered 64-byte messages: the scheduler pass alone (packing into containers, or gathering into stream sends); four pairs, the queues filled in the iteration setup, delivery in the iteration cleanup | flush |
 | `SessionPassBench.SendCopy` | the admission of one 64-byte message (channel lookup, entry, lease, copy, header, queue); 4 × 100 per invocation, delivery in the iteration cleanup | message |
 | `LatestBench.Latest1000Keys` | 1 000 keys of a `ReliableLatest` channel updated once per 60 Hz tick: `SendCopy` per key, client `Flush`, one tick of virtual time, server `Poll` (dispatch) + `Flush` (the coalesced `LatestAck` batch), client `Poll` (the acks and the completions) | value |
@@ -95,6 +97,51 @@ lands on the large-object heap and is no longer scanned. Nothing here measures t
 the caveat above.
 
 Messages/s = 10⁹ / Mean, for one core doing both ends and the simulator.
+
+### Group streams (ReliableUnordered, wave C2b)
+
+Measured 2026-09-16 and **re-measured the same day after the wave C2b review fixes** (the release path, the group list, the
+carrier completion and the receive chunk branch all changed) with
+`dotnet run -c Release -f net10.0 --project benchmarks/Tedd.Quicly.Benchmarks -- --filter '*Group*' '*Ordered64*'`
+on the machine above (again not idle: another agent was building and testing throughout). The table below is the re-run.
+`Ordered64` was included in that invocation as an **in-run control**: it came out at 262.9 ns (Default) and 275.2 ns (in
+process), within noise of the 262.0 / 263.1 ns in the end-to-end table above, so the machine state is comparable to the run that
+produced that table. Every batch is **one group on one
+stream**, so a row includes a stream's whole lifetime — `OpenStream`, the preamble and the `Start` flag, the confirmation, the
+gathered carriers, FIN, the shutdown and the credit coming back — not just the messages. That lifetime is *not* contained in one
+iteration, though: `Deliver` stops as soon as the server has dispatched the batch, which is before that group's carrier
+completions, its FIN's shutdown and the returning credit have been processed, so those land inside the next iteration's window.
+Over a run of many iterations each row therefore still pays exactly one stream's cost per batch — the previous batch's teardown
+instead of its own — which is what makes the steady-state figures comparable; only a single iteration in isolation would be
+mis-attributed. The peers run with
+`PeerOptions.GroupMinInterval = 0` because the benchmark's virtual clock does not advance between cycles; the interval bounds
+how often a channel opens a stream in wall-clock time (PROTOCOL.md §3.2) and would otherwise seal one group for the whole run.
+
+| Method  | Toolchain              | Mean       | Error      | StdDev    | Messages/s (derived) | Allocated |
+|-------- |----------------------- |-----------:|-----------:|----------:|---------------------:|----------:|
+| Group64 | Default                |   284.8 ns |   88.04 ns |   4.83 ns |  3.51 M (225 MB/s)   |         - |
+| Group4K | Default                | 1,423.4 ns |  394.37 ns |  21.62 ns |   703 k (2.9 GB/s)   |         - |
+| Group64 | InProcessEmitToolchain |   308.6 ns |   90.54 ns |   4.96 ns |  3.24 M (207 MB/s)   |         - |
+| Group4K | InProcessEmitToolchain | 1,466.4 ns |  286.31 ns |  15.69 ns |   682 k (2.8 GB/s)   |         - |
+
+The wave C2b run of the same four rows was 365.0 / 1,560.4 / 341.0 / 1,807.8 ns, so every row came out 12–25 % faster. **Do not
+read that as a speed-up from the review fixes:** on the measured path they are neutral at best and slightly more work at worst
+(one extra branch per received chunk, one channel lookup per carrier completion), and the O(1) group release only pays off with
+many live groups, of which this benchmark has one. The earlier run's own error bars say what happened — `Group4K` was ±1.6 µs
+then against ±0.39 µs now — so the first numbers were inflated by whatever else the machine was doing, and the control row above
+is the evidence that today's state is the cleaner one. What matters here is that nothing regressed.
+
+**Reading.** A 64-byte message on a group stream costs 285–309 ns against the same run's 263–275 ns on the persistent ordered
+stream: about 22–33 ns per message more, which is the per-group stream lifetime spread over the batch's 100 messages (a group of
+100 costs a couple of µs of stream setup and teardown — the teardown being the previous batch's, as the workload note above
+explains) plus the extra pass every group needs before its second carrier, since nothing else goes out until its start is
+confirmed. The wave C2b run put that premium at about 100 ns per message; with both modes measured in one invocation it is far
+smaller, and the difference is in the group rows, not the ordered control. That is the price of the mode's promise: no message
+waits for another's retransmission (PROTOCOL.md §3.2). At 4 KiB the difference disappears into the error bars (1.42–1.47 µs
+against the ordered stream's 1.34–1.41 µs from the end-to-end table above, which was not re-run; `Group4K`'s ShortRun error is
+±0.29–0.39 µs, so read it as indicative only) because the stream's fixed cost is amortised over 64 KiB of payload. Nothing allocates in either row, which is the same result the unit tests assert over
+windows of ticks. As everywhere in this file, both peers and the simulator share one core, so these are single-core figures
+with no cross-thread coherence cost.
 
 ### The two halves of the send path
 
@@ -206,7 +253,7 @@ machine: `Ordered64` measured 331 / 398 ns (out of process / in process) with V0
 
 ## ReliableLatest: what a keyed value costs (wave C2a)
 
-`LatestBench` (added with the `ReliableLatest` engine, docs/design/session-layer.md §7.5) measures the mode's own cycle on
+`LatestBench` (added with the `ReliableLatest` engine, docs/design/session-layer.md §7.6) measures the mode's own cycle on
 the same machine and with the same `InProcessShortRunConfig` as the tables above, on net10.0 (measured 2026-09-16, re-run
 after the session hooks were merged). One
 operation is one *value*: the key's slot lookup, the version from the channel's counter, the value entry with its payload
@@ -252,7 +299,7 @@ three digits. What both runs agree on is the shape of the cost, below.
   the default to **2 000/s with a sizing rule**, so the benchmark now runs at the default and raises nothing. Its `Check()`
   fails the run if either peer is not connected, if any value was retransmitted, or if fewer values reached the peer's
   handler than the cycles sent — so a run that started refusing admission or closing the session cannot produce numbers.
-  Hosts running channels with more keys or a higher rate than this still size the limit themselves (session-layer.md §7.5).
+  Hosts running channels with more keys or a higher rate than this still size the limit themselves (session-layer.md §7.6).
 * The single-core caveat of the tables above applies unchanged: both peers and the simulator run on one thread, so the
   transport-thread → game-thread hand-offs (mailboxes, the ack ring, the completion ring) cost no cross-core coherence here.
   Another agent was building and testing on the machine during the run.
@@ -274,6 +321,11 @@ receive paths are measured too.
   Poll + Flush + client Poll). Loss, jitter and retransmission are covered by
   `Steady_Ordered_Traffic_Under_Loss_And_Jitter_Delivers_Every_Message_In_Order`, which asserts order and byte-exactness for
   ~9 600 messages instead of allocation.
+* `GroupZeroAllocationTests.Steady_Group_Traffic_Of_64_Byte_Messages_Does_Not_Allocate`: a clean 10 ms link, 60 Hz ticks of 16
+  plain 64-byte messages plus a keyed, an LZ4-compressed and a tracked one and one the other way — so **three group streams are
+  opened, FIN'd and shut down every tick** in each direction; 1 200 ticks of warm-up (long enough for the peak of concurrent
+  streams, group records and simulator slots), windows of 120 ticks. Group records, stream notices and receive records are
+  pooled, so a stream per group costs no allocation.
 * `OrderedZeroAllocationTests.The_Synchronous_Paths_Of_SendAsync_And_FlushAsync_Do_Not_Allocate`: 8 × `SendAsync` and one
   `FlushAsync` per cycle, all completing synchronously; windows of 200 cycles.
 * `OrderedZeroAllocationTests.Admitting_Sends_Queued_By_Another_Thread_Does_Not_Allocate_On_The_Game_Thread`: a producer thread

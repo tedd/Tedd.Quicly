@@ -12,7 +12,7 @@ namespace Tedd.Quicly.Core.Session.Engines;
 
 /// <summary>
 /// The <see cref="ChannelMode.ReliableLatest"/> engine (PROTOCOL.md §2.1, §2.3, §3.2, §4.4; docs/design/session-layer.md
-/// §7.5): intermediate versions of a key may be discarded, the latest one is eventually delivered while the epoch lives.
+/// §7.6): intermediate versions of a key may be discarded, the latest one is eventually delivered while the epoch lives.
 /// One instance per peer owns the structure-of-arrays state of every ReliableLatest channel.
 /// </summary>
 /// <remarks>

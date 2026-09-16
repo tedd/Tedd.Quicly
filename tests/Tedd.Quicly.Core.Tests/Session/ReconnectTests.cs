@@ -253,24 +253,272 @@ public class ReconnectTests
     }
 
     [Fact]
-    public void A_Connector_That_Throws_Leaves_The_Peer_Closed()
+    public void A_Connector_That_Throws_Leaves_The_Peer_Closed_And_Re_Armable()
     {
         using SessionHarness h = new(connect: false, client: QuietOptions.Apply, server: QuietOptions.Apply);
         AcceptResumes(h);
         Assert.True(h.RunUntilConnected());
         CutTheConnection(h);
         Assert.True(h.RunUntil(() => h.Client.State == PeerState.Closed));
+        CloseReason lost = h.Client.CloseReason;
+        Assert.True(h.Client.CanReconnect);
 
         Assert.Throws<InvalidOperationException>(() => h.Client.Reconnect(new ThrowingReconnectConnector(), h.Listener.LocalEndPoint, null, default));
         Assert.Equal(PeerState.Closed, h.Client.State);
         // No transport, so nothing can call back and Poll stays a no-op.
         Assert.Equal(0, h.Client.Poll());
         Assert.False(h.Client.HasPendingWork);
+        // The peer is where the lost connection left it: the close is still observable, so it can be re-armed again.
+        Assert.True(h.Client.Core.IsTransportClosed);
+        Assert.True(h.Client.CanReconnect);
+        Assert.Equal(lost, h.Client.CloseReason);
+        Assert.Equal(HelloStatus.Accepted, h.Client.HandshakeStatus);
+        Assert.Equal(long.MaxValue, h.Client.NextDeadlineMicros);
+        Assert.DoesNotContain((PeerState.Closed, PeerState.Reconnecting), h.ClientEvents);
+    }
+
+    [Fact]
+    public void A_Connector_That_Throws_Once_Resumes_In_Place_On_The_Second_Attempt()
+    {
+        using SessionHarness h = new(connect: false, authToken: "secret"u8.ToArray(), client: QuietOptions.Apply, server: QuietOptions.Apply);
+        AcceptResumes(h);
+        Assert.True(h.RunUntilConnected());
+        QuiclyPeer oldServer = h.Server!;
+        h.Client.Index = 11;
+        h.Client.Tag = 0xABCD;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Client.RegisterHandler(2, Handlers.Collect(got));
+        oldServer.SendCopy(new SendHeader(2), [1]);
+        h.Run(200_000, 1_000);
+        Assert.Single(got);
+        h.Client.GetStatistics(out PeerStatistics before);
+        Assert.True(before.DatagramsReceived > 0);
+
+        CutTheConnection(h);
+        Assert.True(h.RunUntil(() => h.Client.State == PeerState.Closed));
+        FailingConnector connector = new(h.Connector, failures: 1);
+        Assert.Throws<InvalidOperationException>(() => h.Client.Reconnect(connector, h.Listener.LocalEndPoint, "test", "secret"u8));
+        Assert.True(h.Client.CanReconnect);
+        h.Client.GetStatistics(out PeerStatistics afterFailure);
+        Assert.Equal(before.DatagramsReceived, afterFailure.DatagramsReceived);
+
+        // The second attempt reconnects the same peer in place and resumes the session.
+        h.Client.Reconnect(connector, h.Listener.LocalEndPoint, "test", "secret"u8);
+        Assert.Equal(PeerState.Reconnecting, h.Client.State);
+        Assert.True(h.RunUntil(() => h.Client.State == PeerState.Connected && h.Server is not null
+            && !ReferenceEquals(h.Server, oldServer) && h.Server.State == PeerState.Connected));
+        oldServer.Dispose();
+        Assert.Equal(2, connector.Attempts);
+
+        Assert.Equal(2u, h.Client.Epoch);
+        Assert.Equal(SessionId, h.Client.SessionId);
+        Assert.Equal(SessionToken, h.Admission.LastSessionToken);
+        Assert.Equal("secret"u8.ToArray(), h.Admission.LastAuthToken);
+        Assert.False(h.Client.CanReconnect);
+
+        // Identity, handlers and statistics survived the failed attempt as well as the resume.
+        Assert.Equal(11, h.Client.Index);
+        Assert.Equal(0xABCDul, h.Client.Tag);
+        h.Client.GetStatistics(out PeerStatistics after);
+        Assert.True(after.DatagramsReceived >= before.DatagramsReceived);
+        Assert.Equal(0, h.Client.Core.Segments.Used);
+        h.Server!.SendCopy(new SendHeader(2), [2]);
+        h.Run(200_000, 1_000);
+        Assert.Equal(2, got.Count);
+        Assert.Equal(2, got[1].Payload[0]);
+        Assert.Equal(2u, got[1].Header.Epoch);
+    }
+
+    [Fact]
+    public void A_Connector_That_Keeps_Throwing_Keeps_The_Peer_Re_Armable_And_Leaks_Nothing()
+    {
+        using SessionHarness h = new(connect: false, client: QuietOptions.Apply, server: QuietOptions.Apply);
+        AcceptResumes(h);
+        Assert.True(h.RunUntilConnected());
+        QuiclyPeer oldServer = h.Server!;
+        SendResult pending = h.Client.SendCopy(new SendHeader(4), new byte[256], SendOptions.Tracked);
+        Assert.True(pending.IsAdmitted);
+        CutTheConnection(h);
+        Assert.True(h.RunUntil(() => h.Client.State == PeerState.Closed));
+
+        FailingConnector connector = new(h.Connector, failures: 3);
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            // Every failure reaches the caller and leaves the peer exactly as re-armable as before it.
+            Assert.Throws<InvalidOperationException>(() => h.Client.Reconnect(connector, h.Listener.LocalEndPoint, "test", default));
+            Assert.True(h.Client.CanReconnect, $"attempt {attempt} left the peer unable to reconnect");
+            Assert.Equal(PeerState.Closed, h.Client.State);
+            Assert.True(h.Client.Core.IsTransportClosed);
+            Assert.Equal(0, h.Client.Poll());
+            h.Client.Flush();
+        }
+
+        // Nothing of the lost connection is still held: the tracked send is done and every table is empty.
+        Assert.Equal(DeliveryStatus.Disconnected, h.Client.GetDeliveryStatus(pending.Token));
+        h.Client.GetStatistics(out PeerStatistics statistics);
+        Assert.Equal(0, statistics.SendEntriesInUse);
+        Assert.Equal(0, statistics.SendBytesOutstanding);
+        Assert.Equal(0, statistics.ReceiveBytesOutstanding);
+        Assert.Equal(0, h.Client.Core.Segments.Used);
+        Assert.Equal(0, h.Client.Core.Streams.Count);
+        oldServer.Dispose();
+
+        // And Dispose is still clean: without a transport the close counts as seen, so the native memory goes at once.
+        h.DisposeClient();
+        Assert.True(h.Client.IsFreed);
+        Assert.False(h.Client.CanReconnect);
+    }
+
+    [Fact]
+    public void A_Connector_That_Returns_No_Transport_Leaves_The_Peer_Re_Armable()
+    {
+        using SessionHarness h = new(connect: false, client: QuietOptions.Apply, server: QuietOptions.Apply);
+        AcceptResumes(h);
+        Assert.True(h.RunUntilConnected());
+        QuiclyPeer oldServer = h.Server!;
+        CutTheConnection(h);
+        Assert.True(h.RunUntil(() => h.Client.State == PeerState.Closed));
+
+        FailingConnector connector = new(h.Connector, failures: 1, returnNull: true);
+        Assert.Throws<InvalidOperationException>(() => h.Client.Reconnect(connector, h.Listener.LocalEndPoint, "test", default));
+        Assert.True(h.Client.CanReconnect);
+        Assert.Equal(PeerState.Closed, h.Client.State);
+        Assert.True(h.Client.Core.IsTransportClosed);
+
+        h.Client.Reconnect(connector, h.Listener.LocalEndPoint, "test", default);
+        Assert.True(h.RunUntil(() => h.Client.State == PeerState.Connected && h.Server is not null
+            && !ReferenceEquals(h.Server, oldServer) && h.Server.State == PeerState.Connected));
+        oldServer.Dispose();
+        Assert.Equal(2u, h.Client.Epoch);
+    }
+
+    [Fact]
+    public void A_Failed_Attempt_Still_Reports_The_Loss_To_A_Host_That_Never_Polled()
+    {
+        using SessionHarness h = new(connect: false, client: QuietOptions.Apply, server: QuietOptions.Apply);
+        AcceptResumes(h);
+        Assert.True(h.RunUntilConnected());
+        QuiclyPeer oldServer = h.Server!;
+        SendResult pending = h.Client.SendCopy(new SendHeader(4), new byte[128], SendOptions.Tracked);
+        Assert.True(pending.IsAdmitted);
+
+        // The transport's close is delivered but never polled, so the failed attempt has to settle the peer itself.
+        CutTheConnection(h);
+        h.Network.Advance(500_000);
+        Assert.True(h.Client.Core.IsTransportClosed);
+        Assert.NotEqual(PeerState.Closed, h.Client.State);
+
+        Assert.Throws<InvalidOperationException>(() => h.Client.Reconnect(new ThrowingReconnectConnector(), h.Listener.LocalEndPoint, "test", default));
+        Assert.Equal(DeliveryStatus.Disconnected, h.Client.GetDeliveryStatus(pending.Token));
+        Assert.True(h.Client.CanReconnect);
+        Assert.Equal(PeerState.Closed, h.Client.State);
+
+        // The Closed transition the host had not seen yet is still raised, exactly once, and no Reconnecting was invented.
+        h.Client.Poll();
+        h.Client.Poll();
+        Assert.Single(h.ClientEvents.FindAll(e => e == (PeerState.Connected, PeerState.Closed)));
+        Assert.DoesNotContain((PeerState.Closed, PeerState.Reconnecting), h.ClientEvents);
+        Assert.NotEqual(CloseSource.None, h.Client.CloseReason.Source);
+
+        h.Client.Reconnect(h.Connector, h.Listener.LocalEndPoint, "test", default);
+        Assert.True(h.RunUntil(() => h.Client.State == PeerState.Connected && h.Server is not null
+            && !ReferenceEquals(h.Server, oldServer) && h.Server.State == PeerState.Connected));
+        oldServer.Dispose();
+        Assert.Equal(2u, h.Client.Epoch);
+    }
+
+    [Fact]
+    public void CanReconnect_Answers_The_Preconditions_Of_An_In_Place_Resume()
+    {
+        SessionHarness h = new(connect: false, client: QuietOptions.Apply, server: QuietOptions.Apply);
+        try
+        {
+            AcceptResumes(h);
+            Assert.True(h.RunUntilConnected());
+            // A live connection is not reconnected in place, and a server peer never is (PROTOCOL.md §4.1).
+            Assert.False(h.Client.CanReconnect);
+            Assert.False(h.Server!.CanReconnect);
+
+            bool insidePoll = true;
+            h.Client.StateChanged += (peer, _, to) =>
+            {
+                if (to == PeerState.Closed)
+                {
+                    insidePoll = peer.CanReconnect;
+                }
+            };
+
+            CutTheConnection(h);
+            Assert.True(h.RunUntil(() => h.Client.State == PeerState.Closed));
+            // Inside Poll a Reconnect would throw, so the probe says no there too.
+            Assert.False(insidePoll);
+            Assert.True(h.Client.CanReconnect);
+            Assert.False(h.Server.CanReconnect);
+        }
+        finally
+        {
+            h.Dispose();
+        }
+
+        Assert.False(h.Client.CanReconnect);
+        Assert.True(h.Client.IsDisposed);
+    }
+
+    [Fact]
+    public void CanReconnect_Does_Not_Allocate()
+    {
+        using SessionHarness h = new(connect: false, client: QuietOptions.Apply, server: QuietOptions.Apply);
+        AcceptResumes(h);
+        Assert.True(h.RunUntilConnected());
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        int permitted = 0;
+        AllocationAssert.NoAllocations(() =>
+        {
+            if (client.CanReconnect)
+            {
+                permitted++;
+            }
+
+            if (server.CanReconnect)
+            {
+                permitted++;
+            }
+        });
+
+        Assert.Equal(0, permitted);
+        CutTheConnection(h);
+        Assert.True(h.RunUntil(() => client.State == PeerState.Closed));
+        AllocationAssert.NoAllocations(() =>
+        {
+            if (client.CanReconnect)
+            {
+                permitted++;
+            }
+        });
+
+        Assert.True(permitted > 0);
     }
 
     private sealed class ThrowingReconnectConnector : ITransportConnector
     {
         public ITransport Connect(EndPoint endpoint, string? serverName, ITransportSink sink) =>
             throw new InvalidOperationException("the connector refused to start");
+    }
+
+    /// <summary>Fails the first <paramref name="failures"/> attempts — by throwing, or by returning no transport at all.</summary>
+    private sealed class FailingConnector(ITransportConnector inner, int failures, bool returnNull = false) : ITransportConnector
+    {
+        public int Attempts { get; private set; }
+
+        public ITransport Connect(EndPoint endpoint, string? serverName, ITransportSink sink)
+        {
+            if (++Attempts <= failures)
+            {
+                return returnNull ? null! : throw new InvalidOperationException("the connector refused to start");
+            }
+
+            return inner.Connect(endpoint, serverName, sink);
+        }
     }
 }

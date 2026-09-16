@@ -284,7 +284,8 @@ public sealed class QuiclyPeer : IDisposable
     public bool TryCancel(SendToken t);              // best effort; never releases the payload by itself
 
     public void Close(CloseReason reason);           // graceful; completes through Poll with PeerState.Closed
-    public void Reconnect(ITransportConnector connector, EndPoint endpoint, string? serverName, ReadOnlySpan<byte> authToken); // client: resume this session over a new transport (PROTOCOL §4.1)
+    public void Reconnect(ITransportConnector connector, EndPoint endpoint, string? serverName, ReadOnlySpan<byte> authToken); // client: resume this session over a new transport (PROTOCOL §4.1). An attempt that never reaches a transport (the connector throws or returns none) restores the peer to the state the lost connection left it in — closed with its transport close observed — and rethrows, so the same peer can be re-armed again
+    public bool CanReconnect { get; }                    // whether an in-place resume is permitted right now: a client peer, closed with its transport close observed, alive, and no Poll/Flush running. Allocation-free; a server peer is always false (its accept callback must return a sink before the Hello is read, so a resumed connection gets a new peer)
     public event Action<QuiclyPeer, PeerState, PeerState>? StateChanged;   // raised from Poll; a throwing handler never sees the same transition twice
 }
 
@@ -334,8 +335,9 @@ public sealed class QuiclyClient
     public int Poll(int maxItems = int.MaxValue);     // polls the current peer and drives the reconnect attempts
     public void Flush(uint tick = 0);
     // ReconnectPolicy: attempts, back-off, browser-suspend awareness. A resume reconnects the same peer in place
-    // (QuiclyPeer.Reconnect: Closed → Reconnecting → Handshaking → Connected, epoch + 1); a refused resume falls back to a
-    // fresh session on a new peer.
+    // (QuiclyPeer.Reconnect: Closed → Reconnecting → Handshaking → Connected, epoch + 1), chosen by asking that peer's
+    // CanReconnect when the attempt starts — an attempt whose connector failed leaves the peer re-armable, so the next one
+    // resumes it in place again; only a refused resume falls back to a fresh session on a new peer.
 }
 ```
 

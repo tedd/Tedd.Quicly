@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Server;
@@ -249,11 +250,6 @@ public class ReconnectTests
     }
 
     /// <summary>
-    /// A connector that throws counts as a failed attempt, and it also leaves that peer unable to take another in-place
-    /// resume (the peer was already re-armed when the connector failed): the next attempt presents the same session token on a
-    /// new peer, so the session is still resumed.
-    /// </summary>
-    /// <summary>
     /// <see cref="QuiclyClient.Close"/> also abandons an attempt that runs on its own peer (a fresh session), not just one
     /// that resumes the current peer in place.
     /// </summary>
@@ -283,12 +279,13 @@ public class ReconnectTests
     }
 
     /// <summary>
-    /// A connector that throws counts as a failed attempt, and it also leaves that peer unable to take another in-place
-    /// resume (the peer was already re-armed when the connector failed): the next attempt presents the same session token on a
-    /// new peer, so the session is still resumed.
+    /// A connector that throws counts as a failed attempt and nothing more: it never reached a transport, so the peer stays
+    /// where the lost connection left it (<see cref="QuiclyPeer.CanReconnect"/> stays true) and the next attempt resumes that
+    /// <em>same</em> peer in place, with its handlers, <see cref="QuiclyPeer.Index"/>, <see cref="QuiclyPeer.Tag"/> and
+    /// statistics, and with the session resumed (a higher epoch on the same session id).
     /// </summary>
     [Fact]
-    public async Task A_Connector_That_Throws_Counts_As_A_Failed_Attempt_And_The_Next_One_Uses_A_New_Peer()
+    public async Task A_Connector_That_Throws_Once_Is_Retried_In_Place_On_The_Same_Peer()
     {
         await using ClientFixture f = new();
         ScriptedConnector connector = new ScriptedConnector(f.Connector, f.Clock).Then(f.Cutting(100_000));
@@ -296,31 +293,145 @@ public class ReconnectTests
         List<ReconnectingInfo> reconnecting = [];
         List<ReconnectedInfo> reconnected = [];
         List<QuiclyPeer> created = [];
-        List<string> log = [];
-        client.Reconnecting += (_, info) => reconnecting.Add(info);
-        client.Reconnected += (_, info) => reconnected.Add(info);
-        client.StateChanged += (_, from, to) => log.Add(from + "->" + to);
-        client.Disconnected += (_, reason) => log.Add("disconnected " + reason.Code);
-        ClientOptions options = f.Options(reconnect: Policy());
-        options.PeerCreated = created.Add;
-        QuiclyPeer first = await client.ConnectAsync(f.EndPoint, options, TestContext.Current.CancellationToken);
-        connector.ThrowNext = new SocketException((int)SocketError.HostNotFound);
-        if (!f.RunUntil(client, () => reconnecting.Count == 2, maxMicros: 5_000_000))
+        List<PeerState> peerStates = [];
+        List<bool> canReconnect = [];
+        int handled = 0;
+        client.Reconnecting += (c, info) =>
         {
-            Assert.Fail($"state={client.State}, connects={connector.Connects}, scheduled={reconnecting.Count}, attempt={client.ReconnectAttempt}, "
-                + $"peer={client.Peer?.State}, reason={client.Peer?.CloseReason.Code}, log={string.Join(" | ", log)}");
-        }
-        Assert.Equal(QuiclyErrorCode.InternalError, reconnecting[1].LastReason.Code);
+            reconnecting.Add(info);
+            canReconnect.Add(c.Peer!.CanReconnect); // the probe the client gates the in-place path on
+        };
+        client.Reconnected += (_, info) => reconnected.Add(info);
+        ClientOptions options = f.Options("alice", Policy());
+        options.PeerCreated = peer =>
+        {
+            created.Add(peer);
+            peer.Index = 7;
+            peer.Tag = 0x5EED;
+            peer.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => handled++);
+            peer.StateChanged += (_, _, to) => peerStates.Add(to);
+        };
+        QuiclyPeer first = await client.ConnectAsync(f.EndPoint, options, TestContext.Current.CancellationToken);
+        f.ServerPeerOf(first).SendCopy(new SendHeader(2), [1]);
+        Assert.True(f.RunUntil(client, () => handled == 1));
+        first.GetStatistics(out PeerStatistics before);
+        Assert.True(before.DatagramsReceived > 0);
+
+        connector.Throwing(new SocketException((int)SocketError.HostNotFound));
+        Assert.True(f.RunUntil(client, () => reconnecting.Count == 2, maxMicros: 5_000_000));
+        Assert.Equal(QuiclyErrorCode.InternalError, reconnecting[1].LastReason.Code); // the connector's failure, counted
+        Assert.Equal(new[] { true, true }, canReconnect);                             // still re-armable after it failed
+        Assert.Same(first, client.Peer);
         Assert.True(f.RunUntil(client, () => client.State == PeerState.Connected, maxMicros: 5_000_000));
 
         ReconnectedInfo info = Assert.Single(reconnected);
+        Assert.Same(first, info.Peer);              // the same peer object, resumed in place on the second attempt
+        Assert.Same(first, info.PreviousPeer);
+        Assert.Same(first, client.Peer);
+        Assert.False(first.IsDisposed);
         Assert.True(info.Resumed);
         Assert.Equal(first.SessionId, info.Peer.SessionId);
-        Assert.Equal(2u, info.Peer.Epoch);
-        Assert.NotSame(first, info.Peer); // the peer the connector failed on could not be resumed in place again
+        Assert.Equal(2u, first.Epoch);              // the session was resumed, not started over
+        Assert.Equal(2, info.Attempts);
+        Assert.Equal(3, connector.Connects);        // the first connect, the one that threw, and the resume
+        Assert.Same(first, Assert.Single(created)); // PeerCreated ran once: these are the handlers registered then
+        Assert.Equal(7, first.Index);
+        Assert.Equal(0x5EEDul, first.Tag);
+        Assert.Equal((first.SessionId, 2u), f.ServerAdmitted[^1]);
+        Assert.Equal([PeerState.Closed, PeerState.Reconnecting, PeerState.Handshaking, PeerState.Connected], peerStates[^4..]);
+
+        // The statistics are the peer's, not the connection's, and the handler registered before the loss still receives.
+        first.GetStatistics(out PeerStatistics after);
+        Assert.True(after.DatagramsReceived >= before.DatagramsReceived);
+        f.ServerPeerOf(first).SendCopy(new SendHeader(2), [2]);
+        Assert.True(f.RunUntil(client, () => handled == 2));
+    }
+
+    /// <summary>
+    /// However often the connector fails, every attempt resumes the same peer in place: the peer is re-armable before each of
+    /// them, and the one that finally reaches a transport resumes the session on it.
+    /// </summary>
+    [Fact]
+    public async Task Repeated_Connector_Failures_Keep_Retrying_In_Place()
+    {
+        await using ClientFixture f = new();
+        ScriptedConnector connector = new ScriptedConnector(f.Connector, f.Clock).Then(f.Cutting(100_000));
+        QuiclyClient client = f.CreateClient(connector);
+        List<ReconnectingInfo> reconnecting = [];
+        List<ReconnectedInfo> reconnected = [];
+        List<QuiclyPeer> created = [];
+        List<bool> canReconnect = [];
+        client.Reconnecting += (c, info) =>
+        {
+            reconnecting.Add(info);
+            canReconnect.Add(c.Peer!.CanReconnect);
+        };
+        client.Reconnected += (_, info) => reconnected.Add(info);
+        ClientOptions options = f.Options(reconnect: Policy(attempts: 5));
+        options.PeerCreated = created.Add;
+        QuiclyPeer first = await client.ConnectAsync(f.EndPoint, options, TestContext.Current.CancellationToken);
+        connector.Throwing(new SocketException((int)SocketError.NetworkUnreachable), times: 3);
+
+        Assert.True(f.RunUntil(client, () => reconnected.Count == 1, maxMicros: 10_000_000));
+        Assert.Equal(new[] { 1, 2, 3, 4 }, reconnecting.Select(r => r.Attempt).ToArray());
+        Assert.Equal(new[] { true, true, true, true }, canReconnect); // never left unusable by a failed attempt
+        ReconnectedInfo info = Assert.Single(reconnected);
+        Assert.Same(first, info.Peer);
         Assert.Same(first, info.PreviousPeer);
-        Assert.Equal(2, created.Count);
-        Assert.True(first.IsDisposed);
+        Assert.Same(first, client.Peer);
+        Assert.True(info.Resumed);
+        Assert.Equal(4, info.Attempts);
+        Assert.Equal(2u, first.Epoch);
+        Assert.Equal(5, connector.Connects); // the first connect, three that threw, and the resume
+        Assert.Same(first, Assert.Single(created));
+        Assert.Equal(0, client.ReconnectAttempt);
+    }
+
+    /// <summary>
+    /// The client picks the in-place path by asking <see cref="QuiclyPeer.CanReconnect"/>, not by calling
+    /// <see cref="QuiclyPeer.Reconnect"/> to see whether it throws: a whole lost-connection cycle — the loss, an attempt whose
+    /// connector fails, and the resume — raises no <see cref="InvalidOperationException"/> anywhere, and the probe's answers
+    /// are the ones the client acts on (false while connected, true while the peer waits closed for the next attempt).
+    /// </summary>
+    [Fact]
+    public async Task The_In_Place_Path_Is_Chosen_By_The_Probe_Not_By_Catching()
+    {
+        await using ClientFixture f = new();
+        ScriptedConnector connector = new ScriptedConnector(f.Connector, f.Clock).Then(f.Cutting(100_000));
+        QuiclyClient client = f.CreateClient(connector);
+        List<ReconnectingInfo> reconnecting = [];
+        client.Reconnecting += (_, info) => reconnecting.Add(info);
+        QuiclyPeer first = await client.ConnectAsync(f.EndPoint, f.Options(reconnect: Policy()), TestContext.Current.CancellationToken);
+        Assert.False(first.CanReconnect); // connected: there is nothing to resume
+
+        // The simulation, the server and the client all run on this thread, so no other test's exceptions are counted.
+        List<string> refused = [];
+        int thread = Environment.CurrentManagedThreadId;
+        void Watch(object? sender, FirstChanceExceptionEventArgs e)
+        {
+            if (e.Exception is InvalidOperationException && Environment.CurrentManagedThreadId == thread)
+            {
+                refused.Add(e.Exception.Message);
+            }
+        }
+
+        AppDomain.CurrentDomain.FirstChanceException += Watch;
+        try
+        {
+            connector.Throwing(new SocketException((int)SocketError.NetworkDown));
+            Assert.True(f.RunUntil(client, () => reconnecting.Count == 2, maxMicros: 5_000_000));
+            Assert.True(first.CanReconnect); // the failed attempt left it re-armable; the client asks again before retrying
+            Assert.True(f.RunUntil(client, () => client.State == PeerState.Connected, maxMicros: 5_000_000));
+        }
+        finally
+        {
+            AppDomain.CurrentDomain.FirstChanceException -= Watch;
+        }
+
+        Assert.Empty(refused); // a precondition decided by catching would show up here
+        Assert.Same(first, client.Peer);
+        Assert.Equal(2u, first.Epoch);
+        Assert.False(first.CanReconnect);
     }
 
     [Fact]

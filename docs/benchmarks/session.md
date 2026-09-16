@@ -98,8 +98,13 @@ Messages/s = 10⁹ / Mean, for one core doing both ends and the simulator.
 
 ### Group streams (ReliableUnordered, wave C2b)
 
-Measured 2026-09-16 with `dotnet run -c Release -f net10.0 --project benchmarks/Tedd.Quicly.Benchmarks -- --filter '*Group*'`
-on the machine above (again not idle: another agent was building and testing throughout). Every batch is **one group on one
+Measured 2026-09-16 and **re-measured the same day after the wave C2b review fixes** (the release path, the group list, the
+carrier completion and the receive chunk branch all changed) with
+`dotnet run -c Release -f net10.0 --project benchmarks/Tedd.Quicly.Benchmarks -- --filter '*Group*' '*Ordered64*'`
+on the machine above (again not idle: another agent was building and testing throughout). The table below is the re-run.
+`Ordered64` was included in that invocation as an **in-run control**: it came out at 262.9 ns (Default) and 275.2 ns (in
+process), within noise of the 262.0 / 263.1 ns in the end-to-end table above, so the machine state is comparable to the run that
+produced that table. Every batch is **one group on one
 stream**, so a row includes a stream's whole lifetime — `OpenStream`, the preamble and the `Start` flag, the confirmation, the
 gathered carriers, FIN, the shutdown and the credit coming back — not just the messages. That lifetime is *not* contained in one
 iteration, though: `Deliver` stops as soon as the server has dispatched the batch, which is before that group's carrier
@@ -112,18 +117,27 @@ how often a channel opens a stream in wall-clock time (PROTOCOL.md §3.2) and wo
 
 | Method  | Toolchain              | Mean       | Error      | StdDev    | Messages/s (derived) | Allocated |
 |-------- |----------------------- |-----------:|-----------:|----------:|---------------------:|----------:|
-| Group64 | Default                |   365.0 ns |   126.6 ns |   6.94 ns |  2.74 M (175 MB/s)   |         - |
-| Group4K | Default                | 1,560.4 ns | 1,576.7 ns |  86.42 ns |   641 k (2.6 GB/s)   |         - |
-| Group64 | InProcessEmitToolchain |   341.0 ns |   252.3 ns |  13.83 ns |  2.93 M (188 MB/s)   |         - |
-| Group4K | InProcessEmitToolchain | 1,807.8 ns | 2,999.7 ns | 164.42 ns |   553 k (2.3 GB/s)   |         - |
+| Group64 | Default                |   284.8 ns |   88.04 ns |   4.83 ns |  3.51 M (225 MB/s)   |         - |
+| Group4K | Default                | 1,423.4 ns |  394.37 ns |  21.62 ns |   703 k (2.9 GB/s)   |         - |
+| Group64 | InProcessEmitToolchain |   308.6 ns |   90.54 ns |   4.96 ns |  3.24 M (207 MB/s)   |         - |
+| Group4K | InProcessEmitToolchain | 1,466.4 ns |  286.31 ns |  15.69 ns |   682 k (2.8 GB/s)   |         - |
 
-**Reading.** A 64-byte message on a group stream costs 341–365 ns against 262 ns on the persistent ordered stream: about
-100 ns per message more, which is the per-group stream lifetime spread over the batch's 100 messages (a group of 100 costs
-roughly 10 µs of stream setup and teardown — the teardown being the previous batch's, as the workload note above explains) plus
-the extra pass every group needs before its second carrier, since nothing else goes out until its start is confirmed. That is the price of the mode's promise: no message waits for another's
-retransmission (PROTOCOL.md §3.2). At 4 KiB the difference disappears into the error bars (1.56–1.81 µs against the ordered
-stream's 1.34–1.41 µs; `Group4K`'s ShortRun error is ±1.6 µs, so read it as indicative only) because the stream's fixed cost
-is amortised over 64 KiB of payload. Nothing allocates in either row, which is the same result the unit tests assert over
+The wave C2b run of the same four rows was 365.0 / 1,560.4 / 341.0 / 1,807.8 ns, so every row came out 12–25 % faster. **Do not
+read that as a speed-up from the review fixes:** on the measured path they are neutral at best and slightly more work at worst
+(one extra branch per received chunk, one channel lookup per carrier completion), and the O(1) group release only pays off with
+many live groups, of which this benchmark has one. The earlier run's own error bars say what happened — `Group4K` was ±1.6 µs
+then against ±0.39 µs now — so the first numbers were inflated by whatever else the machine was doing, and the control row above
+is the evidence that today's state is the cleaner one. What matters here is that nothing regressed.
+
+**Reading.** A 64-byte message on a group stream costs 285–309 ns against the same run's 263–275 ns on the persistent ordered
+stream: about 22–33 ns per message more, which is the per-group stream lifetime spread over the batch's 100 messages (a group of
+100 costs a couple of µs of stream setup and teardown — the teardown being the previous batch's, as the workload note above
+explains) plus the extra pass every group needs before its second carrier, since nothing else goes out until its start is
+confirmed. The wave C2b run put that premium at about 100 ns per message; with both modes measured in one invocation it is far
+smaller, and the difference is in the group rows, not the ordered control. That is the price of the mode's promise: no message
+waits for another's retransmission (PROTOCOL.md §3.2). At 4 KiB the difference disappears into the error bars (1.42–1.47 µs
+against the ordered stream's 1.34–1.41 µs from the end-to-end table above, which was not re-run; `Group4K`'s ShortRun error is
+±0.29–0.39 µs, so read it as indicative only) because the stream's fixed cost is amortised over 64 KiB of payload. Nothing allocates in either row, which is the same result the unit tests assert over
 windows of ticks. As everywhere in this file, both peers and the simulator share one core, so these are single-core figures
 with no cross-thread coherence cost.
 

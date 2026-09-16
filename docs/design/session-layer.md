@@ -905,7 +905,12 @@ free list of `Σ max(MaxGroups, 1)` records. The peer's files are untouched; the
   groups, a segment arena too small for a whole group, an immediate send sealing its group inside the call, the send cap handing
   a group over in pieces, the entry-table reserve, a channel whose group records all wait answering `QueueFull`, receive-budget
   back-pressure, cancelling inside a group, closing with carriers in flight, and the transport-thread paths peer input cannot
-  reach).
+  reach, including a `Chunk` outside a staged message). `ReviewGroupTests` holds the wave C2b review findings: a group stream the
+  peer stops releasing its record **exactly once** (the send cap leaves the group holding its stream with nothing in flight,
+  which is the state the double free needed and the delivery suites never reached), a locally opened stream the peer stops
+  reaching the engines exactly once, and a shared lease on a group channel retained and released once per peer (the guard that
+  the engine commits every payload through `EnginePayload.Commit`, which is what takes the reference). `GroupStreamTests` adds a
+  start that fails for a reason other than the stream limit and is retried at the next pass.
 
 Waves:
 

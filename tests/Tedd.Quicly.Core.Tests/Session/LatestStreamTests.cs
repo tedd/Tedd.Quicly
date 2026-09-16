@@ -95,10 +95,10 @@ public class LatestStreamTests
     }
 
     [Fact]
-    public void A_Group_Stream_Beyond_The_Receiver_Limit_Is_Reset_And_The_Value_Is_Delivered_Later()
+    public void Two_Large_Values_Share_A_One_Stream_Channel_Without_Exceeding_Its_Cap()
     {
-        // Two keys send large values at once on a channel that accepts one stream at a time: the second is reset
-        // LimitExceeded (PROTOCOL.md §7) and the retry delivers it once the first stream is gone.
+        // Both peers read the same channel table, so the sender keeps itself inside the channel's concurrent-stream cap
+        // (PROTOCOL.md §7): the second key's value waits for the first stream to shut down instead of being reset.
         using SessionHarness h = Harness(new LinkOptions { DelayMicros = 2_000, BandwidthBitsPerSecond = 8_000_000 });
         List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
         h.Server!.RegisterHandler(8, LatestKit.Collect(received));
@@ -111,6 +111,9 @@ public class LatestStreamTests
         Assert.Equal(2, received.Count(v => v.Payload.Length == 20_000));
         Assert.True(LatestKit.Matches(received.Last(v => v.Key == 1).Payload, 1, 20_000));
         Assert.True(LatestKit.Matches(received.Last(v => v.Key == 2).Payload, 2, 20_000));
+
+        // The receiver never had to reset one of our streams for its MaxGroups limit.
+        Assert.Equal(0, DatagramKit.Statistics(h.Server).StreamsReset);
     }
 
     [Fact]

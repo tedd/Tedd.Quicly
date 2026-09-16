@@ -33,10 +33,17 @@ internal sealed unsafe partial class ReliableLatestEngine
     private int _sweepSlot;
     private long _maxStage;
 
+    private bool _ackDatagramsRefused;
+    private TransportStreamId[] _txStreams = [];
+    private int[] _txLocals = [];
+
     private enum NoticeKind : byte
     {
         Ack = 0,
         Reject = 1,
+
+        /// <summary>A large-value stream this engine opened has shut down; its per-channel slot is free again.</summary>
+        StreamClosed = 2,
     }
 
     /// <summary>Builds the receive-side state (engine construction, game thread).</summary>
@@ -59,6 +66,8 @@ internal sealed unsafe partial class ReliableLatestEngine
 
         _streamCapacity = Math.Max(streams, 1);
         _streams = new NativeArray<LatestRecvStream>(_streamCapacity);
+        _txStreams = new TransportStreamId[_streamCapacity];
+        _txLocals = new int[_streamCapacity];
         _streamFree = new int[_streamCapacity];
         for (int i = 0; i < _streamCapacity; i++)
         {
@@ -509,9 +518,9 @@ internal sealed unsafe partial class ReliableLatestEngine
 
     /// <inheritdoc/>
     /// <remarks>
-    /// Releases what a half-received value held (the peer's mid-message idle sweep resets a stalled stream, PROTOCOL.md §7).
-    /// Events of streams this engine opened itself carry no receive state; the transmission's own completion drives the
-    /// retry, so they are ignored here.
+    /// A stream this engine opened has shut down (or never started): its per-channel slot is handed back to the game thread
+    /// through a notice, because the receiver frees its own slot at the same point. For a peer stream this releases what a
+    /// half-received value held (the peer's mid-message idle sweep resets a stalled stream, PROTOCOL.md §7).
     /// </remarks>
     public override void OnStreamClosed(TransportStreamId id, bool aborted, ulong errorCode)
     {
@@ -534,6 +543,103 @@ internal sealed unsafe partial class ReliableLatestEngine
             _streamFree[_streamFreeCount++] = index;
             return;
         }
+
+        if (!id.IsValid)
+        {
+            return;
+        }
+
+        for (int index = 0; index < _txStreams.Length; index++)
+        {
+            if (_txStreams[index] == id)
+            {
+                _txStreams[index] = default;
+                Post(new LatestNotice { Local = _txLocals[index], Kind = NoticeKind.StreamClosed });
+                return;
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Records a large-value stream this engine opened so that <see cref="OnStreamClosed"/> can recognise it (transport
+    /// thread; the peer routes it here by the context's mode). A start the peer's stream limit refused is followed by the
+    /// canceled completion of its send, which is what schedules the retransmission.
+    /// </remarks>
+    public override void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status)
+    {
+        if (!PeerCore.TryDecodeEngineStreamContext(context, out ChannelMode mode, out int dense, out _)
+            || mode != ChannelMode.ReliableLatest
+            || (uint)dense >= (uint)_localOf.Length)
+        {
+            return;
+        }
+
+        int local = _localOf[dense];
+        if (local < 0)
+        {
+            return;
+        }
+
+        for (int index = 0; index < _txStreams.Length; index++)
+        {
+            if (!_txStreams[index].IsValid)
+            {
+                _txStreams[index] = id;
+                _txLocals[index] = local;
+                return;
+            }
+        }
+    }
+
+    /// <summary>Drops everything the lost connection held (game thread, <see cref="ChannelEngine.OnReconnecting"/>).</summary>
+    private void ResetReceiveForReconnect()
+    {
+        for (int index = 0; index < _streamCapacity; index++)
+        {
+            ref LatestRecvStream stream = ref _streams[index];
+            if (stream.InUse != 0 && !stream.Lease.IsEmpty)
+            {
+                _core.ReturnReceive(in stream.Lease);
+            }
+
+            stream = default;
+            _txStreams[index] = default;
+            _streamFree[index] = _streamCapacity - 1 - index;
+        }
+
+        _streamFreeCount = _streamCapacity;
+        Array.Clear(_activeGroups);
+        Array.Clear(_ackSweep);
+        while (_ackQueue.TryDequeue(out _))
+        {
+        }
+
+        while (_rejectQueue.TryDequeue(out _))
+        {
+        }
+
+        while (_notices.TryDequeue(out _))
+        {
+        }
+
+        // Pending acks name versions of the epoch that ended.
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            LatestRecvKeys keys = _recvKeys[local];
+            int used = keys.SlotsUsed;
+            for (int slot = 0; slot < used; slot++)
+            {
+                Interlocked.Exchange(ref keys.VersionRef(slot), 0);
+            }
+        }
+
+        _heldAck.Local = -1;
+        _heldReject = default;
+        _sweepLocal = -1;
+        _sweepSlot = 0;
+        _nextAckMicros = 0;
+        _ackDatagramsRefused = false;
     }
 
     // ------------------------------------------------------------------ acks the peer sent us (game thread)
@@ -545,6 +651,19 @@ internal sealed unsafe partial class ReliableLatestEngine
         while (ring.TryDequeue(out LatestNotice notice))
         {
             int local = notice.Local;
+            if (notice.Kind == NoticeKind.StreamClosed)
+            {
+                // A large-value stream of ours shut down, so its per-channel slot is free again (the receiver freed its own
+                // at the same point) and a value waiting for credit may go out.
+                if (_openStreams[local] > 0)
+                {
+                    _openStreams[local]--;
+                }
+
+                _streamBlocked[local] = false;
+                continue;
+            }
+
             LatestSendKeys keys = _sendKeys[local];
             if (!keys.TryGet(notice.Key, out int keySlot))
             {
@@ -620,7 +739,9 @@ internal sealed unsafe partial class ReliableLatestEngine
         }
 
         _nextAckMicros = now + _ackDelayMicros;
-        bool datagrams = _core.DatagramsEnabled;
+        // The carrier is chosen before the batch is written, because the two carriers frame a control message differently: a
+        // datagram the transport refused makes the next transmission take the control stream instead (PROTOCOL.md §2.3).
+        bool datagrams = _core.DatagramsEnabled && !_ackDatagramsRefused;
         ControlCarrier carrier = datagrams ? ControlCarrier.Datagram : ControlCarrier.Stream;
         int limit = datagrams ? Math.Min(_core.MaxDatagramPayload, AckFrameBytes) : AckFrameBytes;
         if (limit <= 8)
@@ -685,70 +806,15 @@ internal sealed unsafe partial class ReliableLatestEngine
             return;
         }
 
-        if (carrier == ControlCarrier.Stream)
+        if (_core.SendControlFrame(buffer.Slice(0, length), carrier))
         {
-            _core.SendControlFrame(buffer.Slice(0, length), ControlCarrier.Stream);
+            _ackDatagramsRefused = false;
             return;
         }
 
-        if (!_core.SendControlFrame(buffer.Slice(0, length), ControlCarrier.Datagram))
-        {
-            // No datagram could carry it, so the batch is re-encoded for the control stream (PROTOCOL.md §2.3): the two
-            // carriers frame a control message differently, so the datagram's bytes cannot simply be written to the stream.
-            ResendOnStream(buffer.Slice(0, length));
-        }
-    }
-
-    private void ResendOnStream(ReadOnlySpan<byte> frame)
-    {
-        if (ControlCodec.TryReadDatagram(frame, out ControlType type, out ReadOnlySpan<byte> body, out _) != ControlParseStatus.Ok)
-        {
-            return;
-        }
-
-        Span<byte> stream = stackalloc byte[AckFrameBytes + 8];
-        int written;
-        if (type == ControlType.LatestAck)
-        {
-            if (ControlCodec.TryParse(body, out LatestAckBatchReader acks) != ControlParseStatus.Ok)
-            {
-                return;
-            }
-
-            LatestAckBatchWriter writer = new(stream, ControlCarrier.Stream);
-            foreach (LatestAckEntry entry in acks)
-            {
-                if (!writer.TryAdd(in entry))
-                {
-                    break;
-                }
-            }
-
-            written = writer.Finish();
-        }
-        else
-        {
-            if (ControlCodec.TryParse(body, out LatestRejectBatchReader rejects) != ControlParseStatus.Ok)
-            {
-                return;
-            }
-
-            LatestRejectBatchWriter writer = new(stream, ControlCarrier.Stream);
-            foreach (LatestRejectEntry entry in rejects)
-            {
-                if (!writer.TryAdd(in entry))
-                {
-                    break;
-                }
-            }
-
-            written = writer.Finish();
-        }
-
-        if (written > 0)
-        {
-            _core.SendControlFrame(stream.Slice(0, written), ControlCarrier.Stream);
-        }
+        // The batch is lost: the sender's timer retransmits the value and the duplicate is re-acked (PROTOCOL.md §4.4), and
+        // the next coalesced transmission goes on the control stream.
+        _ackDatagramsRefused = carrier == ControlCarrier.Datagram;
     }
 
     /// <summary>Takes the next key whose ack is due: the held one, then the ring, then a sweep after a ring overflow.</summary>

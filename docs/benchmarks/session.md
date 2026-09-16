@@ -207,7 +207,8 @@ machine: `Ordered64` measured 331 / 398 ns (out of process / in process) with V0
 ## ReliableLatest: what a keyed value costs (wave C2a)
 
 `LatestBench` (added with the `ReliableLatest` engine, docs/design/session-layer.md §7.5) measures the mode's own cycle on
-the same machine and with the same `InProcessShortRunConfig` as the tables above, on net10.0 (measured 2026-09-16). One
+the same machine and with the same `InProcessShortRunConfig` as the tables above, on net10.0 (measured 2026-09-16, re-run
+after the session hooks were merged). One
 operation is one *value*: the key's slot lookup, the version from the channel's counter, the value entry with its payload
 lease, one transmission handed to the packer (packed with the other keys' values into containers), the transport, the
 receiving side's per-key acceptance and mailbox post, dispatch to the handler, the peer's coalesced `LatestAck` batch and the
@@ -216,20 +217,25 @@ completion it produces. Channel 2 is a `ReliableLatest` channel with a dense key
 
 | Method         | Toolchain              | Mean     | Error     | StdDev   | Values/s (derived) | Allocated |
 |--------------- |----------------------- |---------:|----------:|---------:|-------------------:|----------:|
-| Latest1000Keys | Default                | 471.8 ns |  92.50 ns |  5.07 ns |             2.12 M |         - |
-| Latest64Keys   | Default                | 470.9 ns | 633.10 ns | 34.70 ns |             2.12 M |         - |
-| Latest1000Keys | InProcessEmitToolchain | 610.4 ns |  26.88 ns |  1.47 ns |             1.64 M |         - |
-| Latest64Keys   | InProcessEmitToolchain | 564.4 ns | 112.82 ns |  6.18 ns |             1.77 M |         - |
+| Latest1000Keys | Default                | 606.4 ns | 186.69 ns | 10.23 ns |             1.65 M |         - |
+| Latest64Keys   | Default                | 560.9 ns | 295.61 ns | 16.20 ns |             1.78 M |         - |
+| Latest1000Keys | InProcessEmitToolchain | 479.8 ns |  85.52 ns |  4.69 ns |             2.08 M |         - |
+| Latest64Keys   | InProcessEmitToolchain | 463.8 ns | 176.42 ns |  9.67 ns |             2.16 M |         - |
+
+An earlier valid run of the same benchmark — before the session hooks were merged and before the engine started limiting
+its own large-value streams — reported 471.8 / 470.9 ns out of process and 610.4 / 564.4 ns in process: the two runs
+straddle each other and the toolchains swapped places, with error bars of ±86 … ±633 ns. **The honest reading is therefore
+0.46 … 0.61 µs per value, about 1.6 … 2.2 M values per second on one core, with no allocation** — not a figure to quote to
+three digits. What both runs agree on is the shape of the cost, below.
 
 ### Reading
 
-* **No allocation per value, end to end**, in both jobs: admission with the per-key slot, the transmission, the mailbox
-  receive, the ack batch and the completions. `LatestZeroAllocationTests` asserts the same thing over five windows of 60
-  ticks with 1 000 keys (and a second workload that supersedes and retires keys every tick).
-* **The per-value cost dominates**: 1 000 keys cost the same per value as 64 out of process (471.8 vs 470.9 ns), so the
-  per-pass work (the scheduler pass, the container submissions, the ack batches) is already amortised at 64 keys. The
-  in-process rows differ by 8 % in the other direction, which is inside their own error bars.
-* **About 1.8 × a packed unreliable datagram** (471.8 vs 239.8 ns for `Unreliable64Packed`). The extra work per value is the
+* **No allocation per value, end to end**, in both jobs and both runs: admission with the per-key slot, the transmission, the
+  mailbox receive, the ack batch and the completions. `LatestZeroAllocationTests` asserts the same thing over five windows of
+  60 ticks with 1 000 keys (and a second workload that supersedes and retires 32 keys every tick).
+* **The per-value cost dominates**: 1 000 keys cost within 8 % of 64 keys per value in every row of both runs, so the
+  per-pass work (the scheduler pass, the container submissions, the ack batches) is already amortised at 64 keys.
+* **About 2 × a packed unreliable datagram** (0.46–0.61 µs vs 239.8 ns for `Unreliable64Packed`). The extra work per value is the
   key slot and version bookkeeping, the second send entry (the value keeps its payload for retransmission while the
   transmission carries it), the receiver's per-key version check and mailbox post instead of a ring entry, and the ack: one
   entry written into the peer's batch, one control datagram per ~170 keys, and the completion it decides.

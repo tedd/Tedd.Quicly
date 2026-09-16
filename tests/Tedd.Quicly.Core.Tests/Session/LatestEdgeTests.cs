@@ -479,6 +479,75 @@ public class LatestEdgeTests
     }
 
     [Fact]
+    public void Reconnecting_Drops_Everything_The_Lost_Connection_Held()
+    {
+        using SessionHarness h = Harness(client: LatestKit.Roomy, server: LatestKit.Roomy,
+            link: new LinkOptions { DelayMicros = 2_000, BandwidthBitsPerSecond = 2_000_000 });
+        DatagramKit.TransportOf(h.Client).DropNextDatagrams(4);
+        h.Client.SendCopy(new SendHeader(2, 61), LatestKit.Payload(1, 64));
+        h.Client.SendCopy(new SendHeader(2, 62), LatestKit.Payload(2, 40_000));
+        h.Run(30_000);
+        Assert.True(LatestKit.LiveKeys(h.Client, 2) > 0, "no key was live");
+        long staged = DatagramKit.Statistics(h.Server!).ReceiveBytesOutstanding;
+        Assert.True(staged > 1_000, $"only {staged} bytes were staged, so the large value was not in flight");
+
+        // The hook is called here directly (a real resume completes every value Disconnected first, PROTOCOL.md §4.1): what
+        // it must do is forget the lost connection's streams, queues and keys, and release what the peer's group streams
+        // staged. Values already sitting in a mailbox belong to the peer's own reconnect step (ReleaseAllReceived).
+        LatestKit.Engine(h.Client).OnReconnecting();
+        LatestKit.Engine(h.Server!).OnReconnecting();
+        Assert.Equal(0, LatestKit.LiveKeys(h.Client, 2));
+        Assert.True(DatagramKit.Statistics(h.Server!).ReceiveBytesOutstanding < staged / 2,
+            $"{DatagramKit.Statistics(h.Server!).ReceiveBytesOutstanding} bytes of {staged} are still staged");
+    }
+
+    [Fact]
+    public void Admission_Refuses_When_The_Send_Table_Reserve_Is_Reached()
+    {
+        using SessionHarness h = Harness(client: o => o.SendTableCapacity = 16);
+        SendStatus last = SendStatus.Admitted;
+        int admitted = 0;
+        for (ulong key = 0; key < 64 && last == SendStatus.Admitted; key++)
+        {
+            last = h.Client.SendCopy(new SendHeader(2, key), LatestKit.Payload(1, 16)).Status;
+            admitted += last == SendStatus.Admitted ? 1 : 0;
+        }
+
+        // The reserve keeps entries for the transmissions that drain the queue, so a full table cannot deadlock.
+        Assert.Equal(SendStatus.QueueFull, last);
+        Assert.InRange(admitted, 1, 16);
+        h.Run(500_000);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2, 0), LatestKit.Payload(2, 16)).Status);
+    }
+
+    [Fact]
+    public void An_Owned_Lease_That_Compresses_Goes_Back_At_Admission()
+    {
+        using SessionHarness h = Harness();
+        List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
+        h.Server!.RegisterHandler(5, LatestKit.Collect(received));
+        BufferLease lease = h.Client.RentBuffer(512);
+        h.Client.GetBufferSpan(in lease).Clear();
+        long outstanding = DatagramKit.Statistics(h.Client).SendBytesOutstanding;
+
+        // Channel 5 compresses: the value keeps the LZ4 block and the caller's lease goes straight back to the pool.
+        Assert.Equal(SendStatus.Admitted, h.Client.SendOwned(new SendHeader(5, 1), lease, 512).Status);
+        Assert.True(DatagramKit.Statistics(h.Client).SendBytesOutstanding < outstanding + 512, "the owned lease was not returned");
+        Assert.True(h.RunUntil(() => received.Count == 1), "the compressed value did not arrive");
+        Assert.Equal(512, received[0].Payload.Length);
+    }
+
+    [Fact]
+    public void Retiring_A_Key_Without_A_Control_Stream_Reports_NotConnected()
+    {
+        using SessionHarness h = Harness();
+        ReliableLatestEngine engine = LatestKit.Engine(h.Client);
+        h.Client.Close();
+        Assert.True(h.RunUntilClosed(), "the session did not close");
+        Assert.Equal(SendStatus.NotConnected, engine.RetireKey(Table[2]!, 1));
+    }
+
+    [Fact]
     public void Retiring_A_Key_Whose_Value_The_Application_Has_Not_Polled_Reports_The_Retirement()
     {
         using SessionHarness h = Harness();

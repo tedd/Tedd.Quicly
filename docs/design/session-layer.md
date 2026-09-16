@@ -857,12 +857,24 @@ state of the peer's group streams. Every per-key array grows with the slots in u
   `RetryShareOfEstimatedBandwidth` × (congestion window ÷ RTT) when the transport reports one; with neither, only the
   per-version budget applies. `Tick` moves due keys to the retry queue and keeps each channel's earliest deadline, so a pass
   that is not due costs one comparison per channel.
-* **Large values.** A value whose header + payload exceeds the current `MaxDatagramPayload` goes out as one group stream
+* **Large values.** A value whose header + payload exceeds the pass's `MaxDatagramPayload` goes out as one group stream
   (PROTOCOL.md §3.2, §8 item 8): `WriteGroupPreamble(channel, version)` + the frame `Length, Sequence = version, Key,
   RawLength` in the transmission's own header block, the value's payload as the second segment of the entry's own pair, one
   `SubmitStream` with `Start | Fin`. The packer's pending container is handed over first, as on ordered channels. A refused
   start (`StreamLimitReached`) releases the stream with `CloseStream` and the value waits until `StreamCreditGeneration`
   changes; a newer version aborts the older stream of the same key.
+* **The channel's stream cap binds the sender too.** Both peers read the same channel table, so opening more than
+  `MaxGroups` streams on a channel would make the *receiver* reset a live stream of ours (PROTOCOL.md §7) — silent loss of a
+  value we believe is on its way. The engine therefore counts its own open streams per channel and holds a large value back
+  until one shuts down. The slot is released at **shutdown**, not when the send completes: the receiver frees its own slot at
+  the same point, so counting the completion would allow one stream more than it still holds. The transport thread posts the
+  shutdown (and a start the peer refused) as a notice, which the game thread applies together with the acks.
+* **Reconnect** (`OnReconnecting`, session-layer.md §4.8). Everything bound to the lost transport is dropped: the per-key
+  large-value streams, the per-channel stream counts and credit generation, both queues, the notices the transport thread had
+  handed over, the pending ack versions and the half-received values of the peer's group streams (their staging leases go
+  back). The peer completes every live value `Disconnected` before the hook runs, so the re-queue of PROTOCOL.md §4.1 applies
+  to whatever is still live when `OnEpochReset(resumed: true)` runs — on an in-place resume that is nothing, and the
+  application resends; the re-queue matters for a host that drives a new epoch without losing the values.
 * **Receive** (transport thread). Only a version newer than the key's last accepted one is accepted (serial arithmetic, 32
   bits), into the key's mailbox — ReliableLatest always coalesces, so it uses **no receive-ring entry and no reservation**
   (PROTOCOL.md §7, ADR 0008 invariant 6) and the `TryReserveReceive`/`PublishReserved` protocol does not apply. An older or
@@ -877,8 +889,10 @@ state of the peer's group streams. Every per-key array grows with the slots in u
   non-zero previous value means the key is already queued, so the SPSC ring of (channel, key slot) holds at most one entry per
   key; the ring is bounded at 1 024 keys (8 KiB) whatever `MaxKeys` is, and when it overflows a per-channel sweep flag makes
   the game thread walk that channel's slots instead, so no ack is stranded. The game thread sends them in the engine's `Flush`: at most one coalesced transmission per peer per
-  `PeerOptions.AckDelay` (default 5 ms), LatestAck first and then LatestReject, as high-priority control datagrams with the
-  control stream as the fallback, de-duplicated per key by construction (one pending version per key, the highest). A
+  `PeerOptions.AckDelay` (default 5 ms), LatestAck first and then LatestReject, as high-priority control datagrams,
+  de-duplicated per key by construction (one pending version per key, the highest). The carrier is chosen *before* the batch
+  is written, because the two carriers frame a control message differently: a datagram the transport refuses costs that batch
+  (the sender's timer retransmits and the duplicate is re-acked) and the next transmission goes on the control stream. A
   transmission whose batch does not fit one datagram continues in further datagrams, at most
   `MaxAckDatagramsPerPass` = 8 per transmission (about 1 300 keys), which is what a 1 000-key channel needs; `NextDeadline`
   is lowered to the next ack time so a host that sleeps still acks in time.

@@ -95,15 +95,14 @@ public class LatestZeroAllocationTests
         long received = 0;
         server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
         byte[] payload = new byte[64];
-        ulong generation = 0;
         void Tick()
         {
-            // Two values per key in the same tick (the first is superseded before it is submitted), then the keys are retired.
+            // Two values per key in the same tick (the first is superseded before it is submitted), then the keys are retired
+            // and used again next tick, so the key tables and their slots stay at a steady size.
             for (ulong key = 0; key < 32; key++)
             {
-                ulong id = (generation * 32) + key;
-                client.SendCopy(new SendHeader(2, id), payload);
-                client.SendCopy(new SendHeader(2, id), payload);
+                client.SendCopy(new SendHeader(2, key), payload);
+                client.SendCopy(new SendHeader(2, key), payload);
             }
 
             client.Flush();
@@ -113,10 +112,9 @@ public class LatestZeroAllocationTests
             client.Poll();
             for (ulong key = 0; key < 32; key++)
             {
-                client.RetireKey(2, (generation * 32) + key);
+                client.RetireKey(2, key);
             }
 
-            generation++;
             client.Flush();
             network.Advance(16_667);
             server.Poll();
@@ -124,7 +122,7 @@ public class LatestZeroAllocationTests
             client.Poll();
         }
 
-        for (int i = 0; i < 400; i++)
+        for (int i = 0; i < 600; i++)
         {
             Tick();
         }
@@ -136,7 +134,7 @@ public class LatestZeroAllocationTests
                 Tick();
             }
         });
-        Assert.True(received > 400 * 32, $"{received} values");
+        Assert.True(received > 600 * 32, $"{received} values");
         Assert.Equal(PeerState.Connected, client.State);
     }
 }

@@ -84,6 +84,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     private int[] _localOf = [];
     private int[] _denseOf = [];
     private bool[] _streamBlocked = [];
+    private int[] _openStreams = [];
     private LatestSendKeys[] _sendKeys = [];
     private NativeArray<LatestSendState> _send = null!;
     private TokenBucket _retryBucket;
@@ -128,6 +129,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         Array.Fill(_localOf, -1);
         _denseOf = new int[count];
         _streamBlocked = new bool[count];
+        _openStreams = new int[count];
         _sendKeys = new LatestSendKeys[count];
         _send = new NativeArray<LatestSendState>(Math.Max(count, 1));
         InitializeReceive(core, count);
@@ -826,6 +828,14 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             return false;
         }
 
+        // Both peers read the same channel table, so the channel's concurrent-stream cap binds the sender too: opening one
+        // more than MaxGroups would make the receiver reset a live stream of ours (PROTOCOL.md §7). The value waits instead.
+        if (_openStreams[local] >= Math.Max(channel.MaxGroups, 1))
+        {
+            _core.DiscardEntry(transmission);
+            return false;
+        }
+
         uint version = entries.Sequences[value];
         uint serial = (send.StreamSerial + 1) & PeerCore.EngineStreamSerialMask;
         ulong context = PeerCore.MakeEngineStreamContext(ChannelMode.ReliableLatest, _denseOf[local], serial);
@@ -875,6 +885,10 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         }
 
         _streamBlocked[local] = false;
+
+        // The slot is held until the stream shuts down, not until this send completes: the receiver frees its own slot at
+        // shutdown, so counting the send would let us open one more stream than it still holds.
+        _openStreams[local]++;
         long bytes = written + header.Length;
         flush.BudgetBytes -= bytes;
         flush.BytesSubmitted += bytes;
@@ -1184,6 +1198,49 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         }
 
         ResetReceiveState();
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Everything bound to the lost transport goes: the per-key large-value streams and the per-channel stream counts, the
+    /// queues (the peer completed every value <see cref="DeliveryStatus.Disconnected"/> before this call), the notices the
+    /// transport thread had handed over, and the half-received values of the peer's group streams. The session's own rules —
+    /// the version counters and the re-queue of the keys still live — belong to <see cref="OnEpochReset"/>, which runs when
+    /// the resume is accepted. Nothing here queues a completion or touches the transport.
+    /// </remarks>
+    public override void OnReconnecting()
+    {
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            ref LatestSendState send = ref _send[local];
+            send.PendingHead = -1;
+            send.PendingTail = -1;
+            send.RetryHead = -1;
+            send.RetryTail = -1;
+            send.PendingCount = 0;
+            send.PendingBytes = 0;
+            send.InFlightCount = 0;
+            send.InFlightBytes = 0;
+            send.NextRetryMicros = long.MaxValue;
+            send.CreditGeneration = 0;
+            send.LiveKeys = 0;
+            _streamBlocked[local] = false;
+            _openStreams[local] = 0;
+            LatestSendKeys keys = _sendKeys[local];
+            int keySlot = keys.ArmedHead;
+            while (keySlot >= 0)
+            {
+                int next = keys.ArmedNext(keySlot);
+                ref KeySendSlot key = ref keys[keySlot];
+                key.InFlightEntry = -1;
+                key.Flags = KeySendFlags.None;
+                key.LargeValueStream = default;
+                keys.Disarm(keySlot);
+                keySlot = next;
+            }
+        }
+
+        ResetReceiveForReconnect();
     }
 
     /// <summary>Re-stamps a live value with a new version of the new epoch and re-arms its budget.</summary>

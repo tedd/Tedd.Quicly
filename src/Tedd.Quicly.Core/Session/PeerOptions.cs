@@ -92,6 +92,19 @@ public sealed class PeerOptions
     /// </summary>
     public TimeSpan StreamIdleTimeout { get; set; } = TimeSpan.FromSeconds(30);
 
+    // ---- region added by wave C2b (ReliableUnordered group streams)
+
+    /// <summary>
+    /// Shortest time between two group streams of one <see cref="ChannelMode.ReliableUnordered"/> channel
+    /// (PROTOCOL.md §3.2 <c>GroupMinIntervalMicros</c>): while the interval has not passed the channel's open group keeps
+    /// collecting messages instead of opening another stream, which bounds stream churn. A message sent with
+    /// <see cref="SendMode.Immediate"/> opens its group's stream at once. <see cref="TimeSpan.Zero"/> disables the bound.
+    /// Default 1 ms.
+    /// </summary>
+    public TimeSpan GroupMinInterval { get; set; } = TimeSpan.FromMilliseconds(1);
+
+    // ---- end of the wave C2b region
+
     /// <summary>
     /// After Close is sent, how long the peer waits for the control stream to deliver it before closing the transport
     /// anyway. Default 1 s.
@@ -213,6 +226,7 @@ public sealed class PeerOptions
         CheckNonNegative(FastLockDuration, nameof(FastLockDuration));
         CheckNonNegative(HeartbeatTimeout, nameof(HeartbeatTimeout));
         CheckNonNegative(StreamIdleTimeout, nameof(StreamIdleTimeout));
+        CheckNonNegative(GroupMinInterval, nameof(GroupMinInterval));
         CheckNonNegative(CloseLinger, nameof(CloseLinger));
         CheckNonNegative(SessionGrace, nameof(SessionGrace));
         if (MaxSendBytesPerSecond < 0 || BulkMaxBytesPerSecond < 0)

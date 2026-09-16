@@ -186,6 +186,13 @@ public sealed class BulkTransfer
             return;
         }
 
+        // Already finished: leave the outcome the first caller published alone. Without this a late second call — a close
+        // path running after a completion already landed — would overwrite Result while Status correctly kept the first.
+        if (Volatile.Read(ref _status) != (int)BulkStatus.Running)
+        {
+            return;
+        }
+
         // The status word publishes the result: a reader that sees a terminal status sees the result written before it.
         _result = result;
         if (Interlocked.CompareExchange(ref _status, (int)result.Status, (int)BulkStatus.Running) != (int)BulkStatus.Running)

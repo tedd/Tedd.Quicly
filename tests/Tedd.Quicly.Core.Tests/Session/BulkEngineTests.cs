@@ -18,6 +18,114 @@ namespace Tedd.Quicly.Core.Tests.Session;
 public class BulkEngineTests
 {
     [Fact]
+    public void A_Transfer_Object_Finishes_Exactly_Once()
+    {
+        BulkTransfer transfer = new(new BulkDescriptor(5, 1, 1, 10), transferId: 1, length: 10);
+
+        // Running is not a terminal state, so it is not an outcome and does not complete anything.
+        transfer.Finish(new BulkResult(BulkStatus.Running, 5, BulkHashState.None, QuiclyErrorCode.NoError));
+        Assert.Equal(BulkStatus.Running, transfer.Status);
+        Assert.False(transfer.Completion.IsCompleted);
+
+        transfer.Advance(4);
+        Assert.Equal(4, transfer.BytesTransferred);
+        Assert.Equal(0.4, transfer.Progress);
+
+        transfer.Finish(new BulkResult(BulkStatus.Completed, 10, BulkHashState.Verified, QuiclyErrorCode.NoError));
+        Assert.Equal(BulkStatus.Completed, transfer.Status);
+        Assert.Equal(10, transfer.BytesTransferred);
+        Assert.Equal(BulkHashState.Verified, transfer.Result.Hash);
+
+        // A second outcome — a close path arriving after the completion — leaves the first one exactly as it was.
+        transfer.Finish(new BulkResult(BulkStatus.Failed, 0, BulkHashState.Mismatch, QuiclyErrorCode.BulkCanceled));
+        Assert.Equal(BulkStatus.Completed, transfer.Status);
+        Assert.Equal(10, transfer.BytesTransferred);
+        Assert.Equal(BulkHashState.Verified, transfer.Result.Hash);
+        Assert.Equal(QuiclyErrorCode.NoError, transfer.Result.Code);
+
+        // A transfer with no engine behind it still records the request, so a later Cancel is inert rather than a throw.
+        transfer.Cancel();
+        Assert.True(transfer.CancelRequested);
+    }
+
+    [Fact]
+    public void A_Router_Need_Not_Handle_A_Rejected_Request()
+    {
+        // The default interface method exists so a router that only selects targets still compiles and is callable.
+        IBulkRouter router = new TargetOnlyRouter();
+        router.OnRequestRejected(new BulkRangeRequest(5, 1, 1, 0, 10), QuiclyErrorCode.BulkRejected);
+        Assert.True(router.SelectTarget(default).Accepted);
+    }
+
+    private sealed class TargetOnlyRouter : IBulkRouter
+    {
+        public BulkReceiveDecision SelectTarget(in BulkTransferInfo info) => BulkReceiveDecision.Accept(new CountingSink());
+    }
+
+    [Fact]
+    public void A_Corrupt_Compressed_Chunk_Resets_Its_Stream()
+    {
+        AcceptRouter router = AcceptRouter.Memory(4096);
+        using ServerHarness h = new(link: new LinkOptions { DelayMicros = 1_000 }, table: BulkTables.Main, server: BulkKit.Receiver(router));
+        Assert.True(h.Admit(), "the raw client was not admitted");
+
+        // A chunk that claims to decode to 4 096 bytes but is not a valid LZ4 block: the staged bytes are consumed, so the
+        // transfer's stream is reset rather than pended, and both its leases go back (PROTOCOL.md §6).
+        BulkHeader header = new()
+        {
+            TransferId = 1,
+            ObjectId = 1,
+            ObjectVersion = 1,
+            TotalLength = 4096,
+            Offset = 0,
+            Length = 4096,
+            Flags = BulkFlags.Chunked,
+        };
+        byte[] garbage = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        byte[] body = new byte[16 + garbage.Length];
+        int position = StreamFraming.WriteBulkChunkHeader(body, garbage.Length, 4096);
+        garbage.CopyTo(body.AsSpan(position));
+
+        long resets = h.Statistics().StreamsReset;
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(BulkKit.BulkStream(5, in header, body.AsSpan(0, position + garbage.Length)), out _));
+        Assert.True(h.RunUntil(() => h.Statistics().StreamsReset > resets), "the corrupt chunk was not reset");
+
+        Assert.Single(router.Accepted);
+        Assert.Equal(BulkStatus.Failed, router.Sink<MemorySink>().Result!.Value.Status);
+        Assert.Equal(0, h.Statistics().ReceiveBytesOutstanding);
+        Assert.Equal(PeerState.Connected, h.Server!.State);
+    }
+
+    [Fact]
+    public void A_Chunk_Longer_Than_Its_Header_Promised_Resets_Its_Stream()
+    {
+        AcceptRouter router = AcceptRouter.Memory(4096);
+        using ServerHarness h = new(link: new LinkOptions { DelayMicros = 1_000 }, table: BulkTables.Main, server: BulkKit.Receiver(router));
+        Assert.True(h.Admit(), "the raw client was not admitted");
+
+        // Two uncompressed chunks whose decoded sizes exceed the transfer's Length: the second is more than the header
+        // promised, which the engine refuses even though the parser bounds it too.
+        BulkHeader header = new()
+        {
+            TransferId = 2,
+            ObjectId = 1,
+            ObjectVersion = 1,
+            TotalLength = 8,
+            Offset = 0,
+            Length = 8,
+            Flags = BulkFlags.Chunked,
+        };
+        byte[] body = BulkKit.RawChunks(new byte[8], new byte[8]);
+
+        long resets = h.Statistics().StreamsReset;
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(BulkKit.BulkStream(5, in header, body), out _));
+        Assert.True(h.RunUntil(() => h.Statistics().StreamsReset > resets), "the overlong body was not reset");
+
+        Assert.Equal(0, h.Statistics().ReceiveBytesOutstanding);
+        Assert.Equal(PeerState.Connected, h.Server!.State);
+    }
+
+    [Fact]
     public async Task Beginning_A_Transfer_Validates_Its_Descriptor()
     {
         using SessionHarness h = new(table: BulkTables.Main, client: BulkKit.Quiet, server: BulkKit.Quiet);

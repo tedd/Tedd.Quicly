@@ -308,6 +308,57 @@ than replaced, because no run separates the three. What they all agree on is the
   transport-thread → game-thread hand-offs (mailboxes, the ack ring, the completion ring) cost no cross-core coherence here.
   Another agent was building and testing on the machine during the run.
 
+## Bulk: what a megabyte costs (wave C2c)
+
+`BulkBench` (added with the `Bulk` engine, docs/design/session-layer.md §7.7) transfers a 4 MiB object end to end over a
+zero-delay simulated link, with and without chunked LZ4 compression, on the machine above and with the same
+`InProcessShortRunConfig`, on net10.0 (measured 2026-09-16). Run with
+
+```
+dotnet run -c Release -f net10.0 --project benchmarks/Tedd.Quicly.Benchmarks -- --filter '*Bulk*'
+```
+
+`OperationsPerInvoke` is the object's size in MiB, so **`Mean` is the time per MiB** and throughput is
+`1.048576e9 / Mean(ns)` MB/s. One operation is a whole transfer's share of a megabyte: the stream's open at priority
+band 0, the reads from the application's `IBulkSource` into pooled blocks, the §3.3 header and the body framing, the
+transport, the progressive write into the application's `IBulkSink`, the receiver's `BulkProgress` (one per 64 KiB
+accepted) and the completions — and, because the measurement runs until the transfer's record is released, the stream's
+FIN and shutdown as well.
+
+| Method         | Toolchain              | Mean       | Error    | StdDev   | MB/s (derived) | Allocated |
+|--------------- |----------------------- |-----------:|---------:|---------:|---------------:|----------:|
+| BulkRaw        | Default                |   970.3 µs | 469.9 µs | 25.76 µs |      1 081 MB/s |      72 B |
+| BulkCompressed | Default                | 1,138.8 µs | 259.8 µs | 14.24 µs |        921 MB/s |      72 B |
+| BulkRaw        | InProcessEmitToolchain | 1,076.3 µs | 305.5 µs | 16.75 µs |        974 MB/s |      72 B |
+| BulkCompressed | InProcessEmitToolchain | 1,259.9 µs | 675.4 µs | 37.02 µs |        832 MB/s |      80 B |
+
+### Reading
+
+* **About 0.8–1.1 GB/s of object bytes on one core**, for both peers and the simulator together — the single-core caveat
+  of the tables above applies unchanged. A bulk transfer is two copies of every byte (the source into a pooled block, the
+  block into the application's target) plus the framing and the stream, which is what puts it in the same range as the
+  ordered stream's 2.9–3.0 GB/s for 4 KiB messages: bulk pays a per-object stream lifetime and a progress frame per
+  64 KiB where the ordered channel amortises one persistent stream over everything.
+* **Compression costs about 15–20 % here, and that is the expected result on this link.** The chunked body puts roughly a
+  tenth of the bytes on the wire, but the wire is an in-memory simulator with no delay and no bandwidth limit, so LZ4
+  compressing every 64 KiB chunk on the send side and decompressing it on the receive side is pure added CPU. The trade
+  only pays where the bytes saved are bytes that would have queued: `A_Chunked_Compressed_Body_Round_Trips_And_Shrinks_The_Wire`
+  asserts the wire really shrinks (`StreamBytesSent` below half the object), and it is a capped or metered link that turns
+  that into time saved.
+* **72–80 B per MiB is per *object*, not per byte**: one `BulkTransfer` and its `TaskCompletionSource` per 4 MiB transfer
+  (about 290 B), which amortises to the figure above. The streaming path itself allocates nothing, which
+  `BulkZeroAllocationTests` asserts over five windows of passes in the middle of a transfer, for the raw and the chunked
+  body alike.
+* **Caveat: the control-message limit is part of this workload, and both peers keep the 2 000/s default.** The receiver
+  owes one `BulkProgress` per 64 KiB accepted (PROTOCOL.md §2.3), so the benchmark advances the virtual clock 4 ms per
+  pass and holds 256 KiB outstanding, which keeps that traffic near 1 000/s. The first run of this benchmark was
+  **discarded**: it gave each peer its own `VirtualClock`, copied from `GroupStreamBench` where it is harmless because
+  group streams send no control traffic at all. A peer whose clock never advances can never refill its control-message
+  bucket, so the session closed with `LimitExceeded` part way through and the remaining invocations measured a dead
+  session — `BulkRaw`, which sends the most progress frames, failed outright while `BulkCompressed` still reported a
+  number. Both peers now share the network's clock, and `Transfer` fails the run if a transfer ends in any state but
+  `Completed` or leaves its record behind, so a run that stopped transferring cannot produce numbers.
+
 ## Allocation
 
 Besides the *Allocated* columns, the steady-state tests assert zero bytes allocated with

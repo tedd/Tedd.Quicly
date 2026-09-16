@@ -309,11 +309,14 @@ public sealed class QuiclyServer : IAsyncDisposable
 {
     public QuiclyServer(ServerOptions options, ITransportListenerFactory listener);
     public ValueTask StartAsync(CancellationToken ct);
-    public int PollAll(int maxItems = int.MaxValue);          // drains every peer with pending work (tracked by a work queue, idle peers cost nothing)
+    public int PollAll(int maxItems = int.MaxValue);          // polls the peers the work signal marked (gated on HasPendingWork) and those whose poll deadline is due; idle peers cost nothing
+    public void FlushAll(uint tick = 0);                       // PollAll also brings a flush forward to NextFlushDeadlineMicros
+    public long NextPollDeadlineMicros { get; }                // sleep the polling loop on this (peers' timers + session expiry)
+    public long NextFlushDeadlineMicros { get; }               // engine work and the auto-flush schedule
     public ReadOnlySpan<PeerSlot> Peers { get; }               // dense, generation-tagged
     public QuiclyPeer? GetPeer(int index);
     public PeerSet CreateSet();                                 // bitset over peer indices
-    public SharedSendResult SendShared(PeerSet set, in SendHeader h, SharedLease lease, int length, SendOptions o = default); // admitted/rejected masks
+    public SharedSendResult SendShared(PeerSet set, in SendHeader h, SharedLease lease, int length, SendOptions o = default); // admitted/rejected masks; each peer retains and releases its own reference
     public event Action<QuiclyPeer>? PeerAdmitted;             // raised from PollAll
     public event Action<QuiclyPeer, CloseReason>? PeerClosed;  // raised from PollAll
 }
@@ -327,7 +330,12 @@ public interface IAdmissionPolicy
 public sealed class QuiclyClient
 {
     public ValueTask<QuiclyPeer> ConnectAsync(EndPoint endpoint, ClientOptions options, CancellationToken ct);
-    // ReconnectPolicy: attempts, back-off, browser-suspend awareness; raises PeerState.Reconnecting → Connected with a new epoch
+    public QuiclyPeer? Peer { get; }                 // kept across a resumed reconnect: handlers, Index, Tag and statistics survive
+    public int Poll(int maxItems = int.MaxValue);     // polls the current peer and drives the reconnect attempts
+    public void Flush(uint tick = 0);
+    // ReconnectPolicy: attempts, back-off, browser-suspend awareness. A resume reconnects the same peer in place
+    // (QuiclyPeer.Reconnect: Closed → Reconnecting → Handshaking → Connected, epoch + 1); a refused resume falls back to a
+    // fresh session on a new peer.
 }
 ```
 

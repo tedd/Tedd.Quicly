@@ -287,18 +287,29 @@ Control-message bounds (clarifications; they apply to both endpoints, and a viol
 * `sessionToken` is minted only by the server. Layout (69 bytes, integers little-endian):
   `version u8 (= 1) ‖ sessionId u64 ‖ epoch u32 ‖ expiry i64 ‖ random (16 bytes) ‖ HMAC-SHA256(serverKey, all
   37 preceding bytes)`. `sessionId` and `epoch` travel in clear (neither is a secret) so the server can verify a
-  token without a lookup; `expiry` is absolute microseconds on the server's clock (issue time + `graceMicros`);
+  token without a lookup; `expiry` is absolute microseconds on the server's clock: the token's *maximum age*
+  (issue time + the server's token lifetime, 24 h in the reference implementation), not the grace period;
   the HMAC makes every field tamper-evident. Clients treat the token as opaque bytes. *(Clarification: the
   earlier layout "16 random bytes ‖ HMAC ‖ expiry, ≥ 56 bytes" did not carry `sessionId`/`epoch`, so the server
   could not recompute the MAC without already knowing the session.)* It is rotated in every HelloAck, single-use
-  (an old token is invalid once a resume succeeded or a newer token was issued), expires after `graceMicros`,
+  (an old token is invalid once a resume succeeded or a newer token was issued), expires at its `expiry`,
   and is a *locator*, not a credential: a resume MUST also present an `authToken` that the admission policy
   accepts. Token comparison is constant-time; failed auth attempts are rate-limited per remote address.
-  Implementation policy: single use is enforced by a bounded replay cache of the random parts, each entry kept
-  until its token expires; when the cache is full of unexpired entries a presented token is rejected (fail
-  closed: status 3, the client starts a fresh session) rather than an entry evicted. "A newer token was issued"
-  is enforced by the session registry comparing the token's `epoch` with the session's current epoch. Key
-  rotation keeps accepting the previous key until a deadline (typically `graceMicros` after the rotation). The
+  Implementation policy: the **session registry is the authority** on single use. It compares the token's
+  `epoch` with the session's current epoch, and a resume that commits advances that epoch, so a replayed token
+  can no longer match its session and is rejected (status 3) whatever any cache holds. A bounded replay cache
+  of spent tokens is a secondary guard that **never fails closed**: an entry is kept for the grace period —
+  the window in which a replayed token could still match a live record — not for the token's maximum age, and
+  when the cache is full its **oldest entry is evicted** and the new token stored rather than a resume being
+  refused, because refusing would let one authenticated client (one resume per minimum resume interval) fill
+  the cache and lock every other client out. Evictions are counted and reported in the server's statistics, so
+  a cache under pressure is visible and can be sized up. How long a
+  session outlives its connection is the registry's decision, not the token's: a *live* session can be resumed at
+  any time within its token's maximum age, and a session whose connection was lost only within `graceMicros` of
+  that loss (the server starts the grace period when the connection is lost, not when the token was issued). A
+  resume refused because the session resumed too often (a per-session rate with a small burst) is answered
+  status 3, leaves the token usable and is not charged to the per-address failure limiter. Key rotation keeps
+  accepting the previous key until a deadline (typically one token maximum age after the rotation). The
   server inspects a presented token at admission and consumes it only when the resume commits, so a resume
   refused for another reason (status 2, 4 or 7) leaves the token usable. The per-address failure limiter keys
   IPv4 (and IPv4-mapped IPv6) by address and IPv6 by /64 prefix. It only ever refuses addresses it is tracking:
@@ -308,8 +319,10 @@ Control-message bounds (clarifications; they apply to both endpoints, and a viol
 * `epoch` is allocated by the server, strictly increasing per `sessionId`, starting at 1; the client's
   `lastEpoch` is informational. Every sequence/version/counter is scoped to the current epoch.
 * A valid resume for a session that still has a live connection replaces that connection (the old one is
-  closed with `SessionReplaced`). A token presented after the grace period is rejected (status 3), never
-  silently turned into a fresh session.
+  closed with `SessionReplaced`), unless that connection is already closing deliberately (a goodbye, or the
+  server kicking the player): such a session ends with that close, and a resume racing it is rejected
+  (status 3). A resume after the session's grace period, counted from the loss of its connection, is rejected
+  (status 3), never silently turned into a fresh session.
 * A resumed session (new epoch): `UnreliableSequenced` tables reset; every live `ReliableLatest` key is
   re-queued at its current version (a free full-state resync); in-flight `ReliableOrdered` /
   `ReliableUnordered` sends complete `Disconnected` and are the application's responsibility; Bulk transfers

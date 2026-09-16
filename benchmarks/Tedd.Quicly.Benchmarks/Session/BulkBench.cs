@@ -101,11 +101,18 @@ public class BulkBench
     [Benchmark(OperationsPerInvoke = Megabytes)]
     public void BulkCompressed() => Transfer(compress: true);
 
+    /// <summary>
+    /// One object, start to finish: the transfer completes on the peer's <c>BulkProgress</c>, but its record is released
+    /// only when the stream shuts down a pass or two later (PROTOCOL.md §7: the slot returns with the peer's credit), so
+    /// the measurement runs to that point too. Stopping at completion would leave records behind and the invocation after
+    /// next would be refused by the two-per-direction limit — which is also why each row includes a stream's whole
+    /// lifetime rather than just its bytes.
+    /// </summary>
     private void Transfer(bool compress)
     {
         BulkDescriptor descriptor = new(5, 1, 1, ObjectBytes, 0, 0, compress);
         BulkTransfer transfer = _client.BeginBulkSendAsync(descriptor, _source).GetAwaiter().GetResult();
-        for (int pass = 0; pass < 20_000 && !transfer.IsFinished; pass++)
+        for (int pass = 0; pass < 20_000 && (!transfer.IsFinished || LiveTransfers() > 0); pass++)
         {
             _client.Flush();
             _network.Advance(0);
@@ -119,7 +126,15 @@ public class BulkBench
         {
             throw new InvalidOperationException($"The transfer ended {transfer.Status}, not Completed.");
         }
+
+        if (LiveTransfers() > 0)
+        {
+            throw new InvalidOperationException("The transfer's stream did not shut down.");
+        }
     }
+
+    /// <summary>Transfer records the sending engine still holds on the bulk channel.</summary>
+    private long LiveTransfers() => _client.GetChannelStatistics(5, out ChannelStatistics statistics) ? statistics.QueuedMessages : 0;
 
     private static PeerOptions Options(IBulkRouter? router)
     {

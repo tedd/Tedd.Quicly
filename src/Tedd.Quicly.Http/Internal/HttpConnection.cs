@@ -192,9 +192,11 @@ internal sealed class HttpConnection
 
         // Peek the ClientHello so that ALPN acme-tls/1 can pick the challenge certificate (SslStream's own
         // selection callback only exposes the SNI host, not the offered protocols). The whole peek plus the
-        // handshake must finish within HeaderReadTimeout. The peek buffer starts small and grows with what the
-        // client actually sent, so a connection trickling a hello holds memory proportional to its own bytes.
-        long deadline = Deadline(_limits.HeaderReadTimeout);
+        // handshake must finish within TlsHandshakeTimeout; a request's HeaderReadTimeout starts after it, so a
+        // slow handshake (the server's first credential setup, a chain build) never eats a request's budget. The
+        // peek buffer starts small and grows with what the client actually sent, so a connection trickling a
+        // hello holds memory proportional to its own bytes.
+        long deadline = Deadline(_limits.TlsHandshakeTimeout);
         var rented = ArrayPool<byte>.Shared.Rent(InitialPeekBytes);
         bool handedOff = false;
         int filled = 0;
@@ -226,15 +228,20 @@ internal sealed class HttpConnection
                     capacity = Math.Min(rented.Length, ClientHelloParser.MaxPeekBytes);
                 }
                 var remaining = Remaining(deadline);
-                if (remaining <= TimeSpan.Zero)
+                if (remaining <= TimeSpan.Zero && remaining != Timeout.InfiniteTimeSpan)
                 {
-                    _server.OnHandshakeFailure();
+                    _server.OnHandshakeTimeout();
                     return null;
                 }
                 int n;
                 try
                 {
                     n = await ReadWithTimeoutAsync(network, rented.AsMemory(filled, capacity - filled), remaining, IoCts()).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!AbortToken.IsCancellationRequested)
+                {
+                    _server.OnHandshakeTimeout(); // the client stopped sending its hello (everyday noise on a public port)
+                    throw;
                 }
                 catch (Exception)
                 {
@@ -261,33 +268,31 @@ internal sealed class HttpConnection
         // From here on the rented buffer belongs to the PrefixedStream, which returns it once replayed.
         var ssl = new SslStream(new PrefixedStream(network, rented, filled), leaveInnerStreamOpen: false);
         _stream = ssl;
-        var sslOptions = new SslServerAuthenticationOptions
-        {
-            ClientCertificateRequired = false,
-            EnabledSslProtocols = tls.EnabledSslProtocols,
-            CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
-            AllowRenegotiation = false,
-        };
-        bool acme = false;
+        // A validation client that offers only acme-tls/1 for a published name gets the challenge certificate; every other
+        // client gets what its SNI host resolves to, through the options callback (SslStream parses the SNI itself). Both
+        // serve a credential built once per certificate, so no handshake pays for a chain build twice.
+        SslServerAuthenticationOptions? acmeOptions = null;
         if (parsed && hello.Offers("acme-tls/1") && tls.Alpn01Responder is { } responder && responder.TryGetCertificate(hello.ServerName, out var challengeCertificate))
-        {
-            sslOptions.ServerCertificate = challengeCertificate;
-            sslOptions.ApplicationProtocols = TlsAlpn01Responder.AcmeOnlyProtocols;
-            acme = true;
-        }
-        else
-        {
-            sslOptions.ServerCertificateSelectionCallback = tls.SelectionCallback;
-            if (tls.ProtocolList.Count > 0)
-                sslOptions.ApplicationProtocols = tls.ProtocolList;
-        }
+            acmeOptions = tls.CreateAcmeOptions(challengeCertificate);
 
-        var handshakeBudget = Remaining(deadline);
         var cts = IoCts();
-        cts.CancelAfter(handshakeBudget);
+        cts.CancelAfter(Remaining(deadline));
         try
         {
-            await ssl.AuthenticateAsServerAsync(sslOptions, cts.Token).ConfigureAwait(false);
+            if (acmeOptions is not null)
+                await ssl.AuthenticateAsServerAsync(acmeOptions, cts.Token).ConfigureAwait(false);
+            else
+                await ssl.AuthenticateAsServerAsync(tls.OptionsCallback, state: null, cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (cts.IsCancellationRequested && !AbortToken.IsCancellationRequested)
+        {
+            // The handshake budget ran out: the client stalled after a complete ClientHello, or the server's own credential
+            // setup was too slow. Reported as well as counted, because it is not the scanner noise the peek phase sees and it
+            // can point at the server (the exception may be the cancellation, or an AuthenticationException wrapping it).
+            _server.OnHandshakeTimeout();
+            _server.ReportError(new TimeoutException("The TLS handshake with " + (RemoteEndPoint?.ToString() ?? "a client")
+                + " did not complete within TlsHandshakeTimeout (" + _limits.TlsHandshakeTimeout + ").", ex));
+            throw;
         }
         catch
         {
@@ -299,7 +304,7 @@ internal sealed class HttpConnection
             cts.CancelAfter(Timeout.InfiniteTimeSpan);
         }
 
-        if (acme)
+        if (acmeOptions is not null)
         {
             _server.OnAcmeTlsAlpnHandshake();
             return null;
@@ -466,7 +471,7 @@ internal sealed class HttpConnection
                 else
                 {
                     var remaining = Remaining(deadline);
-                    if (remaining <= TimeSpan.Zero)
+                    if (remaining <= TimeSpan.Zero && remaining != Timeout.InfiniteTimeSpan)
                         return 408;
                     n = await ReadWithTimeoutAsync(_stream, _buffer.AsMemory(_end), remaining, available == 0 ? IdleCts() : IoCts()).ConfigureAwait(false);
                 }

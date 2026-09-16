@@ -16,6 +16,7 @@ public class LimitsAndPolicyTests
         Assert.Equal(8 * 1024, limits.MaxHeadersBytes);
         Assert.Equal(32, limits.MaxHeaderCount);
         Assert.Equal(TimeSpan.FromSeconds(5), limits.HeaderReadTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(10), limits.TlsHandshakeTimeout);
         Assert.Equal(TimeSpan.FromSeconds(15), limits.KeepAliveTimeout);
         Assert.Equal(64, limits.MaxConnectionsPerAddress);
         Assert.Equal(2048, limits.MaxConnections);

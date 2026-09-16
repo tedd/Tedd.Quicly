@@ -118,6 +118,7 @@ public class TlsFragmentationTests
         using var cert = TestCertificates.CreateSelfSigned("localhost", "localhost");
         await using var host = TestHost.Start(o =>
         {
+            o.Limits.TlsHandshakeTimeout = TimeSpan.FromSeconds(2);
             o.Limits.HeaderReadTimeout = TimeSpan.FromSeconds(2);
             o.Use(new HealthHandler());
         }, HttpTlsOptions.FromCertificate(cert));

@@ -46,6 +46,7 @@ public sealed class OptionsTests
             o.TlsAlpnEndpoint = null!;
         },
         ["redirect-port"] = o => o.RedirectHttpsPort = 0,
+        ["tls-handshake-timeout"] = o => o.TlsHandshakeTimeout = TimeSpan.Zero,
         ["health-path"] = o =>
         {
             o.EnableHealthEndpoint = true;
@@ -187,6 +188,7 @@ public sealed class OptionsTests
         Assert.Equal([AcmeChallengeKind.Http01], options.ChallengeTypes); // ADR 0009: ACME responder plus redirect on TCP 80
         Assert.Equal(new IPEndPoint(IPAddress.IPv6Any, 80), options.HttpChallengeEndpoint); // dual-mode
         Assert.Equal(new IPEndPoint(IPAddress.IPv6Any, 443), options.TlsAlpnEndpoint);
+        Assert.Equal(TimeSpan.FromSeconds(10), options.TlsHandshakeTimeout);
         Assert.True(options.RedirectToHttps);
         Assert.False(options.EnableHealthEndpoint);
         Assert.Equal(AcmeProvisioningOptions.DefaultHealthPath, options.HealthPath);

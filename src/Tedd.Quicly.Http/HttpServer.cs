@@ -28,6 +28,7 @@ public sealed class HttpServer : IAsyncDisposable
     private long _rejected;
     private long _acmeHandshakes;
     private long _handshakeFailures;
+    private long _handshakeTimeouts;
     private long _requestTimeouts;
     private long _protocolErrors;
 
@@ -71,6 +72,13 @@ public sealed class HttpServer : IAsyncDisposable
 
     /// <summary>TLS connections that never completed a handshake (non-TLS bytes, oversized or malformed ClientHello, handshake failure or timeout).</summary>
     public long HandshakeFailures => Volatile.Read(ref _handshakeFailures);
+
+    /// <summary>
+    /// Handshakes that ran out of <see cref="HttpServerLimits.TlsHandshakeTimeout"/> (a subset of
+    /// <see cref="HandshakeFailures"/>): a client that stalled, or a server whose credential setup was too slow. Timeouts
+    /// after a complete ClientHello are also reported through <see cref="HttpServerOptions.OnError"/>.
+    /// </summary>
+    public long HandshakeTimeouts => Volatile.Read(ref _handshakeTimeouts);
 
     /// <summary>Requests whose header section did not arrive within <see cref="HttpServerLimits.HeaderReadTimeout"/> (answered with 408).</summary>
     public long RequestTimeouts => Volatile.Read(ref _requestTimeouts);
@@ -323,6 +331,12 @@ public sealed class HttpServer : IAsyncDisposable
     internal void OnAcmeTlsAlpnHandshake() => Interlocked.Increment(ref _acmeHandshakes);
 
     internal void OnHandshakeFailure() => Interlocked.Increment(ref _handshakeFailures);
+
+    internal void OnHandshakeTimeout()
+    {
+        Interlocked.Increment(ref _handshakeTimeouts);
+        Interlocked.Increment(ref _handshakeFailures);
+    }
 
     internal void OnRequestTimeout() => Interlocked.Increment(ref _requestTimeouts);
 

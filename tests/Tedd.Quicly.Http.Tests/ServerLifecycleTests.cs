@@ -71,11 +71,13 @@ public class ServerLifecycleTests
         Check(l => l.MaxConnectionsPerAddress = 0);
         Check(l => l.MaxRequestsPerConnection = 0);
         Check(l => l.HeaderReadTimeout = TimeSpan.Zero);
+        Check(l => l.TlsHandshakeTimeout = TimeSpan.Zero);
         Check(l => l.KeepAliveTimeout = TimeSpan.FromSeconds(-1));
         Check(l => l.RequestBodyReadTimeout = TimeSpan.Zero);
         Check(l => l.ResponseWriteTimeout = TimeSpan.Zero);
         // CancellationTokenSource.CancelAfter refuses anything above uint.MaxValue - 1 ms (~49.7 days)
         Check(l => l.HeaderReadTimeout = TimeSpan.FromDays(60));
+        Check(l => l.TlsHandshakeTimeout = TimeSpan.FromDays(60));
         Check(l => l.KeepAliveTimeout = HttpServerLimits.MaxTimeout + TimeSpan.FromMilliseconds(1));
         Check(l => l.RequestBodyReadTimeout = TimeSpan.MaxValue);
         Check(l => l.ResponseWriteTimeout = TimeSpan.FromDays(50));
@@ -95,6 +97,7 @@ public class ServerLifecycleTests
         var infinite = new HttpServerOptions().Listen(IPAddress.Loopback, 0);
         infinite.Limits.KeepAliveTimeout = Timeout.InfiniteTimeSpan;
         infinite.Limits.HeaderReadTimeout = Timeout.InfiniteTimeSpan;
+        infinite.Limits.TlsHandshakeTimeout = Timeout.InfiniteTimeSpan;
         infinite.Limits.RequestBodyReadTimeout = HttpServerLimits.MaxTimeout; // the largest finite value is accepted
         infinite.Limits.MaxRequestLineBytes = HttpServerLimits.MaxHeaderBufferLimit;
         infinite.Limits.MaxHeadersBytes = HttpServerLimits.MaxHeaderBufferLimit;

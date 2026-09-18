@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Memory;
@@ -78,7 +79,25 @@ internal static unsafe class EnginePayload
     /// <param name="takeSinglePage">A gather of exactly one page that is not compressed is taken as it is (zero copy).</param>
     /// <param name="payload">Receives the prepared payload.</param>
     /// <returns><see langword="false"/> when no send lease was available (answer <see cref="SendStatus.OutOfBuffers"/>).</returns>
+    /// <remarks>
+    /// The common case — a copy (<c>SendCopy</c>) on a channel without compression — is inlined into the engine's
+    /// <c>Admit</c>: it rents one send lease, resolves its address once and copies. Every other kind, and any channel that
+    /// compresses, goes through <see cref="TryPrepareGeneral"/>.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool TryPrepare(PeerCore core, ref SendRequest request, ChannelDefinition channel, int length, bool takeSinglePage, ref PreparedPayload payload)
+    {
+        if (request.Kind == SendPayloadKind.Copy && channel.Compression == ChannelCompression.None)
+        {
+            return TryCopyInUncompressed(core, request.Source, ref payload);
+        }
+
+        return TryPrepareGeneral(core, ref request, channel, length, takeSinglePage, ref payload);
+    }
+
+    /// <summary>Every payload kind (see <see cref="TryPrepare"/>).</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool TryPrepareGeneral(PeerCore core, ref SendRequest request, ChannelDefinition channel, int length, bool takeSinglePage, ref PreparedPayload payload)
     {
         switch (request.Kind)
         {
@@ -217,6 +236,31 @@ internal static unsafe class EnginePayload
                 core.ReturnSend(in page);
             }
         }
+    }
+
+    /// <summary>The copy path of <see cref="TryPrepare"/> on a channel without compression (the same result as <see cref="TryCopyIn"/>).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TryCopyInUncompressed(PeerCore core, ReadOnlySpan<byte> source, ref PreparedPayload payload)
+    {
+        int length = source.Length;
+        if (length == 0)
+        {
+            return true;
+        }
+
+        if (!core.TryRentSend(length, out BufferLease lease))
+        {
+            return false;
+        }
+
+        // The lease is at least `length` bytes (TryRentSend), so one address lookup serves both the copy and the entry.
+        byte* target = core.GetPointer(in lease);
+        payload.Lease = lease;
+        payload.Rented = true;
+        payload.Pointer = target;
+        payload.Length = length;
+        source.CopyTo(new Span<byte>(target, length));
+        return true;
     }
 
     private static bool TryCopyIn(PeerCore core, ReadOnlySpan<byte> source, ChannelDefinition channel, bool compress, ref PreparedPayload payload)

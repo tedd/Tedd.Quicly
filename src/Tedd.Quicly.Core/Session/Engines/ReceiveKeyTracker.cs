@@ -78,6 +78,12 @@ internal sealed class ReceiveKeyTracker : IDisposable
     {
         if (TryGetSlot(key, out slot))
         {
+            if (Diag.Mode == 51)
+            {
+                Touch(slot);
+                return KeyAcceptance.Accepted;
+            }
+
             uint last = _last[slot];
             bool newer = sixteenBit ? SerialNumber.IsNewer((ushort)sequence, (ushort)last) : SerialNumber.IsNewer(sequence, last);
             if (!newer)
@@ -171,6 +177,11 @@ internal sealed class ReceiveKeyTracker : IDisposable
 
     private void Touch(int slot)
     {
+        if (Diag.Mode == 50)
+        {
+            return;
+        }
+
         if (_hashed is null || slot == _newest)
         {
             return;

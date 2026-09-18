@@ -1552,6 +1552,6 @@ Waves:
 | C2b (done) | `GroupStreamEngine` (`ReliableUnordered`, §7.5): groups and carriers, refused starts, per-group failure, progressive receive | C1 |
 | C2c (done) | `BulkEngine` (§7.7): a stream per transfer at the lowest priority, the send window and rate cap, chunked compression, progress, cancel, resume, request authorisation, the whole-object hash | C1 |
 | C2d (done) | fragmentation in the shared datagram engine and request/response in the ordered engine (§7.8): at most 8 fragments per message with a bounded reassembly table, correlated requests with a pooled value-task source and timeouts served by Poll and Flush | C1 |
-| C3 | `MsQuicTransport` (ITransport over the MsQuic wrappers) + listener/connector; `QuiclyServer` / `QuiclyClient`; admission; reconnect | C1, msquic bindings |
+| C3 (done) | `MsQuicTransport` (ITransport over the MsQuic wrappers) + listener/connector; `QuiclyServer` / `QuiclyClient`; admission; reconnect | C1, msquic bindings |
 | C4 | WebTransport-over-HTTP/3 carrier (opt-in), HTTP/3 static responder | C3, Http3 |
-| C5 | End-to-end tests (MsQuic loopback, ACME mock CA + HTTP server + QUIC listener cert swap), samples, E2E benchmarks | all |
+| C5 | End-to-end tests (MsQuic loopback, ACME mock CA + HTTP server + QUIC listener cert swap), samples, E2E benchmarks | C1–C3 (C4 is opt-in and nothing depends on it, so C5 comes first) |

@@ -170,7 +170,7 @@ public sealed class QuiclyClient : IDisposable
         _peer = null;
         _table = options.Channels;
         PeerOptions peerOptions = options.PeerOptions.Clone();
-        _autoFlushMicros = peerOptions.AutoFlushInterval.Ticks / TimeSpan.TicksPerMicrosecond;
+        _autoFlushMicros = ToMicros(peerOptions.AutoFlushInterval);
         peerOptions.AutoFlushInterval = TimeSpan.Zero; // implemented by Poll, not by the peer
         peerOptions.WorkSignal = _signal;              // a transport callback wakes the wait inside ConnectAsync
         peerOptions.Validate();                        // the peer's own checks, before a transport is created
@@ -598,4 +598,18 @@ public sealed class QuiclyClient : IDisposable
     }
 
     private static string Truncate(string text) => text.Length <= 200 ? text : text[..200];
+
+    /// <summary>Converts a duration to whole microseconds, rounding a positive sub-microsecond value up to 1.</summary>
+    /// <remarks>
+    /// 0 means "off" for the auto-flush interval, so truncating a positive sub-microsecond duration to 0 would silently switch
+    /// auto-flush off. The rule matches <c>PeerOptions.ToMicros</c> and <c>QuiclyServer.ToMicros</c>, which are internal to
+    /// their own assemblies.
+    /// </remarks>
+    /// <param name="value">The duration.</param>
+    /// <returns>Whole microseconds; 0 only for a duration that is not positive.</returns>
+    internal static long ToMicros(TimeSpan value)
+    {
+        long micros = value.Ticks / TimeSpan.TicksPerMicrosecond;
+        return micros == 0 && value.Ticks > 0 ? 1 : micros;
+    }
 }

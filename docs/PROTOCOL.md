@@ -475,7 +475,7 @@ logging.
 | concurrent peer streams per channel (`MaxGroups`) | 8 (ReliableUnordered), 4 (large ReliableLatest), 2 (Bulk) | further streams are reset `LimitExceeded` |
 | stream idle mid-message | 30 s | stream reset `Timeout` |
 | concurrent reassemblies per channel (`MaxReassemblies`) | 16 | evict oldest; reassembly expiry 2 × RTT + 100 ms; on a channel whose sequence carries ordering (`UnreliableSequenced`), a newer sequence for the same key abandons the older partial |
-| fragmented message size | ≤ 255 × (maxDatagram − header) and ≤ `MaxMessageSize` | drop before any buffer is chosen |
+| fragmented message size | ≤ 8 × (maxDatagram − header), the §2.1 `FragCount` cap, and ≤ `MaxMessageSize` | drop before any buffer is chosen |
 | control messages per second | 2 000 (per peer, configurable; size it from the channel table, because acks scale with keyed `ReliableLatest` traffic and one ack datagram carries about 170 keys) | connection close `LimitExceeded` |
 | decoded (decompressed) bytes per second per peer | 8 MiB/s | further compressed messages dropped + counted |
 | bulk transfers per direction per peer | 2 transfers, and an outbound range-request table of one more than that (3), so a further range can be asked for while both transfers run | `BulkReject` |

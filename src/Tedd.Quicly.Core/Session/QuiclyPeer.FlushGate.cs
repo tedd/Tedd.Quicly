@@ -23,7 +23,6 @@ internal enum FlushGateDecision : byte
 public sealed unsafe partial class QuiclyPeer
 {
     private FlushGate _gate;
-    private ReliableLatestEngine? _gateLatest;
     private ReliableOrderedEngine? _gateOrdered;
 
     /// <summary>
@@ -48,10 +47,6 @@ public sealed unsafe partial class QuiclyPeer
             if (engines[i].Mode == ChannelMode.Bulk)
             {
                 allowed = false;
-            }
-            else if (engines[i] is ReliableLatestEngine latest)
-            {
-                _gateLatest = latest;
             }
             else if (engines[i] is ReliableOrderedEngine ordered)
             {
@@ -102,7 +97,7 @@ public sealed unsafe partial class QuiclyPeer
             || (_threadSafeSend && Volatile.Read(ref _gameThreadId) != threadId)
             || _sendWaiters.Count != 0
             || _flushWaiters.Count != 0
-            || (_gateLatest is not null && _gateLatest.HasUnsentControl)
+            || (_latest is not null && _latest.HasUnsentControl)
             || (_gateOrdered is not null && _gateOrdered.HasCanceledRequests)
             || (_gate.RttMatters && _ping.SmoothedRtt != _gate.Rtt))
         {

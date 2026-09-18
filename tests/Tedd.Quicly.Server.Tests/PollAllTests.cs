@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.Reflection;
+using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Session;
+using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Testing.Simulation;
 
 namespace Tedd.Quicly.Server.Tests;
@@ -124,6 +126,75 @@ public class PollAllTests
         f.Server.PollAll();
         f.Server.GetStatistics(out ServerStatistics polled);
         Assert.True(polled.PeersPolled > skipped.PeersPolled);
+    }
+
+    /// <summary>
+    /// A ReliableLatest value is posted into its key's mailbox on the transport thread, not into the receive ring, so the
+    /// engine itself must raise the peer's work signal: otherwise an idle peer's slot stays unmarked and the value waits for
+    /// the peer's next poll deadline (its ping, up to <see cref="PeerOptions.PingInterval"/>). Once dispatched, the ack the
+    /// value is owed is the next FlushAll's work — the level reports it, but PollAll does not poll the peer again for it.
+    /// </summary>
+    [Fact]
+    public async Task A_ReliableLatest_Value_Reaching_An_Idle_Peer_Is_Dispatched_By_The_Next_PollAll()
+    {
+        ChannelTable table = ChannelTable.Create()
+            .Add(2, "state", ChannelMode.UnreliableUnordered)
+            .Add(4, "chat", ChannelMode.ReliableOrdered)
+            .Add(6, "latest", ChannelMode.ReliableLatest)
+            .Build();
+        await using ServerFixture f = new(o => o.Channels = table);
+        List<uint> received = [];
+        f.Server.PeerAdmitted += peer => peer.RegisterHandler(6, (QuiclyPeer _, in ReceiveHeader header, ReadOnlySpan<byte> _) => received.Add(header.Sequence));
+        QuiclyPeer client = f.Connect(table: table);
+        Assert.True(f.RunUntil(() => client.State == PeerState.Connected), "not admitted: " + client.State);
+        QuiclyPeer peer = f.ServerPeerOf(client);
+        f.Run(4_000_000, step: 10_000); // the fast-lock pings settle; from here the peer only has its 1 s pings
+
+        // Start in the middle of the ping cycle from a slot without a work bit: the traffic of a ping just sent, or a bit left
+        // over from it, would get the value polled by luck.
+        Assert.True(f.RunUntil(() =>
+        {
+            long untilPing = peer.NextPollDeadlineMicros - f.Clock.NowMicros;
+            return untilPing > 300_000 && untilPing < 700_000 && !IsMarked(f.Server, peer.Index) && !peer.HasPendingWork;
+        }, 3_000_000, step: 10_000), "the slot never settled");
+
+        SendResult sent = client.SendCopy(new SendHeader(6, 42), [1, 2, 3], SendOptions.Tracked);
+        Assert.True(sent.IsAdmitted);
+        client.Flush();
+        f.Network.Advance(1_000); // the value reaches the server peer's mailbox; nothing on the server runs
+        Assert.True(peer.HasPendingWork);
+
+        long arrived = f.Clock.NowMicros;
+        f.Server.PollAll();
+        while (received.Count == 0 && f.Clock.NowMicros - arrived < 2_000_000)
+        {
+            f.Network.Advance(1_000);
+            f.Server.PollAll(); // no FlushAll: this measures only when PollAll gets to the value
+        }
+
+        Assert.True(received.Count == 1 && f.Clock.NowMicros == arrived,
+            $"the value was dispatched {(f.Clock.NowMicros - arrived) / 1000} ms after it arrived (received {received.Count})");
+        Assert.False(IsMarked(f.Server, peer.Index), "PollAll re-marked the peer for work only a Flush does");
+
+        // The ack it owes is pending work, but only a Flush sends it: further PollAll calls leave the peer alone.
+        Assert.True(peer.HasPendingWork);
+        f.Server.GetStatistics(out ServerStatistics before);
+        for (int i = 0; i < 5; i++)
+        {
+            f.Server.PollAll();
+        }
+
+        f.Server.GetStatistics(out ServerStatistics after);
+        Assert.Equal(before.PeersPolled, after.PeersPolled);
+
+        f.Server.FlushAll();
+        Assert.False(peer.HasPendingWork);
+        for (int i = 0; i < 3; i++)
+        {
+            f.Step(1_000); // the ack reaches the client, whose next pass completes the value
+        }
+
+        Assert.Equal(DeliveryStatus.Delivered, client.GetDeliveryStatus(sent.Token));
     }
 
     /// <summary>

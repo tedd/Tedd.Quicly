@@ -456,10 +456,12 @@ public sealed partial class QuiclyServer
         }
 
         UpdateDeadlines(slot, peer);
-        if (peer.HasPendingWork && peer.NextDeadlineMicros > now)
+        if (peer.HasPendingPollWork && peer.NextDeadlineMicros > now)
         {
             // Work this Poll did not consume (a message of a channel without a handler, a stream held back): the peer raises
-            // no second signal for it, so the level is what keeps the slot marked.
+            // no second signal for it, so the level is what keeps the slot marked. Engine work only a Flush consumes (the
+            // ReliableLatest acks the peer owes) is left out: polling again cannot serve it, the next FlushAll does, and this
+            // Poll re-armed the peer's edge for anything published after it.
             MarkWork(slot);
         }
 

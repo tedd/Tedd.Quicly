@@ -218,7 +218,12 @@ public unsafe class FragmentEdgeTests
         h.Server!.RegisterHandler(2, Handlers.Collect(got));
         const int Length = 3_000;
         byte[] copy = DatagramKit.Payload(1, Length);
-        byte[] pinned = DatagramKit.Payload(2, Length);
+
+        // SendPinned keeps the pointer (zero copy) and its fragments read it at the Flush inside RunUntil, long after the
+        // fixed block below has ended; the contract is "valid and unchanged until BufferReleased". A heap array the GC may
+        // move would hand the transport stale bytes, so the payload lives on the pinned object heap.
+        byte[] pinned = GC.AllocateArray<byte>(Length, pinned: true);
+        DatagramKit.Payload(2, Length).CopyTo(pinned, 0);
         byte[] borrowed = DatagramKit.Payload(3, Length);
 
         BufferLease owned = client.RentBuffer(Length);

@@ -102,7 +102,8 @@ NestedContainer, BadLength, ...
   backward-shift deletion (no tombstones). `DenseKeyTable`: direct index for `KeySpace.Dense(max)`.
 * Per-key send slot (`KeySendSlot`, 64 B): current version, acked version, lease of current value (ReliableLatest), retry deadline,
   attempts, entry index in flight, large-value stream id. Per-key receive slot (`KeyRecvSlot`): last accepted sequence,
-  mailbox lease index (int, −1 empty), reassembly index, flags.
+  mailbox lease index (int, −1 empty), flags, and a reserved `Reassembly` field that no engine uses — fragments are not
+  reassembled per key but per `(channel, key, sequence)` in the datagram engine's own table (§7.8).
 * `Mailboxes`: `int[] mailbox` per key slot + `ulong[] dirty` bitset per channel; transport thread `Interlocked.Exchange` in,
   game thread `Interlocked.Exchange(-1)` out; `PopDirty(Span<int> keys)` scans the bitset with `BitOperations.TrailingZeroCount`.
 * `ChannelSendState` / `ChannelRecvState` (64 B each, per channel): counters, next sequence, queue head/tail/bytes, stream id,
@@ -1341,9 +1342,11 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   (ADR 0008 invariant 5), which is what removed the one live instance of this class of bug — a failed dequeue writing
   `default(int)`, a perfectly valid record index, into the field that then "retired" a live transfer. The stronger form,
   storing an integer ring's elements **offset by one** so that no value a failed dequeue can leave behind is a valid index,
-  was deliberately not applied: it touches every engine that hands record indices between threads, another branch is in
-  flight over those files, and an audit of the current engines found no surviving instance that needs it. This is the next
-  step if one is ever found.
+  was deliberately not applied: it touches every engine that hands record indices between threads, and no surviving
+  instance needs it. The audit was repeated after waves C2c and C2d merged: every `TryDequeue` call site in `src` (the
+  fragmentation and request/response code takes nothing out of a ring) either loops on the result or dequeues into a
+  local it reads only after a `true` return, and none passes a field as the `out` argument. This is the next step if an
+  instance is ever found.
 
 ### 7.8 Fragmentation and request/response (as built: wave C2d)
 

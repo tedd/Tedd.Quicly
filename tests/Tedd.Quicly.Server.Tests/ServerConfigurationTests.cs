@@ -111,6 +111,39 @@ public class ServerConfigurationTests
     }
 
     [Fact]
+    public async Task A_Positive_Sub_Microsecond_Duration_Never_Becomes_The_Zero_Sentinel()
+    {
+        // Every caller of QuiclyServer.ToMicros reads 0 as "off" (Grace, AutoFlushInterval, MinResumeInterval) or has had the
+        // option validated positive (TokenLifetime, and AuthFailureRefillInterval, whose rate limiter refuses anything below
+        // 1 µs), so truncating a positive duration towards zero switched a feature off or broke start-up. Rounding up is the
+        // rule PeerOptions.ToMicros already applies.
+        Assert.Equal(0, QuiclyServer.ToMicros(TimeSpan.Zero));
+        Assert.Equal(1, QuiclyServer.ToMicros(TimeSpan.FromTicks(1)));
+        Assert.Equal(1, QuiclyServer.ToMicros(TimeSpan.FromTicks(5)));
+        Assert.Equal(1, QuiclyServer.ToMicros(TimeSpan.FromTicks(19)));
+        Assert.Equal(2, QuiclyServer.ToMicros(TimeSpan.FromTicks(20)));
+        Assert.Equal(1_000, QuiclyServer.ToMicros(TimeSpan.FromMilliseconds(1)));
+        Assert.Equal(-1, QuiclyServer.ToMicros(TimeSpan.FromTicks(-10)));
+
+        // End to end: 500 ns values pass validation (they are positive), so the server starts with them — the refill interval
+        // used to make the constructor throw — and the features whose 0 means "off" stay on.
+        TimeSpan halfMicrosecond = TimeSpan.FromTicks(5);
+        await using ServerFixture f = new(o =>
+        {
+            o.Admission.AuthFailureRefillInterval = halfMicrosecond;
+            o.Sessions.Grace = halfMicrosecond;
+            o.Sessions.TokenLifetime = halfMicrosecond;
+            o.PeerOptions.AutoFlushInterval = halfMicrosecond;
+        });
+        Assert.Equal(1L, Field(f.Server, "_graceMicros"));
+        Assert.Equal(1L, Field(f.Server, "_tokenLifetimeMicros"));
+        Assert.Equal(1L, Field(f.Server, "_autoFlushMicros"));
+
+        static long Field(QuiclyServer server, string name) =>
+            (long)typeof(QuiclyServer).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(server)!;
+    }
+
+    [Fact]
     public void Invalid_Peer_Template_Is_Refused_By_The_Constructor()
     {
         ServerOptions options = Valid();

@@ -35,8 +35,8 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// releases.</para>
 /// <para><b>Fragmentation</b> (<see cref="ChannelDefinition.Fragmentation"/>, PROTOCOL.md §2.1; the
 /// <c>DatagramEngine.Fragmentation.cs</c> half of this class): a message that does not fit one datagram goes out as at most
-/// 8 fragments of one owner entry, and the receive side reassembles per channel within
-/// <see cref="ChannelDefinition.MaxReassemblies"/> partials.</para>
+/// 8 fragments of one owner entry, and the receive side reassembles each <c>(channel, key, sequence)</c> in a partial of
+/// its own, at most <see cref="ChannelDefinition.MaxReassemblies"/> per channel.</para>
 /// </remarks>
 internal abstract unsafe partial class DatagramEngine : ChannelEngine
 {

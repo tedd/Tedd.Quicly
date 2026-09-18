@@ -182,7 +182,9 @@ public struct PeerStatistics
     public long FragmentsDropped;
 
     /// <summary>
-    /// Partial reassemblies given up because a newer sequence of the same key arrived, or because the channel's
+    /// Partial reassemblies given up because a newer sequence of the same key arrived on an
+    /// <see cref="Channels.ChannelMode.UnreliableSequenced"/> channel (on an unordered channel the sequence is only a
+    /// reassembly id, so two messages of one key reassemble side by side), or because the channel's
     /// <see cref="Channels.ChannelDefinition.MaxReassemblies"/> cap evicted the oldest partial (PROTOCOL.md §7).
     /// </summary>
     public long ReassembliesAbandoned;

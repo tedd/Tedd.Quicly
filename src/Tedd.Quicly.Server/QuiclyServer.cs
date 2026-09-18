@@ -413,7 +413,26 @@ public sealed partial class QuiclyServer : IAsyncDisposable
         statistics.EventsDropped = _failures.Dropped + _consumerFailures.Dropped;
     }
 
-    internal static long ToMicros(TimeSpan value) => value.Ticks / TimeSpan.TicksPerMicrosecond;
+    /// <summary>
+    /// Converts a duration option to whole microseconds, rounding a positive sub-microsecond duration up to 1 µs instead of
+    /// truncating it to 0 (the rule of <c>PeerOptions.ToMicros</c>).
+    /// </summary>
+    /// <remarks>
+    /// Every caller reads 0 as "off" — <see cref="ServerSessionOptions.Grace"/> (no resume window),
+    /// <see cref="PeerOptions.AutoFlushInterval"/> (no flush timer), <see cref="ServerAdmissionOptions.MinResumeInterval"/>
+    /// (no resume rate limit) — or has had the option validated positive: <see cref="ServerSessionOptions.TokenLifetime"/>
+    /// (a 0 lifetime would mint tokens that are already expired) and
+    /// <see cref="ServerAdmissionOptions.AuthFailureRefillInterval"/> (whose rate limiter refuses anything below 1 µs).
+    /// Plain truncation turned a positive sub-microsecond duration into that 0: it silently switched the first group off,
+    /// and a refill interval that validation had accepted made the constructor throw.
+    /// </remarks>
+    /// <param name="value">The duration.</param>
+    /// <returns>Whole microseconds; 0 only for a duration that is not positive.</returns>
+    internal static long ToMicros(TimeSpan value)
+    {
+        long micros = value.Ticks / TimeSpan.TicksPerMicrosecond;
+        return micros == 0 && value.Ticks > 0 ? 1 : micros;
+    }
 
     /// <summary>Reports a refused admission now (game thread); handler exceptions are swallowed and counted.</summary>
     internal void ReportFailure(in AdmissionFailure failure) => RaiseFailure(failure);

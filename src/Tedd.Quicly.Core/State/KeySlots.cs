@@ -28,7 +28,10 @@ public enum KeyRecvFlags : uint
     None = 0,
     /// <summary>A latest-ack for <see cref="KeyRecvSlot.LastAccepted"/> is queued.</summary>
     AckPending = 1,
-    /// <summary>A fragmented value is being reassembled (<see cref="KeyRecvSlot.Reassembly"/> is valid).</summary>
+    /// <summary>
+    /// Reserved; no engine sets it. Fragments are not reassembled per key: the datagram engine keeps its own reassembly
+    /// table, scoped by <c>(channel, key, sequence)</c> (PROTOCOL.md §2.1; docs/design/session-layer.md §7.8).
+    /// </summary>
     Reassembling = 2,
     /// <summary>The peer retired the key; the slot is released once the game thread has drained it.</summary>
     Retired = 4,
@@ -94,7 +97,10 @@ public struct KeyRecvSlot
     [FieldOffset(0)] public uint LastAccepted;
     /// <summary>Index of the key's mailbox in the channel's <see cref="Mailboxes"/> (normally the slot itself), or -1. Owner: transport thread.</summary>
     [FieldOffset(4)] public int Mailbox;
-    /// <summary>Index of the reassembly in progress, or -1. Owner: transport thread.</summary>
+    /// <summary>
+    /// Reserved; no engine uses it. Fragment reassembly is not per key: the datagram engine keeps its own table, scoped by
+    /// <c>(channel, key, sequence)</c> (PROTOCOL.md §2.1; docs/design/session-layer.md §7.8). Owner: transport thread.
+    /// </summary>
     [FieldOffset(8)] public int Reassembly;
     /// <summary>Flags. Owner: transport thread.</summary>
     [FieldOffset(12)] public KeyRecvFlags Flags;

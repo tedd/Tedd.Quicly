@@ -87,8 +87,14 @@ public class ReviewBulkTests
     }
 
     /// <summary>
-    /// PROTOCOL.md §3.3 ("<c>TransferId</c> unique per (peer, direction)") and §3.4 (<c>BulkCancel</c> travels in
-    /// <em>both</em> directions), with §4.3's terminal states.
+    /// PROTOCOL.md §3.3 ("<c>TransferId</c> unique per (peer, direction)") and §3.4, with §4.3's terminal states.
+    /// <para>
+    /// <b>Resolved.</b> The text below records the finding as it was at review time, when §3.4 let <c>BulkCancel</c>
+    /// travel in both directions and the sender's <c>Cancel()</c> emitted one. The wave C2c fix made <c>BulkCancel</c>
+    /// receiver-to-sender only (PROTOCOL.md §3.4; docs/design/session-layer.md §7.7): a sender cancels by resetting its
+    /// stream with <c>BulkCanceled</c> and sends no frame, and the recipient resolves a <c>BulkCancel</c> against the
+    /// transfers it is sending, so no direction bit was needed. The test pins that outcome.
+    /// </para>
     /// <para>
     /// A transfer id identifies a transfer only together with its direction, so id 1 exists twice on one session: once
     /// for what this end sends and once for what the peer sends. <c>BulkEngine.ApplyCancel</c> resolves an incoming
@@ -176,6 +182,12 @@ public class ReviewBulkTests
     /// Fix: finish the engine's live transfers <see cref="BulkStatus.Disconnected"/> from <c>BulkEngine.Dispose</c> (or
     /// dispatch <c>OnPeerClosed</c> from <c>QuiclyPeer.Dispose</c> before freeing), so the terminal state is reported on
     /// the dispose path as it is on the close path.
+    /// </para>
+    /// <para>
+    /// <b>Resolved</b> differently from both suggestions: <c>OnPeerClosed</c> from <c>Dispose</c> would race the still live
+    /// transport, and <c>BulkEngine.Dispose</c> runs only once the transport has reported its close. <c>QuiclyPeer.Dispose</c>
+    /// calls <c>ChannelEngine.OnDisposing</c> instead, which touches game-thread state only (docs/design/session-layer.md
+    /// §7.7); <c>DisposingPeerTests</c> covers it together with a pending request and a tracked send.
     /// </para>
     /// </summary>
     [Fact]

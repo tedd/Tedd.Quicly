@@ -10,8 +10,8 @@ using Tedd.Quicly.Core.Threading;
 namespace Tedd.Quicly.Core.Session.Engines;
 
 // Fragmentation of the unreliable modes (PROTOCOL.md §2.1, §7; docs/design/session-layer.md §7.8): a message that does not
-// fit one datagram is split into at most 8 fragments on the send side (game thread) and reassembled per channel on the
-// receive side (transport thread).
+// fit one datagram is split into at most 8 fragments on the send side (game thread) and reassembled on the receive side
+// (transport thread) in a partial per (channel, key, sequence), at most MaxReassemblies per channel.
 internal abstract unsafe partial class DatagramEngine
 {
     /// <summary>Most fragments one message may be split into (PROTOCOL.md §2.1).</summary>

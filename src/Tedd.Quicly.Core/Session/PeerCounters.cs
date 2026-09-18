@@ -69,7 +69,7 @@ internal sealed class PeerCounters
     /// <summary>Fragments dropped: duplicates, inconsistent fragment fields, a partial's limits, or no receive buffer.</summary>
     public long FragmentsDropped;
 
-    /// <summary>Partial reassemblies given up because a newer sequence of the same key arrived, or the channel's cap evicted them.</summary>
+    /// <summary>Partial reassemblies given up because a newer sequence of the same key arrived on a sequenced channel, or the channel's cap evicted them.</summary>
     public long ReassembliesAbandoned;
 
     /// <summary>Partial reassemblies given up because they were not completed within 2 × RTT + 100 ms.</summary>

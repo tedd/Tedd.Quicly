@@ -100,30 +100,21 @@ public class HandshakeTimeoutTests
     [Fact]
     public async Task The_intermediates_of_a_certificate_are_sent_with_it()
     {
-        using ECDsa rootKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        CertificateRequest rootRequest = new("CN=Quicly Test Root", rootKey, HashAlgorithmName.SHA256);
-        rootRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
-        rootRequest.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(rootRequest.PublicKey, false));
-        DateTimeOffset now = DateTimeOffset.UtcNow;
-        using X509Certificate2 root = rootRequest.CreateSelfSigned(now.AddDays(-1), now.AddDays(1));
-        using ECDsa leafKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        CertificateRequest leafRequest = new("CN=localhost", leafKey, HashAlgorithmName.SHA256);
-        SubjectAlternativeNameBuilder san = new();
-        san.AddDnsName("localhost");
-        leafRequest.CertificateExtensions.Add(san.Build());
-        leafRequest.CertificateExtensions.Add(X509AuthorityKeyIdentifierExtension.CreateFromCertificate(root, true, false));
-        using X509Certificate2 issued = leafRequest.Create(root, now.AddMinutes(-5), now.AddDays(1), RandomNumberGenerator.GetBytes(8));
-        using X509Certificate2 ephemeral = issued.CopyWithPrivateKey(leafKey);
-        // Through a PKCS#12 round trip: SChannel cannot sign with an ephemeral key.
-        using X509Certificate2 leaf = X509CertificateLoader.LoadPkcs12(ephemeral.Export(X509ContentType.Pkcs12), null, X509KeyStorageFlags.DefaultKeySet);
+        (X509Certificate2 root, X509Certificate2 leaf, _) = CreateChain();
+        try
+        {
+            HttpTlsOptions tls = HttpTlsOptions.FromCertificate(leaf);
+            tls.AdditionalCertificates = [root]; // the issuer is in no store, and a handshake never fetches it
+            await using var host = TestHost.Start(o => o.Use(Routes()), tls);
 
-        HttpTlsOptions tls = HttpTlsOptions.FromCertificate(leaf);
-        tls.AdditionalCertificates = [root]; // the issuer is in no store, and a handshake never fetches it
-        await using var host = TestHost.Start(o => o.Use(Routes()), tls);
-
-        List<string> received = await ChainSubjectsAsync(host.EndPoint);
-        Assert.Contains("CN=localhost", received);
-        Assert.Contains("CN=Quicly Test Root", received);
+            List<string> received = await ChainSubjectsAsync(host.EndPoint);
+            Assert.Contains("CN=localhost", received);
+            Assert.Contains(root.Subject, received);
+        }
+        finally
+        {
+            Release(root, leaf);
+        }
     }
 
     [Fact]
@@ -148,13 +139,12 @@ public class HandshakeTimeoutTests
             await using var host = TestHost.Start(o => o.Use(Routes()), HttpTlsOptions.FromSource(source));
             List<string> received = await ChainSubjectsAsync(host.EndPoint);
             Assert.Contains("CN=localhost", received);
-            Assert.Contains("CN=Quicly Test Root", received); // sent from the file's chain, never fetched
+            Assert.Contains(root.Subject, received); // sent from the file's chain, never fetched
         }
         finally
         {
             File.Delete(path);
-            root.Dispose();
-            leaf.Dispose();
+            Release(root, leaf);
         }
     }
 
@@ -179,8 +169,7 @@ public class HandshakeTimeoutTests
         finally
         {
             File.Delete(path);
-            root.Dispose();
-            leaf.Dispose();
+            Release(root, leaf);
         }
     }
 
@@ -197,8 +186,7 @@ public class HandshakeTimeoutTests
         }
         finally
         {
-            root.Dispose();
-            leaf.Dispose();
+            Release(root, leaf);
         }
     }
 
@@ -222,11 +210,20 @@ public class HandshakeTimeoutTests
         Assert.Equal(0, host.Server.HandshakeTimeouts); // the read failed, it did not run out of time
     }
 
-    /// <summary>A leaf for <c>localhost</c> issued by a root that is in no store, the root itself, and the leaf's PKCS#12 bytes.</summary>
+    /// <summary>
+    /// A leaf for <c>localhost</c> issued by a root that is in no store, the root itself, and the leaf's PKCS#12 bytes. Hand
+    /// the root and the leaf to <see cref="Release"/> when done.
+    /// </summary>
+    /// <remarks>
+    /// Every root gets a name of its own. On Windows, building a credential for the leaf (SslStreamCertificateContext) copies
+    /// the root into the "Intermediate Certification Authorities" store, because the OS cannot build the chain alone; with one
+    /// fixed name those copies piled up across runs, and past 50 same-named certificates that did not sign a leaf, Windows
+    /// chain building for that leaf fails ("An unknown chain building error occurred").
+    /// </remarks>
     private static (X509Certificate2 Root, X509Certificate2 Leaf, byte[] LeafPfx) CreateChain()
     {
         using ECDsa rootKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        CertificateRequest rootRequest = new("CN=Quicly Test Root", rootKey, HashAlgorithmName.SHA256);
+        CertificateRequest rootRequest = new("CN=Quicly Test Root " + Convert.ToHexString(RandomNumberGenerator.GetBytes(6)), rootKey, HashAlgorithmName.SHA256);
         rootRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
         rootRequest.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(rootRequest.PublicKey, false));
         DateTimeOffset now = DateTimeOffset.UtcNow;
@@ -243,6 +240,32 @@ public class HandshakeTimeoutTests
         byte[] leafPfx = ephemeral.Export(X509ContentType.Pkcs12)!;
         X509Certificate2 leaf = X509CertificateLoader.LoadPkcs12(leafPfx, null, X509KeyStorageFlags.DefaultKeySet);
         return (root, leaf, leafPfx);
+    }
+
+    /// <summary>
+    /// Takes the root of <see cref="CreateChain"/> out of the Windows intermediate stores SslStream may have copied it into
+    /// (a store this process cannot write is skipped), then disposes both certificates.
+    /// </summary>
+    private static void Release(X509Certificate2 root, X509Certificate2 leaf)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            foreach (StoreLocation location in (StoreLocation[])[StoreLocation.CurrentUser, StoreLocation.LocalMachine])
+            {
+                try
+                {
+                    using X509Store store = new(StoreName.CertificateAuthority, location);
+                    store.Open(OpenFlags.ReadWrite | OpenFlags.OpenExistingOnly);
+                    store.Remove(root); // a certificate that is not in the store is ignored
+                }
+                catch (Exception e) when (e is CryptographicException or UnauthorizedAccessException)
+                {
+                }
+            }
+        }
+
+        root.Dispose();
+        leaf.Dispose();
     }
 
     /// <summary>A selector that also knows the chain of the certificate it returns.</summary>

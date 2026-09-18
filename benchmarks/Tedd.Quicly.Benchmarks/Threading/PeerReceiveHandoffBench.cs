@@ -63,6 +63,11 @@ public unsafe class PeerReceiveHandoffBench
     private long _setupTimestamp;
     private bool _measuring;
     private int _harnessThread;
+    private PaddedLong _produced;
+    private PaddedLong _consumed;
+    private long _producerTicksBase;
+    private long _producedBase;
+    private long _receivedBase;
 
     /// <summary>Messages per pass (one client flush; must divide <see cref="Messages"/>).</summary>
     [Params(10, 100)]
@@ -75,6 +80,14 @@ public unsafe class PeerReceiveHandoffBench
     /// <summary>Whether the server has a work signal (hosts always set one).</summary>
     [Params(true, false)]
     public bool Signal { get; set; } = true;
+
+    /// <summary>
+    /// Both threads run at once, as in a real peer: the producer keeps publishing (at most two batches ahead of what the
+    /// consumer has taken) while the consumer polls, so lines both use are contended instead of handed over once per pass.
+    /// Only with a producer thread (<see cref="Placement"/> other than <c>Single</c>).
+    /// </summary>
+    [Params(false, true)]
+    public bool Pipelined { get; set; }
 
     [GlobalSetup]
     public void Setup()
@@ -152,6 +165,7 @@ public unsafe class PeerReceiveHandoffBench
         }
 
         _containers = _tap.Captured.ToArray();
+        _receivedBase = _received;
         if (Placement != "Single")
         {
             int cpu = Placement switch
@@ -160,7 +174,9 @@ public unsafe class PeerReceiveHandoffBench
                 "CrossCcd" => CrossCcdCpu,
                 _ => throw new ArgumentException(Placement),
             };
-            _producer = new Thread(() => ProducerMain(cpu)) { IsBackground = true, Priority = ThreadPriority.Highest };
+            _producer = Pipelined
+                ? new Thread(() => PipelinedProducerMain(cpu)) { IsBackground = true, Priority = ThreadPriority.Highest }
+                : new Thread(() => ProducerMain(cpu)) { IsBackground = true, Priority = ThreadPriority.Highest };
             _producer.Start();
         }
 
@@ -176,9 +192,21 @@ public unsafe class PeerReceiveHandoffBench
             _producer.Join();
         }
 
+        double f = 1e9 / Stopwatch.Frequency / Math.Max(1, _measuredMessages);
         if (_measuredMessages > 0)
         {
-            double f = 1e9 / Stopwatch.Frequency / _measuredMessages;
+            if (Pipelined && _producer is not null)
+            {
+                double pf = 1e9 / Stopwatch.Frequency / Math.Max(1, _produced.Value - _producedBase);
+                _server.GetStatistics(out PeerStatistics s);
+                Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"HANDOFF PeerReceive{(Signal ? "Signal" : "")} {Placement}Pipe batch={Batch}: producer {(_producerTicks.Value - _producerTicksBase) * pf:F1} | consumer {_consumerTicks * f:F1} | busy {(_producerTicks.Value - _producerTicksBase) * pf + _consumerTicks * f:F1} | wall {_wallTicks * f:F1} ns/msg ({_measuredMessages} msgs, containers/pass {_containers.Length}, signals {_signal.Count}, drops {s.ReceiveRingDrops + s.OutOfReceiveBuffers}, outstanding {s.ReceiveBytesOutstanding})"));
+                _measuredMessages = 0;
+            }
+        }
+
+        if (_measuredMessages > 0)
+        {
             _server.GetStatistics(out PeerStatistics statistics);
             Console.WriteLine(string.Create(System.Globalization.CultureInfo.InvariantCulture,
                 $"HANDOFF PeerReceive{(Signal ? "Signal" : "")} {Placement} batch={Batch}: producer {_producerTicks.Value * f:F1} | consumer {_consumerTicks * f:F1} | busy {(_producerTicks.Value + _consumerTicks) * f:F1} | wall {_wallTicks * f:F1} ns/msg ({_measuredMessages} msgs, containers/pass {_containers.Length}, signals {_signal.Count}, drops {statistics.ReceiveRingDrops + statistics.OutOfReceiveBuffers}, outstanding {statistics.ReceiveBytesOutstanding})"));
@@ -201,12 +229,26 @@ public unsafe class PeerReceiveHandoffBench
 
         if (!_measuring && Stopwatch.GetElapsedTime(_setupTimestamp).TotalSeconds > 2.5)
         {
-            // The producer is idle between passes (it has published its last `done`), so its counter can be reset here.
+            // Lockstep: the producer is idle between passes (it has published its last `done`), so its counter can be reset
+            // here. Pipelined: it keeps running, so its counters are sampled instead.
+            _producerTicksBase = Volatile.Read(ref _producerTicks.Value);
+            _producedBase = Volatile.Read(ref _produced.Value);
             _measuring = true;
-            _producerTicks.Value = 0;
+            if (!Pipelined)
+            {
+                _producerTicks.Value = 0;
+                _producerTicksBase = 0;
+            }
+
             _consumerTicks = 0;
             _wallTicks = 0;
             _measuredMessages = 0;
+        }
+
+        if (Pipelined && _producer is not null)
+        {
+            RunPipelined();
+            return;
         }
 
         int passes = Messages / Batch;
@@ -248,6 +290,49 @@ public unsafe class PeerReceiveHandoffBench
         _consumerTicks += consumer;
         _wallTicks += Stopwatch.GetTimestamp() - start;
         _measuredMessages += Messages;
+    }
+
+    private void RunPipelined()
+    {
+        long first = _received;
+        long target = first + Messages;
+        long consumer = 0;
+        long start = Stopwatch.GetTimestamp();
+        while (_received < target)
+        {
+            long t0 = Stopwatch.GetTimestamp();
+            if (_server.Poll() > 0)
+            {
+                consumer += Stopwatch.GetTimestamp() - t0;
+                Volatile.Write(ref _consumed.Value, _received - _receivedBase);
+            }
+        }
+
+        _consumerTicks += consumer;
+        _wallTicks += Stopwatch.GetTimestamp() - start;
+        _measuredMessages += _received - first;
+    }
+
+    private void PipelinedProducerMain(int cpu)
+    {
+        Pin(cpu);
+        long produced = 0;
+        long ticks = 0;
+        while (Volatile.Read(ref _go.Value) >= 0)
+        {
+            if (produced - Volatile.Read(ref _consumed.Value) > 2 * Batch)
+            {
+                Thread.SpinWait(1);
+                continue;
+            }
+
+            long t0 = Stopwatch.GetTimestamp();
+            Produce();
+            ticks += Stopwatch.GetTimestamp() - t0;
+            produced += Batch;
+            Volatile.Write(ref _producerTicks.Value, ticks);
+            Volatile.Write(ref _produced.Value, produced);
+        }
     }
 
     private void SendBatch(byte[] message)

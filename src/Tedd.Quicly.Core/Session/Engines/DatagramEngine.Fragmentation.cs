@@ -871,7 +871,7 @@ internal abstract unsafe partial class DatagramEngine
                 counters.Superseded++;
             }
 
-            _core.NoteWork();
+            _core.NoteTransportWork();
         }
         else if (!_core.TryEnqueueReceive(in entry))
         {

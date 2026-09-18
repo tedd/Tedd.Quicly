@@ -601,7 +601,7 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
             }
 
             // A mailbox bypasses the receive ring, so the peer's work signal is raised here instead (ADR 0008 §6).
-            _core.NoteWork();
+            _core.NoteTransportWork();
         }
         else if (!_core.TryEnqueueReceive(in entry))
         {

@@ -288,4 +288,48 @@ public class WorkSignalTests
         Assert.Equal(30, received);
         Assert.False(h.Server.HasPendingWork);
     }
+
+    [Fact]
+    public void Mailbox_Posts_And_Reassembled_Fragments_Signal_Once_Per_Receive_Callback_Burst()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        using SessionHarness h = NewPair(clientSignal, serverSignal, DatagramTables.Main);
+        QuiclyPeer server = h.Server!;
+        int latest = 0;
+        int fragmented = 0;
+        server.RegisterHandler(4, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => latest++);
+        server.RegisterHandler(13, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) =>
+        {
+            Assert.Equal(3_000, payload.Length);
+            fragmented++;
+        });
+        h.Client.Poll();
+        server.Poll();
+        serverSignal.Take();
+
+        // Twenty coalescing posts in one container: one edge.
+        for (ulong key = 0; key < 20; key++)
+        {
+            h.Client.SendCopy(new SendHeader(4, key), new byte[16]);
+        }
+
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        Assert.Equal(1, serverSignal.Calls);
+        Assert.True(server.HasPendingWork);
+        server.Poll();
+        Assert.Equal(20, latest);
+        Assert.False(server.HasPendingWork);
+
+        // A fragmented message is published when its last fragment arrives: one edge, and the message is there to poll.
+        serverSignal.Take();
+        h.Client.SendCopy(new SendHeader(13), DatagramKit.Payload(1, 3_000));
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        Assert.Equal(1, serverSignal.Calls);
+        Assert.True(server.HasPendingWork);
+        server.Poll();
+        Assert.Equal(1, fragmented);
+    }
 }

@@ -197,4 +197,32 @@ public class MpscRingTests
             }
         }
     }
+
+    [Fact]
+    public void Pinned_Heap_Ring_Is_Aligned_Keeps_Fifo_And_Survives_Dispose()
+    {
+        // The completion table's free list: slots on the pinned object heap, 64-byte aligned like a native ring, and still
+        // usable after Dispose (which frees nothing for this storage), so a late enqueue is harmless.
+        var ring = new MpscRing<int>(100, pinnedObjectHeap: true);
+        Assert.Equal(128, ring.Capacity);
+        Assert.Equal(0, ring.Address % CacheLine.Size);
+        for (int lap = 0; lap < 3; lap++)
+        {
+            for (int i = 0; i < ring.Capacity; i++)
+                Assert.True(ring.TryEnqueue(lap * 1000 + i));
+            Assert.False(ring.TryEnqueue(-1));
+            for (int i = 0; i < ring.Capacity; i++)
+            {
+                Assert.True(ring.TryDequeue(out int item));
+                Assert.Equal(lap * 1000 + i, item);
+            }
+        }
+
+        ring.Dispose();
+        ring.Dispose();
+        Assert.True(ring.TryEnqueue(7));
+        Assert.True(ring.TryDequeue(out int late));
+        Assert.Equal(7, late);
+        Assert.True(ring.IsEmpty);
+    }
 }

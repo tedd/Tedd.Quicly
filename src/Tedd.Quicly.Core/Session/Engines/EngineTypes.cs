@@ -299,6 +299,15 @@ internal enum StreamMessagePhase : byte
 
     /// <summary>A bulk stream header was parsed: <see cref="StreamMessageContext.Bulk"/>.</summary>
     BulkHeader = 3,
+
+    /// <summary>
+    /// A whole message in one event, in place of <see cref="Start"/>, <see cref="Chunk"/> and <see cref="End"/>:
+    /// <see cref="StreamMessageContext.Header"/> is valid and <see cref="StreamMessageContext.Chunk"/> is the complete payload
+    /// (empty for an empty message). The peer uses it only for engines that set
+    /// <see cref="ChannelEngine.AcceptsWholeMessages"/>, when a message's payload lies wholly in the current receive segment.
+    /// <see cref="StreamConsumeAction.Pend"/> un-reads the whole message.
+    /// </summary>
+    Whole = 4,
 }
 
 /// <summary>One stream event for an engine (transport thread). Payload is never copied by the peer.</summary>

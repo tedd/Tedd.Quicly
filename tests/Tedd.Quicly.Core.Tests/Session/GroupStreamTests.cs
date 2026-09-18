@@ -236,6 +236,40 @@ public class GroupStreamTests
     }
 
     [Fact]
+    public void Whole_And_Split_Messages_Of_One_Group_Arrive_Intact_And_Only_A_Split_One_Is_Watched()
+    {
+        using ServerHarness h = new(table: Table, server: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.StreamIdleTimeout = TimeSpan.FromMilliseconds(50);
+        });
+        Assert.True(h.Admit());
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(5, Handlers.Collect(got));
+
+        // Two messages that each arrive whole (one engine event apiece): the stream is not watched between messages, so
+        // waiting past the idle timeout resets nothing.
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStream(5, 1, [1, 2], [3, 4, 5]), out TransportStreamId id));
+        Assert.True(h.RunUntil(() => got.Count == 2));
+        h.Run(200_000);
+        Assert.Equal(0, h.Statistics().StreamIdleTimeouts);
+        Assert.False(Aborted(h.Raw, id, out _));
+
+        // A message split across two writes (staged, so its lease is held in between), then a whole one with the FIN.
+        Assert.Equal(TransportStatus.Success, RawClient.SendStream(h.Raw.Transport, id, [4, 6, 7], TransportSendFlags.None));
+        Assert.True(h.RunUntil(() => h.Statistics().ReceiveBytesOutstanding > 0));
+        Assert.Equal(TransportStatus.Success, RawClient.SendStream(h.Raw.Transport, id, [8, 9, 2, 10, 11], TransportSendFlags.Fin));
+        Assert.True(h.RunUntil(() => got.Count == 4 && GroupKit.OpenPeerGroups(h.Server, 5) == 0));
+        Assert.Equal(new byte[] { 1, 2 }, got[0].Payload);
+        Assert.Equal(new byte[] { 3, 4, 5 }, got[1].Payload);
+        Assert.Equal(new byte[] { 6, 7, 8, 9 }, got[2].Payload);
+        Assert.Equal(new byte[] { 10, 11 }, got[3].Payload);
+        Assert.Equal(0, h.Statistics().StreamIdleTimeouts);
+        Assert.Equal(0, h.Statistics().ReceiveBytesOutstanding);
+        Assert.Equal(PeerState.Connected, h.Server.State);
+    }
+
+    [Fact]
     public void The_Group_Interval_Bounds_Stream_Churn()
     {
         using SessionHarness slow = new(table: Table, client: o => o.GroupMinInterval = TimeSpan.FromMilliseconds(10));

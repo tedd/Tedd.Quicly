@@ -203,6 +203,13 @@ internal abstract class ChannelEngine : IDisposable
     /// <returns>Accept (with a cookie), reject (the stream is reset with the code) or close the connection.</returns>
     public abstract StreamAccept OnStreamOpened(TransportStreamId id, ushort channel, ulong groupId);
 
+    /// <summary>
+    /// Whether <see cref="OnStreamMessage"/> takes <see cref="StreamMessagePhase.Whole"/>: a message whose payload lies wholly
+    /// in one receive segment is then handed over in one event instead of <c>Start, Chunk, End</c>. Set once by the engine
+    /// (in <see cref="Initialize"/>); default <see langword="false"/>.
+    /// </summary>
+    public bool AcceptsWholeMessages { get; protected set; }
+
     /// <summary>A message event on an accepted stream (transport thread).</summary>
     /// <param name="message">The event.</param>
     /// <returns>What to do next.</returns>

@@ -429,7 +429,7 @@ server layers run without MsQuic. `RecordingSink` records every callback with pa
 packets, modelled as a retransmission delay of `RetransmitDelayMicros`, never as missing data), `ReorderPercent`, `BandwidthBitsPerSecond`
 (0 = unlimited; a per-direction serialization queue served highest priority first: priority datagrams, then datagrams, then streams
 by priority), `MaxQueueBytes` (datagrams beyond it are dropped), `MaxDatagramPayload` (default 1200, also the stream packet size),
-`DatagramsEnabled`, `DatagramSendStateReporting`, `PeerUnidiStreams` / `PeerBidiStreams` (default 0 / 1, like MsQuic before admission),
+`DatagramsEnabled`, `DatagramSendStateReporting`, `IdealSendBufferReporting` (note 7), `PeerUnidiStreams` / `PeerBidiStreams` (default 0 / 1, like MsQuic before admission),
 `MtuChanges` (list of `(AtMicros, MaxDatagramPayload)`), `DisconnectAtMicros`, `ConnectDelayMicros` (default one round trip; the
 connector ignores it: the client connects after one RTT, the server half an RTT later).
 
@@ -470,7 +470,12 @@ Notes for session-layer tests over the simulator:
    contract, identical on both transports).
 6. Zero-allocation tests need a warm-up that reaches the run's peak of concurrent events, streams and sends; the tables grow to that peak
    and then stay. A stream-per-message workload under jitter needs about 15,000 messages.
-7. `OnIdealSendBufferSize` and `OnPeerAddressChanged` are never raised. `IdealSendBufferSize` and `AppOwnedReceiveBuffers` are false.
+7. `OnPeerAddressChanged` is never raised and `AppOwnedReceiveBuffers` is false. `OnIdealSendBufferSize` is raised only with
+   `LinkOptions.IdealSendBufferReporting` (default off; the `IdealSendBufferSize` capability follows it), the way MsQuic raises
+   it with send buffering disabled: each local stream hears the connection's ideal right after it starts, and every started
+   stream still sending hears it again when it grows. The ideal starts at 128 KiB and, whenever the bytes in flight — counted
+   up to the reported congestion window, as MsQuic counts only bytes on the wire — reach a new maximum, becomes the first
+   value of 128 KiB × 1.5ⁿ above it (at most 128 MiB); it never shrinks, and a stream is never told the same value twice.
 8. Link options are fixed at creation. There is no mid-run change of loss, delay or bandwidth; use the targeted drops or a new link.
 9. `CloseStream` before shutdown aborts both directions with code 0. Pending completions are still reported (canceled), but the shutdown
    callback is not.

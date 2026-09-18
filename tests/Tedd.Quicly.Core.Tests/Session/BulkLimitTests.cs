@@ -1,3 +1,4 @@
+using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Framing;
 using Tedd.Quicly.Core.Memory;
@@ -13,10 +14,11 @@ namespace Tedd.Quicly.Core.Tests.Session;
 /// <summary>
 /// What bounds a bulk transfer, and what it does when a bound bites (docs/design/session-layer.md §7.7, PROTOCOL.md §7):
 /// the three send gates (the pass's send cap, the per-peer rate bucket, the per-transfer send window), the send table and
-/// the send budget, the receive budget on both of its rental paths, the rate rule itself — including the 16 KiB/s floor and
-/// the case where there is no rate information at all — and a range request the transfer limit refuses. Plus the two
-/// adverse-link cases the rest of the bulk suite never exercises: a chunked object over a lossy, reordered, jittery link,
-/// and a cancellation racing that loss.
+/// the send budget, the receive budget on both of its rental paths, the rate rule itself — the 16 KiB/s floor under a tiny
+/// estimate and as the whole rate when the transport measures nothing, and the gate switched off for an estimate without a
+/// bound — the send window following the transport's ideal send buffer, progress that cannot go out, an overflowing
+/// notice ring, and a range request the transfer limit refuses. Plus the two adverse-link cases the rest of the bulk suite
+/// never exercises: a chunked object over a lossy, reordered, jittery link, and a cancellation racing that loss.
 /// </summary>
 public class BulkLimitTests
 {
@@ -344,12 +346,13 @@ public class BulkLimitTests
     /// <summary>
     /// The rate rule of docs/design/session-layer.md §7.7, asserted where it is decided rather than through a stopwatch:
     /// an explicit <see cref="PeerOptions.BulkMaxBytesPerSecond"/> is taken as it is, a rate <em>derived</em> from a
-    /// bandwidth estimate is floored at 16 KiB/s so a tiny estimate still moves a transfer, and when there is no rate
-    /// information at all — the transport reports no usable RTT and no send cap is set — no rate is derived and the bucket
-    /// stays off, because flooring an unmetered link at 16 KiB/s would be orders of magnitude slower than the link.
+    /// bandwidth estimate is floored at 16 KiB/s so a tiny estimate still moves a transfer, and a congestion window with no
+    /// measurable round trip — a zero-delay link — is an estimate without a bound, so no rate is derived and the gate is off.
+    /// The case with no window at all, where the floor is the rate, is
+    /// <see cref="A_Transport_That_Measures_Nothing_Moves_Bulk_At_The_Floor"/>.
     /// </summary>
     [Fact]
-    public void The_Bulk_Rate_Floors_A_Derived_Estimate_And_Is_Off_Without_One()
+    public void The_Bulk_Rate_Floors_A_Derived_Estimate_And_Is_Off_For_An_Unbounded_One()
     {
         // A one-second one-way delay over a 64 kbit/s link: the estimate (congestion window ÷ RTT, halved by the default
         // share) is a few kilobytes a second, so the floor is what the bucket runs at.
@@ -374,7 +377,8 @@ public class BulkLimitTests
         capped.Run(5_000);
         Assert.Equal(4 * Kib, BulkKit.Engine(capped.Client).RatePerSecond);
 
-        // A zero-delay link reports an RTT below a microsecond, and no send cap is configured: nothing to derive from.
+        // A zero-delay link reports a congestion window and an RTT below a microsecond: the window crosses in no time, so the
+        // estimate has no bound and there is no rate to hold a transfer to.
         using SessionHarness free = new(table: BulkTables.Main, client: BulkKit.Quiet, server: BulkKit.Quiet);
         free.Run(5_000);
         Assert.Equal(0, BulkKit.Engine(free.Client).RatePerSecond);
@@ -449,10 +453,12 @@ public class BulkLimitTests
     }
 
     /// <summary>
-    /// ADR 0009 ("every violation is a counter"): a <c>BulkProgress</c> claiming bytes this end never submitted is counted
-    /// in <see cref="PeerStatistics.BulkProgressOverClaims"/> and clamped, while a claim that merely runs ahead of a
-    /// completion still in flight is ordinary traffic and is not counted — the two are told apart by the bytes handed to
-    /// the transport, not by the bytes whose sends have completed.
+    /// ADR 0009 ("every violation is a counter") and PROTOCOL.md §3.4's control-message bounds: a <c>BulkProgress</c> claiming
+    /// bytes this end never submitted carries a field no honest peer can produce, so as a control datagram it is dropped
+    /// whole and counted in <see cref="PeerStatistics.BulkProgressOverClaims"/> (on the control stream it closes the
+    /// connection: <see cref="BulkRulesTests.An_Over_Claim_On_The_Control_Stream_Closes_The_Connection_As_A_Protocol_Violation"/>).
+    /// A claim that merely runs ahead of a completion still in flight is ordinary traffic and is not counted — the two are
+    /// told apart by the bytes handed to the transport, not by the bytes whose sends have completed.
     /// </summary>
     [Fact]
     public async Task An_Over_Claimed_Progress_Frame_Is_Counted_And_An_Early_Honest_One_Is_Not()
@@ -654,6 +660,208 @@ public class BulkLimitTests
 
         Assert.Equal(BulkStatus.Completed, ((CountingSink)router.Sinks[0]).Result!.Value.Status);
         Assert.Equal(PeerState.Connected, h.Server!.State);
+    }
+
+    /// <summary>
+    /// N4, the floor made real (docs/design/session-layer.md §7.7): a transport that reports no congestion window, with no
+    /// <see cref="PeerOptions.MaxSendBytesPerSecond"/> to fall back on, gives the engine no estimate at all — and an
+    /// unmeasured link is not assumed to be a fast one, so bulk moves at exactly the 16 KiB/s floor, and really is paced by
+    /// it. With a send cap the cap is the estimate, and bulk gets its share of that.
+    /// </summary>
+    [Fact]
+    public async Task A_Transport_That_Measures_Nothing_Moves_Bulk_At_The_Floor()
+    {
+        byte[] payload = Compressible(48 * Kib);
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
+        BulkRefusalConnector? connector = null;
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 1_000 },
+            table: BulkTables.Main,
+            client: o =>
+            {
+                BulkKit.Quiet(o);
+
+                // 4 KiB pieces, so the pace shows across a dozen of them rather than in one overdrawn piece.
+                o.BulkChunkBytes = (4 * Kib) + 128;
+            },
+            server: BulkKit.Receiver(router),
+            connector: inner => connector = new BulkRefusalConnector(inner));
+        connector!.Transport!.ReportNoStatistics = true;
+
+        BulkEngine engine = BulkKit.Engine(h.Client);
+        long start = h.Network.NowMicros;
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, payload.Length), new MemorySource(payload));
+        Assert.True(h.RunUntil(() => transfer.IsFinished, 60_000_000), "the transfer never finished");
+
+        Assert.Equal(16 * Kib, engine.RatePerSecond);
+        Assert.Equal(BulkStatus.Completed, transfer.Status);
+        Assert.Equal(payload, router.Sink<MemorySink>().Bytes);
+
+        // 48 KiB at 16 KiB/s with a 1.6 KiB burst is close to three seconds on a link that would carry it in one pass.
+        long elapsed = h.Network.NowMicros - start;
+        Assert.True(elapsed > 2_000_000, $"the floor did not pace the transfer: {elapsed} µs");
+
+        // Still no window, but a send cap: the cap is the estimate, and bulk takes its default half of it.
+        BulkRefusalConnector? capped = null;
+        using SessionHarness withCap = new(
+            link: new LinkOptions { DelayMicros = 1_000 },
+            table: BulkTables.Main,
+            client: o =>
+            {
+                BulkKit.Quiet(o);
+                o.MaxSendBytesPerSecond = Mib;
+            },
+            server: BulkKit.Quiet,
+            connector: inner => capped = new BulkRefusalConnector(inner));
+        capped!.Transport!.ReportNoStatistics = true;
+        withCap.Run(5_000);
+        Assert.Equal(Mib / 2, BulkKit.Engine(withCap.Client).RatePerSecond);
+    }
+
+    /// <summary>
+    /// N3: the send window MsQuic will drive. With send buffering disabled MsQuic tells each stream its ideal send buffer
+    /// (<see cref="ITransportSink.OnIdealSendBufferSize"/>), starting at 128 KiB and growing with the bytes in flight, and the
+    /// engine's window is <c>min(that ideal, BulkShareOfCongestionWindow × cwnd)</c> in place of
+    /// <see cref="PeerOptions.BulkSendWindowBytes"/> (ARCHITECTURE.md §7). The simulator now reports it the same way
+    /// (<see cref="LinkOptions.IdealSendBufferReporting"/>), so the path is measured rather than assumed: the same transfer
+    /// keeps its 16 KiB configured window without the reports, and follows the reported ideal — past anything 16 KiB could
+    /// allow, and still under the congestion window's share — with them.
+    /// </summary>
+    [Fact]
+    public async Task The_Send_Window_Follows_The_Ideal_Send_Buffer_The_Transport_Reports()
+    {
+        // One piece (a 64 KiB block less the 128-byte prefix reserve, plus the prefix itself) may overdraw any window.
+        const long Piece = 64 * Kib;
+        const long CongestionWindow = 500_000; // 400 Mbit/s over a 10 ms round trip
+
+        (long peak, long ideal) = await Run(reporting: false);
+        Assert.Equal(0, ideal);
+        Assert.True(peak <= (16 * Kib) + Piece, $"without reports the configured window did not bind: {peak} bytes outstanding");
+
+        (peak, ideal) = await Run(reporting: true);
+
+        // What the transport reported: MsQuic's series, 128 KiB × 1.5ⁿ.
+        long step = 128 * Kib;
+        while (step < ideal)
+        {
+            step += step / 2;
+        }
+
+        Assert.Equal(step, ideal);
+        Assert.True(ideal >= 128 * Kib);
+
+        // The window followed it past anything the configured 16 KiB allows, and the congestion window's share still capped it.
+        Assert.True(peak > (16 * Kib) + Piece, $"the reported ideal did not replace the configured window: {peak} bytes outstanding");
+        Assert.True(peak <= CongestionWindow + Piece, $"the congestion window's share did not bind: {peak} bytes outstanding");
+
+        static async Task<(long Peak, long Ideal)> Run(bool reporting)
+        {
+            using SessionHarness h = new(
+                link: new LinkOptions
+                {
+                    DelayMicros = 5_000,
+                    BandwidthBitsPerSecond = 400_000_000,
+                    IdealSendBufferReporting = reporting,
+                },
+                table: BulkTables.Main,
+                client: o =>
+                {
+                    BulkKit.Quiet(o);
+                    o.BulkSendWindowBytes = 16 * Kib;
+                    o.BulkShareOfCongestionWindow = 1;
+                },
+                server: BulkKit.Receiver(AcceptRouter.Pattern()));
+
+            BulkEngine engine = BulkKit.Engine(h.Client);
+            BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, 2 * Mib), new PatternSource(2 * Mib));
+            long peak = 0;
+            long ideal = 0;
+            Assert.True(
+                h.RunUntil(
+                    () =>
+                    {
+                        peak = Math.Max(peak, BulkKit.Stats(h.Client, 5).InFlightBytes);
+                        ideal = Math.Max(ideal, engine.LargestIdealSendBuffer);
+                        return transfer.IsFinished;
+                    },
+                    30_000_000,
+                    step: 100),
+                "the transfer never finished");
+            Assert.Equal(BulkStatus.Completed, transfer.Status);
+            return (peak, ideal);
+        }
+    }
+
+    /// <summary>
+    /// PROTOCOL.md §2.3: progress is sent at most every 64 KiB or 100 ms, and on completion; the window advances only when a
+    /// frame really went out. Here none can: the receiving end's transport refuses every <c>BulkProgress</c> datagram. Both
+    /// of the engine's progress paths — the periodic one over a live transfer and the final one over a retired transfer —
+    /// must then hold what they owe rather than skip it, so the sender sees nothing until the frames can leave and then
+    /// completes on the exact final count.
+    /// </summary>
+    [Fact]
+    public async Task Progress_That_Cannot_Go_Out_Is_Held_And_Sent_Later_Rather_Than_Skipped()
+    {
+        byte[] payload = Compressible(256 * Kib);
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
+        BulkRefusalConnector? connector = null;
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 5_000, BandwidthBitsPerSecond = 4_000_000 },
+            table: BulkTables.Main,
+            client: BulkKit.Receiver(router),
+            server: BulkKit.Quiet,
+            connector: inner => connector = new BulkRefusalConnector(inner));
+        connector!.Transport!.FailProgressDatagrams = true;
+
+        BulkTransfer transfer = await h.Server!.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, payload.Length), new MemorySource(payload));
+        Assert.True(h.RunUntil(() => router.Sinks.Count == 1 && router.Sink<MemorySink>().IsFinished, 30_000_000), "the object did not arrive");
+        h.Run(300_000);
+
+        // Every byte arrived and the receiver finished, yet the sender was told nothing: every attempt was refused, and
+        // attempts continued after the transfer retired.
+        int refused = connector.Transport!.FailedProgressDatagrams;
+        Assert.True(refused >= 2, $"only {refused} progress frames were attempted");
+        Assert.Equal(0, transfer.BytesTransferred);
+        Assert.False(transfer.IsFinished);
+
+        connector.Transport!.FailProgressDatagrams = false;
+        Assert.True(h.RunUntil(() => transfer.IsFinished, 30_000_000), "the held progress never went out");
+        Assert.Equal(BulkStatus.Completed, transfer.Status);
+        Assert.Equal(payload.Length, transfer.BytesTransferred);
+        Assert.Equal(payload, router.Sink<MemorySink>().Bytes);
+    }
+
+    /// <summary>
+    /// The stream-notice ring is sized for every live stream's notices between two passes, so it overflows only when a
+    /// transport reports more stream events than its contract allows. That is counted as a callback fault rather than lost
+    /// silently, the notices that did fit are ignored because they name no live transfer, and the engine carries on.
+    /// </summary>
+    [Fact]
+    public async Task An_Overflowing_Stream_Notice_Ring_Counts_A_Fault_And_Keeps_The_Engine_Working()
+    {
+        byte[] payload = Compressible(32 * Kib);
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 1_000 },
+            table: BulkTables.Main,
+            client: BulkKit.Quiet,
+            server: BulkKit.Receiver(router));
+        BulkEngine engine = BulkKit.Engine(h.Client);
+        long faults = DatagramKit.Statistics(h.Client).CallbackFaults;
+
+        ulong context = PeerCore.MakeEngineStreamContext(ChannelMode.Bulk, 0, 5);
+        for (int i = 0; i < 64; i++)
+        {
+            engine.OnStreamStarted(new TransportStreamId(900, 1), context, TransportStatus.Success);
+        }
+
+        Assert.True(DatagramKit.Statistics(h.Client).CallbackFaults > faults, "the overflow was not counted");
+
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, payload.Length), new MemorySource(payload));
+        Assert.True(h.RunUntil(() => transfer.IsFinished), "the engine stopped working after the overflow");
+        Assert.Equal(BulkStatus.Completed, transfer.Status);
+        Assert.Equal(payload, router.Sink<MemorySink>().Bytes);
+        Assert.Equal(PeerState.Connected, h.Client.State);
     }
 
     /// <summary>A provider that answers a request with a descriptor for another channel than the one asked on.</summary>

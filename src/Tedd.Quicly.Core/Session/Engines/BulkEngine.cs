@@ -171,6 +171,21 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     /// </summary>
     internal long RatePerSecond => _rate;
 
+    /// <summary>The largest ideal send buffer the transport has reported for any send stream of this engine, or 0 (tests).</summary>
+    internal long LargestIdealSendBuffer
+    {
+        get
+        {
+            long largest = 0;
+            for (int record = 0; record < _idealSendBuffer.Length; record++)
+            {
+                largest = Math.Max(largest, Volatile.Read(ref _idealSendBuffer[record]));
+            }
+
+            return largest;
+        }
+    }
+
     /// <summary>
     /// Checks the sizes of the explicit-layout bulk structs (game thread, at construction). A <c>Size</c> that cuts off the
     /// last field, or an 8-byte field at a misaligned offset, makes the type fail to load at all — and the first touch would
@@ -1196,8 +1211,10 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             }
         }
 
-        ClosePendingRequests(BulkStatus.Disconnected);
+        // Receive first: a request whose answer was arriving is settled by that transfer (a resumable one keeps the part still
+        // missing), so only the requests nothing answered are reported to the router as closed.
         OnPeerClosedReceive();
+        ClosePendingRequests(BulkStatus.Disconnected);
     }
 
     /// <inheritdoc/>
@@ -1778,11 +1795,14 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
                     break;
                 case NoticeKind.ShutDown:
                     // The stream is gone either way, so it is forgotten before the verdict: its slot (and the peer's
-                    // credit) are free again, and no termination can try to reset it.
+                    // credit) are free again, and no termination can try to reset it. A live transfer whose stream shut down
+                    // before it sent FIN, with no stop from the peer (that is a Stopped notice) and no reset of ours (that
+                    // finished it first), lost it to the connection: the transport shuts every stream down before it reports
+                    // its own close, so this can arrive while IsTransportClosing is still false.
                     send.Stream = default;
                     if (send.Phase is BulkPhase.Starting or BulkPhase.Open && (send.Flags & SendFinSent) == 0)
                     {
-                        FinishSend(local, record, _core.IsTransportClosing ? BulkStatus.Disconnected : BulkStatus.Failed, QuiclyErrorCode.NoError);
+                        FinishSend(local, record, BulkStatus.Disconnected, QuiclyErrorCode.NoError);
                     }
 
                     ReleaseStreamSlot(ref send, ref state);
@@ -1879,7 +1899,10 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         /// <summary>The request id on the wire.</summary>
         public ulong RequestId;
 
-        /// <summary>What was asked for; its offset and length advance as the answer arrives, so a resume asks for the rest.</summary>
+        /// <summary>
+        /// What was asked for. A resumable request whose answer a disconnect cut short advances past the bytes that arrived
+        /// (<see cref="SettleRequest"/>), so the resume asks for the rest.
+        /// </summary>
         public BulkRangeRequest Range;
     }
 

@@ -167,9 +167,7 @@ public sealed unsafe partial class SimulatedTransport : ITransport
             statistics.MinRttMicros = statistics.RttMicros;
             statistics.MaxRttMicros = ClampU32(2 * (o.DelayMicros + o.JitterMicros));
             statistics.RttVarianceMicros = ClampU32(o.JitterMicros);
-            statistics.CongestionWindowBytes = o.BandwidthBitsPerSecond == 0
-                ? 16u << 20
-                : ClampU32(Math.Max(2L * Link.MaxPayload, (long)(o.BandwidthBitsPerSecond / 8.0 * Math.Max(2 * o.DelayMicros, 1000) / 1_000_000)));
+            statistics.CongestionWindowBytes = CongestionWindow();
             statistics.BytesInFlight = (ulong)_bytesInFlight;
             statistics.PathMtu = (ushort)Math.Min(ushort.MaxValue, Link.MaxPayload + PathOverheadBytes);
             statistics.SendTotalBytes = _sendBytes;
@@ -178,6 +176,15 @@ public sealed unsafe partial class SimulatedTransport : ITransport
             statistics.RecvTotalPackets = _recvPackets;
             statistics.SendSuspectedLostPackets = _suspectedLost;
         }
+    }
+
+    /// <summary>The congestion window <see cref="GetStatistics"/> reports: the bandwidth-delay product (at least two packets) under a bandwidth limit, else 16 MiB.</summary>
+    private uint CongestionWindow()
+    {
+        LinkOptions o = Link.Options;
+        return o.BandwidthBitsPerSecond == 0
+            ? 16u << 20
+            : ClampU32(Math.Max(2L * Link.MaxPayload, (long)(o.BandwidthBitsPerSecond / 8.0 * Math.Max(2 * o.DelayMicros, 1000) / 1_000_000)));
     }
 
     /// <summary>Copies the counters of the direction from this end to its peer.</summary>

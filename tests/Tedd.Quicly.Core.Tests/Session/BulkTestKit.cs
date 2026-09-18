@@ -141,6 +141,27 @@ internal static class BulkKit
         return buffer.AsSpan(0, position + tail.Length).ToArray();
     }
 
+    /// <summary>
+    /// A bulk stream of one chunked body: the §3.3 header of a whole object of <paramref name="rawLength"/> bytes, then one
+    /// chunk header announcing <paramref name="chunkLength"/> wire bytes and only <paramref name="bodyBytes"/> of them.
+    /// </summary>
+    public static byte[] ChunkedStream(ushort channel, ulong transferId, int chunkLength, int rawLength, int bodyBytes)
+    {
+        BulkHeader header = new()
+        {
+            TransferId = transferId,
+            ObjectId = transferId,
+            ObjectVersion = 1,
+            TotalLength = (ulong)rawLength,
+            Offset = 0,
+            Length = (ulong)rawLength,
+            Flags = BulkFlags.Chunked,
+        };
+        byte[] body = new byte[16 + bodyBytes];
+        int position = StreamFraming.WriteBulkChunkHeader(body, chunkLength, rawLength);
+        return BulkStream(channel, in header, body.AsSpan(0, position + bodyBytes));
+    }
+
     /// <summary>A body of chunk frames (<c>ChunkLength, RawLength, bytes</c>), each stored uncompressed.</summary>
     public static byte[] RawChunks(params byte[][] chunks)
     {
@@ -369,7 +390,9 @@ internal sealed class DenyAll : IBulkAuthorizer
 /// <see cref="TransportStatus.StreamLimitReached"/> (the simulator only ever refuses a start asynchronously, the way
 /// MsQuic does), and <see cref="FailStarts"/> fails the send that carries <see cref="TransportSendFlags.Start"/>
 /// <em>after</em> the open succeeded — nothing took stream credit then, so no credit event is coming and the transfer
-/// must go out on a new stream at the next pass rather than wait.
+/// must go out on a new stream at the next pass rather than wait. It can also play a transport that measures nothing
+/// (<see cref="ReportNoStatistics"/>) and one that refuses the peer's <c>BulkProgress</c> control datagrams
+/// (<see cref="FailProgressDatagrams"/>).
 /// </summary>
 internal sealed unsafe class BulkRefusalTransport(ITransport inner, ITransportSink sink) : ITransport
 {
@@ -390,6 +413,14 @@ internal sealed unsafe class BulkRefusalTransport(ITransport inner, ITransportSi
 
     public int FailedStarts { get; private set; }
 
+    /// <summary>Report all-zero statistics — no congestion window, no RTT — like a transport that measures nothing.</summary>
+    public bool ReportNoStatistics { get; set; }
+
+    /// <summary>Refuse every <c>BulkProgress</c> control datagram (PROTOCOL.md §2.3: <c>0x00 0x05 ...</c>) this end sends.</summary>
+    public bool FailProgressDatagrams { get; set; }
+
+    public int FailedProgressDatagrams { get; private set; }
+
     public TransportCapabilities Capabilities => inner.Capabilities;
 
     public TransportState State => inner.State;
@@ -397,8 +428,20 @@ internal sealed unsafe class BulkRefusalTransport(ITransport inner, ITransportSi
     /// <summary>Tells the peer it may open a stream again (what a shutdown elsewhere would have done).</summary>
     public void GrantCredit() => sink.OnStreamsAvailable(0, 2);
 
-    public TransportStatus SendDatagram(TransportSegment* segments, int count, ulong context, TransportSendFlags flags) =>
-        inner.SendDatagram(segments, count, context, flags);
+    public TransportStatus SendDatagram(TransportSegment* segments, int count, ulong context, TransportSendFlags flags)
+    {
+        if (FailProgressDatagrams && count > 0 && segments[0].Length >= 2)
+        {
+            ReadOnlySpan<byte> head = segments[0].AsSpan();
+            if (head[0] == 0x00 && head[1] == (byte)ControlType.BulkProgress)
+            {
+                FailedProgressDatagrams++;
+                return TransportStatus.OutOfMemory;
+            }
+        }
+
+        return inner.SendDatagram(segments, count, context, flags);
+    }
 
     public TransportStatus OpenStream(StreamKind kind, ulong context, ushort priority, out TransportStreamId id)
     {
@@ -448,7 +491,16 @@ internal sealed unsafe class BulkRefusalTransport(ITransport inner, ITransportSi
 
     public void Close(ulong errorCode, ReadOnlySpan<byte> reason) => inner.Close(errorCode, reason);
 
-    public void GetStatistics(out TransportStatistics statistics) => inner.GetStatistics(out statistics);
+    public void GetStatistics(out TransportStatistics statistics)
+    {
+        if (ReportNoStatistics)
+        {
+            statistics = default;
+            return;
+        }
+
+        inner.GetStatistics(out statistics);
+    }
 
     public void Dispose() => inner.Dispose();
 

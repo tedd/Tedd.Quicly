@@ -425,13 +425,18 @@ public sealed unsafe partial class SimulatedTransport
     /// <summary>
     /// MsQuic's <c>QuicSendBufferConnectionAdjust</c> (<see cref="LinkOptions.IdealSendBufferReporting"/>): a new maximum of
     /// the bytes in flight may grow the connection's ideal send buffer to the next step of 128 KiB × 1.5ⁿ above it, and a
-    /// grown ideal is told to every started local stream that can still send, at the next step.
+    /// grown ideal is told to every started local stream that can still send, at the next step. MsQuic counts only bytes
+    /// on the wire, which its congestion control keeps within the window, while <c>_bytesInFlight</c> here also counts bytes
+    /// queued behind a bandwidth limit, so the maximum is taken of the two's minimum.
     /// </summary>
     private void NoteBytesInFlight()
     {
-        if (!Link.Options.IdealSendBufferReporting || _bytesInFlight <= _bytesInFlightMax)
+        if (!Link.Options.IdealSendBufferReporting)
             return;
-        _bytesInFlightMax = _bytesInFlight;
+        long inFlight = Math.Min(_bytesInFlight, CongestionWindow());
+        if (inFlight <= _bytesInFlightMax)
+            return;
+        _bytesInFlightMax = inFlight;
         ulong ideal = DefaultIdealSendBufferBytes;
         while (ideal <= (ulong)_bytesInFlightMax && ideal < MaxIdealSendBufferBytes)
             ideal += ideal / 2;

@@ -449,13 +449,16 @@ internal sealed unsafe partial class BulkEngine
 
             if ((recv.Flags & RecvAccepted) != 0)
             {
+                // A completed transfer was finished at its last byte and FinishReceive ignores it. For an unfinished one: a
+                // FIN before the last byte is a parser error, which resets the stream, so a stream that shuts down with no
+                // reset in either direction and no cancel of ours was taken down by the connection itself — the transport
+                // shuts every stream down before it reports its own close, so IsTransportClosing is not set yet.
                 int cancelled = Volatile.Read(ref _recvCancelCode[record]);
                 QuiclyErrorCode code = cancelled != 0 ? (QuiclyErrorCode)cancelled : (QuiclyErrorCode)errorCode;
                 BulkStatus status = _core.IsTransportClosing ? BulkStatus.Disconnected
                     : cancelled != 0 || (aborted && code == QuiclyErrorCode.BulkCanceled) ? BulkStatus.Canceled
-                    : BulkStatus.Failed;
-
-                // A FIN before the last byte is already a parser error, so an unfinished transfer ends Failed either way.
+                    : aborted ? BulkStatus.Failed
+                    : BulkStatus.Disconnected;
                 FinishReceive(record, ref recv, status, aborted ? code : QuiclyErrorCode.NoError);
             }
 
@@ -578,6 +581,7 @@ internal sealed unsafe partial class BulkEngine
 
             _retiredPending = -1;
             _sinks[record] = null;
+            SettleRequest(ref recv);
             if (!_recycle.TryEnqueue(in record))
             {
                 _core.Counters.CallbackFaults++;
@@ -776,11 +780,55 @@ internal sealed unsafe partial class BulkEngine
             ref BulkRecv recv = ref _recv[record];
             if ((recv.Flags & RecvAccepted) != 0)
             {
-                // The transport can no longer call back, so the game thread finishes what the connection left half done.
+                // The transport can no longer call back, so the game thread finishes what the connection left half done,
+                // and settles the range request each finished transfer answered — including one retired but not yet
+                // reported, whose final progress will never go out now.
                 FinishReceive(record, ref recv, BulkStatus.Disconnected, QuiclyErrorCode.NoError);
+                SettleRequest(ref recv);
             }
 
             ReleaseStaging(ref recv);
+        }
+    }
+
+    /// <summary>
+    /// Settles the range request a finished receive transfer answered (game thread, once per transfer). A transfer answers a
+    /// pending <see cref="QuiclyPeer.RequestBulk"/> when its channel, object identity and first byte are the request's — a
+    /// provider may shorten the range, never move its start (<see cref="IBulkProvider.TryGetObject"/>). The request is then
+    /// released, so the table of PROTOCOL.md §7 holds only requests still waiting for an answer; the application learns the
+    /// outcome from its sink. The one exception is a <em>resumable</em> request whose transfer the connection cut: it keeps
+    /// the part still missing, which <see cref="OnEpochReset"/> asks for on the resumed session (PROTOCOL.md §4.1).
+    /// </summary>
+    /// <param name="recv">A finished, accepted receive transfer whose record the transport thread no longer touches.</param>
+    private void SettleRequest(ref BulkRecv recv)
+    {
+        if (recv.Settled != 0 || (recv.Flags & RecvAccepted) == 0)
+        {
+            return;
+        }
+
+        recv.Settled = 1;
+        for (int i = 0; i < _requests.Length; i++)
+        {
+            ref PendingRequest request = ref _requests[i];
+            BulkRangeRequest range = request.Range;
+            if (!request.InUse || range.Channel != recv.Channel || range.ObjectId != recv.ObjectId
+                || range.ObjectVersion != recv.ObjectVersion || range.Offset != recv.Offset)
+            {
+                continue;
+            }
+
+            long accepted = Volatile.Read(ref recv.BytesAccepted);
+            if ((BulkStatus)recv.Status == BulkStatus.Disconnected && range.Resumable && accepted < range.Length)
+            {
+                request.Range = range with { Offset = range.Offset + accepted, Length = range.Length - accepted };
+            }
+            else
+            {
+                request = default;
+            }
+
+            return;
         }
     }
 
@@ -924,7 +972,10 @@ internal sealed unsafe partial class BulkEngine
         /// <summary>Bytes the last <c>BulkProgress</c> reported.</summary>
         [FieldOffset(128)] public long ReportedBytes;
 
-        /// <summary>Clock micros of the last <c>BulkProgress</c> (or of the header, so the first window starts then).</summary>
+        /// <summary>Clock micros of the last <c>BulkProgress</c>, or 0 until the first pass that sees the transfer stamps it.</summary>
         [FieldOffset(136)] public long LastReportMicros;
+
+        /// <summary>1 once the game thread matched the finished transfer against this end's range requests (<see cref="SettleRequest"/>).</summary>
+        [FieldOffset(144)] public byte Settled;
     }
 }

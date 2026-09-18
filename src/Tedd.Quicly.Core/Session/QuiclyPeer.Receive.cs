@@ -704,6 +704,12 @@ public sealed unsafe partial class QuiclyPeer
         ChannelTable table = _core.Table;
         int consumed = 0;
         StreamFrameParser snapshot = default;
+
+        // The event context's per-callback fields (stream, channel, engine cookie, clock) are filled in once, at the first
+        // message event (after OpenEngineStream when the preamble arrives in this callback); each event then sets only its
+        // phase, header and payload. Bulk is valid only in the BulkHeader phase.
+        scoped StreamMessageContext context = default;
+        ChannelEngine? engine = null;
         for (int i = 0; i < segments.Length; i++)
         {
             ReadOnlySpan<byte> segment = segments[i].AsSpan();
@@ -747,15 +753,18 @@ public sealed unsafe partial class QuiclyPeer
                     return ReceiveResult.Consumed(total);
                 }
 
-                scoped StreamMessageContext context = default;
-                context.Id = id;
-                context.Channel = record.Channel;
-                context.ChannelIndex = record.ChannelIndex;
-                context.GroupId = record.Parser.GroupId;
-                context.Cookie = ref record.Cookie;
-                context.NowMicros = now;
+                if (engine is null)
+                {
+                    engine = _core.GetEngine(record.ChannelIndex);
+                    context.Id = id;
+                    context.Channel = record.Channel;
+                    context.ChannelIndex = record.ChannelIndex;
+                    context.GroupId = record.Parser.GroupId;
+                    context.Cookie = ref record.Cookie;
+                    context.NowMicros = now;
+                }
+
                 context.Header = record.Parser.Message;
-                ChannelEngine engine = _core.GetEngine(record.ChannelIndex);
                 switch (streamEvent)
                 {
                     case StreamEvent.MessageStart:
@@ -769,6 +778,7 @@ public sealed unsafe partial class QuiclyPeer
                         else
                         {
                             context.Phase = StreamMessagePhase.Start;
+                            context.Chunk = default;
                         }
 
                         break;
@@ -778,9 +788,11 @@ public sealed unsafe partial class QuiclyPeer
                         break;
                     case StreamEvent.MessageEnd:
                         context.Phase = StreamMessagePhase.End;
+                        context.Chunk = default;
                         break;
                     default:
                         context.Phase = StreamMessagePhase.BulkHeader;
+                        context.Chunk = default;
                         context.Bulk = record.Parser.Bulk;
                         break;
                 }

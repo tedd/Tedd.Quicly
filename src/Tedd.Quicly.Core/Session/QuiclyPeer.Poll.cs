@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Primitives;
@@ -131,11 +132,15 @@ public sealed unsafe partial class QuiclyPeer
                 _queuedWithHandler--;
             }
 
+            // A response is taken by its engine where it leaves the receive ring (below, and in Route), and that is the only
+            // way into a per-channel queue or the held slot, so neither can hold one (see IsResponse).
+            Debug.Assert(!IsResponse(in entry), "a response never reaches a per-channel queue");
             Emit(ref entry, now, into, ref written);
         }
 
         if (_hasHeld && written < into.Length)
         {
+            Debug.Assert(!IsResponse(in _held), "a response never reaches the held slot");
             if (_held.Channel == channel)
             {
                 ReceiveEntry entry = _held;
@@ -151,7 +156,12 @@ public sealed unsafe partial class QuiclyPeer
         SpscRing<ReceiveEntry> ring = _core.ReceiveRing;
         while (!_hasHeld && written < into.Length && ring.TryDequeue(out ReceiveEntry entry))
         {
-            if (entry.Channel == channel)
+            if (IsResponse(in entry))
+            {
+                // A response never reaches the application: it completes its SendRequestAsync, or is dropped and counted.
+                TakeResponse(ref entry, now);
+            }
+            else if (entry.Channel == channel)
             {
                 Emit(ref entry, now, into, ref written);
             }
@@ -324,6 +334,12 @@ public sealed unsafe partial class QuiclyPeer
 
     private bool Route(ref ReceiveEntry entry, long now, ref int dispatched)
     {
+        if (IsResponse(in entry))
+        {
+            TakeResponse(ref entry, now);
+            return true;
+        }
+
         int index = _core.ChannelIndexOf(entry.Channel);
         MessageHandler? handler = index >= 0 ? _handlers[index] : null;
         if (handler is not null)
@@ -369,6 +385,7 @@ public sealed unsafe partial class QuiclyPeer
             while (handler is not null && dispatched < maxItems && !_disposed && queues.TryTake(index, out ReceiveEntry entry))
             {
                 _queuedWithHandler--;
+                Debug.Assert(!IsResponse(in entry), "a response never reaches a per-channel queue");
                 Dispatch(handler, ref entry, now);
                 dispatched++;
                 handler = _handlers[index];
@@ -432,6 +449,62 @@ public sealed unsafe partial class QuiclyPeer
             {
                 _core.ReturnReceive(in entry.Lease);
             }
+        }
+    }
+
+    /// <summary>
+    /// Whether a received message is the response of a request/response channel (PROTOCOL.md §3.1).
+    /// </summary>
+    /// <remarks>
+    /// Every message the game thread takes out of the receive ring is offered to its engine first — in <see cref="Route"/> for
+    /// <see cref="Poll"/>, in the ring loop of <see cref="Drain"/> for the batch API — and only a message that is not a
+    /// response is dispatched, written to the caller's span, queued for another channel or held. Those two are therefore the
+    /// only interception points the peer needs: a per-channel queue and the held slot can only ever receive what already
+    /// passed one of them, so no channel handler and no <see cref="Drain"/> caller can see a response. The queue and held
+    /// paths assert that invariant instead of checking it again.
+    /// </remarks>
+    private static bool IsResponse(in ReceiveEntry entry) => (entry.Flags & ReceiveFlags.IsResponse) != 0;
+
+    /// <summary>
+    /// Hands a response to the engine of its channel instead of the application (game thread, from <see cref="Poll"/> and
+    /// <see cref="Drain"/>): a request waiting for it completes with the payload, and a response no request matches is
+    /// dropped and counted (PROTOCOL.md §3.1). A compressed response is decoded first, exactly as a dispatched message is.
+    /// </summary>
+    private void TakeResponse(ref ReceiveEntry entry, long now)
+    {
+        if ((entry.Flags & ReceiveFlags.Compressed) != 0 && !TryDecode(ref entry, now))
+        {
+            // Dropped and counted (DecodeFailures); the request ends with its timeout.
+            return;
+        }
+
+        int index = _core.ChannelIndexOf(entry.Channel);
+        if (index >= 0)
+        {
+            byte* data = entry.Lease.IsEmpty ? null : _core.GetPointer(in entry.Lease);
+            ReceiveLease response = new(MakeHeader(in entry, now), in entry.Lease, data);
+            if (_core.GetEngine(index).TryTakeResponse(in response))
+            {
+                return;
+            }
+        }
+
+        _core.Counters.ResponsesUnmatched++;
+        _core.ReturnReceive(in entry.Lease);
+    }
+
+    /// <summary>
+    /// Fails every request still waiting for its response with <see cref="ObjectDisposedException"/> (game thread, from
+    /// <see cref="Dispose"/>, right after the peer is marked disposed). A response is only ever matched here, in Poll or Drain,
+    /// and neither runs after Dispose — so without this, a peer disposed without being closed first would leave each
+    /// <see cref="SendRequestAsync"/> awaiting the transport's close callback, which may come much later or never
+    /// (docs/design/session-layer.md §7.8).
+    /// </summary>
+    private void FailRequestsOnDispose()
+    {
+        if (_core.GetEngine(Tedd.Quicly.Core.Channels.ChannelMode.ReliableOrdered) is ReliableOrderedEngine ordered)
+        {
+            ordered.FailRequestsOnDispose();
         }
     }
 

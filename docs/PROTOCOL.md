@@ -455,7 +455,7 @@ logging.
 | keys per channel per peer (`MaxKeys`) | 4 096 | UnreliableSequenced: evict least-recently-updated key (evicted keys re-accept any sequence; replay window documented); ReliableLatest: reject with `LatestReject(4)`, never evict |
 | concurrent peer streams per channel (`MaxGroups`) | 8 (ReliableUnordered), 4 (large ReliableLatest), 2 (Bulk) | further streams are reset `LimitExceeded` |
 | stream idle mid-message | 30 s | stream reset `Timeout` |
-| concurrent reassemblies per channel (`MaxReassemblies`) | 16 | evict oldest; reassembly expiry 2 × RTT + 100 ms; a newer sequence for the same key abandons the older partial |
+| concurrent reassemblies per channel (`MaxReassemblies`) | 16 | evict oldest; reassembly expiry 2 × RTT + 100 ms; on a channel whose sequence carries ordering (`UnreliableSequenced`), a newer sequence for the same key abandons the older partial |
 | fragmented message size | ≤ 255 × (maxDatagram − header) and ≤ `MaxMessageSize` | drop before any buffer is chosen |
 | control messages per second | 2 000 (per peer, configurable; size it from the channel table, because acks scale with keyed `ReliableLatest` traffic and one ack datagram carries about 170 keys) | connection close `LimitExceeded` |
 | decoded (decompressed) bytes per second per peer | 8 MiB/s | further compressed messages dropped + counted |
@@ -498,6 +498,9 @@ Byte-exact examples are in [protocol-vectors.md](protocol-vectors.md).
   and size(fragment 0) bytes. A receiver can therefore bound the total from any single fragment: a non-last
   fragment of size *s* implies a total ≥ *s* × (FragCount − 1) + 1, the last fragment of size *l* implies a total
   ≥ *l* × FragCount; if that bound exceeds the effective `MaxMessageSize` (uncompressed), the fragment is dropped.
+  Both are lower bounds, so once a receiver knows both sizes of one message — in whichever order they arrive — it
+  checks the exact total, *s* × (FragCount − 1) + *l*, against the effective `MaxMessageSize` and drops the fragment
+  with its partial when it exceeds it.
 * **§2.1 / §3.1 compression.** A compressed payload (`RawLength > 0`) is non-empty and strictly shorter than
   `RawLength` (for fragments: the bound above is strictly below `RawLength`); anything else is malformed.
 * **§2.2 containers.** `Flags` bits 1–7 are reserved and MUST be 0; `Tick` is ≤ 2^32 − 1; a container holds at

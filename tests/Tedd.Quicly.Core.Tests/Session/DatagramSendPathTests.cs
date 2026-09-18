@@ -363,7 +363,11 @@ public class DatagramSendPathTests
         Assert.Equal(SendStatus.TooLarge, client.SendCopy(new SendHeader(2), new byte[1201]).Status);
         Assert.Equal(SendStatus.TooLarge, client.SendCopy(new SendHeader(2), new byte[1200]).Status);
         Assert.Equal(2, DatagramKit.ChannelStats(client, 2).TooLarge);
-        Assert.Equal(SendStatus.NotSupported, client.SendCopy(new SendHeader(13), new byte[2000]).Status);
+        // On a fragmenting channel a message above the channel's own MaxMessageSize is still refused, while one that merely
+        // exceeds the datagram limit is split into fragments (PROTOCOL.md §2.1; docs/design/session-layer.md §7.8).
+        Assert.Equal(SendStatus.TooLarge, client.SendCopy(new SendHeader(13), new byte[5000]).Status);
+        Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(13), new byte[2000]).Status);
+        Assert.Equal(1, DatagramKit.Statistics(client).FragmentedMessagesSent);
         Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(13), new byte[100]).Status);
         Assert.Throws<ArgumentOutOfRangeException>(() => client.SendCopy(new SendHeader(3, 1UL << 62), [1]));
         Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(2, ulong.MaxValue), [1]).Status);
@@ -378,7 +382,8 @@ public class DatagramSendPathTests
         }
 
         Assert.Equal(SendStatus.QueueFull, last);
-        Assert.InRange(admitted, 10, 16);
+        // The fragmented message above holds one entry per fragment plus its owner, so fewer slots are left for the loop.
+        Assert.InRange(admitted, 8, 16);
         Assert.True(h.RunUntil(() => DatagramKit.Statistics(client).SendEntriesInUse == 0));
         Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(2), [1]).Status);
     }

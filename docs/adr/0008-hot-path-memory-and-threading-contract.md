@@ -63,7 +63,11 @@
     split hot/cold and by owner; scanned fields are structure-of-arrays.
 13. **Diagnostics are allocation-free**: counters are plain `long` fields incremented by the owning thread
     and snapshotted into `PeerStatistics`; any `EventSource` use takes primitive arguments only and is
-    guarded by `IsEnabled()`.
+    guarded by `IsEnabled()`. A snapshot reads the *other* thread's counters with a single `Volatile.Read` per
+    field and is therefore allowed to cross the ownership rule of invariant 4 — it never reads two fields as one
+    consistent pair and nothing in the library decides anything from what it read. The same licence covers an
+    engine's diagnostic accessors for a field the transport thread owns (for example the fragment engine's
+    reassembly count): one volatile read of one counter, exposed for statistics and tests only.
 14. **Interop cost is O(flushes + packed datagrams)**, not O(messages): buffered datagram sends are packed
     per peer (container sized from the current max datagram payload) and stream sends are gathered per
     stream per flush.

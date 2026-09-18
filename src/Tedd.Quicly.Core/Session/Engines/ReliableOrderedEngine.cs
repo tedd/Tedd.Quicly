@@ -51,8 +51,13 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// <see cref="QuiclyErrorCode.LimitExceeded"/>. Chunks are copied progressively; the end publishes the message into the
 /// reserved slot. <c>MaxMessageSize</c> (session cap included) and frame errors are enforced by the peer's
 /// <see cref="StreamFrameParser"/> (connection <see cref="QuiclyErrorCode.ProtocolViolation"/>).</para>
+/// <para><b>Request/response</b> (<see cref="ChannelDefinition.RequestResponse"/>, PROTOCOL.md §3.1, §4.3; the
+/// <c>ReliableOrderedEngine.RequestResponse.cs</c> half of this class): <see cref="SendRequestAsync"/> numbers a request with
+/// an odd <c>RequestId</c> and keeps it in the engine's request table until <see cref="TryTakeResponse"/> matches the peer's
+/// <see cref="Respond"/>, its timeout elapses (<see cref="RunPollDeadlines"/>, in every Poll and Flush) or the session
+/// ends.</para>
 /// </remarks>
-internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
+internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
 {
     /// <summary>Most segments one stream send carries (docs/design/session-layer.md §7.2).</summary>
     public const int MaxSegmentsPerSend = 64;
@@ -146,6 +151,7 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
             send.StartCarrier = -1;
         }
 
+        InitializeRequestResponse(channelsOfMode);
         _carrierReserve = count + 1;
         _maxReceiveMessage = Math.Min(core.ReceiveBudgetBytes, core.Allocator.MaxBlockSize);
         _maxSegments = Math.Min(MaxSegmentsPerSend, core.Segments.Capacity);
@@ -446,6 +452,9 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
                 slot = next;
             }
         }
+
+        // A request waiting for a response cannot be answered any more (docs/design/session-layer.md §7.8).
+        FailRequests(new InvalidOperationException("The session closed before the response arrived."));
     }
 
     /// <inheritdoc/>
@@ -493,6 +502,9 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
             ReleaseReceive(ref recv);
             recv = default;
         }
+
+        // The resumed connection is a new epoch with new streams: nothing can answer a request of the lost one.
+        FailRequests(new InvalidOperationException("The connection was lost before the response arrived."));
     }
 
     private void DropExpiredHead(ref OrderedSendState send, ref ChannelSendCounters counters, long now)
@@ -1145,6 +1157,7 @@ internal sealed unsafe class ReliableOrderedEngine : ChannelEngine
             _recv.Dispose();
         }
 
+        FailRequests(new ObjectDisposedException(nameof(QuiclyPeer)));
         _send?.Dispose();
         _notices?.Dispose();
     }

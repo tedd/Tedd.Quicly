@@ -403,6 +403,9 @@ logs a warning per connection). Session/auth token rules, admission timeouts, re
 | channel state | peer × channel | 2 × 64 B | send + receive halves |
 | group records | peer × group channel | `(3 × max(MaxGroups, 1) + 4) × 64 B` send + `max(MaxGroups, 1) × 64 B` receive | `ReliableUnordered`: one record per live group (filling, waiting, or holding a stream) and one per accepted peer stream; the engine's notice ring adds `4 × its send records + 8` × 12 B |
 | key slots | peer × keyed channel | `MaxKeys` × 64 B (+ mailbox) | dense or hashed |
+| reassembly table | peer × fragmenting channel | `MaxReassemblies` × 64 B (1 KiB at the default of 16) | one record per partial message; its buffer comes from the receive byte budget (at most `MaxReassemblies` × `MaxMessageSize`, so 16 × 8 800 = 138 KiB per channel with the defaults — size `ReceiveBudgetBytes` for it, or lower `MaxReassemblies`) |
+| fragment owner map | peer with a fragmenting channel | send table × 4 B (4 KiB) | which send entry a fragment belongs to |
+| request table | peer with a `RequestResponse` channel | 256 slots × ~56 B, created on demand | one pooled value-task source per outstanding `SendRequestAsync` |
 
 With the defaults a peer's fixed native tables are therefore about **560 KiB**: 256 KiB receive ring, 32 KiB
 completion ring, 64 KiB send entries plus ~120 KiB of their header blocks and cold side arrays, 68 KiB drain

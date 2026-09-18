@@ -60,6 +60,21 @@ internal sealed class PeerCounters
     /// <summary>Stream receives held back (<see cref="Engines.StreamConsume.Pend"/>): ring full or receive budget used up.</summary>
     public long StreamReceivePends;
 
+    /// <summary>Fragments of larger messages received (PROTOCOL.md §2.1).</summary>
+    public long FragmentsReceived;
+
+    /// <summary>Fragmented messages reassembled completely and delivered.</summary>
+    public long FragmentedMessagesReceived;
+
+    /// <summary>Fragments dropped: duplicates, inconsistent fragment fields, a partial's limits, or no receive buffer.</summary>
+    public long FragmentsDropped;
+
+    /// <summary>Partial reassemblies given up because a newer sequence of the same key arrived, or the channel's cap evicted them.</summary>
+    public long ReassembliesAbandoned;
+
+    /// <summary>Partial reassemblies given up because they were not completed within 2 × RTT + 100 ms.</summary>
+    public long ReassembliesExpired;
+
     /// <summary>Highest receive ring occupancy seen (including reservations).</summary>
     public int ReceiveRingHighWater;
 
@@ -112,4 +127,19 @@ internal sealed class PeerCounters
 
     /// <summary>Peer streams reset because they stopped mid-message (PROTOCOL.md §7, <see cref="PeerOptions.StreamIdleTimeout"/>).</summary>
     public long StreamIdleTimeouts;
+
+    /// <summary>Messages split into fragments by the sender (PROTOCOL.md §2.1).</summary>
+    public long FragmentedMessagesSent;
+
+    /// <summary>Fragments produced by the sender (each goes out as its own datagram).</summary>
+    public long FragmentsSent;
+
+    /// <summary>Requests sent with <see cref="QuiclyPeer.SendRequestAsync"/>.</summary>
+    public long RequestsSent;
+
+    /// <summary>Requests that ended without a response because their timeout elapsed.</summary>
+    public long RequestsTimedOut;
+
+    /// <summary>Responses dropped because no outstanding request matched them (PROTOCOL.md §3.1).</summary>
+    public long ResponsesUnmatched;
 }

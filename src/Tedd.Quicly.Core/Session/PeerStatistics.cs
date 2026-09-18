@@ -147,6 +147,42 @@ public struct PeerStatistics
 
     /// <summary>Receive lease bytes held now.</summary>
     public long ReceiveBytesOutstanding;
+
+    /// <summary>Messages split into fragments by this end (PROTOCOL.md §2.1).</summary>
+    public long FragmentedMessagesSent;
+
+    /// <summary>
+    /// Fragments produced by the sender (each goes out as its own datagram and counts as one <c>Sent</c> message of its
+    /// channel, because each is a datagram the scheduler hands over separately).
+    /// </summary>
+    public long FragmentsSent;
+
+    /// <summary>Fragments received (before reassembly).</summary>
+    public long FragmentsReceived;
+
+    /// <summary>Fragmented messages reassembled completely and delivered.</summary>
+    public long FragmentedMessagesReceived;
+
+    /// <summary>Fragments dropped: duplicates, inconsistent fragment fields, a limit of the reassembly table, or no receive buffer.</summary>
+    public long FragmentsDropped;
+
+    /// <summary>
+    /// Partial reassemblies given up because a newer sequence of the same key arrived, or because the channel's
+    /// <see cref="Channels.ChannelDefinition.MaxReassemblies"/> cap evicted the oldest partial (PROTOCOL.md §7).
+    /// </summary>
+    public long ReassembliesAbandoned;
+
+    /// <summary>Partial reassemblies given up because they were not completed within 2 × RTT + 100 ms (PROTOCOL.md §7).</summary>
+    public long ReassembliesExpired;
+
+    /// <summary>Requests sent with <see cref="QuiclyPeer.SendRequestAsync"/>.</summary>
+    public long RequestsSent;
+
+    /// <summary>Requests that ended without a response because their timeout elapsed.</summary>
+    public long RequestsTimedOut;
+
+    /// <summary>Responses dropped because no outstanding request matched them (PROTOCOL.md §3.1).</summary>
+    public long ResponsesUnmatched;
 }
 
 /// <summary>Per-channel statistics (<see cref="QuiclyPeer.GetChannelStatistics"/>). Fixed layout, no references.</summary>

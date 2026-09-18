@@ -641,6 +641,17 @@ public sealed unsafe partial class QuiclyPeer
                 }
 
                 next = SweepIdleStreams(now, next);
+                if (_state == PeerState.Connected)
+                {
+                    // Deadlines a Poll serves too (the request table's timeouts, docs/design/session-layer.md §7.8): the
+                    // engines' Tick belongs to the scheduler pass, but a request must time out even for a host that only polls.
+                    ReadOnlySpan<ChannelEngine> engines = _core.ActiveEngines;
+                    for (int i = 0; i < engines.Length; i++)
+                    {
+                        engines[i].RunPollDeadlines(now, ref next);
+                    }
+                }
+
                 break;
             case PeerState.Closing:
                 if (_lingerDeadline != 0 && now >= _lingerDeadline)

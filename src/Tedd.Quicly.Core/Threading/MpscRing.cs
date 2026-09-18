@@ -1,5 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Tedd.Quicly.Core.State;
 
 namespace Tedd.Quicly.Core.Threading;
@@ -21,6 +22,13 @@ namespace Tedd.Quicly.Core.Threading;
 /// cache line. The ring never allocates after construction. <see cref="Dispose"/> frees the native memory and must
 /// not race with element access; a finalizer frees it if the owner forgot.
 /// </para>
+/// <para>
+/// An internal owner whose producers may still enqueue after it is done with the ring (the completion table's free
+/// list: a wait consumed after the table was disposed returns its slot) creates it with <c>pinnedObjectHeap</c>: the
+/// block is then a reference-free byte array on the pinned object heap (the other storage invariant 12 allows), still
+/// 64-byte aligned, which <see cref="Dispose"/> leaves alone and the GC reclaims once nothing references the ring, so a
+/// late enqueue writes into live memory instead of freed memory.
+/// </para>
 /// </remarks>
 /// <typeparam name="T">Element type; must be unmanaged so that the buffer is a flat block of values.</typeparam>
 public sealed unsafe class MpscRing<T> : IDisposable where T : unmanaged
@@ -31,7 +39,8 @@ public sealed unsafe class MpscRing<T> : IDisposable where T : unmanaged
         public T Value;
     }
 
-    private readonly NativeArray<Slot> _buffer;
+    private readonly NativeArray<Slot>? _buffer;
+    private readonly byte[]? _pinned;
     private readonly Slot* _slots;
     private readonly int _mask;
     private MpscPositions _pos;
@@ -40,10 +49,33 @@ public sealed unsafe class MpscRing<T> : IDisposable where T : unmanaged
     /// <param name="minimumCapacity">Requested capacity; rounded up to the next power of two (minimum 2).</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="minimumCapacity"/> is not positive or exceeds 2^30.</exception>
     public MpscRing(int minimumCapacity)
+        : this(minimumCapacity, pinnedObjectHeap: false)
+    {
+    }
+
+    /// <summary>Creates a ring whose slots live in native memory or, with <paramref name="pinnedObjectHeap"/>, on the pinned object heap.</summary>
+    /// <param name="minimumCapacity">Requested capacity; rounded up to the next power of two (minimum 2).</param>
+    /// <param name="pinnedObjectHeap">
+    /// Keep the slots in GC-managed memory (a reference-free byte array on the pinned object heap) whose lifetime is the
+    /// ring's reachability: <see cref="Dispose"/> frees nothing, and an enqueue after it is harmless.
+    /// </param>
+    internal MpscRing(int minimumCapacity, bool pinnedObjectHeap)
     {
         int capacity = SpscRing<T>.RoundUpCapacity(minimumCapacity);
-        _buffer = new NativeArray<Slot>(capacity);
-        _slots = _buffer.Pointer;
+        if (pinnedObjectHeap)
+        {
+            // Pinned-heap objects never move, so the aligned start computed once stays valid for the array's lifetime,
+            // and the array lives as long as this ring references it.
+            _pinned = GC.AllocateUninitializedArray<byte>(capacity * sizeof(Slot) + CacheLine.Size - 1, pinned: true);
+            nint start = (nint)Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(_pinned));
+            _slots = (Slot*)((start + (CacheLine.Size - 1)) & ~(nint)(CacheLine.Size - 1));
+        }
+        else
+        {
+            _buffer = new NativeArray<Slot>(capacity);
+            _slots = _buffer.Pointer;
+        }
+
         _mask = capacity - 1;
         for (int i = 0; i < capacity; i++)
             _slots[i].Sequence = i;
@@ -93,6 +125,10 @@ public sealed unsafe class MpscRing<T> : IDisposable where T : unmanaged
                 {
                     slot.Value = item;
                     Volatile.Write(ref slot.Sequence, pos + 1);
+
+                    // The slot is addressed through a raw pointer, which does not keep the block alive: keep the ring (and
+                    // with it a pinned-heap block) reachable until the element is published.
+                    GC.KeepAlive(this);
                     return true;
                 }
 
@@ -163,6 +199,9 @@ public sealed unsafe class MpscRing<T> : IDisposable where T : unmanaged
         return count;
     }
 
-    /// <summary>Frees the native slot block. Safe to call more than once; must not race with element access.</summary>
-    public void Dispose() => _buffer.Dispose();
+    /// <summary>
+    /// Frees the native slot block. Safe to call more than once; must not race with element access. A ring on the pinned
+    /// object heap frees nothing here (the GC reclaims it once unreachable), so for it element access after this call is safe.
+    /// </summary>
+    public void Dispose() => _buffer?.Dispose();
 }

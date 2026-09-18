@@ -46,9 +46,14 @@ public class StreamFrameParserMarkTests
     /// <summary>
     /// Parses <paramref name="data"/> in segments of <paramref name="segmentSize"/>. With <paramref name="pendEveryEvent"/> every
     /// message event is un-read once (rewound, and the input handed back from the offset it had), as the peer does on Pend.
-    /// Returns one line per complete message.
+    /// Returns one line per complete message. With <paramref name="whole"/> a message whose payload lies wholly in the segment
+    /// is taken in one step after its <see cref="StreamEvent.MessageStart"/> (<see cref="StreamFrameParser.TryTakeWholePayload"/>,
+    /// the peer's fast path), counted in <paramref name="wholes"/>, and un-read as one event.
     /// </summary>
-    private static List<string> Parse(byte[] data, int segmentSize, bool pendEveryEvent, out int pends)
+    private static List<string> Parse(byte[] data, int segmentSize, bool pendEveryEvent, out int pends, bool whole = false) =>
+        Parse(data, segmentSize, pendEveryEvent, out pends, whole, out _);
+
+    private static List<string> Parse(byte[] data, int segmentSize, bool pendEveryEvent, out int pends, bool whole, out int wholes)
     {
         StreamFrameParser parser = default;
         parser.Reset(StreamRole.Unknown);
@@ -57,6 +62,7 @@ public class StreamFrameParserMarkTests
         HashSet<int> pended = [];
         int delivered = 0;
         pends = 0;
+        wholes = 0;
         int offset = 0;
         bool replay = false;
 
@@ -79,6 +85,21 @@ public class StreamFrameParserMarkTests
                 }
 
                 Assert.NotEqual(StreamEvent.Error, streamEvent);
+                bool taken = false;
+                if (whole && streamEvent == StreamEvent.MessageStart)
+                {
+                    int remaining = parser.RemainingPayload;
+                    int available = input.Length;
+                    taken = parser.TryTakeWholePayload(ref input, out chunk);
+                    Assert.Equal(remaining <= available, taken);
+                    if (!taken)
+                    {
+                        // Nothing changed: the message continues event by event.
+                        Assert.Equal(remaining, parser.RemainingPayload);
+                        Assert.Equal(available, input.Length);
+                    }
+                }
+
                 bool message = streamEvent is StreamEvent.MessageStart or StreamEvent.PayloadChunk or StreamEvent.MessageEnd;
                 if (pendEveryEvent && message && pended.Add(delivered))
                 {
@@ -92,6 +113,15 @@ public class StreamFrameParserMarkTests
                 if (message)
                 {
                     delivered++;
+                }
+
+                if (taken)
+                {
+                    wholes++;
+                    StreamMessageHeader header = parser.Message;
+                    Assert.Equal(header.Length, chunk.Length);
+                    messages.Add($"{header.Length}/{header.Key}/{header.RequestId}/{Convert.ToHexString(chunk)}");
+                    continue;
                 }
 
                 switch (streamEvent)
@@ -131,6 +161,77 @@ public class StreamFrameParserMarkTests
         List<string> replayed = Parse(data, segmentSize, pendEveryEvent: true, out int pends);
         Assert.Equal(reference, replayed);
         Assert.True(pends >= Lengths.Length * 2, $"{pends} events were un-read");
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(7)]
+    [InlineData(64)]
+    [InlineData(1_200)]
+    [InlineData(100_000)]
+    public void Whole_Messages_Parse_And_Rewind_Like_Their_Events(int segmentSize)
+    {
+        byte[] data = BuildStream();
+        List<string> reference = Parse(data, segmentSize, pendEveryEvent: false, out _);
+        List<string> whole = Parse(data, segmentSize, pendEveryEvent: false, out _, whole: true, out int wholes);
+        Assert.Equal(reference, whole);
+        List<string> replayed = Parse(data, segmentSize, pendEveryEvent: true, out int pends, whole: true, out _);
+        Assert.Equal(reference, replayed);
+        Assert.True(pends >= Lengths.Length, $"{pends} events were un-read");
+        if (segmentSize >= data.Length)
+        {
+            Assert.Equal(Lengths.Length, wholes);
+        }
+        else if (segmentSize == 1)
+        {
+            // Only the empty messages fit a one-byte segment whole.
+            Assert.Equal(Lengths.Count(l => l == 0), wholes);
+        }
+    }
+
+    [Fact]
+    public void A_Whole_Message_Ends_A_ReliableLatest_Group_Stream()
+    {
+        ChannelTable table = ChannelTable.Create().Add(6, "latest", ChannelMode.ReliableLatest, o => o.Keyed = true).Build();
+        ChannelDefinition channel = table[6]!;
+        byte[] data = new byte[64];
+        int length = StreamFraming.WriteGroupPreamble(data, 6, 9);
+        StreamMessageHeader header = new() { Length = 3, Sequence = 9, Key = 5 };
+        length += StreamFraming.WriteFrameHeader(data.AsSpan(length), channel, in header);
+        data[length++] = 1;
+        data[length++] = 2;
+        data[length++] = 3;
+
+        StreamFrameParser parser = default;
+        parser.Reset(StreamRole.Unknown);
+        ReadOnlySpan<byte> input = data.AsSpan(0, length);
+        Assert.Equal(StreamEvent.Preamble, parser.Read(table, ref input, out _));
+        Assert.Equal(StreamEvent.MessageStart, parser.Read(table, ref input, out _));
+        Assert.True(parser.TryTakeWholePayload(ref input, out ReadOnlySpan<byte> payload));
+        Assert.Equal(new byte[] { 1, 2, 3 }, payload.ToArray());
+        Assert.True(input.IsEmpty);
+        Assert.Equal(ParseStatus.Ok, parser.Finish());
+        Assert.Equal(StreamEvent.NeedMore, parser.Read(table, ref input, out _));
+
+        // The value is the stream's only message: anything after it is still an error.
+        ReadOnlySpan<byte> extra = [0];
+        Assert.Equal(StreamEvent.Error, parser.Read(table, ref extra, out _));
+    }
+
+    [Fact]
+    public void A_Whole_Message_Is_Not_Taken_Outside_A_Message_Start()
+    {
+        byte[] data = BuildStream();
+        StreamFrameParser parser = default;
+        parser.Reset(StreamRole.Unknown);
+        ReadOnlySpan<byte> input = data;
+        Assert.False(parser.TryTakeWholePayload(ref input, out _));
+        Assert.Equal(StreamEvent.Preamble, parser.Read(Table, ref input, out _));
+        int before = input.Length;
+        Assert.False(parser.TryTakeWholePayload(ref input, out ReadOnlySpan<byte> payload));
+        Assert.True(payload.IsEmpty);
+        Assert.Equal(before, input.Length);
     }
 
     [Fact]

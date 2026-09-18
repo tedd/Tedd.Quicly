@@ -755,10 +755,22 @@ public sealed unsafe partial class QuiclyPeer
                 context.Cookie = ref record.Cookie;
                 context.NowMicros = now;
                 context.Header = record.Parser.Message;
+                ChannelEngine engine = _core.GetEngine(record.ChannelIndex);
                 switch (streamEvent)
                 {
                     case StreamEvent.MessageStart:
-                        context.Phase = StreamMessagePhase.Start;
+                        // A message whose payload lies wholly in this segment goes to an engine that takes it in one event
+                        // instead of Start, Chunk, End; the mark taken before the header un-reads all of it on Pend.
+                        if (engine.AcceptsWholeMessages && record.Parser.TryTakeWholePayload(ref input, out payload))
+                        {
+                            context.Phase = StreamMessagePhase.Whole;
+                            context.Chunk = payload;
+                        }
+                        else
+                        {
+                            context.Phase = StreamMessagePhase.Start;
+                        }
+
                         break;
                     case StreamEvent.PayloadChunk:
                         context.Phase = StreamMessagePhase.Chunk;
@@ -773,7 +785,7 @@ public sealed unsafe partial class QuiclyPeer
                         break;
                 }
 
-                StreamConsume result = _core.GetEngine(record.ChannelIndex).OnStreamMessage(ref context);
+                StreamConsume result = engine.OnStreamMessage(ref context);
                 switch (result.Action)
                 {
                     case StreamConsumeAction.Pend:
@@ -801,7 +813,7 @@ public sealed unsafe partial class QuiclyPeer
                 // PROTOCOL.md §7 "stream idle mid-message": watch the stream while a message is only half received (its
                 // staging lease and ring reservation are held), and stop watching when the message is complete. Refreshed
                 // by every accepted event, so only a peer that really stopped sending times out.
-                StreamTable.NoteProgress(ref record, context.Phase == StreamMessagePhase.End ? 0 : now);
+                StreamTable.NoteProgress(ref record, context.Phase is StreamMessagePhase.End or StreamMessagePhase.Whole ? 0 : now);
             }
 
             consumed += segment.Length;

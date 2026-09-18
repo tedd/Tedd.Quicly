@@ -182,6 +182,33 @@ public struct StreamFrameParser
         _controlType = mark.ControlType;
     }
 
+    /// <summary>
+    /// Completes the current message in one step when the whole of its remaining payload lies in <paramref name="input"/>.
+    /// Call it right after <see cref="Read"/> returned <see cref="StreamEvent.MessageStart"/>: on success the payload is
+    /// handed out as one slice of the input and the parser stands where the <see cref="StreamEvent.PayloadChunk"/> and
+    /// <see cref="StreamEvent.MessageEnd"/> events would have left it, so a <see cref="Rewind"/> to the mark taken before that
+    /// <see cref="Read"/> un-reads the whole message. Otherwise nothing changes and the message continues event by event.
+    /// </summary>
+    /// <param name="input">The unconsumed bytes of the current receive segment; advanced past the payload on success.</param>
+    /// <param name="payload">The whole payload (empty for an empty message), or empty.</param>
+    /// <returns><see langword="true"/> when the message was completed.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryTakeWholePayload(scoped ref ReadOnlySpan<byte> input, out ReadOnlySpan<byte> payload)
+    {
+        int n = _remaining;
+        if ((uint)n > (uint)input.Length || (_state != State.Payload && _state != State.MessageEnd))
+        {
+            payload = default;
+            return false;
+        }
+
+        payload = input.Slice(0, n);
+        input = input.Slice(n);
+        _remaining = 0;
+        _state = StateAfterMessage();
+        return true;
+    }
+
     /// <summary>Prepares the parser for a new stream.</summary>
     /// <param name="role">
     /// <see cref="StreamRole.Control"/> for the control stream (preamble must be 0); <see cref="StreamRole.Unknown"/>

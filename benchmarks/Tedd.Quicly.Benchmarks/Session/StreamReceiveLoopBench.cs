@@ -152,6 +152,7 @@ public class StreamReceiveLoopBench
         }
     }
 
+    // A struct method's receiver is implicitly scoped, so the accessor declares it scoped too: the payload never refers to the parser.
     [UnsafeAccessor(UnsafeAccessorKind.Method, Name = "TryTakeWholePayload")]
-    private static extern bool TryTakeWholePayload(ref StreamFrameParser parser, scoped ref ReadOnlySpan<byte> input, out ReadOnlySpan<byte> payload);
+    private static extern bool TryTakeWholePayload(scoped ref StreamFrameParser parser, scoped ref ReadOnlySpan<byte> input, out ReadOnlySpan<byte> payload);
 }

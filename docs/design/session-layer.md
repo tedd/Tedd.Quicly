@@ -340,8 +340,10 @@ is back in `Filling` and still owned by the caller.
   call and `Poll` re-arms it at entry, so a burst of a thousand messages costs one host call — and work that Poll does not consume (a
   message of a channel without a handler, engine work that needs a `Flush`) raises no second call, because `HasPendingWork` is the
   level. Raised from the transport thread by `Signal(bit)` (every handshake, close and table signal), `TryEnqueueReceive`,
-  `PublishReserved`, a coalescing mailbox post, `PushCompletion`, `NotePendedStream` and the pong / stream-ping rings; and from the
-  game thread by `SetState` (a queued `StateChanged` is work, which covers `Close` and `CompleteAdmission` without a hook of their
+  `PublishReserved`, a coalescing mailbox post (the datagram engine's and the ReliableLatest engine's: a value, whether it came
+  in a datagram or on a group stream, and a key retirement), `PushCompletion`, `NotePendedStream`, the pong / stream-ping rings
+  and the ReliableLatest engine's pass work (an ack or reject it owes, a LatestAck / LatestReject / stream notice to apply —
+  §7.6); and from the game thread by `SetState` (a queued `StateChanged` is work, which covers `Close` and `CompleteAdmission` without a hook of their
   own), `QueueLocalCompletion` and a send queued by another thread. Allocation-free — two field reads when no signal is configured —
   and a host exception is wrapped like a transport callback fault (counted, kept in `LastCallbackFault`, turned into a queued
   `InternalError` close), so it never reaches the transport. **Inside a transport callback the signal is raised once per
@@ -353,10 +355,16 @@ is back in `Filling` and still owned by the caller.
   (x86 store-load reordering) and lose a wake-up. Outside a callback `NoteTransportWork` is `NoteWork`.
 * **`HasPendingWork`** answers whether anything is really waiting: the signal word, the completion ring and the local completions,
   the receive ring, the per-channel drain queues and the held entry, the mailbox dirty bitsets (`Mailboxes.HasDirty`),
-  `PendedStreams`, the pong and stream-ping rings, the `ThreadSafeSend` front, a state transition that has not been raised, and a due
-  timer (`NextDeadlineMicros` passed). `false` once the session is closed or the peer disposed. The rings, the bitsets and the signal
-  word are read with acquire semantics; the game thread's own bookkeeping is read plainly, so a foreign caller gets an advisory
-  answer — which is why a host wakes on the edge and decides on this probe from its game thread.
+  `PendedStreams`, the pong and stream-ping rings, the `ThreadSafeSend` front, a state transition that has not been raised, a due
+  timer (`NextDeadlineMicros` passed), and — while `Connected` — the ReliableLatest engine's pass work
+  (`ReliableLatestEngine.HasUnsentControl`: acks and rejects owed, notices to apply). `false` once the session is closed or the peer
+  disposed. The rings, the bitsets and the signal word are read with acquire semantics; the game thread's own bookkeeping is read
+  plainly, so a foreign caller gets an advisory answer — which is why a host wakes on the edge and decides on this probe from its
+  game thread. Every publication that raises the edge is in the level, so a host that woke never finds the probe clear with the
+  edge still set (it would then skip the `Poll` that re-arms it and sleep through the next publication). The pass work stays in
+  the level until a `Flush` consumes it (owed acks can wait out `AckDelay` there); `QuiclyServer.PollAll` therefore keeps a peer
+  marked after its Poll only for the rest (`HasPendingPollWork`), and its next `FlushAll` — whose gate reads the same
+  `HasUnsentControl` — serves the pass work.
 * **Split deadlines.** `NextPollDeadlineMicros` is the peer's own timers (ping schedule, heartbeat, admission timeout, close linger,
   the mid-message stream idle sweep). `NextFlushDeadlineMicros` is the engine work only a scheduler pass can serve (retries, expiry,
   the send cap's refill time), and is `long.MaxValue` unless the session is `Connected`. `NextDeadline`/`NextDeadlineMicros` stay the
@@ -1061,8 +1069,14 @@ state of the peer's group streams. Every per-key array grows with the slots in u
   application resends; the re-queue matters for a host that drives a new epoch without losing the values.
 * **Receive** (transport thread). Only a version newer than the key's last accepted one is accepted (serial arithmetic, 32
   bits), into the key's mailbox — ReliableLatest always coalesces, so it uses **no receive-ring entry and no reservation**
-  (PROTOCOL.md §7, ADR 0008 invariant 6) and the `TryReserveReceive`/`PublishReserved` protocol does not apply. An older or
-  duplicate version re-acks the current one, so a lost ack cannot stall completion. Local drops answer `LatestReject`:
+  (PROTOCOL.md §7, ADR 0008 invariant 6) and the `TryReserveReceive`/`PublishReserved` protocol does not apply. Without a ring
+  publication to raise the peer's work signal, the engine raises it itself (`NoteTransportWork`, so once per transport callback
+  however many values, acks, rejects and notices it published): for a value or key retirement posted into a mailbox, an ack
+  or reject it now owes, and a LatestAck / LatestReject / stream notice queued for its pass; `HasUnsentControl` is the level
+  behind the pass part (§4.7). Before this (up to 055d68d) none of them raised it, so on an idle `QuiclyServer` peer a received
+  value waited for the peer's next poll deadline — its ping, up to `PingInterval` — and a sender that slept on the edge
+  completed a value only at its retry timer. An older or duplicate version re-acks the current one, so a lost ack cannot stall
+  completion. Local drops answer `LatestReject`:
   1 (`RingFull`) when no receive lease was available or the mailbox had no record, 2 (`TooLarge`) for a group-stream value
   above `min(ReceiveBudgetBytes, largest pool block)`, 3 (`DecodeError`) for a compressed value whose *decoded* size is above
   that same limit (the receiver could never produce those bytes; the wire-format rules themselves are enforced by the framing

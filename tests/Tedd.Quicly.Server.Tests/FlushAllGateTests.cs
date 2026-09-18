@@ -204,9 +204,10 @@ public class FlushAllGateTests
     }
 
     [Fact]
-    public async Task The_Ack_Of_A_ReliableLatest_Value_Goes_Out_Although_Nothing_Signalled_The_Peer()
+    public async Task The_Ack_Of_A_ReliableLatest_Value_Goes_Out_In_A_FlushAll_Although_Only_A_Pass_Consumes_It()
     {
-        // The transport thread queues the ack a ReliableLatest value is owed without raising the work signal: only a Flush sends it.
+        // The transport thread queues the ack a ReliableLatest value is owed; the work signal it raises gets the value polled, but
+        // only a Flush sends the ack, so the gate must see the engine's level (HasUnsentControl) and not skip the peer.
         await using ServerFixture f = new(o => o.Channels = LatestTable);
         QuiclyPeer client = ConnectAdmitted(f, LatestTable);
         uint tick = 0;

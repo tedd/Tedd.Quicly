@@ -250,13 +250,20 @@ internal sealed unsafe partial class ReliableLatestEngine
         return dense >= 0 ? _localOf[dense] : -1;
     }
 
+    /// <summary>
+    /// Hands a LatestAck / LatestReject entry or a stream shutdown to the game thread, whose next scheduler pass applies it,
+    /// and raises the work signal for it (transport thread; once per callback, <see cref="PeerCore.NoteTransportWork"/>).
+    /// </summary>
     private void Post(in LatestNotice notice)
     {
         if (!_notices.TryEnqueue(in notice))
         {
             // The game thread has not drained them yet; a lost ack is covered by the sender's timer (PROTOCOL.md §4.4).
             _core.Counters.CallbackFaults++;
+            return;
         }
+
+        _core.NoteTransportWork();
     }
 
     // ------------------------------------------------------------------ datagram values (transport thread)
@@ -330,7 +337,8 @@ internal sealed unsafe partial class ReliableLatestEngine
 
     /// <summary>
     /// Publishes an accepted value into the key's mailbox (ReliableLatest always coalesces, so no receive-ring entry and no
-    /// reservation, ADR 0008 invariant 6) and queues the key's ack.
+    /// reservation, ADR 0008 invariant 6), queues the key's ack and raises the work signal: a mailbox bypasses the receive
+    /// ring, whose publication would otherwise have raised it.
     /// </summary>
     private void Accept(int local, int keySlot, ref KeyRecvSlot key, in ReceiveEntry entry, long nowMicros, ref ChannelRecvCounters counters)
     {
@@ -355,7 +363,22 @@ internal sealed unsafe partial class ReliableLatestEngine
         key.Flags |= KeyRecvFlags.HasAccepted;
         counters.Received++;
         counters.Bytes += entry.Length;
-        QueueAck(local, keySlot, entry.Sequence);
+        EnqueueAck(local, keySlot, entry.Sequence);
+
+        // One signal covers the value and its ack (and, inside a callback, every other value of the burst).
+        _core.NoteTransportWork();
+    }
+
+    /// <summary>
+    /// Records the version to acknowledge for a key and raises the work signal when the key was not queued yet: the ack goes
+    /// out in the next scheduler pass (transport thread).
+    /// </summary>
+    private void QueueAck(int local, int keySlot, uint version)
+    {
+        if (EnqueueAck(local, keySlot, version))
+        {
+            _core.NoteTransportWork();
+        }
     }
 
     /// <summary>
@@ -363,18 +386,19 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// value means the key is already queued, so the ring holds at most one entry per key. When the ring is full the version
     /// stays in the word and a sweep flag makes the game thread find it.
     /// </summary>
-    private void QueueAck(int local, int keySlot, uint version)
+    /// <returns><see langword="true"/> when the key was queued now (ring entry or sweep flag); an already queued key only had its version raised.</returns>
+    private bool EnqueueAck(int local, int keySlot, uint version)
     {
         if (version == 0)
         {
-            return;
+            return false;
         }
 
         LatestRecvKeys keys = _recvKeys[local];
         uint previous = Interlocked.Exchange(ref keys.VersionRef(keySlot), version);
         if (previous != 0)
         {
-            return;
+            return false;
         }
 
         AckRequest request = new() { Local = local, KeySlot = keySlot };
@@ -382,8 +406,11 @@ internal sealed unsafe partial class ReliableLatestEngine
         {
             Interlocked.Exchange(ref _ackSweep[local], 1);
         }
+
+        return true;
     }
 
+    /// <summary>Queues a LatestReject for the next scheduler pass and raises the work signal (transport thread).</summary>
     private void QueueReject(int local, ulong key, uint version, LatestRejectReason reason)
     {
         RejectRequest request = new() { Channel = _channels[local].Id, Key = key, Version = version, Reason = reason };
@@ -391,7 +418,10 @@ internal sealed unsafe partial class ReliableLatestEngine
         {
             // A lost reject only costs the sender one more timed retry (PROTOCOL.md §4.4).
             _core.Counters.CallbackFaults++;
+            return;
         }
+
+        _core.NoteTransportWork();
     }
 
     /// <summary>Frees the per-key receive state of a key the peer retired and reports it to the application (PROTOCOL.md §3.4 type 0x17).</summary>
@@ -412,10 +442,16 @@ internal sealed unsafe partial class ReliableLatestEngine
         entry.Sequence = keys[keySlot].LastAccepted;
         entry.Flags = ReceiveFlags.KeyRetired;
         entry.ReceivedMicrosDelta = PeerCore.StampReceive(nowMicros);
-        if (_mailboxes[local].TryPost(keySlot, in entry, out BufferLease displaced, out bool replaced) && replaced)
+        if (_mailboxes[local].TryPost(keySlot, in entry, out BufferLease displaced, out bool replaced))
         {
-            _core.ReturnReceive(in displaced);
-            counters.Superseded++;
+            if (replaced)
+            {
+                _core.ReturnReceive(in displaced);
+                counters.Superseded++;
+            }
+
+            // The retirement bypasses the receive ring like a value, so it raises the work signal itself.
+            _core.NoteTransportWork();
         }
 
         // The slot is kept until the application has taken the notice: freeing it here would let a new holder of the same key
@@ -864,7 +900,10 @@ internal sealed unsafe partial class ReliableLatestEngine
 
     /// <summary>
     /// Whether the transport thread left work only a scheduler pass consumes: acks or rejects this end owes, or LatestAck /
-    /// LatestReject / stream notices to apply (game thread; the peer's flush gate). Neither raises the work signal.
+    /// LatestReject / stream notices to apply. Every one of them raised the work signal when it was published, and this is
+    /// the level behind that edge: <see cref="QuiclyPeer.HasPendingWork"/> reports it and the flush gate
+    /// (<see cref="QuiclyPeer.CanSkipFlush"/>) flushes for it. Game thread; from another thread the answer is advisory (the
+    /// held entries and the sweep cursor are the game thread's own).
     /// </summary>
     internal bool HasUnsentControl => !_notices.IsEmpty || HasPendingAcks();
 

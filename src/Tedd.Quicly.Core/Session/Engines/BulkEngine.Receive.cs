@@ -527,8 +527,9 @@ internal sealed unsafe partial class BulkEngine
     /// <summary>
     /// The record holding <paramref name="transferId"/>, ignoring <paramref name="except"/> (transport thread). A transfer
     /// that has <em>finished</em> but whose record is still on its way back through the retire/recycle rings counts: a
-    /// transfer id is unique per peer and direction for the whole epoch (PROTOCOL.md §3.3), so an id may not be used again
-    /// while any trace of it is live — the record's recycle is what frees the id.
+    /// transfer id is unique per peer and direction for the epoch (PROTOCOL.md §3.3), and it is enforced over every transfer
+    /// this end still holds any trace of. Once the record is recycled the id is free again — the tolerance PROTOCOL.md §8
+    /// documents, because remembering every id an epoch has seen would be unbounded state the peer controls.
     /// </summary>
     /// <param name="transferId">The id to look for.</param>
     /// <param name="except">A record to ignore (the one being opened).</param>

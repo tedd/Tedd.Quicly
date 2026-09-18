@@ -1271,6 +1271,10 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         for (int record = _records.Length - 1; record >= 0; record--)
         {
             ref BulkSend send = ref _records[record];
+
+            // A backstop, not an exit: the peer settles the lost connection (OnPeerClosed, so TerminateSend for every live
+            // transfer) before it resets for the reconnect, so this Finish finds each transfer already finished and is a
+            // no-op; the table itself is wiped wholesale below because nothing bound to the old transport survives.
             _transfers[record]?.Finish(new BulkResult(BulkStatus.Disconnected, send.BytesAcked, BulkHashState.None, QuiclyErrorCode.NoError));
             uint serial = (send.Serial + 1) & PeerCore.EngineStreamSerialMask;
             send = default;
@@ -1581,6 +1585,13 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             return;
         }
 
+        if (send.Phase == BulkPhase.Finished)
+        {
+            // A late frame for a transfer that already ended (its record waits for pieces or its stream): its outcome and its
+            // byte count were published when it finished and must not move afterwards.
+            return;
+        }
+
         // BytesRead never exceeds Length, so an honest claim of the whole range is exactly Length.
         if (bytesAccepted == send.Length)
         {
@@ -1799,9 +1810,11 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
                     send.Stream = default;
                     if (send.Phase is BulkPhase.Starting or BulkPhase.Open && (send.Flags & SendFinSent) == 0)
                     {
-                        FinishSend(local, record, BulkStatus.Disconnected, QuiclyErrorCode.NoError);
+                        // The one exit, like every other termination; with the stream forgotten it resets nothing.
+                        TerminateSend(local, record, BulkStatus.Disconnected, QuiclyErrorCode.NoError);
                     }
 
+                    // A transfer that did send FIN keeps its record until the peer's final progress; only the slot is free.
                     ReleaseStreamSlot(ref send, ref state);
                     break;
                 default:
@@ -1813,7 +1826,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
                         BulkStatus status = _core.IsTransportClosing ? BulkStatus.Disconnected
                             : code == QuiclyErrorCode.BulkCanceled ? BulkStatus.Canceled
                             : BulkStatus.Failed;
-                        FinishSend(local, record, status, code);
+                        TerminateSend(local, record, status, code);
                     }
 
                     ReleaseStreamSlot(ref send, ref state);

@@ -99,6 +99,59 @@ public class ReviewPerfContractTests
     }
 
     /// <summary>
+    /// The same budget arithmetic on a <see cref="ChannelMode.ReliableOrdered"/> channel with LZ4: the stream delivered the
+    /// message, so the drop at decode loses a message of a reliable channel for good (the sender saw it acknowledged by
+    /// the transport and will never resend it).
+    /// </summary>
+    [Fact]
+    public void A_Compressed_Reliable_Ordered_Message_That_Fits_The_Receive_Budget_Is_Not_Lost_At_Decode()
+    {
+        using SessionHarness h = new(
+            table: OrderedTables.Main,
+            client: DatagramKit.Quiet,
+            server: o =>
+            {
+                DatagramKit.Quiet(o);
+                o.AllocatorOptions = Pool();
+                o.ReceiveBudgetBytes = 2048;
+            });
+        QuiclyPeer server = h.Server!;
+        List<ReceiveLease> retained = [];
+        int plain = 0;
+        int decoded = 0;
+        server.RegisterHandler(4, (QuiclyPeer peer, in ReceiveHeader header, ReadOnlySpan<byte> payload) =>
+        {
+            plain++;
+            if (payload.Length != 64)
+            {
+                retained.Add(peer.Retain(in header));
+            }
+        });
+        server.RegisterHandler(6, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) =>
+        {
+            Assert.Equal(1000, payload.Length);
+            decoded++;
+        });
+
+        int next = 0;
+        SendAndDeliver(h, ref next, 1, 200, () => plain, channel: 4);
+        SendAndDeliver(h, ref next, 1, 40, () => plain, channel: 4);
+        SendAndDeliver(h, ref next, 4, 64, () => plain, channel: 4);
+        Assert.Equal(320, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+
+        Assert.True(h.Client.SendCopy(new SendHeader(6), new byte[1000]).IsAdmitted);
+        h.Run(200_000);
+
+        Assert.Equal(0, DatagramKit.Statistics(server).DecodeFailures);
+        Assert.Equal(1, decoded);
+
+        foreach (ReceiveLease lease in retained)
+        {
+            server.Release(in lease);
+        }
+    }
+
+    /// <summary>
     /// A peer without <see cref="PeerOptions.Allocator"/> gets a private allocator sized by
     /// <see cref="PeerOptions.AllocatorOptions"/> that serves its send leases and its receive leases. Once the handlers of
     /// received messages have returned, their blocks belong to the pool again, so a burst of received messages must not

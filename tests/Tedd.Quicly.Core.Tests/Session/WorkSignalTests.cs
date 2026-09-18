@@ -1,6 +1,9 @@
+using System.Reflection;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Session;
+using Tedd.Quicly.Core.State;
+using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Testing.Simulation;
 
 namespace Tedd.Quicly.Core.Tests.Session;
@@ -331,5 +334,253 @@ public class WorkSignalTests
         Assert.True(server.HasPendingWork);
         server.Poll();
         Assert.Equal(1, fragmented);
+    }
+
+    /// <summary>
+    /// A ReliableLatest value reaches the game thread through the key's mailbox, not the receive ring (ADR 0008 invariant 6),
+    /// whichever way it arrives — one datagram, a group stream for a large value, or a key retirement on the control stream
+    /// — so each of them must raise the edge itself, or an idle peer's host sleeps on while the value waits.
+    /// </summary>
+    [Fact]
+    public void ReliableLatest_Values_And_Key_Retirements_Signal_The_Receiver()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        using SessionHarness h = NewPair(clientSignal, serverSignal, LatestTables.Single);
+        QuiclyPeer server = h.Server!;
+        List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
+        server.RegisterHandler(2, LatestKit.Collect(received));
+        SettleLatest(h, clientSignal, serverSignal);
+
+        // A value in one datagram.
+        h.Client.SendCopy(new SendHeader(2, 7), [1, 2, 3]);
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        Assert.Equal(1, serverSignal.Calls);
+        Assert.True(server.HasPendingWork);
+        server.Poll();
+        Assert.Single(received);
+
+        // A large value on a group stream, posted when its last byte is in.
+        SettleLatest(h, clientSignal, serverSignal);
+        h.Client.SendCopy(new SendHeader(2, 8), LatestKit.Payload(1, 3_000));
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        Assert.Equal(1, serverSignal.Calls);
+        Assert.True(server.HasPendingWork);
+        server.Poll();
+        Assert.Equal(2, received.Count);
+        Assert.True(LatestKit.Matches(received[1].Payload, 1, 3_000));
+
+        // A key retirement, posted into the key's mailbox by the control path.
+        SettleLatest(h, clientSignal, serverSignal);
+        Assert.Equal(SendStatus.Admitted, h.Client.RetireKey(2, 7));
+        h.Network.Advance(1_000);
+        Assert.Equal(1, serverSignal.Calls);
+        Assert.True(server.HasPendingWork);
+        server.Poll();
+        Assert.Equal(3, received.Count);
+        Assert.Equal(ReceiveFlags.KeyRetired, received[2].Flags);
+    }
+
+    /// <summary>
+    /// The acks a received value is owed are work only a scheduler pass does: <see cref="QuiclyPeer.HasPendingWork"/> reports
+    /// them until a Flush sends them, so a host that woke on the edge and probes the level does not go back to sleep with
+    /// the edge still set.
+    /// </summary>
+    [Fact]
+    public void The_Acks_A_ReliableLatest_Value_Is_Owed_Are_Pending_Work_Until_A_Flush_Sends_Them()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        using SessionHarness h = NewPair(clientSignal, serverSignal, LatestTables.Single);
+        QuiclyPeer server = h.Server!;
+        int received = 0;
+        server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
+        SettleLatest(h, clientSignal, serverSignal);
+        Assert.False(server.HasPendingWork);
+
+        h.Client.SendCopy(new SendHeader(2, 7), [1, 2, 3]);
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        server.Poll();
+        Assert.Equal(1, received);
+        Assert.True(server.HasPendingWork, "the ack the value is owed waits for a Flush");
+        server.Flush();
+        Assert.False(server.HasPendingWork);
+    }
+
+    /// <summary>
+    /// The sender's side: a LatestAck completes a value and a LatestReject re-arms its retry, both in the sender's next
+    /// scheduler pass (PROTOCOL.md §2.3, §4.4). The transport thread hands them over as notices, which must raise the edge
+    /// and show up in <see cref="QuiclyPeer.HasPendingWork"/>, or a host that sleeps until the edge completes the value only
+    /// at its retry timer.
+    /// </summary>
+    [Fact]
+    public void A_LatestAck_Or_A_LatestReject_Reaching_The_Sender_Signals_It()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+
+        // The receiver's budget holds one 900-byte value and nothing takes it out of the mailbox (no handler), so a second
+        // one is answered with LatestReject(RingFull).
+        using SessionHarness h = new(table: LatestTables.Single,
+            client: o =>
+            {
+                QuietOptions.Apply(o);
+                o.WorkSignal = clientSignal;
+            },
+            server: o =>
+            {
+                QuietOptions.Apply(o);
+                o.WorkSignal = serverSignal;
+                o.ReceiveBudgetBytes = 2048;
+            });
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        SettleLatest(h, clientSignal, serverSignal);
+
+        SendResult first = client.SendCopy(new SendHeader(2, 1), LatestKit.Payload(1, 900), SendOptions.Tracked);
+        Assert.True(first.IsAdmitted);
+        client.Flush();
+        h.Network.Advance(1_000); // the value reaches the server; the client's own datagram states come back
+        client.Poll();            // the host takes those: nothing is left for the client
+        clientSignal.Take();
+        Assert.False(client.HasPendingWork);
+
+        server.Poll();
+        server.Flush(); // the LatestAck
+        h.Network.Advance(1_000);
+        Assert.Equal(1, clientSignal.Calls);
+        Assert.True(client.HasPendingWork);
+        client.Flush(); // the pass applies the ack: Delivered
+        client.Poll();
+        Assert.Equal(DeliveryStatus.Delivered, client.GetDeliveryStatus(first.Token));
+        Assert.False(client.HasPendingWork);
+
+        SendResult second = client.SendCopy(new SendHeader(2, 2), LatestKit.Payload(2, 900), SendOptions.Tracked);
+        Assert.True(second.IsAdmitted);
+        client.Flush();
+        h.Network.Advance(1_000);
+        Assert.True(DatagramKit.ChannelStats(server, 2).OutOfBuffers > 0, "the receiver did not refuse the second value");
+        client.Poll();
+        clientSignal.Take();
+        Assert.False(client.HasPendingWork);
+
+        h.Network.Advance(10_000); // past the receiver's AckDelay window, which its LatestAck opened
+        server.Poll();
+        server.Flush(); // the LatestReject
+        h.Network.Advance(1_000);
+        Assert.Equal(1, clientSignal.Calls);
+        Assert.True(client.HasPendingWork);
+    }
+
+    /// <summary>
+    /// ReliableLatest publications inside a transport callback raise the signal once when the callback ends, not once per
+    /// value: twenty values in one container (twenty mailbox posts, twenty acks owed) and their twenty acks in one LatestAck
+    /// datagram cost one host call each. The recording signal re-arms the edge itself, so it counts every call the peer makes.
+    /// </summary>
+    [Fact]
+    public void A_Burst_Of_ReliableLatest_Values_And_Their_Acks_Signal_Once_Per_Receive_Callback()
+    {
+        ReArmingWorkSignal clientSignal = new();
+        ReArmingWorkSignal serverSignal = new();
+        using SessionHarness h = new(table: LatestTables.Single,
+            client: o =>
+            {
+                QuietOptions.Apply(o);
+                o.WorkSignal = clientSignal;
+            },
+            server: o =>
+            {
+                QuietOptions.Apply(o);
+                o.WorkSignal = serverSignal;
+            });
+        QuiclyPeer server = h.Server!;
+        int received = 0;
+        server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
+        h.Run(20_000);
+        h.Client.Poll();
+        server.Poll();
+        clientSignal.Calls = 0;
+        serverSignal.Calls = 0;
+
+        for (ulong key = 0; key < 20; key++)
+        {
+            Assert.True(h.Client.SendCopy(new SendHeader(2, key), new byte[16]).IsAdmitted);
+        }
+
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        Assert.Equal(1, serverSignal.Calls);
+        server.Poll();
+        Assert.Equal(20, received);
+
+        h.Client.Poll(); // the client's own datagram states
+        clientSignal.Calls = 0;
+        server.Flush(); // twenty acks, one LatestAck datagram
+        h.Network.Advance(1_000);
+        Assert.Equal(1, clientSignal.Calls);
+        Assert.True(h.Client.HasPendingWork);
+    }
+
+    [Fact]
+    public void The_Work_Signal_Does_Not_Allocate_With_ReliableLatest_Traffic()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        using SessionHarness h = NewPair(clientSignal, serverSignal, LatestTables.Single);
+        SimulatedNetwork network = h.Network;
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        int received = 0;
+        server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
+        byte[] payload = new byte[64];
+        ulong key = 0;
+        AllocationAssert.NoAllocations(() =>
+        {
+            client.SendCopy(new SendHeader(2, key++ & 15), payload);
+            client.Flush();
+            network.Advance(1_000);
+            server.Poll();
+            _ = server.HasPendingWork;
+            server.Flush();
+            network.Advance(1_000);
+            client.Poll();
+            _ = client.HasPendingWork;
+            client.Flush();
+        });
+
+        Assert.True(received > 1_000);
+        Assert.True(serverSignal.Calls > 1_000);
+        Assert.True(clientSignal.Calls > 1_000);
+    }
+
+    /// <summary>Runs both ends until the link is quiet, polls them (re-arming both edges) and forgets the calls so far.</summary>
+    private static void SettleLatest(SessionHarness h, RecordingWorkSignal clientSignal, RecordingWorkSignal serverSignal)
+    {
+        h.Run(20_000);
+        h.Client.Poll();
+        h.Server!.Poll();
+        clientSignal.Take();
+        serverSignal.Take();
+    }
+
+    /// <summary>
+    /// Counts every <see cref="IPeerWorkSignal.OnWork"/> the peer makes: it re-arms the peer's edge at once, as a host that
+    /// polled instantly would, so a signal raised per publication instead of per callback shows up as extra calls.
+    /// </summary>
+    private sealed class ReArmingWorkSignal : IPeerWorkSignal
+    {
+        private static readonly FieldInfo Signalled =
+            typeof(QuiclyPeer).GetField("_workSignalled", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        public int Calls;
+
+        public void OnWork(QuiclyPeer peer)
+        {
+            Calls++;
+            Signalled.SetValue(peer, 0);
+        }
     }
 }

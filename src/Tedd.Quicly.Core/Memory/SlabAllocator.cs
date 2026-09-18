@@ -386,8 +386,8 @@ public sealed unsafe class SlabAllocator : IDisposable
     /// Blocks rented by one thread from one class — a send path's payloads — form one run.
     /// </summary>
     /// <param name="leases">Leases obtained from this allocator, each returned exactly once (no duplicates).</param>
-    /// <exception cref="ArgumentException">A lease is empty or does not address a block of this allocator; the leases before its run were returned.</exception>
-    /// <exception cref="InvalidOperationException">Lease validation is enabled and a lease is stale or its block is not rented; the leases before its run were returned.</exception>
+    /// <exception cref="ArgumentException">A lease is empty or does not address a block of this allocator; the leases before its run were returned, the leases of its run were not (they are still rented).</exception>
+    /// <exception cref="InvalidOperationException">Lease validation is enabled and a lease is stale or its block is not rented; the leases before its run were returned, the leases of its run were not (they are still rented).</exception>
     /// <exception cref="ObjectDisposedException">The allocator has been disposed.</exception>
     public void ReturnMany(ReadOnlySpan<BufferLease> leases)
     {
@@ -434,16 +434,32 @@ public sealed unsafe class SlabAllocator : IDisposable
         }
     }
 
+    // Validates a run and marks its blocks free, all or nothing: when a lease is stale or its block is not rented (a double
+    // return, or the same lease twice in the run), the blocks of the run marked free before it are marked rented again
+    // before the exception, so every lease of the rejected run is still rented and can be returned later.
     private static void ValidateRun(BlockMeta* blocks, ReadOnlySpan<BufferLease> run)
     {
-        foreach (ref readonly BufferLease lease in run)
+        for (int k = 0; k < run.Length; k++)
         {
+            ref readonly BufferLease lease = ref run[k];
             BlockMeta* block = blocks + lease.BlockIndex;
             if (block->Generation != lease.Generation)
-                ThrowStaleLease(in lease, block->Generation);
+                RejectRun(blocks, run[..k], in lease, stale: true, block->Generation);
             if (Interlocked.Exchange(ref block->State, StateFree) != StateRented)
-                ThrowDoubleReturn(in lease);
+                RejectRun(blocks, run[..k], in lease, stale: false, block->Generation);
         }
+    }
+
+    /// <summary>Slow path of <see cref="ValidateRun"/>: marks the blocks of <paramref name="validated"/> rented again, then throws for <paramref name="lease"/>.</summary>
+    [DoesNotReturn]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void RejectRun(BlockMeta* blocks, ReadOnlySpan<BufferLease> validated, in BufferLease lease, bool stale, ushort currentGeneration)
+    {
+        foreach (ref readonly BufferLease done in validated)
+            Volatile.Write(ref blocks[done.BlockIndex].State, StateRented);
+        if (stale)
+            ThrowStaleLease(in lease, currentGeneration);
+        ThrowDoubleReturn(in lease);
     }
 
     /// <summary>Slow path of <see cref="ReturnMany"/>: retry pushing the chain with back-off after a lost CAS.</summary>

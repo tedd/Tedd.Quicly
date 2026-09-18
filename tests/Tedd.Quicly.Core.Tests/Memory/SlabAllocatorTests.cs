@@ -703,6 +703,16 @@ public unsafe class SlabAllocatorTests
         Assert.True(allocator.TryRent(10, out BufferLease b));
         Assert.Throws<InvalidOperationException>(() => allocator.ReturnMany([a, b, a]));
 
+        // With one shard, d and e form one run: the duplicate rejects the whole run, so both are still rented after it.
+        using var single = new SlabAllocator(new SlabAllocatorOptions { FreeListShards = 1, SizeClasses = [new(64, 8)], ValidateLeases = true });
+        Assert.True(single.TryRent(10, out BufferLease d));
+        Assert.True(single.TryRent(10, out BufferLease e));
+        Assert.Throws<InvalidOperationException>(() => single.ReturnMany([d, e, d]));
+        Assert.Equal(2, single.GetClassStatistics(0).Rented);
+        single.Return(d);
+        single.Return(e);
+        Assert.Equal(0, single.GetStatistics().TotalRentedBytes);
+
         using var other = new SlabAllocator(new SlabAllocatorOptions { FreeListShards = 1, SizeClasses = [new(64, 8)], ValidateLeases = true });
         Assert.True(other.TryRent(10, out BufferLease c));
         other.Return(c);

@@ -736,4 +736,141 @@ public unsafe class FragmentEdgeTests
         Assert.Equal(1, FragmentKit.Reassemblies(server, 2));
         Assert.Equal(held, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
     }
+
+    [Fact]
+    public void A_Quiet_Engine_Keeps_The_Closed_Epochs_Partial_Until_It_Hears_A_Datagram()
+    {
+        // Decided and documented (docs/design/session-layer.md §7.8, "Epoch reset"): the reset is a request the transport
+        // thread consumes inside the engine's next datagram, because the reassembly table is that thread's (ADR 0008
+        // invariant 4). Until then the old epoch's partial keeps its buffer — bounded by MaxReassemblies × MaxMessageSize and
+        // already counted in the receive budget — and nothing of the new epoch can mix into it. Any datagram of the engine
+        // consumes the request, not only a fragment of the channel that holds the partial.
+        using ServerHarness h = new(table: Table);
+        Assert.True(h.Admit(), "the raw client was not admitted");
+        QuiclyPeer server = h.Server!;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        server.RegisterHandler(7, Handlers.Collect(got));
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(FragmentKit.Split(Table[2]!, 1, 0, DatagramKit.Payload(1, 2_000), 2)[0]));
+        h.Run(10_000);
+        long before = DatagramKit.Statistics(server).ReceiveBytesOutstanding;
+        Assert.True(before > 0, "the partial holds a receive lease");
+
+        FragmentKit.Engine(server, ChannelMode.UnreliableUnordered).OnEpochReset(resumed: true);
+        h.Run(500_000);
+        Assert.Equal(1, FragmentKit.Reassemblies(server, 2));
+        Assert.Equal(before, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+
+        // A plain datagram of another channel of the same engine (7 does not fragment) is enough.
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(DatagramKit.Frame(Table, 7, 0, 0, [42])));
+        Assert.True(h.RunUntil(() => got.Count == 1), "the plain datagram did not arrive");
+        Assert.Equal(0, FragmentKit.Reassemblies(server, 2));
+        Assert.Equal(0, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+        Assert.Equal(0, h.Statistics().ReassembliesAbandoned);
+    }
+
+    [Fact]
+    public void A_Fragment_Whose_Count_Implies_More_Than_The_Limit_Rents_Only_The_Limit()
+    {
+        // PROTOCOL.md §8: a non-last fragment of size s bounds its message from below, by s × (FragCount − 1) + 1, so a fragment
+        // can pass that bound while s × FragCount is far above the limit. This peer can buffer 4 096 bytes, and 1 195-byte
+        // fragments of a 4-fragment message imply at least 3 586 bytes (legal) but at most 4 780 (not). Renting 4 780 bytes for
+        // the partial fails on a budget that has room for every legal message: it would drop a message that fits, and count
+        // OutOfReceiveBuffers and the channel's OutOfBuffers for pressure that does not exist. The rent is clamped to the
+        // limit, and the exact total is checked once the last fragment tells it.
+        using ServerHarness h = new(table: Table, server: o => o.ReceiveBudgetBytes = 4_096);
+        Assert.True(h.Admit(), "the raw client was not admitted");
+        QuiclyPeer server = h.Server!;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        server.RegisterHandler(2, Handlers.Collect(got));
+        byte[] message = DatagramKit.Payload(1, (3 * 1_195) + 500);
+
+        byte[] Fragment(uint sequence, int index, int length) => FragmentKit.RawFragment(
+            2, 2, sequence, null, fragCount: 4, fragIndex: (byte)index, rawLength: null, message.AsSpan(index * 1_195, length));
+
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(Fragment(1, 0, 1_195)));
+        h.Run(10_000);
+        PeerStatistics statistics = h.Statistics();
+        Assert.Equal(1, FragmentKit.Reassemblies(server, 2));
+        Assert.Equal(0, statistics.OutOfReceiveBuffers);
+        Assert.Equal(0, DatagramKit.ChannelStats(server, 2).OutOfBuffers);
+        Assert.Equal(0, statistics.FragmentsDropped);
+        Assert.InRange(statistics.ReceiveBytesOutstanding, 1, 4_096);
+
+        // A 4 085-byte message: it fits the limit, so it is delivered whole.
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(Fragment(1, 1, 1_195)));
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(Fragment(1, 3, 500)));
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(Fragment(1, 2, 1_195)));
+        Assert.True(h.RunUntil(() => got.Count == 1), "the message that fits the limit was not delivered");
+        Assert.Equal(message, got[0].Payload);
+
+        // The same shape with a last fragment that takes the total past the limit is dropped with its partial.
+        byte[] oversized = DatagramKit.Payload(2, 1_000);
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(Fragment(2, 0, 1_195)));
+        Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(FragmentKit.RawFragment(2, 2, 2, null, 4, 3, null, oversized)));
+        h.Run(10_000);
+        Assert.Single(got);
+        Assert.Equal(0, FragmentKit.Reassemblies(server, 2));
+        statistics = h.Statistics();
+        Assert.Equal(1, statistics.FragmentsDropped);
+        Assert.Equal(0, statistics.OutOfReceiveBuffers);
+        Assert.Equal(0, DatagramKit.ChannelStats(server, 2).OutOfBuffers);
+        Assert.Equal(0, statistics.ReceiveBytesOutstanding);
+        Assert.Equal(PeerState.Connected, server.State);
+    }
+
+    [Fact]
+    public void A_Fragment_Packed_Beside_A_Tracked_Message_Gives_Its_Payload_Back_Exactly_Once()
+    {
+        // docs/design/session-layer.md §7.8 "Completions": a fragment is never tracked itself, but a container forwards its
+        // Sent notice to every member as soon as any member is tracked. A fragment that shares a container with a tracked
+        // message therefore hears twice — the container's Sent notice and its own final completion — and must give its
+        // reference on the message's payload back exactly once. A shared block makes that visible: its reference count must
+        // come back to exactly the caller's one, not zero (released twice) and not two (never released).
+        using SharedPool pool = new();
+        using SessionHarness h = new(
+            table: Table,
+            client: o =>
+            {
+                DatagramKit.Quiet(o);
+                o.Allocator = pool.Allocator;
+            },
+            server: DatagramKit.Quiet);
+        QuiclyPeer client = h.Client;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(2, Handlers.Collect(got));
+        // Two fragments of ~600 bytes: never two in one datagram, but either one leaves room for a small message beside it.
+        int length = FragmentKit.LengthFor(Table[2]!, 2);
+        SharedLease shared = pool.Share(length, seed: 5);
+        byte[] expected = new byte[length];
+        for (int i = 0; i < length; i++)
+        {
+            expected[i] = (byte)(5 + i);
+        }
+
+        SendResult fragmented = client.SendShared(new SendHeader(2), pool.Table, in shared, length, SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, fragmented.Status);
+        SendResult small = client.SendCopy(new SendHeader(2), [1, 2, 3], SendOptions.Tracked);
+        Assert.Equal(SendStatus.Admitted, small.Status);
+        Assert.Equal(2, pool.Count(in shared));
+        ValueTask<DeliveryStatus> released = client.WaitAsync(fragmented.Token, CompletionStage.BufferReleased);
+
+        PeerStatistics before = DatagramKit.Statistics(client);
+        client.Flush();
+        PeerStatistics sent = DatagramKit.Statistics(client);
+        // The first fragment goes alone; the second one and the tracked message share one container.
+        Assert.Equal(1, sent.ContainersSent - before.ContainersSent);
+        Assert.Equal(2, sent.MessagesPacked - before.MessagesPacked);
+
+        Assert.True(h.RunUntil(() => got.Count == 2), $"{got.Count} of 2 messages arrived");
+        Assert.Equal(expected, got[0].Payload);
+        Assert.Equal(new byte[] { 1, 2, 3 }, got[1].Payload);
+        Assert.True(h.RunUntil(() => client.GetDeliveryStatus(fragmented.Token) != DeliveryStatus.Pending), "the message never completed");
+        Assert.Equal(DeliveryStatus.Delivered, client.GetDeliveryStatus(fragmented.Token));
+        Assert.Equal(DeliveryStatus.Delivered, client.GetDeliveryStatus(small.Token));
+        Assert.True(released.IsCompleted, "BufferReleased never completed");
+        _ = released.Result;
+        Assert.Equal(1, pool.Count(in shared));
+        pool.Table.Release(in shared);
+        Assert.Equal(0, DatagramKit.Statistics(client).SendBytesOutstanding);
+    }
 }

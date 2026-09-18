@@ -493,6 +493,21 @@ public sealed unsafe partial class QuiclyPeer
         _core.ReturnReceive(in entry.Lease);
     }
 
+    /// <summary>
+    /// Fails every request still waiting for its response with <see cref="ObjectDisposedException"/> (game thread, from
+    /// <see cref="Dispose"/>, right after the peer is marked disposed). A response is only ever matched here, in Poll or Drain,
+    /// and neither runs after Dispose — so without this, a peer disposed without being closed first would leave each
+    /// <see cref="SendRequestAsync"/> awaiting the transport's close callback, which may come much later or never
+    /// (docs/design/session-layer.md §7.8).
+    /// </summary>
+    private void FailRequestsOnDispose()
+    {
+        if (_core.GetEngine(Tedd.Quicly.Core.Channels.ChannelMode.ReliableOrdered) is ReliableOrderedEngine ordered)
+        {
+            ordered.FailRequestsOnDispose();
+        }
+    }
+
     private void Emit(ref ReceiveEntry entry, long now, Span<ReceivedMessage> into, ref int written)
     {
         if ((entry.Flags & ReceiveFlags.Compressed) != 0 && !TryDecode(ref entry, now))

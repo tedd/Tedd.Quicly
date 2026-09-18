@@ -274,20 +274,26 @@ public sealed class PeerOptions
         }
     }
 
-    internal static long ToMicros(TimeSpan value) => value.Ticks / (TimeSpan.TicksPerMillisecond / 1000);
-
     /// <summary>
-    /// A <em>timeout</em> in microseconds: a positive duration always becomes at least one micro. Timeouts read 0 as their
-    /// "no timeout" sentinel (<see cref="QuiclyPeer.SendRequestAsync"/>), so the truncation towards zero that
-    /// <see cref="ToMicros"/> does — and that its other callers, where 0 means "off" or "every pass", rely on — would turn a
-    /// positive sub-microsecond timeout into "wait until the response arrives or the session ends".
+    /// A duration in clock microseconds, truncated towards zero — except that a <em>positive</em> duration always becomes at
+    /// least one micro.
     /// </summary>
-    /// <param name="value">A non-negative duration.</param>
-    /// <returns>0 only for <see cref="TimeSpan.Zero"/>, otherwise at least 1.</returns>
-    internal static long ToTimeoutMicros(TimeSpan value)
+    /// <remarks>
+    /// Every caller reads 0 as "off" or "none" and nothing else: the request timeout of
+    /// <see cref="QuiclyPeer.SendRequestAsync"/> ("wait until the response arrives"), <see cref="HeartbeatTimeout"/>,
+    /// <see cref="StreamIdleTimeout"/>, <see cref="GroupMinInterval"/> and <see cref="CloseLinger"/> ("disabled"),
+    /// <see cref="AckDelay"/> ("acknowledge at once"), and the options <see cref="Validate"/> requires to be positive
+    /// (<see cref="PingInterval"/>, <see cref="FastPingInterval"/>, <see cref="AdmissionTimeout"/>,
+    /// <see cref="FlushInterval"/>), for which 0 is not a value at all. Plain truncation turned a positive sub-microsecond
+    /// duration into that sentinel — a 500 ns request timeout waited forever, a 500 ns heartbeat timeout switched the check
+    /// off — so the rounding is here, once, for every caller.
+    /// </remarks>
+    /// <param name="value">The duration.</param>
+    /// <returns>Whole microseconds; 0 only for a duration that is not positive.</returns>
+    internal static long ToMicros(TimeSpan value)
     {
-        long micros = ToMicros(value);
-        return micros == 0 && value > TimeSpan.Zero ? 1 : micros;
+        long micros = value.Ticks / (TimeSpan.TicksPerMillisecond / 1000);
+        return micros == 0 && value.Ticks > 0 ? 1 : micros;
     }
 
     private static void CheckRange(int value, int min, int max, string name)

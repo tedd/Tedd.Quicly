@@ -1,6 +1,7 @@
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.State;
+using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Testing.Simulation;
 
@@ -328,5 +329,96 @@ public class FragmentDeliveryTests
         // replacing the other (PROTOCOL.md §2.1, §7).
         Assert.Equal(0, statistics.ReassembliesAbandoned);
         Assert.Equal(PeerState.Connected, client.State);
+    }
+
+    [Fact]
+    public void Over_A_Seeded_Lossy_Link_Exactly_The_Messages_Whose_Every_Fragment_Arrived_Are_Delivered()
+    {
+        // The link's own loss this time, drawn from a fixed seed, so the run is the same every time. The set of messages that
+        // must arrive does not come from the receiver under test but from the link: every message is tracked, and a
+        // fragmented message completes Delivered exactly when the transport acknowledged every one of its fragments and Lost
+        // when it lost any (docs/design/session-layer.md §7.8). The receiver must deliver exactly that set — nothing missing
+        // (reassembly lost a message that was whole) and nothing extra (it delivered one that could not be) — byte-exact, and
+        // over a link that reorders and jitters, so messages of 2 … 6 fragments interleave while some of them lose one.
+        const int Messages = 150;
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 5_000, JitterMicros = 3_000, LossPercent = 3, ReorderPercent = 20 },
+            table: Table,
+            client: DatagramKit.Quiet,
+            server: DatagramKit.Quiet,
+            seed: 20_260_918);
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        ChannelDefinition channel = Table[2]!;
+        List<int> arrived = [];
+        string? damaged = null;
+        server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) =>
+        {
+            int id = payload.Length >= 4 ? BitConverter.ToInt32(payload) : -1;
+            if (damaged is null && (id < 0 || !payload.SequenceEqual(DatagramKit.Payload(id, payload.Length))))
+            {
+                damaged = $"a message arrived damaged ({payload.Length} bytes, id {id})";
+            }
+
+            arrived.Add(id);
+        });
+
+        SendToken[] tokens = new SendToken[Messages];
+        DeliveryStatus[] outcome = new DeliveryStatus[Messages];
+        for (int i = 0; i < Messages; i++)
+        {
+            int count = 2 + (i % 5);
+            SendResult result = client.SendCopy(new SendHeader(2), DatagramKit.Payload(i, LengthFor(channel, count)), SendOptions.Tracked);
+            Assert.True(result.IsAdmitted, $"message {i} was refused ({result.Status})");
+            tokens[i] = result.Token;
+            if (i % 2 == 1)
+            {
+                client.Flush();
+                h.Network.Advance(16_667);
+                server.Poll();
+                client.Poll();
+                Record();
+            }
+        }
+
+        Assert.True(
+            h.RunUntil(() =>
+            {
+                Record();
+                return Array.TrueForAll(outcome, s => s != DeliveryStatus.Pending);
+            }, 2_000_000),
+            $"{outcome.Count(s => s == DeliveryStatus.Pending)} messages never completed");
+        List<int> whole = [];
+        for (int i = 0; i < Messages; i++)
+        {
+            Assert.True(outcome[i] is DeliveryStatus.Delivered or DeliveryStatus.Lost, $"message {i} ended {outcome[i]}");
+            if (outcome[i] == DeliveryStatus.Delivered)
+            {
+                whole.Add(i);
+            }
+        }
+
+        // The seed has to produce both outcomes, or the test would prove nothing about loss.
+        Assert.InRange(whole.Count, Messages / 2, Messages - 5);
+        h.Run(500_000);
+        Assert.Null(damaged);
+        arrived.Sort();
+        Assert.Equal(whole, arrived);
+        PeerStatistics statistics = DatagramKit.Statistics(server);
+        Assert.Equal(whole.Count, statistics.FragmentedMessagesReceived);
+        Assert.Equal(0, statistics.ReassembliesAbandoned);
+        Assert.Equal(PeerState.Connected, client.State);
+
+        // Read the status of every message the pass completed before a later send could reuse its completion slot.
+        void Record()
+        {
+            for (int i = 0; i < Messages; i++)
+            {
+                if (outcome[i] == DeliveryStatus.Pending && tokens[i] != default)
+                {
+                    outcome[i] = client.GetDeliveryStatus(tokens[i]);
+                }
+            }
+        }
     }
 }

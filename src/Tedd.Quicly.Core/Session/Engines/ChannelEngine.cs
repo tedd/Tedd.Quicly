@@ -157,19 +157,6 @@ internal abstract class ChannelEngine : IDisposable
     /// <returns><see langword="true"/> when the engine took the response and its lease.</returns>
     public virtual bool TryTakeResponse(in ReceiveLease response) => false;
 
-    /// <summary>
-    /// The peer is being disposed (game thread, from <see cref="QuiclyPeer.Dispose"/>, before the transport has reported its
-    /// close): fail every application wait the engine still holds — a value task it handed out that only an arriving message
-    /// could complete — with <paramref name="reason"/>. Disposing a peer without closing it first is ordinary teardown, so an
-    /// <c>await</c> must not outlive it: <see cref="Dispose"/> itself runs only once the transport can no longer call back,
-    /// which may be much later or (for a transport that reports no close) never. Engines that hold no waits do nothing;
-    /// failing the same waits again in <see cref="Dispose"/> must be harmless. Default: nothing.
-    /// </summary>
-    /// <param name="reason">What the awaiters see (an <see cref="ObjectDisposedException"/>).</param>
-    public virtual void FailWaitsOnDispose(Exception reason)
-    {
-    }
-
     /// <summary>Starts a bulk transfer (wave C2). Default: faults with <see cref="NotSupportedException"/>.</summary>
     /// <param name="channel">The bulk channel.</param>
     /// <param name="descriptor">What to send.</param>

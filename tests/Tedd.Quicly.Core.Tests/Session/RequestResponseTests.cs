@@ -1,7 +1,9 @@
 using Tedd.Quicly.Core.Channels;
+using Tedd.Quicly.Core.Framing;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Session.Engines;
 using Tedd.Quicly.Core.State;
+using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Testing.Simulation;
 
 namespace Tedd.Quicly.Core.Tests.Session;
@@ -338,16 +340,60 @@ public class RequestResponseTests
     [Fact]
     public void Requests_Fail_When_The_Peer_Is_Disposed()
     {
+        // Disposing a peer without closing it first is ordinary teardown. After Dispose no Poll, Flush or Drain runs, so
+        // nothing can match a response or serve a timeout any more, and the engine's own Dispose waits for the transport's
+        // close callback — which may come much later or never. Dispose itself therefore fails every request, synchronously:
+        // nothing runs between the Dispose call and the assertions below, not even one step of the network
+        // (docs/design/session-layer.md §7.8).
         using SessionHarness h = Harness();
         QuiclyPeer client = h.Client;
         h.Server!.RegisterHandler(10, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => { });
-        ValueTask<ReceiveLease> pending = client.SendRequestAsync(new SendHeader(10), new byte[] { 1 }, TimeSpan.Zero);
-        Assert.True(h.RunUntil(() => OrderedKit.Engine(client).OutstandingRequests == 1), "the request was not armed");
+        ValueTask<ReceiveLease> patient = client.SendRequestAsync(new SendHeader(10), new byte[] { 1 }, TimeSpan.Zero);
+        Task<ReceiveLease> awaited = client.SendRequestAsync(new SendHeader(10), new byte[] { 2 }, TimeSpan.FromSeconds(30)).AsTask();
+        Assert.True(h.RunUntil(() => OrderedKit.Engine(client).OutstandingRequests == 2), "the requests were not armed");
 
         h.DisposeClient();
+        Assert.True(patient.IsCompleted, "a request without a timeout outlived the Dispose of its peer");
+        Assert.Throws<ObjectDisposedException>(() => _ = patient.Result);
+        Assert.True(awaited.IsCompleted, "the continuation of an awaited request did not run when its peer was disposed");
+        Assert.IsType<ObjectDisposedException>(awaited.Exception?.InnerException);
+        Assert.Equal(0, OrderedKit.Engine(client).OutstandingRequests);
+        Assert.Equal(long.MaxValue, OrderedKit.Engine(client).RequestDeadlineMicros);
+        Assert.Throws<ObjectDisposedException>(() => client.SendRequestAsync(new SendHeader(10), new byte[] { 3 }, TimeSpan.Zero));
+
+        // The transport's close callback, when it does come, frees the engine; failing the requests again is a no-op.
         h.Network.RunUntilIdle(1_000_000);
-        Assert.True(pending.IsCompleted);
-        Assert.ThrowsAny<Exception>(() => _ = pending.Result);
+        Assert.Equal(0, OrderedKit.Engine(client).OutstandingRequests);
+    }
+
+    [Fact]
+    public void A_Positive_Duration_Never_Becomes_The_Zero_Sentinel()
+    {
+        // Every caller of PeerOptions.ToMicros reads 0 as "off" or "none" — a request without a timeout, a disabled heartbeat
+        // or stream-idle check, no close linger, no group interval, immediate acks — so truncating a positive duration towards
+        // zero would silently switch the feature off. Rounding up is done once, for all of them.
+        Assert.Equal(0, PeerOptions.ToMicros(TimeSpan.Zero));
+        Assert.Equal(1, PeerOptions.ToMicros(TimeSpan.FromTicks(1)));
+        Assert.Equal(1, PeerOptions.ToMicros(TimeSpan.FromTicks(5)));
+        Assert.Equal(1, PeerOptions.ToMicros(TimeSpan.FromTicks(19)));
+        Assert.Equal(2, PeerOptions.ToMicros(TimeSpan.FromTicks(20)));
+        Assert.Equal(1_000, PeerOptions.ToMicros(TimeSpan.FromMilliseconds(1)));
+        Assert.Equal(-1, PeerOptions.ToMicros(TimeSpan.FromTicks(-10)));
+
+        // End to end for the option whose zero means "disabled": a 500 ns heartbeat timeout is a heartbeat that fires, not one
+        // that was switched off.
+        using SessionHarness h = new(
+            connect: false,
+            table: Table,
+            client: o =>
+            {
+                DatagramKit.Quiet(o);
+                o.HeartbeatTimeout = TimeSpan.FromTicks(5);
+            },
+            server: DatagramKit.Quiet);
+        Assert.True(
+            h.RunUntil(() => h.ClientEvents.Exists(e => e.To == PeerState.Connected) && h.Client.State is PeerState.Closing or PeerState.Closed, 5_000_000),
+            $"a 500 ns heartbeat timeout never fired; the client is {h.Client.State}");
     }
 
     [Fact]
@@ -649,6 +695,110 @@ public class RequestResponseTests
         Assert.True(response.Header.Flags.HasFlag(ReceiveFlags.IsResponse));
         client.Release(in response);
         Assert.Equal(0, DatagramKit.Statistics(client).ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void A_Response_Waiting_Behind_Queued_And_Held_Messages_Is_Taken_By_Drain()
+    {
+        // The invariant that replaces the per-path checks (docs/design/session-layer.md §7.8, "Where responses are
+        // intercepted"): a response is taken where it leaves the receive ring, so the per-channel queues and the held slot —
+        // which only ever receive what already left the ring — cannot hold one. Here both are really in use when the response
+        // arrives: a Drain-style channel's messages fill the queue pool, the next one is held, and the response waits in the
+        // ring behind it. Drain then walks all three paths in order — queue, held slot, ring — and must hand the caller only
+        // the plain messages while the response completes its request.
+        using ServerHarness h = HeldBehindHarness(out ValueTask<ReceiveLease> pending);
+        QuiclyPeer server = h.Server!;
+
+        ReceivedMessage[] drained = new ReceivedMessage[4 * HeldPool];
+        int count = server.Drain(2, drained);
+        Assert.Equal(HeldPool + 1, count);
+        for (int i = 0; i < count; i++)
+        {
+            Assert.Equal(new[] { (byte)i }, drained[i].Payload.ToArray());
+            Assert.False(drained[i].Header.Flags.HasFlag(ReceiveFlags.IsResponse), "a response reached the batch API");
+        }
+
+        server.Release(drained.AsSpan(0, count));
+        Assert.True(pending.IsCompleted, "the response that waited behind the held message did not complete its request");
+        ReceiveLease response = pending.Result;
+        Assert.Equal(new byte[] { 0x77 }, response.Payload.ToArray());
+        server.Release(in response);
+        Assert.Equal(0, h.Statistics().ResponsesUnmatched);
+        Assert.Equal(0, OrderedKit.Engine(server).OutstandingRequests);
+        Assert.Equal(0, h.Statistics().ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void A_Response_Waiting_Behind_Queued_And_Held_Messages_Is_Taken_By_Poll()
+    {
+        // The Poll side of the same invariant: once the channel gets a handler, Poll's handler-queue loop dispatches the queued
+        // messages, then the held one, then reads the ring again — and only the plain messages reach the handler.
+        using ServerHarness h = HeldBehindHarness(out ValueTask<ReceiveLease> pending);
+        QuiclyPeer server = h.Server!;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        server.RegisterHandler(2, Handlers.Collect(got));
+
+        server.Poll();
+        Assert.Equal(HeldPool + 1, got.Count);
+        for (int i = 0; i < got.Count; i++)
+        {
+            Assert.Equal(new[] { (byte)i }, got[i].Payload);
+            Assert.False(got[i].Header.Flags.HasFlag(ReceiveFlags.IsResponse), "a response reached a channel handler");
+        }
+
+        Assert.True(pending.IsCompleted, "the response that waited behind the held message did not complete its request");
+        ReceiveLease response = pending.Result;
+        Assert.Equal(new byte[] { 0x77 }, response.Payload.ToArray());
+        server.Release(in response);
+        Assert.Equal(0, h.Statistics().ResponsesUnmatched);
+        Assert.Equal(0, h.Statistics().ReceiveBytesOutstanding);
+    }
+
+    /// <summary>Drain-queue node pool of <see cref="HeldBehindHarness"/> (it is the receive ring's capacity).</summary>
+    private const int HeldPool = 8;
+
+    /// <summary>
+    /// A server peer (the peer under test) with one request outstanding, whose drain queues are full, whose held slot holds a
+    /// plain message and whose receive ring holds the request's response behind it — so nothing has matched it yet.
+    /// </summary>
+    private static ServerHarness HeldBehindHarness(out ValueTask<ReceiveLease> pending)
+    {
+        ServerHarness h = new(table: Table, server: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.ReceiveRingCapacity = HeldPool;
+        });
+        Assert.True(h.Admit(), "the raw client was not admitted");
+        QuiclyPeer server = h.Server!;
+        pending = server.SendRequestAsync(new SendHeader(10), new byte[] { 1 }, TimeSpan.Zero);
+        Assert.False(pending.IsCompleted, "the request was refused");
+        server.Flush();
+
+        // Channel 2 has no handler, so Poll moves its messages to the channel's drain queue: HeldPool of them fill the node
+        // pool and the next one is held, which stops Poll from taking anything else out of the ring.
+        for (int i = 0; i <= HeldPool; i++)
+        {
+            Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(DatagramKit.Frame(Table, 2, (uint)i, 0, [(byte)i])));
+            h.Network.Advance(1_000);
+            server.Poll();
+        }
+
+        // The peer's response to request 1 (RequestId 2, PROTOCOL.md §3.1) arrives behind the held message.
+        ChannelDefinition rpc = Table[10]!;
+        byte[] frames = new byte[32];
+        int written = StreamFraming.WritePreamble(frames, rpc.Id);
+        StreamMessageHeader header = default;
+        header.Length = 1;
+        header.RequestId = 2;
+        written += StreamFraming.WriteFrameHeader(frames.AsSpan(written), rpc, in header);
+        frames[written++] = 0x77;
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(frames.AsSpan(0, written), out TransportStreamId _));
+        h.Network.Advance(20_000);
+        server.Poll();
+        server.Poll();
+        Assert.False(pending.IsCompleted, "the response was matched although the held message blocks the ring");
+        Assert.Equal(1, OrderedKit.Engine(server).OutstandingRequests);
+        return h;
     }
 
     [Fact]

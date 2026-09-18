@@ -184,15 +184,25 @@ internal sealed unsafe partial class ReliableOrderedEngine
         }
     }
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// The peer is being disposed (game thread, from <see cref="QuiclyPeer.Dispose"/>): every outstanding request fails with
+    /// <see cref="ObjectDisposedException"/> now.
+    /// </summary>
     /// <remarks>
     /// The only wait this engine hands out is <see cref="SendRequestAsync"/>, and only an arriving response, a timeout, a
-    /// close or a cancellation completes it — none of which happens after the peer is disposed. <see cref="Dispose"/> fails
-    /// them too, but it runs from the peer's <c>FreeResources</c>, which waits for the transport's close callback, so a peer
-    /// disposed without being closed first would leave every outstanding request awaiting forever until (or unless) that
-    /// callback arrives. <see cref="FailRequests"/> is idempotent, so failing them again in <see cref="Dispose"/> is a no-op.
+    /// close or a cancellation completes it — none of which can happen after the peer is disposed, because no Poll, Flush or
+    /// Drain runs any more. <see cref="Dispose"/> fails them too, but it runs from the peer's <c>FreeResources</c>, which
+    /// waits for the transport's close callback, so a peer disposed without being closed first (ordinary teardown) would leave
+    /// every outstanding request awaiting until that callback arrives — much later, or for a transport that reports no close,
+    /// never. <see cref="FailRequests"/> is idempotent, so failing them again in <see cref="Dispose"/> is a no-op.
     /// </remarks>
-    public override void FailWaitsOnDispose(Exception reason) => FailRequests(reason);
+    internal void FailRequestsOnDispose()
+    {
+        if (_hasRequestResponse && _requestCount != 0)
+        {
+            FailRequests(new ObjectDisposedException(nameof(QuiclyPeer)));
+        }
+    }
 
     /// <summary>Sets up the request table when a channel of this engine carries request ids (constructor time, game thread).</summary>
     /// <param name="channelsOfMode">The channels of this engine.</param>

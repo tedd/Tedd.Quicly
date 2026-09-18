@@ -50,17 +50,23 @@ public sealed class CompletionTable : IDisposable
     // Dispose), and GC-managed memory is still there then, so the return needs no handshake with Dispose.
     private readonly MpscRing<int> _free;
 
+    /// <summary>The largest capacity (2^26): the pinned free list of that many 16-byte ring slots is 1 GiB, the next power of two exceeds the largest array.</summary>
+    public const int MaxCapacity = 1 << 26;
+
     /// <summary>Creates a table with <paramref name="capacity"/> slots.</summary>
-    /// <param name="capacity">Number of sends that can be tracked at the same time (1 … 2^30).</param>
+    /// <param name="capacity">
+    /// Number of sends that can be tracked at the same time (1 … 2^26: the free list is one pinned array of 16-byte ring
+    /// slots, and 2^27 of them would exceed the largest array). A peer uses its send table capacity, at most 2^20.
+    /// </param>
     /// <param name="runContinuationsAsynchronously">
     /// When true, continuations of <see cref="WaitAsync"/> are queued to the thread pool instead of running
     /// inline on the thread that calls <see cref="Complete"/>.
     /// </param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> is not positive or exceeds 2^30.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> is not positive or exceeds 2^26.</exception>
     public CompletionTable(int capacity, bool runContinuationsAsynchronously = false)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 1);
-        ArgumentOutOfRangeException.ThrowIfGreaterThan(capacity, 1 << 30);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(capacity, MaxCapacity);
         _slots = new Slot[capacity];
         _free = new MpscRing<int>(capacity, pinnedObjectHeap: true);
         for (int i = 0; i < capacity; i++)

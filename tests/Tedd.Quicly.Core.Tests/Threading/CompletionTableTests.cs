@@ -60,7 +60,8 @@ public class CompletionTableTests
     [Theory]
     [InlineData(0)]
     [InlineData(-1)]
-    [InlineData((1 << 30) + 1)]
+    [InlineData(CompletionTable.MaxCapacity + 1)]
+    [InlineData(1 << 30)]
     public void Constructor_Rejects_Invalid_Capacity(int capacity)
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => new CompletionTable(capacity));

@@ -47,6 +47,7 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         _inPoll = true;
+        _gate.Polled = true; // whatever this Poll changes, the next Flush serves (QuiclyPeer.FlushGate.cs)
         EnterCall();
         NoteGameThread();
         // The host is here now: the next work published raises a fresh signal (IPeerWorkSignal is an edge).

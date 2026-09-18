@@ -277,6 +277,7 @@ public sealed partial class QuiclyServer
             info.Sink = activation.Sink;
             info.Unadmitted = true;
             _slots[slot] = new PeerSlot(activation.Peer, activation.Generation, PeerSlotState.Handshaking);
+            activation.Peer.EnableFlushGate(); // FlushAll skips the peer whenever a Flush would do nothing
             UpdateDeadlines(slot, activation.Peer);
             if (slot >= _highWater)
             {

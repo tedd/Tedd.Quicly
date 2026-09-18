@@ -49,7 +49,7 @@ public class StreamFrameParserMarkTests
     /// Returns one line per complete message. With <paramref name="whole"/> a message whose payload lies wholly in the segment
     /// is taken in one step after its <see cref="StreamEvent.MessageStart"/> (<see cref="StreamFrameParser.TryTakeWholePayload"/>,
     /// the peer's fast path), counted in <paramref name="wholes"/>, and un-read as one event. With <paramref name="fast"/> every
-    /// event first tries <see cref="StreamFrameParser.TryReadWholeMessage"/> (the peer's whole-frame path, counted in
+    /// event first tries <see cref="StreamFrameParser.TryReadMessage"/> (the peer's frame-header path, counted in
     /// <paramref name="fastReads"/>) and falls back to <see cref="StreamFrameParser.Read"/>, which must then see an unchanged parser.
     /// </summary>
     private static List<string> Parse(byte[] data, int segmentSize, bool pendEveryEvent, out int pends, bool whole = false) =>
@@ -84,11 +84,17 @@ public class StreamFrameParserMarkTests
                 StreamEvent streamEvent;
                 ReadOnlySpan<byte> chunk;
                 bool taken = false;
-                if (fast && parser.TryReadWholeMessage(ref input, out chunk))
+                if (fast && parser.TryReadMessage(ref input, out chunk, out bool read))
                 {
                     streamEvent = StreamEvent.MessageStart;
-                    taken = true;
+                    taken = read;
                     fastReads++;
+                    if (!read)
+                    {
+                        // A header read ahead of a payload that is not all here: the message continues event by event.
+                        Assert.Equal(parser.Message.Length, parser.RemainingPayload);
+                        Assert.True(parser.RemainingPayload > input.Length);
+                    }
                 }
                 else
                 {
@@ -245,6 +251,40 @@ public class StreamFrameParserMarkTests
     }
 
     [Fact]
+    public void A_Frame_Header_Read_Ahead_Of_Its_Payload_Continues_Event_By_Event()
+    {
+        byte[] data = BuildStream();
+        StreamFrameParser parser = default;
+        parser.Reset(StreamRole.Unknown);
+        ReadOnlySpan<byte> input = data;
+        Assert.Equal(StreamEvent.Preamble, parser.Read(Table, ref input, out _));
+
+        // The first frames: empty, 1 byte, 50 bytes. Hand over the 50-byte frame's header and 10 payload bytes only.
+        Assert.True(parser.TryReadMessage(ref input, out _, out bool whole));
+        Assert.True(whole);
+        Assert.True(parser.TryReadMessage(ref input, out _, out whole));
+        Assert.True(whole);
+        int headerLength = StreamFraming.GetFrameHeaderLength(Table[4]!, new StreamMessageHeader { Length = 50, Key = 2_000_006, RequestId = 2 });
+        ReadOnlySpan<byte> part = input.Slice(0, headerLength + 10);
+        parser.GetMark(out StreamFrameParser.Mark mark);
+        Assert.True(parser.TryReadMessage(ref part, out ReadOnlySpan<byte> payload, out whole));
+        Assert.False(whole);
+        Assert.True(payload.IsEmpty);
+        Assert.Equal(10, part.Length);
+        Assert.Equal(50, parser.Message.Length);
+        Assert.Equal(50, parser.RemainingPayload);
+        Assert.Equal(StreamEvent.PayloadChunk, parser.Read(Table, ref part, out payload));
+        Assert.Equal(10, payload.Length);
+        Assert.Equal(StreamEvent.NeedMore, parser.Read(Table, ref part, out _));
+
+        // Rewinding to the mark un-reads the header as well.
+        parser.Rewind(in mark);
+        part = input.Slice(0, headerLength + 10);
+        Assert.Equal(StreamEvent.MessageStart, parser.Read(Table, ref part, out _));
+        Assert.Equal(50, parser.RemainingPayload);
+    }
+
+    [Fact]
     public void A_Whole_Frame_Is_Left_To_Read_When_It_Is_Not_A_Valid_Message_At_A_Boundary()
     {
         ChannelTable table = ChannelTable.Create().Add(6, "latest", ChannelMode.ReliableLatest).Build();
@@ -261,9 +301,9 @@ public class StreamFrameParserMarkTests
         StreamFrameParser parser = default;
         parser.Reset(StreamRole.Unknown);
         ReadOnlySpan<byte> input = data.AsSpan(0, length);
-        Assert.False(parser.TryReadWholeMessage(ref input, out _)); // before the preamble
+        Assert.False(parser.TryReadMessage(ref input, out _, out _)); // before the preamble
         Assert.Equal(StreamEvent.Preamble, parser.Read(table, ref input, out _));
-        Assert.False(parser.TryReadWholeMessage(ref input, out ReadOnlySpan<byte> payload));
+        Assert.False(parser.TryReadMessage(ref input, out ReadOnlySpan<byte> payload, out _));
         Assert.True(payload.IsEmpty);
         Assert.Equal(length - start, input.Length);
         Assert.Equal(StreamEvent.Error, parser.Read(table, ref input, out _));
@@ -273,7 +313,7 @@ public class StreamFrameParserMarkTests
         parser.Reset(StreamRole.Unknown);
         input = data.AsSpan(0, start + 1);
         Assert.Equal(StreamEvent.Preamble, parser.Read(table, ref input, out _));
-        Assert.False(parser.TryReadWholeMessage(ref input, out _));
+        Assert.False(parser.TryReadMessage(ref input, out _, out _));
         Assert.Equal(1, input.Length);
         Assert.Equal(StreamEvent.NeedMore, parser.Read(table, ref input, out _));
     }

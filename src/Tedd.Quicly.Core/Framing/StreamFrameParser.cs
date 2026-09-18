@@ -211,31 +211,47 @@ public struct StreamFrameParser
 
     /// <summary>
     /// The message-stream fast path: when the parser stands at a message boundary of an ordered or group stream (no partial
-    /// header buffered) and <paramref name="input"/> holds the next frame's header and its whole payload, parses both and
-    /// completes the message in one step — the state <see cref="Read"/> (<see cref="StreamEvent.MessageStart"/>) followed by
-    /// <see cref="TryTakeWholePayload"/> would leave, without the general state machine. <see cref="Message"/> is the frame's
-    /// header, and a <see cref="Rewind"/> to a mark taken before the call un-reads the message. Otherwise nothing changes:
-    /// a frame that is incomplete, invalid or not wholly in the input is left to <see cref="Read"/>.
+    /// header buffered) and <paramref name="input"/> holds the next frame's whole header, parses it without the general state
+    /// machine. When the payload lies wholly in the input too, the message is completed in one step (<paramref name="whole"/>):
+    /// the state <see cref="Read"/> (<see cref="StreamEvent.MessageStart"/>) followed by <see cref="TryTakeWholePayload"/> would
+    /// leave. Otherwise the parser stands where <see cref="Read"/>'s <see cref="StreamEvent.MessageStart"/> leaves it and the
+    /// payload follows event by event. Either way <see cref="Message"/> is the frame's header and a <see cref="Rewind"/> to a
+    /// mark taken before the call un-reads it. A header that is incomplete or invalid (or a ReliableLatest sequence mismatch)
+    /// changes nothing and is left to <see cref="Read"/>.
     /// </summary>
-    /// <param name="input">The unconsumed bytes of the current receive segment; advanced past the frame on success.</param>
-    /// <param name="payload">The whole payload (empty for an empty message), or empty.</param>
-    /// <returns><see langword="true"/> when a whole message was read.</returns>
-    internal bool TryReadWholeMessage(scoped ref ReadOnlySpan<byte> input, out ReadOnlySpan<byte> payload)
+    /// <param name="input">The unconsumed bytes of the current receive segment; advanced past what was read.</param>
+    /// <param name="payload">The whole payload when <paramref name="whole"/> (empty for an empty message), or empty.</param>
+    /// <param name="whole">Whether the whole message was read.</param>
+    /// <returns><see langword="true"/> when a message header was read (the equivalent of <see cref="StreamEvent.MessageStart"/>).</returns>
+    internal bool TryReadMessage(scoped ref ReadOnlySpan<byte> input, out ReadOnlySpan<byte> payload, out bool whole)
     {
         if (_state == State.Header && _bufferLength == 0 && (_role == StreamRole.Ordered || _role == StreamRole.Group)
             && StreamFraming.ParseMessageHeader(input, _shape, _limit, out StreamMessageHeader header, out int consumed) == ParseStatus.Ok
-            && (uint)header.Length <= (uint)(input.Length - consumed)
             && (!_latest || header.Sequence == (uint)_groupId))
         {
             _message = header;
-            payload = input.Slice(consumed, header.Length);
-            input = input.Slice(consumed + header.Length);
-            _remaining = 0;
-            _state = _latest ? State.Done : State.Header;
+            int length = header.Length;
+            if ((uint)length <= (uint)(input.Length - consumed))
+            {
+                payload = input.Slice(consumed, length);
+                input = input.Slice(consumed + length);
+                _remaining = 0;
+                _state = _latest ? State.Done : State.Header;
+                whole = true;
+                return true;
+            }
+
+            // An empty payload always fits, so the message has payload still to come.
+            input = input.Slice(consumed);
+            _remaining = length;
+            _state = State.Payload;
+            payload = default;
+            whole = false;
             return true;
         }
 
         payload = default;
+        whole = false;
         return false;
     }
 

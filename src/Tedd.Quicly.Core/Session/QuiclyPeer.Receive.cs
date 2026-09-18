@@ -726,15 +726,15 @@ public sealed unsafe partial class QuiclyPeer
                     snapshot = record.Parser;
                 }
 
-                // Once the engine is known to take whole messages, a frame that lies wholly in the segment is read without the
-                // parser's general state machine; everything else (and the first event of a callback) goes through Read.
+                // Once the engine is known to take whole messages, a frame header at a message boundary is read without the
+                // parser's general state machine (and the whole message with it when its payload lies in the segment);
+                // everything else (and the first event of a callback) goes through Read.
                 int before = segment.Length - input.Length;
                 StreamEvent streamEvent;
                 ReadOnlySpan<byte> payload;
                 bool whole;
-                if (wholeFrames && record.Parser.TryReadWholeMessage(ref input, out payload))
+                if (wholeFrames && record.Parser.TryReadMessage(ref input, out payload, out whole))
                 {
-                    whole = true;
                     streamEvent = StreamEvent.MessageStart;
                 }
                 else

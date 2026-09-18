@@ -216,11 +216,29 @@ public sealed unsafe class SlabAllocator : IDisposable
         {
             int next = blocks[index].Next;
             long newHead = (long)((((ulong)head + TagIncrement) & TagMask) | (uint)next);
-            if (Interlocked.CompareExchange(ref shard->Head, newHead, head) == head)
-                return CompleteRent(ref c, ci, s, shard, blocks + index, index, out lease);
+            // DIAGNOSTIC ABLATION (single-threaded benchmark only): no lock prefix on the rent fast path.
+            shard->Head = newHead;
+            return CompleteRentDiag(ref c, ci, s, shard, blocks + index, index, out lease);
         }
 
         return TryRentSlow(ref c, ci, s, out lease);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool CompleteRentDiag(ref SizeClass c, int ci, int s, ShardHeader* shard, BlockMeta* block, int index, out BufferLease lease)
+    {
+        ushort generation = (ushort)(block->Generation + 1);
+        block->Generation = generation;
+        if (_validateLeases)
+            block->State = StateRented;
+
+        int rented = ++shard->Rented;
+        if (rented > shard->Peak)
+            shard->Peak = rented;
+
+        int blockSize = c.BlockSize;
+        lease = new BufferLease((byte)ci, (byte)s, generation, index, index * blockSize, blockSize);
+        return true;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

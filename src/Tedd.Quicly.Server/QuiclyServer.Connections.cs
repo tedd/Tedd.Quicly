@@ -284,6 +284,11 @@ public sealed partial class QuiclyServer
                 _highWater = slot + 1;
             }
 
+            // The listener marked the slot when it queued the peer, and the peer's work signal (connected, Hello) marked it
+            // again, once until its first Poll. A PollAll that took those bits before this activation found an empty slot
+            // and dropped them, and nothing would mark the slot again before the admission deadline: visit it now.
+            MarkWork(slot);
+
             if (_shutdownBegun)
             {
                 // Accepted by the listener just before (or while) the shutdown began: it is closed like every other peer,

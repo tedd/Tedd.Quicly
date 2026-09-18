@@ -1277,7 +1277,8 @@ leaving no owner marks, cancel, expiry at scheduling time, close, an epoch reset
 engine keeping the closed epoch's partial until its next datagram, and a resume that fragments again after the owner map
 was reset); `RequestResponseTests` (the happy path, keyed and compressed requests, 64 concurrent requests answered in
 reverse order, 32 of them over a lossy, jittering link with plain messages interleaved, timeouts served by Poll and by
-Flush, a response after the timeout, cancellation that does not cancel the send, an unmatched response, a response
+Flush, the published deadline moving on to the next request's timeout, a response after the timeout, cancellation that
+does not cancel the send, a cancellation that loses to the response, an unmatched response, a response
 drained rather than polled — which is also what reclaims a canceled slot — a `Drain` that hands the caller the plain
 message and not the response, a response waiting in the ring behind full drain queues and a held message, taken by
 `Drain` and by `Poll`, close, a lost connection followed by a resume, a dispose that fails every request synchronously

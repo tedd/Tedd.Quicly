@@ -8,6 +8,7 @@ namespace Tedd.Quicly.Core.Tests.Session;
 /// Receive-lease recycling (<see cref="PeerCore.RecycleReceive"/> → <see cref="PeerCore.TryRentReceive"/>): a dispatched
 /// message's lease is parked for the transport thread to reissue to the next message. A parked lease counts as released for
 /// the application (statistics) and as held for the pool and the budget; a reuse must be exactly a return followed by a rent.
+/// Only a peer that owns its allocator parks.
 /// </summary>
 public class RecycleReceiveTests
 {
@@ -196,8 +197,9 @@ public class RecycleReceiveTests
     }
 
     [Fact]
-    public void Closing_And_Disposing_With_Parked_Leases_Returns_Every_Block_To_A_Shared_Pool()
+    public void A_Peer_On_A_Supplied_Allocator_Never_Parks()
     {
+        // A shared pool: a block parked by one peer could not be reclaimed by another, so every lease goes straight back.
         using SlabAllocator pool = new(Pool());
         int received = 0;
         using (SessionHarness h = Harness(o =>
@@ -211,11 +213,51 @@ public class RecycleReceiveTests
             server.RegisterHandler(2, count);
             server.RegisterHandler(4, count);
             server.RegisterHandler(9, count);
+            h.Run(10_000);
+            long before = pool.GetStatistics().TotalRentedBytes;
+            int next = 0;
+            SendAndDeliver(h, ref next, 30, 64, () => received);
+            Assert.Equal(0, server.Core.RecycledBytes);
+            Assert.Equal(before, pool.GetStatistics().TotalRentedBytes);
+            Assert.Equal(0, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+
+            SendAndDeliver(h, ref next, 10, 200, () => received);
+            for (int round = 0; round < 5; round++)
+            {
+                // Coalescing channels: the transport thread replaces a key's lease, the game thread takes the latest.
+                for (ulong key = 0; key < 8; key++)
+                {
+                    h.Client.SendCopy(new SendHeader(4, key), DatagramKit.Payload(next++, 48));
+                    h.Client.SendCopy(new SendHeader(9, key), DatagramKit.Payload(next++, 100));
+                }
+
+                h.Run(20_000);
+            }
+
+            Assert.Equal(0, server.Core.RecycledBytes);
+            Assert.Equal(before, pool.GetStatistics().TotalRentedBytes);
+            Assert.Equal(0, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+        }
+
+        Assert.Equal(0, pool.GetStatistics().TotalRentedBytes);
+        Assert.True(received >= 40);
+    }
+
+    [Fact]
+    public void Closing_And_Disposing_With_Parked_Leases_Gives_Every_One_Back()
+    {
+        int received = 0;
+        QuiclyPeer server;
+        using (SessionHarness h = Harness())
+        {
+            server = h.Server!;
+            MessageHandler count = (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++;
+            server.RegisterHandler(2, count);
+            server.RegisterHandler(4, count);
+            server.RegisterHandler(9, count);
             int next = 0;
             SendAndDeliver(h, ref next, 30, 64, () => received);
             SendAndDeliver(h, ref next, 10, 200, () => received);
-
-            // Coalescing channels: the transport thread replaces a key's lease, the game thread takes the latest.
             for (int round = 0; round < 5; round++)
             {
                 for (ulong key = 0; key < 8; key++)
@@ -229,25 +271,23 @@ public class RecycleReceiveTests
 
             Assert.True(server.Core.RecycledBytes > 0);
             Assert.Equal(0, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
-            Assert.True(pool.GetStatistics().TotalRentedBytes > 0);
         }
 
-        // The harness disposed both peers and delivered the transports' close: the parked blocks went back with the rest.
-        Assert.Equal(0, pool.GetStatistics().TotalRentedBytes);
+        // The harness disposed both peers and delivered the transports' close: the peer freed its memory, and every parked
+        // lease went back through ReturnReceive before its private pool was disposed (the counters stay readable).
+        Assert.True(server.IsFreed);
+        Assert.Equal(0, server.Core.RecycledBytes);
+        Assert.Equal(0, server.Core.ReceiveBytesOutstanding);
         Assert.True(received >= 40);
     }
 
     [Fact]
-    public void Disposing_From_A_Handler_Returns_The_Parked_Leases()
+    public void Disposing_From_A_Handler_Gives_Back_The_Parked_Leases()
     {
-        using SlabAllocator pool = new(Pool());
-        using (SessionHarness h = Harness(o =>
+        QuiclyPeer server;
+        using (SessionHarness h = Harness())
         {
-            o.AllocatorOptions = null;
-            o.Allocator = pool;
-        }))
-        {
-            QuiclyPeer server = h.Server!;
+            server = h.Server!;
             int received = 0;
             server.RegisterHandler(2, (QuiclyPeer peer, in ReceiveHeader _, ReadOnlySpan<byte> _) =>
             {
@@ -258,6 +298,7 @@ public class RecycleReceiveTests
             });
             int next = 0;
             SendAndDeliver(h, ref next, 20, 64, () => received);
+            Assert.Equal(20 * 64, server.Core.RecycledBytes);
             for (int i = 0; i < 20; i++)
             {
                 h.Client.SendCopy(new SendHeader(2), DatagramKit.Payload(next++, 64));
@@ -270,6 +311,8 @@ public class RecycleReceiveTests
             Assert.True(server.IsDisposed);
         }
 
-        Assert.Equal(0, pool.GetStatistics().TotalRentedBytes);
+        Assert.True(server.IsFreed);
+        Assert.Equal(0, server.Core.RecycledBytes);
+        Assert.Equal(0, server.Core.ReceiveBytesOutstanding);
     }
 }

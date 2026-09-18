@@ -615,12 +615,9 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         // Sizing it from them would be wrong for a chunked body, whose wire cost is a fraction of the bytes it carries — a
         // 64 KiB chunk of compressible data costs a few hundred bytes — so a window in wire bytes would cut the piece to a
         // few hundred object bytes and turn one transfer into thousands of chunks. Each gate is charged the wire bytes the
-        // piece really cost, and the last piece of a pass may overdraw, as §7.1's budget rule allows.
+        // piece really cost, and the last piece of a pass may overdraw, as §7.1's budget rule allows. Both operands are
+        // positive (remaining was checked above, and _bodyBytes is at least one byte by construction), so the piece is too.
         int body = (int)Math.Min(remaining, _bodyBytes);
-        if (body <= 0)
-        {
-            return false;
-        }
 
         ChannelDefinition channel = _channels[local];
         if (!_core.TryAllocateEntry(channel.Id, SendEntryFlags.None, out int slot))
@@ -919,6 +916,22 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         return true;
     }
 
+    /// <summary>
+    /// The peer's stream limit refused the transfer's start and every piece sent with it has come back canceled (game
+    /// thread). Nothing reached the peer, so the transfer rewinds to its last completed byte, forgets that its header went
+    /// out and waits for a <em>new</em> stream once the peer grants credit (docs/design/session-layer.md §7.7). The refusal
+    /// notice and the canceled completions arrive in either order, and whichever is last lands here.
+    /// </summary>
+    private static void RewindRefused(ref BulkSend send, ref BulkSendState state)
+    {
+        send.BytesRead = send.BytesCompleted;
+        send.WireOutstanding = 0;
+        send.Phase = BulkPhase.Waiting;
+        send.Stream = default;
+        send.Flags = (byte)(send.Flags & ~(SendHeaderWritten | SendFinSent));
+        ReleaseStreamSlot(ref send, ref state);
+    }
+
     /// <summary>Releases a stream that never started (no accepted send carried Start): no callback follows for it.</summary>
     private void AbandonStream(ref BulkSend send)
     {
@@ -995,19 +1008,10 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             TerminateSend(local, record, BulkStatus.Disconnected, QuiclyErrorCode.NoError);
             return;
         }
-        else if (send.Phase == BulkPhase.Refused)
+        else if (send.Phase == BulkPhase.Refused && send.CarriersOutstanding == 0)
         {
-            // The peer's stream limit refused the start: nothing reached the peer, so the transfer rewinds to its last
-            // completed byte and goes out on a new stream once the peer grants credit.
-            if (send.CarriersOutstanding == 0)
-            {
-                send.BytesRead = send.BytesCompleted;
-                send.WireOutstanding = 0;
-                send.Phase = BulkPhase.Waiting;
-                send.Stream = default;
-                send.Flags = (byte)(send.Flags & ~(SendHeaderWritten | SendFinSent));
-                ReleaseStreamSlot(ref send, ref state);
-            }
+            // The refusal notice came first and this was the last piece to come back canceled (the simulator's order).
+            RewindRefused(ref send, ref state);
         }
 
         // A piece canceled for any other reason means the stream is going away, but not yet *why*: a peer that stopped it
@@ -1636,12 +1640,9 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     /// <summary>Authorises a range the peer asked for and starts serving it (game thread; default deny).</summary>
     private void ApplyRequest(in ControlNotice notice)
     {
+        // OnControl queued only a request naming a Bulk channel of this table, and the table never changes.
         int dense = _core.ChannelIndexOf(notice.Channel);
-        int local = dense >= 0 ? _localOf[dense] : -1;
-        if (local < 0)
-        {
-            return;
-        }
+        int local = _localOf[dense];
 
         BulkRequestInfo info = new()
         {
@@ -1779,12 +1780,8 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
                         StreamsRefused++;
                         if (send.CarriersOutstanding == 0)
                         {
-                            send.BytesRead = send.BytesCompleted;
-                            send.WireOutstanding = 0;
-                            send.Phase = BulkPhase.Waiting;
-                            send.Stream = default;
-                            send.Flags = (byte)(send.Flags & ~(SendHeaderWritten | SendFinSent));
-                            ReleaseStreamSlot(ref send, ref state);
+                            // Every piece already came back canceled before the notice did (the order is the transport's).
+                            RewindRefused(ref send, ref state);
                         }
                         else
                         {

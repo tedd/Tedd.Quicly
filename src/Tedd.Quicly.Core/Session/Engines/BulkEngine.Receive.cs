@@ -556,36 +556,29 @@ internal sealed unsafe partial class BulkEngine
     /// </summary>
     private void FlushProgress(ref FlushContext flush)
     {
-        // A retired transfer's final progress goes first and is never dropped: its record is recycled only once it is out.
-        while (true)
+        // A retired transfer's final progress goes first and is never dropped: its record is recycled only once it is out, and
+        // one whose frame could not go out stays pending for the next pass. The ring is dequeued into a local, never into the
+        // field: a ring's out value is undefined when TryDequeue returns false (ADR 0008 invariant 5), and the next pass would
+        // then "retire" whatever record that turned out to name, null its sink and recycle it underneath the transport thread.
+        int retired = _retiredPending;
+        while (retired >= 0 || _retired.TryDequeue(out retired))
         {
-            if (_retiredPending < 0)
-            {
-                // Never pass the field itself: a ring's out value is undefined when TryDequeue returns false (ADR 0008
-                // invariant 5), and the next pass would then "retire" whatever record that turned out to name, null its
-                // sink and recycle it underneath the transport thread.
-                if (!_retired.TryDequeue(out int retired))
-                {
-                    break;
-                }
-
-                _retiredPending = retired;
-            }
-
-            int record = _retiredPending;
-            ref BulkRecv recv = ref _recv[record];
+            _retiredPending = retired;
+            ref BulkRecv recv = ref _recv[retired];
             if (!SendProgress(recv.TransferId, recv.BytesAccepted))
             {
                 return;
             }
 
             _retiredPending = -1;
-            _sinks[record] = null;
+            _sinks[retired] = null;
             SettleRequest(ref recv);
-            if (!_recycle.TryEnqueue(in record))
+            if (!_recycle.TryEnqueue(in retired))
             {
                 _core.Counters.CallbackFaults++;
             }
+
+            retired = -1;
         }
 
         for (int record = 0; record < _recv.Length; record++)

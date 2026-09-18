@@ -508,13 +508,100 @@ internal sealed unsafe class BulkRefusalTransport(ITransport inner, ITransportSi
         PeerCore.TryDecodeEngineStreamContext(context, out ChannelMode mode, out _, out _) && mode == ChannelMode.Bulk;
 }
 
-/// <summary>Wraps a connector's transport in <see cref="BulkRefusalTransport"/>.</summary>
-internal sealed class BulkRefusalConnector(ITransportConnector inner) : ITransportConnector
+/// <summary>
+/// Wraps a connector's transport in <see cref="BulkRefusalTransport"/>. With <paramref name="refusalAfterCompletion"/> the
+/// peer's sink is wrapped in <see cref="RefusalAfterCompletionSink"/>, which plays the other order of a refused start's
+/// two callbacks.
+/// </summary>
+internal sealed class BulkRefusalConnector(ITransportConnector inner, bool refusalAfterCompletion = false) : ITransportConnector
 {
     public BulkRefusalTransport? Transport { get; private set; }
 
-    public ITransport Connect(EndPoint endpoint, string? serverName, ITransportSink sink) =>
-        Transport = new BulkRefusalTransport(inner.Connect(endpoint, serverName, sink), sink);
+    public RefusalAfterCompletionSink? Sink { get; private set; }
+
+    public ITransport Connect(EndPoint endpoint, string? serverName, ITransportSink sink)
+    {
+        ITransportSink delivered = sink;
+        if (refusalAfterCompletion)
+        {
+            delivered = Sink = new RefusalAfterCompletionSink(sink);
+        }
+
+        return Transport = new BulkRefusalTransport(inner.Connect(endpoint, serverName, delivered), sink);
+    }
+}
+
+/// <summary>
+/// Delivers a refused bulk start the other way round. The simulator reports <c>OnStreamStarted(StreamLimitReached)</c>
+/// and <em>then</em> the canceled completion of the send that carried the start, in one burst; a transport may just as well
+/// report the refusal after the completion, and late enough that the game thread has already applied the completion.
+/// This sink holds the refusal back until another stream's next completion — a later step of the simulation, so a
+/// scheduler pass runs in between. Every other callback passes straight through.
+/// </summary>
+internal sealed class RefusalAfterCompletionSink(ITransportSink inner) : ITransportSink
+{
+    private readonly Dictionary<TransportStreamId, ulong> _held = [];
+    private readonly List<TransportStreamId> _released = [];
+
+    /// <summary>Refusals delivered after their completion.</summary>
+    public int Reordered { get; private set; }
+
+    public void OnConnected(in TransportConnectedInfo info) => inner.OnConnected(in info);
+
+    public void OnDatagramReceived(ReadOnlySpan<byte> payload) => inner.OnDatagramReceived(payload);
+
+    public void OnPeerStreamStarted(TransportStreamId id, StreamKind kind) => inner.OnPeerStreamStarted(id, kind);
+
+    public void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status)
+    {
+        if (status == TransportStatus.StreamLimitReached
+            && PeerCore.TryDecodeEngineStreamContext(context, out ChannelMode mode, out _, out _) && mode == ChannelMode.Bulk)
+        {
+            _held[id] = context;
+            return;
+        }
+
+        inner.OnStreamStarted(id, context, status);
+    }
+
+    public ReceiveResult OnStreamReceived(TransportStreamId id, ReadOnlySpan<TransportSegment> segments, ulong absoluteOffset, bool fin) =>
+        inner.OnStreamReceived(id, segments, absoluteOffset, fin);
+
+    public void OnStreamSendCompleted(TransportStreamId id, ulong context, bool canceled)
+    {
+        inner.OnStreamSendCompleted(id, context, canceled);
+        if (_held.Count == 0 || _held.ContainsKey(id))
+        {
+            return;
+        }
+
+        _released.Clear();
+        _released.AddRange(_held.Keys);
+        foreach (TransportStreamId refused in _released)
+        {
+            _held.Remove(refused, out ulong start);
+            Reordered++;
+            inner.OnStreamStarted(refused, start, TransportStatus.StreamLimitReached);
+        }
+    }
+
+    public void OnDatagramSendStateChanged(ulong context, DatagramSendState state) => inner.OnDatagramSendStateChanged(context, state);
+
+    public void OnStreamAborted(TransportStreamId id, ulong errorCode, StreamAbortDirection direction) => inner.OnStreamAborted(id, errorCode, direction);
+
+    public void OnStreamPeerSendShutdown(TransportStreamId id) => inner.OnStreamPeerSendShutdown(id);
+
+    public void OnStreamShutdownComplete(TransportStreamId id) => inner.OnStreamShutdownComplete(id);
+
+    public void OnDatagramCapabilityChanged(bool enabled, int maxPayload) => inner.OnDatagramCapabilityChanged(enabled, maxPayload);
+
+    public void OnIdealSendBufferSize(TransportStreamId id, ulong bytes) => inner.OnIdealSendBufferSize(id, bytes);
+
+    public void OnStreamsAvailable(ushort bidirectional, ushort unidirectional) => inner.OnStreamsAvailable(bidirectional, unidirectional);
+
+    public void OnPeerAddressChanged(in TransportConnectedInfo info) => inner.OnPeerAddressChanged(in info);
+
+    public void OnClosed(TransportCloseReason reason, ulong errorCode, int transportStatus) => inner.OnClosed(reason, errorCode, transportStatus);
 }
 
 /// <summary>Serves one in-memory object, honouring the range the peer asked for.</summary>

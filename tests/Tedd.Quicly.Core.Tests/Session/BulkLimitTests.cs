@@ -576,6 +576,39 @@ public class BulkLimitTests
     }
 
     /// <summary>
+    /// The <em>asynchronous</em> stream-limit refusal, in the order the simulator does not produce on its own: the send that
+    /// carried the start comes back canceled first, and the <c>OnStreamStarted(StreamLimitReached)</c> after it. A
+    /// transport may report the two in either order, and the transfer must rewind to its last completed byte on whichever
+    /// is last — here the refusal notice — then wait for credit and go out on a new stream (docs/design/session-layer.md §7.7).
+    /// </summary>
+    [Fact]
+    public async Task A_Refusal_Reported_After_The_Canceled_Start_Still_Rewinds_The_Transfer()
+    {
+        byte[] payload = Compressible(120 * Kib);
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
+        BulkRefusalConnector? connector = null;
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 2_000, BandwidthBitsPerSecond = 8_000_000 },
+            table: BulkTables.TwoStreams,
+            serverTable: BulkTables.OneStream,
+            client: BulkKit.Quiet,
+            server: BulkKit.Receiver(router),
+            connector: inner => connector = new BulkRefusalConnector(inner, refusalAfterCompletion: true));
+
+        // The client may open two bulk streams; the server grants it one, so the second start is refused.
+        BulkTransfer first = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, payload.Length), new MemorySource(payload));
+        BulkTransfer second = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 2, 1, payload.Length), new MemorySource(payload));
+        Assert.True(h.RunUntil(() => first.IsFinished && second.IsFinished, 60_000_000), "the transfers did not finish");
+
+        Assert.True(connector!.Sink!.Reordered > 0, "no refusal was reported after its canceled start");
+        Assert.True(BulkKit.Engine(h.Client).StreamsRefused > 0);
+        Assert.Equal(BulkStatus.Completed, first.Status);
+        Assert.Equal(BulkStatus.Completed, second.Status);
+        Assert.Equal(2, router.Sinks.Count);
+        Assert.All(router.Sinks, s => Assert.Equal(payload, ((MemorySink)s).Bytes));
+    }
+
+    /// <summary>
     /// The other order of the two halves of <c>Delivered</c> (PROTOCOL.md §4.3): the peer's confirmation of the whole range
     /// arrives <em>before</em> this end has seen its own last send complete. Both are triggered by the same round trip, so
     /// either may land first, and the transfer must complete on whichever is last — here the completion — rather than

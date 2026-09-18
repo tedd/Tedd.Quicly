@@ -320,6 +320,73 @@ public class BulkEngineTests
         Assert.Equal(PeerState.Connected, h.Client.State);
     }
 
+    /// <summary>
+    /// The receive side's defence in depth behind the stream parser (PROTOCOL.md §3.3): the parser never produces a second
+    /// header on a bulk stream, more body bytes than the header declared, or more chunk bytes than the chunk header
+    /// promised — but the engine does not rely on that, and each is a reset of the one stream. An empty body piece is
+    /// nothing at all. The events are handed to the engine directly, the way the peer's receive loop hands them over.
+    /// </summary>
+    [Fact]
+    public void The_Receive_Guards_Behind_The_Parser_Refuse_What_It_Never_Produces()
+    {
+        AcceptRouter router = new(_ => new CountingSink());
+        using SessionHarness h = new(table: BulkTables.Main, client: BulkKit.Receiver(router), server: BulkKit.Quiet);
+        BulkEngine engine = BulkKit.Engine(h.Client);
+        int channelIndex = h.Client.Core.ChannelIndexOf(5);
+
+        TransportStreamId raw = new(700, 1);
+        StreamAccept accepted = engine.OnStreamOpened(raw, 5, 0);
+        Assert.True(accepted.Accepted);
+        long cookie = accepted.Cookie;
+        scoped StreamMessageContext context = default;
+        context.Id = raw;
+        context.Cookie = ref cookie;
+        context.Channel = 5;
+        context.ChannelIndex = channelIndex;
+        context.Phase = StreamMessagePhase.BulkHeader;
+        context.Bulk = new BulkHeader { TransferId = 1, ObjectId = 1, ObjectVersion = 1, TotalLength = 100, Offset = 0, Length = 100 };
+        Assert.Equal(StreamConsumeAction.Continue, engine.OnStreamMessage(ref context).Action);
+
+        // A second header on the same stream.
+        Assert.Equal(StreamConsumeAction.ResetStream, engine.OnStreamMessage(ref context).Action);
+
+        // A raw body: an empty piece changes nothing, and one byte more than the header declared is refused.
+        context.Phase = StreamMessagePhase.Start;
+        context.Header = new StreamMessageHeader { Length = 100 };
+        Assert.Equal(StreamConsumeAction.Continue, engine.OnStreamMessage(ref context).Action);
+        context.Phase = StreamMessagePhase.Chunk;
+        context.Chunk = default;
+        Assert.Equal(StreamConsumeAction.Continue, engine.OnStreamMessage(ref context).Action);
+        context.Chunk = new byte[101];
+        Assert.Equal(StreamConsumeAction.ResetStream, engine.OnStreamMessage(ref context).Action);
+        Assert.Equal(0, ((CountingSink)router.Sinks[0]).BytesWritten);
+
+        // A compressed chunk being staged: one byte more than its chunk header promised is refused.
+        TransportStreamId chunked = new(701, 1);
+        accepted = engine.OnStreamOpened(chunked, 5, 0);
+        Assert.True(accepted.Accepted);
+        cookie = accepted.Cookie;
+        context.Id = chunked;
+        context.Phase = StreamMessagePhase.BulkHeader;
+        context.Bulk = new BulkHeader { TransferId = 2, ObjectId = 2, ObjectVersion = 1, TotalLength = 20, Offset = 0, Length = 20, Flags = BulkFlags.Chunked };
+        Assert.Equal(StreamConsumeAction.Continue, engine.OnStreamMessage(ref context).Action);
+        context.Phase = StreamMessagePhase.Start;
+        context.Header = new StreamMessageHeader { Length = 10, RawLength = 20 };
+        Assert.Equal(StreamConsumeAction.Continue, engine.OnStreamMessage(ref context).Action);
+        context.Phase = StreamMessagePhase.Chunk;
+        context.Chunk = new byte[11];
+        Assert.Equal(StreamConsumeAction.ResetStream, engine.OnStreamMessage(ref context).Action);
+
+        // The peer resets both streams on those answers; their close notices finish the transfers and return the staging.
+        engine.OnStreamClosed(raw, aborted: true, (ulong)QuiclyErrorCode.ProtocolViolation);
+        engine.OnStreamClosed(chunked, aborted: true, (ulong)QuiclyErrorCode.ProtocolViolation);
+        h.Run(10_000);
+        Assert.All(router.Sinks, s => Assert.Equal(BulkStatus.Failed, ((CountingSink)s).Result!.Value.Status));
+        Assert.Equal(0, engine.ReceiveTransfers);
+        Assert.Equal(0, DatagramKit.Statistics(h.Client).ReceiveBytesOutstanding);
+        Assert.Equal(PeerState.Connected, h.Client.State);
+    }
+
     [Fact]
     public void The_Completion_Handler_Ignores_What_Is_Not_Its_Own()
     {

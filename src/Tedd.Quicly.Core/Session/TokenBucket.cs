@@ -15,6 +15,12 @@ internal struct TokenBucket
     private const long Scale = 1_000_000; // one token = 1e6 units; refill = rate units per elapsed microsecond
     private const long MaxElapsedMicros = 3_600_000_000L;
 
+    /// <summary>
+    /// The largest rate the bucket's integer refill (elapsed micros × rate, the gap capped at an hour) represents without
+    /// overflowing: about 2.5 GB/s. A caller deriving a rate from an estimate clamps it here.
+    /// </summary>
+    public const long MaxRatePerSecond = long.MaxValue / MaxElapsedMicros;
+
     private long _units;
     private long _capacity;
     private long _rate;

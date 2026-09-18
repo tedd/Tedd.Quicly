@@ -144,6 +144,7 @@ public sealed unsafe partial class SimulatedTransport
             s.FinQueued = fin;
             s.EnqueueSend(record);
             _bytesInFlight += total;
+            NoteBytesInFlight();
             LinkStats.StreamBytesSent += total;
 
             int chunkSize = Link.MaxPayload;
@@ -416,7 +417,40 @@ public sealed unsafe partial class SimulatedTransport
 
         long now = _network.NowMicros;
         Post(SimEventKind.StreamStarted, now, this, slot, s.Generation);
+        if (Link.Options.IdealSendBufferReporting)
+            Post(SimEventKind.StreamIdealSendBuffer, now, this, slot, s.Generation); // after OnStreamStarted (FIFO at equal times)
         Post(SimEventKind.PeerStreamStarted, now + Link.Options.DelayMicros, peer, peerSlot, ps.Generation);
+    }
+
+    /// <summary>
+    /// MsQuic's <c>QuicSendBufferConnectionAdjust</c> (<see cref="LinkOptions.IdealSendBufferReporting"/>): a new maximum of
+    /// the bytes in flight may grow the connection's ideal send buffer to the next step of 128 KiB × 1.5ⁿ above it, and a
+    /// grown ideal is told to every started local stream that can still send, at the next step. MsQuic counts only bytes
+    /// on the wire, which its congestion control keeps within the window, while <c>_bytesInFlight</c> here also counts bytes
+    /// queued behind a bandwidth limit, so the maximum is taken of the two's minimum.
+    /// </summary>
+    private void NoteBytesInFlight()
+    {
+        if (!Link.Options.IdealSendBufferReporting)
+            return;
+        long inFlight = Math.Min(_bytesInFlight, CongestionWindow());
+        if (inFlight <= _bytesInFlightMax)
+            return;
+        _bytesInFlightMax = inFlight;
+        ulong ideal = DefaultIdealSendBufferBytes;
+        while (ideal <= (ulong)_bytesInFlightMax && ideal < MaxIdealSendBufferBytes)
+            ideal += ideal / 2;
+        ideal = Math.Min(ideal, MaxIdealSendBufferBytes);
+        if (ideal <= _idealSendBuffer)
+            return;
+        _idealSendBuffer = ideal;
+        long now = _network.NowMicros;
+        for (int slot = 0; slot < _streamHighWater; slot++)
+        {
+            SimStream? s = _streams[slot];
+            if (s is { InUse: true, Local: true, Started: true, StartRefused: false, CanSend: true, SendDone: false })
+                Post(SimEventKind.StreamIdealSendBuffer, now, this, slot, s.Generation);
+        }
     }
 
     private void DepartChunk(int record, uint generation, int bufferOffset, int length, long streamOffset, bool fin, long now)
@@ -776,6 +810,12 @@ public sealed unsafe partial class SimulatedTransport
             case SimEventKind.StreamStarted:
                 if (!s.AppClosed)
                     Sink!.OnStreamStarted(id, s.OpenContext, (TransportStatus)e.B0);
+                break;
+            case SimEventKind.StreamIdealSendBuffer:
+                if (s.AppClosed || s.SendDone || s.LastIdealSendBuffer == _idealSendBuffer)
+                    break;
+                s.LastIdealSendBuffer = _idealSendBuffer;
+                Sink!.OnIdealSendBufferSize(id, _idealSendBuffer);
                 break;
             case SimEventKind.PeerStreamStarted:
                 s.Announced = true;

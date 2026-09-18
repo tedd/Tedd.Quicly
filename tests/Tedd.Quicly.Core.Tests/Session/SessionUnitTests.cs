@@ -581,8 +581,19 @@ public class SessionSupportTests
         Assert.False(default(ReceiveLease).IsValid);
         Assert.True(default(ReceiveLease).Payload.IsEmpty);
         Assert.Equal(new SendHeader(3, 0), new SendHeader(3));
-        BulkTransfer transfer = new(new BulkDescriptor(7, 1, 2, 3));
+        BulkTransfer transfer = new(new BulkDescriptor(7, 1, 2, 3), transferId: 4, length: 3);
         Assert.Equal((ushort)7, transfer.Descriptor.Channel);
+        Assert.Equal(4UL, transfer.TransferId);
+        Assert.Equal(BulkStatus.Running, transfer.Status);
+        Assert.False(transfer.IsFinished);
+        Assert.False(transfer.CancelRequested);
+        Assert.Equal(0, transfer.Progress);
+        Assert.False(transfer.Completion.IsCompleted);
+        transfer.Cancel();
+        Assert.True(transfer.CancelRequested);
+        Assert.Equal(3, new BulkDescriptor(7, 1, 2, 3).EffectiveLength);
+        Assert.True(new BulkDescriptor(7, 1, 2, 3).IsWholeObject);
+        Assert.False(new BulkDescriptor(7, 1, 2, 3, Offset: 1, Length: 2).IsWholeObject);
         Assert.Equal(0, new EmptySource().Read(0, new byte[1]));
     }
 
@@ -602,9 +613,7 @@ public class SessionSupportTests
         Assert.IsType<ReliableLatestEngine>(ChannelEngines.Create(ChannelMode.ReliableLatest));
 
         Assert.IsType<GroupStreamEngine>(ChannelEngines.Create(ChannelMode.ReliableUnordered));
-
-        // The remaining wave C2 mode stays a placeholder until its engine lands.
-        Assert.IsType<PlaceholderEngine>(ChannelEngines.Create(ChannelMode.Bulk));
+        Assert.IsType<BulkEngine>(ChannelEngines.Create(ChannelMode.Bulk));
         Assert.Throws<ArgumentOutOfRangeException>(() => ChannelEngines.Create((ChannelMode)6));
         Assert.Equal(6, ChannelEngines.ModeCount);
     }
@@ -626,7 +635,9 @@ public class SessionSupportTests
     [Fact]
     public void Placeholder_Engine_Refuses_Everything()
     {
-        using SessionHarness h = new(table: TestTables.AllModes);
+        // Every mode has a real engine now, so the placeholder is substituted for one to keep its own behaviour covered.
+        using SessionHarness h = new(table: TestTables.AllModes,
+            client: o => o.EngineFactory = m => m == ChannelMode.Bulk ? new PlaceholderEngine(m) : null);
         PeerCore core = h.Client.Core;
         ChannelEngine engine = core.GetEngine(ChannelMode.Bulk)!;
         Assert.IsType<PlaceholderEngine>(engine);

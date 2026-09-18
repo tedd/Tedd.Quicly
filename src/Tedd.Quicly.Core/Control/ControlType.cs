@@ -33,7 +33,7 @@ public enum ControlType : byte
     /// <summary>Request for a bulk object range (<see cref="Control.BulkRequest"/>); stream only.</summary>
     BulkRequest = 0x13,
 
-    /// <summary>Cancels a bulk transfer (<see cref="Control.BulkCancel"/>); stream only.</summary>
+    /// <summary>Asks the recipient to stop sending one of its bulk transfers (<see cref="Control.BulkCancel"/>); stream only, receiver-to-sender only.</summary>
     BulkCancel = 0x14,
 
     /// <summary>Rejects a bulk request (<see cref="Control.BulkReject"/>); stream only.</summary>

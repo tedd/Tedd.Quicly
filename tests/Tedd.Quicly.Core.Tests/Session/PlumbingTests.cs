@@ -526,8 +526,11 @@ public class SendPlumbingTests
         Assert.Equal(SendStatus.Admitted, h.Client.RetireKey(6, 1));
         Assert.Equal(SendStatus.NotSupported, h.Client.Respond(new ReceiveHeader { Channel = 4, RequestId = 1 }, data).Status);
         await Assert.ThrowsAsync<NotSupportedException>(async () => await h.Client.SendRequestAsync(new SendHeader(4), data, TimeSpan.FromSeconds(1)));
-        await Assert.ThrowsAsync<NotSupportedException>(async () => await h.Client.BeginBulkSendAsync(new BulkDescriptor(7, 1, 1, 10), new EmptySource()));
-        Assert.Throws<NotSupportedException>(() => h.Client.RequestBulk(new BulkRangeRequest(7, 1, 1, 0, 10)));
+        // Bulk is implemented (wave C2c): a transfer begins and a range request is accepted. BulkTests covers both.
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(7, 1, 1, 10), new EmptySource());
+        Assert.Equal(BulkStatus.Running, transfer.Status);
+        transfer.Cancel();
+        h.Client.RequestBulk(new BulkRangeRequest(7, 1, 1, 0, 10));
         Assert.Throws<ArgumentNullException>(() => h.Client.BeginBulkSendAsync(new BulkDescriptor(7, 1, 1, 10), null!));
         Assert.False(h.Client.TryCancel(default));
     }
@@ -780,9 +783,17 @@ public class StreamPlumbingTests
         Assert.Equal(PeerState.Connected, h.Server!.State);
     }
 
+    /// <summary>
+    /// PROTOCOL.md §3: a unidirectional stream whose preamble names a channel that cannot be carried on a stream — a
+    /// datagram-only channel (2) or one the table does not have (9) — is reset with <c>UnsupportedChannel</c>. Every
+    /// delivery mode has an engine since wave C2c, so "a mode without an engine" is no longer one of these cases; the
+    /// placeholder engine's own refusals are covered by <c>SessionUnitTests</c>.
+    /// </summary>
+    /// <param name="channel">The channel named in the preamble.</param>
     [Theory]
-    [InlineData((byte)5)]
-    public void Streams_Of_Modes_Without_An_Engine_Are_Reset(byte channel)
+    [InlineData((byte)2)]
+    [InlineData((byte)9)]
+    public void Streams_Of_Channels_That_Cannot_Be_Carried_Are_Reset(byte channel)
     {
         using ServerHarness h = new();
         Assert.True(h.Admit());
@@ -790,6 +801,7 @@ public class StreamPlumbingTests
         ulong code = 0;
         Assert.True(h.RunUntil(() => Aborted(h.Raw, id, out code)));
         Assert.Equal((ulong)QuiclyErrorCode.UnsupportedChannel, code);
+        Assert.Equal(PeerState.Connected, h.Server!.State);
     }
 
     [Fact]

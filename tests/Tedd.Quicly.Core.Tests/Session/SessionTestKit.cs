@@ -390,6 +390,13 @@ internal sealed class ServerHarness : SimFixture
         }
     }
 
+    /// <summary>Disposes the server peer mid-test and stops pumping it; the raw client and the network keep running.</summary>
+    public void DisposeServer()
+    {
+        _disposed = true;
+        Server?.Dispose();
+    }
+
     protected override void DisposeEndpoints()
     {
         _disposed = true;

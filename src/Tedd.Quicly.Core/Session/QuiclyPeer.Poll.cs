@@ -596,6 +596,40 @@ public sealed unsafe partial class QuiclyPeer
         RaiseTransitions(holdClosed: false);
     }
 
+    /// <summary>
+    /// Releases the promises a <see cref="Dispose"/> would otherwise leave outstanding for good (ADR 0008). Disposing
+    /// without closing first is ordinary teardown — a host shutting down, a <c>using</c> block left on an exception — and no
+    /// <see cref="Poll"/> will ever run <see cref="FinishClosed"/> afterwards. Every await the session layer hands out is
+    /// released on this path: <see cref="SendAsync"/> and <see cref="FlushAsync"/> waiters were failed by
+    /// <c>FailWaitersOnDispose</c> just before, every outstanding <see cref="WaitAsync"/> on a tracked send completes here
+    /// (nothing drains the completion ring after this), and each engine releases its own (<see cref="ChannelEngine.OnDisposing"/>:
+    /// a bulk transfer this end is sending ends <see cref="BulkStatus.Disconnected"/>). A <c>ForeignSendRetry</c> wait
+    /// ends on its next attempt, which finds the peer disposed.
+    /// <para>
+    /// This is deliberately <em>not</em> <see cref="ChannelEngine.OnPeerClosed"/>: that hook runs once the transport has
+    /// reported its close, and it completes in-flight entries and returns their payloads. Here the transport is still live —
+    /// it may still be reading a payload it was handed, and its thread may still be writing into a receive record — so
+    /// releasing either now would hand a block the transport is using back to the pool. What the transport holds is
+    /// released with the peer's memory, once the transport has reported its close (<c>FreeResources</c>).
+    /// </para>
+    /// </summary>
+    private void FinishEnginesOnDispose()
+    {
+        if (_closedRaised)
+        {
+            // The host polled the peer to Closed already: FinishClosed did all of this.
+            return;
+        }
+
+        ReadOnlySpan<ChannelEngine> engines = _core.ActiveEngines;
+        for (int i = 0; i < engines.Length; i++)
+        {
+            engines[i].OnDisposing();
+        }
+
+        _core.Completions.CompleteAll(Tedd.Quicly.Core.Threading.DeliveryStatus.Disconnected);
+    }
+
     private void ReleaseAllReceived()
     {
         while (_core.ReceiveRing.TryDequeue(out ReceiveEntry entry))

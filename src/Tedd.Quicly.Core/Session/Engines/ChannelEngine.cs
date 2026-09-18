@@ -111,6 +111,19 @@ internal abstract class ChannelEngine : IDisposable
     {
     }
 
+    /// <summary>
+    /// The peer is being disposed without having been polled to <see cref="PeerState.Closed"/> (game thread, from
+    /// <see cref="QuiclyPeer.Dispose"/>, <b>before</b> the transport is closed). Release every await this engine handed
+    /// out whose state belongs to the game thread, and nothing else: unlike <see cref="OnPeerClosed"/>, the transport is
+    /// still live here — it may call back, and it may still be reading a payload it was handed — so an entry the transport
+    /// holds, and any state the transport thread owns, is left alone. That is released by <see cref="Dispose"/>, which the
+    /// peer runs only once the transport has reported its close. Default: nothing (an engine whose only awaits are tracked
+    /// sends is covered by the peer's completion table).
+    /// </summary>
+    public virtual void OnDisposing()
+    {
+    }
+
     /// <summary>Retires a key (KeyRetired, wave C2). Default <see cref="SendStatus.NotSupported"/>.</summary>
     /// <param name="channel">A channel of this engine.</param>
     /// <param name="key">The key.</param>
@@ -221,6 +234,18 @@ internal abstract class ChannelEngine : IDisposable
     /// <param name="context">The context given to <see cref="ITransport.OpenStream"/>.</param>
     /// <param name="status">The outcome.</param>
     public virtual void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status)
+    {
+    }
+
+    /// <summary>
+    /// The transport published the ideal number of bytes to keep outstanding on one of this engine's streams
+    /// (<see cref="ITransportSink.OnIdealSendBufferSize"/>, only when
+    /// <see cref="TransportCapabilities.IdealSendBufferSize"/> is set). Broadcast to every engine like the local-stream
+    /// events, so an engine ignores ids it does not own. Transport thread. Default: nothing.
+    /// </summary>
+    /// <param name="id">The stream.</param>
+    /// <param name="bytes">Bytes the transport would like kept outstanding.</param>
+    public virtual void OnIdealSendBufferSize(TransportStreamId id, ulong bytes)
     {
     }
 

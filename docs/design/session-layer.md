@@ -322,9 +322,9 @@ is back in `Filling` and still owned by the caller.
 * Wave C1 step 3 (done, §7.2): the `ReliableOrdered` engine (lazy persistent stream, carrier gathers, refused-start retry,
   progressive receive, back-pressure); the async APIs and the `ThreadSafeSend` front (§7.3).
 * Wave C2a (done, §7.6): the `ReliableLatest` engine (per-key values, retransmission, group streams for large values,
-  coalesced acks, key retirement). Wave C2b (done, §7.5): the `GroupStreamEngine` (`ReliableUnordered`). Wave C2d (done,
-  §7.8): fragmentation in the shared datagram engine and request/response in the ordered engine. Still open in wave C2:
-  `BulkEngine`.
+  coalesced acks, key retirement). Wave C2b (done, §7.5): the `GroupStreamEngine` (`ReliableUnordered`). Wave C2c (done,
+  §7.7): the `BulkEngine`. Wave C2d (done, §7.8): fragmentation in the shared datagram engine and request/response in the
+  ordered engine. Wave C2 is complete.
 * `PingClock` is peer-level (`Session/PingClock.cs`), not an engine.
 
 ### 4.7 Host hooks (work signal, split deadlines, robustness)
@@ -429,7 +429,7 @@ server layers run without MsQuic. `RecordingSink` records every callback with pa
 packets, modelled as a retransmission delay of `RetransmitDelayMicros`, never as missing data), `ReorderPercent`, `BandwidthBitsPerSecond`
 (0 = unlimited; a per-direction serialization queue served highest priority first: priority datagrams, then datagrams, then streams
 by priority), `MaxQueueBytes` (datagrams beyond it are dropped), `MaxDatagramPayload` (default 1200, also the stream packet size),
-`DatagramsEnabled`, `DatagramSendStateReporting`, `PeerUnidiStreams` / `PeerBidiStreams` (default 0 / 1, like MsQuic before admission),
+`DatagramsEnabled`, `DatagramSendStateReporting`, `IdealSendBufferReporting` (note 7), `PeerUnidiStreams` / `PeerBidiStreams` (default 0 / 1, like MsQuic before admission),
 `MtuChanges` (list of `(AtMicros, MaxDatagramPayload)`), `DisconnectAtMicros`, `ConnectDelayMicros` (default one round trip; the
 connector ignores it: the client connects after one RTT, the server half an RTT later).
 
@@ -470,7 +470,12 @@ Notes for session-layer tests over the simulator:
    contract, identical on both transports).
 6. Zero-allocation tests need a warm-up that reaches the run's peak of concurrent events, streams and sends; the tables grow to that peak
    and then stay. A stream-per-message workload under jitter needs about 15,000 messages.
-7. `OnIdealSendBufferSize` and `OnPeerAddressChanged` are never raised. `IdealSendBufferSize` and `AppOwnedReceiveBuffers` are false.
+7. `OnPeerAddressChanged` is never raised and `AppOwnedReceiveBuffers` is false. `OnIdealSendBufferSize` is raised only with
+   `LinkOptions.IdealSendBufferReporting` (default off; the `IdealSendBufferSize` capability follows it), the way MsQuic raises
+   it with send buffering disabled: each local stream hears the connection's ideal right after it starts, and every started
+   stream still sending hears it again when it grows. The ideal starts at 128 KiB and, whenever the bytes in flight — counted
+   up to the reported congestion window, as MsQuic counts only bytes on the wire — reach a new maximum, becomes the first
+   value of 128 KiB × 1.5ⁿ above it (at most 128 MiB); it never shrinks, and a stream is never told the same value twice.
 8. Link options are fixed at creation. There is no mid-run change of loss, delay or bandwidth; use the targeted drops or a new link.
 9. `CloseStream` before shutdown aborts both directions with code 0. Pending completions are still reported (canceled), but the shutdown
    callback is not.
@@ -1097,6 +1102,242 @@ state of the peer's group streams. Every per-key array grows with the slots in u
   unclaimed) and `TokenBucket.SetRate` (a rate change that carries the level). `PeerOptions` gained
   `RetryShareOfEstimatedBandwidth` and `MaxRetryBytesPerSecond`.
 
+### 7.7 Bulk transfers (as built: wave C2c)
+
+**Engine** (`Engines/BulkEngine.cs` + `.Receive.cs`, registered in `ChannelEngines.Create`). One instance per peer owns
+every `Bulk` channel. Native, reference-free state: a 64-byte `BulkSendState` per channel (its list of live transfers and
+how many hold a stream), a 128-byte `BulkSend` per send transfer (the range, the bytes read / completed / acknowledged,
+the wire bytes outstanding, the stream with its serial and credit generation, the phase) and a 192-byte `BulkRecv` per
+receive transfer, whose first two cache lines belong to the transport thread and whose third holds the game thread's
+progress and request bookkeeping. Both record tables hold `PeerOptions.BulkTransfersPerDirection` entries (PROTOCOL.md §7: two per
+direction). Cold side arrays carry the managed references a transfer needs — its `IBulkSource`, its `BulkTransfer`, its
+`IBulkSink`, its `IncrementalHash` and the 32-byte hash of its object.
+
+* **Starting a transfer.** `BeginBulkSendAsync(channel, descriptor, source, ct)` validates the range before anything else
+  (`Length > 0`, `Offset + Length ≤ TotalLength ≤ 2^62−1`, `Length ≤` the channel's `MaxMessageSize` — PROTOCOL.md §8
+  bounds *one transfer*, not the object — and a hash of 0 or 32 bytes), then registers it and answers a `BulkTransfer`
+  with progress, a completion and `Cancel()`. A session that is not `Connected`, or one already running
+  `BulkTransfersPerDirection` transfers, gets a transfer that is already finished `Rejected` rather than a queue: the
+  application decides when to ask again, exactly as a peer's refused `BulkRequest` does. Nothing is read from the source
+  until a scheduler pass reaches it. A 64 MiB object is therefore four 16 MiB transfers, two at a time.
+* **Scheduling.** All send work happens in the engine's `Flush`, after every channel's `FlushChannel`, because
+  PROTOCOL.md §4.5 schedules bulk *after* fresh real-time traffic; `FlushChannel` itself does nothing. A transfer with no
+  stream opens one at **priority band 0** (§4.5), below every real-time channel, and the packer's pending container is
+  handed over first so datagrams never queue behind bulk bytes. Each piece is one send entry with one pooled block: the
+  first carries the preamble and the §3.3 header, the last carries FIN. No segment arena run is needed, because a piece is
+  a single buffer rather than a gather.
+* **Three gates, and what they bound.** A piece goes out only while the pass's send cap (`FlushContext.BudgetBytes`), a
+  per-peer rate bucket and the transfer's send window all allow it. The rate is
+  `BulkMaxBytesPerSecond` — an explicit cap, taken as it is — or `BulkShareOfEstimatedBandwidth` × an estimate, with a
+  **16 KiB/s floor** under anything derived. The estimate is the congestion window ÷ the RTT; a transport that reports **no
+  congestion window** falls back to `MaxSendBytesPerSecond`, and with no send cap either there is no estimate at all and
+  **the floor is the rate**: an unmeasured link is not assumed to be a fast one, and a transfer still always progresses.
+  A window reported with an RTT **below a microsecond** (a loopback or in-memory carrier) is the one case with no gate: the
+  window crosses in no time, so the estimate has no bound, and the pass's send cap plus the transfer's send window are
+  what bound the traffic. Every rate is clamped to `TokenBucket.MaxRatePerSecond` (about 2.5 GB/s, the largest rate the
+  bucket's integer refill represents after an hour's gap), far above any real link. A rate derived from a moving window
+  carries the bucket's **level** across a change (`TokenBucket.SetRate`) instead of refilling it, or the cap would never
+  bind. The congestion window and the RTT are read from the transport **once per pass** and
+  shared by the window and the rate. The window is `min(IdealSendBufferSize for that stream when the transport reports it, else
+  PeerOptions.BulkSendWindowBytes, BulkShareOfCongestionWindow × the congestion window)` — ARCHITECTURE.md §7: stream
+  priority alone cannot protect datagram latency, because datagrams and streams share one congestion window. MsQuic
+  (send buffering off) reports the ideal per stream right after the start and again whenever it grows with the bytes in
+  flight (128 KiB × 1.5ⁿ), so it replaces `BulkSendWindowBytes` from the first report on and the congestion window's share
+  caps it; the simulator reports it the same way under `LinkOptions.IdealSendBufferReporting` (§5 note 7), which is what the
+  windowing tests run against. The gates count **wire** bytes and the piece is sized from the **object** (`min(remaining, BulkChunkBytes − 128)`): sizing the
+  piece from a wire allowance would cut a compressible 64 KiB chunk — a few hundred bytes on the wire — down to a few
+  hundred object bytes and turn one transfer into thousands of chunks. Each gate is then charged what the piece really
+  cost, and the last piece of a pass may overdraw, as §7.1's budget rule allows.
+* **Body.** Raw bytes read straight from the application's source into the block, or, with `Compress`, one
+  `ChunkLength, RawLength, bytes` chunk per piece (PROTOCOL.md §3.3), LZ4-compressed into a destination one byte short so
+  a chunk that does not shrink is stored uncompressed with `RawLength = 0`. The raw bytes of a chunk are read into a
+  native scratch block of `BulkChunkBytes`, rented lazily so a peer that never compresses never holds one.
+* **The channel's stream cap binds the sender too**, as on group and large-latest streams: both ends read the same table,
+  so opening more than `max(MaxGroups, 1)` streams on a Bulk channel would make the *receiver* reset a live transfer of
+  ours (PROTOCOL.md §7). The slot belongs to the transfer whose stream it is and is returned on that stream's **one**
+  close notice (§4.3), which is also when the peer frees its own slot and returns credit — never earlier, because a
+  transfer that gave its slot back while its stream was still alive would let the next pass open one stream too many.
+  Every terminal path of a send transfer therefore goes through **one** function (`TerminateSend`): it resets the stream
+  when this end never sent FIN on it, finishes the application's transfer exactly once, and returns the record and the
+  slot exactly once. A path that released the slot without ending the stream would leak that stream for the life of the
+  connection while the engine's own accounting said the channel was free. A start the peer's stream limit
+  refused never reached the peer, so the transfer rewinds to its last completed byte, forgets that its header went out and
+  opens a **new** stream once `StreamCreditGeneration` changes. The refusal notice and the canceled completion of the send
+  that carried the start may arrive in either order, and one function (`RewindRefused`) runs on whichever is last; a `SubmitStream` that fails for any *other* reason after
+  the open succeeded does **not** park the transfer on the current generation — nothing took credit, so no credit event is
+  coming — and the next pass simply opens a new stream.
+* **Completions.** A piece's completion returns its pooled block (PROTOCOL.md §4.3 releases a bulk buffer per chunk) and
+  frees that much window. `Delivered` is **not** a transport acknowledgement: §4.3 defines it for this mode as the peer's
+  `BulkProgress` reaching the range's length. That is a *claim* by the peer, so the transfer completes only when **both**
+  ends are done with it — the peer confirmed the whole range *and* this end read the range, put every byte on the wire
+  with FIN and saw every piece complete; whichever arrives last completes it. The claim is bounded twice, for two
+  different questions (ADR 0009: a client parses hostile servers too). What is *reported* is clamped to the bytes whose
+  sends completed, which are the bytes the peer can have seen, so `BulkTransfer.BytesTransferred` never counts a byte this
+  end did not send. What counts as a *violation* is a claim above the bytes handed to the transport at all: a peer cannot
+  have accepted bytes that were never submitted, while a claim running ahead of a completion still in flight is ordinary
+  (both are triggered by the same round trip). A violation is a field no honest peer can produce, so the frame is handled
+  exactly as its sibling control frames with impossible fields are (PROTOCOL.md §3.4, control-message bounds): as a
+  control datagram it is dropped **whole** — neither its bytes nor the confirmation it would imply apply — and on the
+  control stream it closes the connection `ProtocolViolation`; either way `PeerStatistics.BulkProgressOverClaims`
+  counts it. Without both halves of this a peer could report an object as delivered, with its full byte count, before one body byte
+  had left the host and while the application's `IBulkSource` had never been read. A piece canceled while the transport
+  is closing ends the transfer `Disconnected`; one canceled after a refused start re-queues; a piece canceled for any
+  *other* reason decides nothing, because the transport reports a canceled send before the stop that caused it as often as
+  after — the stream's close notice is the verdict (a stop with `BulkCanceled` → `Canceled`, any other stop → `Failed`,
+  and a shutdown before FIN with no stop at all → `Disconnected`: only the connection takes a stream down that way, and
+  the transport shuts every stream down *before* it reports its own close, so the transport-closing flag is not set yet),
+  and the peer delivers exactly one such notice per stream. `OldestQueuedStamp` stays `long.MaxValue`: a bulk object is minutes of
+  rate-capped traffic, so `FlushAsync` must not wait for it.
+* **Receive** (transport thread). A peer stream is accepted while a record is free and neither the per-direction limit nor
+  the channel's `MaxGroups` is reached; the rest are reset `LimitExceeded` (PROTOCOL.md §7). The header is validated by
+  the framing layer before the engine sees it, and the engine then checks its own two rules **before any state is
+  created**: the transfer id must be free and the application's receive router
+  (`PeerOptions.BulkRouter`) must accept the descriptor — with no router every peer-initiated transfer is refused, which
+  is the §3.3 default. Bytes are then written **progressively** into the application's `IBulkSink` as they arrive:
+  a bulk transfer never becomes a `ReceiveEntry`, so it takes **no receive-ring entry and no reservation** (ADR 0008
+  invariant 6, like a coalescing channel's mailbox and unlike every other stream mode), and nothing is ever sized from
+  `TotalLength`, `Offset` or `Length`, which are untrusted. A pooled lease is taken only to stage a *compressed* chunk and
+  the block it decodes into, both returned at the chunk's end. A transfer whose stream shuts down before its last byte with
+  no reset in either direction and no cancel of ours ends `Disconnected`: an early FIN is a parser error, which resets, so
+  only the connection going away ends a stream that way.
+* **Transfer ids, and the tolerance (PROTOCOL.md §8).** §3.3 makes a transfer id unique per (peer, direction) for the
+  epoch. The receiver enforces that over every transfer it still holds any trace of — a running one, and a finished one
+  whose record has not travelled back through the retire/recycle rings yet (the record is recycled once its final
+  `BulkProgress` is out) — and **tolerates** a reuse after that: remembering every id an epoch has seen would be unbounded
+  state the peer controls, and a sender numbers its transfers upward and never reuses one, so a reuse can only confuse the
+  peer that made it. `BulkRulesTests.A_Transfer_Id_Stays_Taken_Until_Its_Record_Is_Recycled` pins both halves.
+* **Receive sizing rule.** Staging a compressed chunk costs one pooled block of its wire length and one of its decoded
+  length, so a peer that accepts chunked transfers needs `min(PeerOptions.BulkMaxChunk, the pool's largest block)` to be at
+  least the largest chunk the peer sends, and a receive budget of at least twice that. A chunk above that limit resets its
+  stream `LimitExceeded` (the transfer fails, the connection survives); a chunk that merely finds the budget exhausted is
+  `Pend`ed and resumed from `Poll`. This end never sends a chunk larger than `BulkChunkBytes` (default 64 KiB, one pooled
+  block), which is the counterpart of §7.2's receive-budget rule.
+* **Hashing, and precisely what a resumed range does.** The hash of PROTOCOL.md §3.3 covers the **whole object**, so only
+  an end that saw every byte of it, in order, can check it. A transfer whose range *is* the whole object
+  (`Offset == 0 && Length == TotalLength`) is hashed as it arrives and verified at its last byte: `Verified`, or
+  `Mismatch`, which ends the transfer `Failed` even though every byte arrived. A transfer that carries only **part** of the
+  object — every resumed range — is **not hashed by the engine at all**: it reports
+  `BulkHashState.DeferredToApplication` and hands the sender's hash to the application, which is the only party holding
+  the assembled object and can verify it once the last range has landed. Resume is a new transfer for the remaining range
+  with the same `ObjectId`/`ObjectVersion`, and the hash value is repeated on every range's header, so it stays comparable
+  across them. The sender's own transfer is unaffected by the verdict: it saw every byte accepted and completes normally,
+  because acting on a mismatch is the receiver's business.
+* **Progress this end owes.** `BulkProgress` (0x05) is sent at most every 64 KiB or 100 ms per transfer, and on
+  completion (PROTOCOL.md §2.3). The decision is the game thread's, in the engine's `Flush`: the carrier is chosen
+  *before* the frame is encoded (the two framings differ), and the 64 KiB / 100 ms window advances **only when a frame
+  really went out**, so a pass that could send nothing does not silently skip a window. `Tick` lowers `NextDeadline` to
+  the next frame a transfer owes and never to a time at or before `now`, which would make a sleeping host spin. The final
+  frame is exact: the transport thread hands a finished record to the game thread through a ring and the record is
+  recycled only once its last frame is out, while the periodic frames read a live record's byte count advisorily (the
+  transfer id is read on both sides of it, and progress is cumulative, so a stale read is skipped or harmless). The
+  window's timestamp has **one owner**, the game thread (ADR 0008 invariant 4): the transport thread stamps nothing when
+  the header arrives, and the first pass that sees the record starts its 100 ms window. A frame that cannot go out — the
+  carrier refused it — is held, not skipped: a retired transfer stays pending and the pass stops, and a live one keeps its
+  window, so both are tried again on the next pass and the sender completes on the exact final count.
+* **Cancelling, and why only one end emits the frame.** `BulkCancel` (0x14) is **receiver-to-sender only**
+  (PROTOCOL.md §3.4): it means "stop sending the transfer you are sending to me", so it always resolves against the
+  recipient's *send* records — which is what the engine does with it. Transfer ids are scoped per (peer, direction), so id
+  1 exists in both directions of one session and the frame has no direction field; a sender that emitted one would name
+  the peer's own unrelated outbound transfer and cancel it. `QuiclyPeer.CancelBulk(channel, transferId)` is therefore the
+  **only** emitter: the receiving end stops the peer's sending side with STOP_SENDING and sends the frame so the peer also
+  stops reading its source. Stopping a peer's stream comes back to *this* end as an ordinary shutdown rather than an abort,
+  so the record remembers the code we cancelled with; without that the transfer we cancelled ourselves would end `Failed`.
+  `BulkTransfer.Cancel()` (the **sending** end, any thread) sets the flag the application's own transfer object holds and
+  wakes the host; the next pass resets the stream with `BulkCanceled` and completes the transfer `Canceled`, and the reset
+  *is* the signal — the receiver turns it into a cancelled transfer through that stream's single close notice, and no
+  control frame is needed or sent. A sender that abandons a peer-requested transfer before any stream exists — its header
+  never went out, or its start was refused and rewound; in practice a provider's source that runs dry on the first read,
+  which happens before the stream is opened — answers `BulkReject` (0x15) with the request's id instead, because there is
+  no stream to reset (`TerminateSend` decides it, so no exit path can miss it; a disconnect sends nothing). No case is
+  left needing a direction bit in the frame. A `BulkCancel` naming no transfer this end is sending — including one that
+  crossed its transfer's completion on the wire — is ignored and counted (`PeerStatistics.BulkCancelsIgnored`).
+* **Requests and authorisation.** `RequestBulk` sends `BulkRequest` (0x13) and keeps the range in a small table of
+  `BulkTransfersPerDirection + 1` entries — three by default, which is what PROTOCOL.md §7's limit row spells out, so a
+  further range can be asked for while both transfers are still running. An incoming request is validated on
+  the transport thread and applied on the game thread, where `IBulkAuthorizer` decides and `IBulkProvider` supplies the
+  object: **both default to deny**, so serving bulk objects is opt-in (ADR 0009), and a refusal — no authorizer, no
+  provider, an invalid descriptor or no free transfer slot — is answered `BulkReject` (0x15). A `BulkReject` for a range
+  this end asked for is reported to the router. An entry leaves the table when it is answered: by that `BulkReject`, or by
+  the transfer that answers it finishing — matched on channel, object identity and first byte (PROTOCOL.md §3.4; the bulk
+  header carries no request id, and a provider may shorten a range but never move its start), on the game thread once the
+  transfer's final progress is out (`SettleRequest`). The application learns the outcome from its sink. Until this was
+  added only a reject or a closed connection released an entry, so after three served requests every further
+  `RequestBulk` was silently refused.
+* **Epochs and reconnect.** PROTOCOL.md §4.1: every resumable outbound request whose transfer did not complete is asked
+  again for the bytes still missing under a fresh request id when the session resumes, and it is the end that *asked* for
+  a range that re-asks. "The bytes still missing" is exact: when the lost connection finishes a transfer that answered a
+  resumable request `Disconnected`, the request advances past the bytes that arrived instead of being released, and the
+  close reports to the router only the requests nothing had answered yet. Transfer ids are scoped to the epoch, so the receive side is told to forget the ids it has seen;
+  that request is consumed at **every** receive entry point — a stream's open, its messages and a control message —
+  because the first thing a resumed session sees may be any of the three, and the control messages of the closed epoch are
+  dropped with it. `OnReconnecting` drops everything bound to the lost transport: streams, phases, records, notices and
+  half-received transfers, with their staging leases returned.
+* **Dispose.** A peer disposed without having been polled to `Closed` gets no `FinishClosed`, yet every await it handed
+  out must still end (ADR 0008; PROTOCOL.md §4.3 gives a transfer terminal states so that its caller always is). The peer
+  therefore calls `ChannelEngine.OnDisposing` — **not** `OnPeerClosed`, which runs once the transport has reported its
+  close and completes in-flight entries: here the transport is still live, may still be reading a payload it was handed and
+  may still be writing into a receive record, so releasing either would give a block the transport is using back to the
+  pool. The bulk engine finishes every `BulkTransfer` it is sending `Disconnected` (game-thread state only: streams are
+  forgotten, not reset, since the transport is closed right after) and drops its pending requests without calling the
+  router back. What the transport thread owns — half-received transfers and their staging leases — is finished when the
+  peer frees its memory, which it does only once the transport has reported its close and no Poll or Flush is running:
+  the engine's `Dispose` then finishes each such sink `Disconnected`, keeping `IBulkSink.Finish`'s "exactly once".
+  Tracked sends' `WaitAsync` complete `Disconnected` from the peer's completion table, and `SendAsync`/`FlushAsync`
+  waiters were failed just before.
+* **Statistics.** Per channel: `Sent`/`BytesSent` per piece (object bytes), `Received`/`BytesReceived` as bytes reach the
+  application, `Dropped` (a refused, duplicate or corrupt transfer), `TooLarge`, `QueueFull` (a transfer or request the
+  limits refused), `ReceiveTooLarge`, `OutOfBuffers`, and `QueuedBytes`/`InFlightBytes` from the live transfers. Per peer:
+  `StreamSends`, `StreamBytesSent`, `StreamsReset`, `BulkProgressOverClaims` and `BulkCancelsIgnored`.
+* **Shared seams added for it** (one region in each file): `PeerOptions.BulkRouter`/`BulkAuthorizer`/`BulkProvider`/
+  `BulkTransfersPerDirection`/`BulkSendWindowBytes`/`BulkShareOfCongestionWindow`/`BulkChunkBytes`/`BulkMaxChunk` with
+  their `PeerCore` accessors (next to the existing `BulkShareOfEstimatedBandwidth` and `BulkMaxBytesPerSecond`),
+  `ChannelEngine.OnIdealSendBufferSize` (broadcast like the other local-stream events, so an engine ignores ids it does
+  not own — and an **invalid** id is refused before the match, because a cleared slot of the engine's stream table holds
+  exactly that and would otherwise "match" record zero) wired from the peer's sink, `ChannelEngine.OnDisposing` (the
+  dispose hook above; default nothing), and `QuiclyPeer.Bulk.cs` with `CancelBulk`. `QuiclyPeer.BeginBulkSendAsync` and
+  `RequestBulk` already routed to the engine.
+* **Tests** (`Session/BulkTestKit.cs` — tables, an object generated from a pattern so a 64 MiB transfer costs no memory
+  and is still checked byte for byte, memory sources and sinks, accepting and denying routers, authorizers, a provider and
+  hand-written bulk streams): `BulkDeliveryTests` (a byte-exact object whose progress completes the transfer; a 64 MiB
+  object as four 16 MiB ranges over a bandwidth-capped link while 60 Hz movement datagrams keep flowing with bounded
+  latency; chunked compression shrinking the wire; the whole-object hash verified and a mismatch failing the transfer; a
+  partial range deferring the hash; the send window bounding outstanding bytes; both concurrency caps; a start the peer's
+  stream limit refused going out on a new stream; an unrouted transfer and a peer with no router at all; a source that
+  runs dry), `BulkStreamTests` (cancel from each side, an unauthorised request, a request with no authorizer, an
+  authorised request served from a provider, a resumable request asked again after an epoch change, a disconnected object
+  resumed byte-exact as a new transfer for the remaining range, hostile and malformed headers creating no state, a huge
+  declared object size that never becomes an allocation, a duplicate transfer id, the receive-side `MaxGroups` reset, a
+  chunk this peer could never stage, and the session closing under a running transfer), `BulkZeroAllocationTests` (the
+  raw and the chunked streaming paths, measured in the middle of one transfer), `BulkLimitTests` (what bounds a transfer and
+  what happens when a bound bites: a chunked object over a lossy, reordered, jittery link with its whole-object hash
+  verified; a cancellation from each side racing that loss; the pass's send cap holding a pass back and setting the refill
+  deadline; an exhausted send table and an exhausted send budget only *delaying* a transfer; a chunk pended because the
+  receive budget is held by another transfer's half-arrived one, and a chunk whose decode block cannot be rented resetting
+  its stream `LimitExceeded`; the rate rule — an explicit cap taken as it is, a derived estimate floored at 16 KiB/s, the
+  gate off for an estimate without a bound, and the floor as the whole rate, really pacing a transfer, on a transport
+  that measures nothing — and an explicit cap really pacing a transfer; the send window following the ideal send buffer
+  the transport reports, and keeping the configured window without reports; a range request the transfer limit answers
+  `BulkReject`; an over-claimed progress frame dropped and counted while an early honest one is not; a progress frame that
+  beats the last completion; progress that cannot go out held and sent later; a refused start on the synchronous path and
+  on the asynchronous path in the order the simulator does not produce by itself; a provider answering with the wrong
+  descriptor; an overflowing notice ring; the structs' declared layout; and a tracked send's wait released on
+  `Dispose`), `BulkRulesTests` (the rules the review tightened: an over-claim on the control stream closing
+  `ProtocolViolation`; a late progress frame for a finished transfer leaving its published count alone; a `BulkCancel`
+  naming nothing this end sends ignored and counted; a served range whose source runs
+  dry before its stream exists answered `BulkReject`; a disposed receiver finishing its sink once the transport closed; a
+  transfer id held until its record is recycled and free after; the request table's size; a served request leaving the
+  table; and a resumable request cut by a disconnect asked again, after a real resume, for exactly the missing part) and
+  `ReviewBulkTests` (the wave's review findings: a forged progress claim completing nothing, a sender's cancel leaving the
+  peer's own outbound transfer alone, and a disposed peer finishing the transfer it was sending). The simulator's ideal
+  send buffer model has its own tests (`Tedd.Quicly.Testing.Tests/Simulation/IdealSendBufferTests`).
+* **Follow-up, recorded rather than done.** A ring's `out` value is now undefined when `TryDequeue` returns false
+  (ADR 0008 invariant 5), which is what removed the one live instance of this class of bug — a failed dequeue writing
+  `default(int)`, a perfectly valid record index, into the field that then "retired" a live transfer. The stronger form,
+  storing an integer ring's elements **offset by one** so that no value a failed dequeue can leave behind is a valid index,
+  was deliberately not applied: it touches every engine that hands record indices between threads, another branch is in
+  flight over those files, and an audit of the current engines found no surviving instance that needs it. This is the next
+  step if one is ever found.
+
 ### 7.8 Fragmentation and request/response (as built: wave C2d)
 
 Two features that ride on engines that already exist: fragmentation is the second half of the shared
@@ -1297,8 +1538,8 @@ Waves:
 | C1 step 3 (done) | `ReliableOrdered` engine (persistent stream, carrier gathers, refused-start retry, progressive receive, back-pressure), `SendAsync`/`FlushAsync`/`ThreadSafeSend`, simulator flow control, benchmarks (§7.2, §7.3) | steps 1–2 |
 | C2a (done) | `ReliableLatestEngine` (§7.6): per-key values and versions, supersede, retransmission and budgets, large values on group streams, coalescing receive with cumulative acks, ack coalescing, epoch resync, key retirement | C1 |
 | C2b (done) | `GroupStreamEngine` (`ReliableUnordered`, §7.5): groups and carriers, refused starts, per-group failure, progressive receive | C1 |
+| C2c (done) | `BulkEngine` (§7.7): a stream per transfer at the lowest priority, the send window and rate cap, chunked compression, progress, cancel, resume, request authorisation, the whole-object hash | C1 |
 | C2d (done) | fragmentation in the shared datagram engine and request/response in the ordered engine (§7.8): at most 8 fragments per message with a bounded reassembly table, correlated requests with a pooled value-task source and timeouts served by Poll and Flush | C1 |
-| C2 (parallel) | `BulkEngine` | C1 |
 | C3 | `MsQuicTransport` (ITransport over the MsQuic wrappers) + listener/connector; `QuiclyServer` / `QuiclyClient`; admission; reconnect | C1, msquic bindings |
 | C4 | WebTransport-over-HTTP/3 carrier (opt-in), HTTP/3 static responder | C3, Http3 |
 | C5 | End-to-end tests (MsQuic loopback, ACME mock CA + HTTP server + QUIC listener cert swap), samples, E2E benchmarks | all |

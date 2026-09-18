@@ -157,8 +157,9 @@ public class SessionEdgeTests
     {
         using ServerHarness h = new(link: new LinkOptions { DelayMicros = 10_000 });
         Assert.True(h.Admit());
-        // Channel 5 (Bulk) is still a placeholder: its stream is reset at the preamble.
-        h.Raw.OpenUni([0x05, 0x01, 0x07], out TransportStreamId id);
+        // Channel 2 is a datagram-only channel, so a stream naming it is reset at the preamble (PROTOCOL.md §3). Channel 5
+        // no longer serves here: Bulk has a real engine since wave C2c, which accepts the stream and parses its header.
+        h.Raw.OpenUni([0x02, 0x01, 0x07], out TransportStreamId id);
         h.Run(5_000);
         Assert.Equal(TransportStatus.Success, RawClient.SendStream(h.Raw.Transport, id, [0x01, 0x08], TransportSendFlags.None));
         h.Run(30_000);

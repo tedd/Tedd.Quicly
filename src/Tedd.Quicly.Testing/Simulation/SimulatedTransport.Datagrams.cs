@@ -190,6 +190,7 @@ public sealed unsafe partial class SimulatedTransport
         LinkOptions o = Link.Options;
         record.InFlight = true;
         _bytesInFlight += record.Length;
+        NoteBytesInFlight();
         _sendPackets++;
         _sendBytes += (ulong)record.Length;
         ref DeterministicRandom random = ref _network.Random;

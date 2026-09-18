@@ -5,7 +5,8 @@ hypothesis about a hot path, implement it (V1), measure again, keep the winner a
 `benchmarks/Tedd.Quicly.Archive/Session` so the comparison stays runnable. The session layer is specified in
 [docs/design/session-layer.md](../design/session-layer.md) §4 and §7.
 
-Benchmarks: `benchmarks/Tedd.Quicly.Benchmarks/Session/*.cs`, every class with `[Config(typeof(InProcessShortRunConfig))]`.
+Benchmarks: `benchmarks/Tedd.Quicly.Benchmarks/Session/*.cs`, every class with `[Config(typeof(InProcessShortRunConfig))]` except
+`BulkBench`, which runs 30 iterations (`InProcessMeasuredConfig`; see its section).
 Run with
 
 ```
@@ -311,6 +312,96 @@ than replaced, because no run separates the three. What they all agree on is the
 * The single-core caveat of the tables above applies unchanged: both peers and the simulator run on one thread, so the
   transport-thread → game-thread hand-offs (mailboxes, the ack ring, the completion ring) cost no cross-core coherence here.
   Another agent was building and testing on the machine during the run.
+
+## Bulk: what a megabyte costs (wave C2c)
+
+`BulkBench` (added with the `Bulk` engine, docs/design/session-layer.md §7.7) transfers a 4 MiB object end to end over a
+zero-delay simulated link, with and without chunked LZ4 compression, on the machine above. Run with
+
+```
+dotnet run -c Release -f net10.0 --project benchmarks/Tedd.Quicly.Benchmarks -- --filter '*BulkBench*'
+dotnet run -c Release -f net11.0 --project benchmarks/Tedd.Quicly.Benchmarks -- --filter '*BulkBench*'
+```
+
+`OperationsPerInvoke` is the object's size in MiB, so **`Mean` is the time per MiB** and throughput is
+`1.048576e9 / Mean(ns)` MB/s. One operation is a whole transfer's share of a megabyte: the stream's open at priority
+band 0, the reads from the application's `IBulkSource` into pooled blocks, the §3.3 header and the body framing, the
+transport, the progressive write into the application's `IBulkSink`, the receiver's `BulkProgress` (one per 64 KiB
+accepted) and the completions — and, because the measurement runs until the transfer's record is released, the stream's
+FIN and shutdown as well.
+
+### Re-measured with 30 iterations (2026-09-18, after the wave C2c review fixes)
+
+The first publication (2026-09-16) used the three-iteration ShortRun and headlined **1 081 MB/s** raw. That figure did not
+reproduce (a re-run gave 969 MB/s), and it could not have been expected to: BenchmarkDotNet's *Error* is half the 99.9 %
+confidence interval, a Student-t quantile over the iteration count, and with three iterations the quantile is about 31 —
+the published row itself had an *Error* of 470 µs on a 970 µs mean. `BulkBench` now runs `InProcessMeasuredConfig`
+(30 iterations after 5 warm-ups, quantile about 3.7): an in-process job, plus an out-of-process one on .NET 10, where
+BenchmarkDotNet can spawn the child. `Program.CreateConfig` still adds its ShortRun job to every class; its rows are kept
+below as the demonstration of the problem (an *Error* up to 3.2 ms on a 1.4 ms mean) and are not used for any figure.
+
+Three runs, each on a quiet machine at its start (processor load 2–9 %); other agents build and test here, and the load
+had risen to 73 % by the end of run C. A fourth run, started at 79 % load, came out bimodal and is **discarded**.
+
+| Run | Runtime | Job            | Method         | Mean (ms/MiB) | Error (ms) | StdDev (ms) | MB/s (mean) | MB/s (mean ± error) | Allocated |
+|-----|---------|----------------|--------------- |--------------:|-----------:|------------:|------------:|--------------------:|----------:|
+| A   | net10.0 | InProcess30    | BulkRaw        |         1.110 |      0.110 |       0.165 |         945 |          859 – 1 049 |      72 B |
+| A   | net10.0 | InProcess30    | BulkCompressed |         1.501 |      0.053 |       0.079 |         699 |            675 – 724 |      79 B |
+| A   | net10.0 | OutOfProcess30 | BulkRaw        |         1.127 |      0.051 |       0.076 |         930 |            890 – 974 |      72 B |
+| A   | net10.0 | OutOfProcess30 | BulkCompressed |         1.297 |      0.093 |       0.139 |         808 |            754 – 871 |      72 B |
+| B   | net11.0 | InProcess30    | BulkRaw        |         1.096 |      0.051 |       0.076 |         957 |          914 – 1 003 |      72 B |
+| B   | net11.0 | InProcess30    | BulkCompressed |         1.359 |      0.092 |       0.137 |         772 |            723 – 828 |      80 B |
+| C   | net10.0 | InProcess30    | BulkRaw        |         1.192 |      0.045 |       0.068 |         880 |            848 – 914 |      72 B |
+| C   | net10.0 | InProcess30    | BulkCompressed |         1.460 |      0.052 |       0.076 |         718 |            694 – 745 |      76 B |
+| C   | net10.0 | OutOfProcess30 | BulkRaw        |         1.168 |      0.040 |       0.060 |         898 |            868 – 930 |      72 B |
+| C   | net10.0 | OutOfProcess30 | BulkCompressed |         1.461 |      0.032 |       0.048 |         718 |            702 – 734 |      72 B |
+
+The ShortRun rows of the same runs (N = 3), for comparison only:
+
+| Run | Runtime | Method         | Mean (ms/MiB) | Error (ms) | StdDev (ms) |
+|-----|---------|--------------- |--------------:|-----------:|------------:|
+| A   | net10.0 | BulkRaw        |         1.184 |      0.615 |       0.034 |
+| A   | net10.0 | BulkCompressed |         1.407 |      3.229 |       0.177 |
+| B   | net11.0 | BulkRaw        |         1.119 |      0.348 |       0.019 |
+| B   | net11.0 | BulkCompressed |         1.447 |      0.143 |       0.008 |
+| C   | net10.0 | BulkRaw        |         1.079 |      1.347 |       0.074 |
+| C   | net10.0 | BulkCompressed |         1.159 |      0.911 |       0.050 |
+
+### Reading
+
+* **Roughly 0.85–1.05 GB/s of object bytes on one core, raw**, for both peers and the simulator together — every
+  30-iteration raw interval above lies inside 848–1 049 MB/s, and the means are 880–957 MB/s. The single-core caveat of
+  the tables above applies unchanged. A bulk transfer is two copies of every byte (the source into a pooled block, the
+  block into the application's target) plus the framing and the stream, which is what puts it below the ordered stream's
+  2.9–3.0 GB/s for 4 KiB messages: bulk pays a per-object stream lifetime and a progress frame per 64 KiB where the ordered
+  channel amortises one persistent stream over everything. The 1 081 MB/s of the first publication sits at the top edge of
+  this range, not in its middle.
+* **Compression costs about 13–26 % of throughput here — 18–20 % in three of the five pairs**, measured as
+  `1 − raw mean ÷ compressed mean` within one run and job (A in process 26 %, A out of process 13 %, B 19 %, C in process
+  18 %, C out of process 20 %); compressed throughput is 0.70–0.81 GB/s. That is the expected direction on this link. The
+  chunked body puts roughly a tenth of the bytes on the wire, but the wire is an in-memory simulator with no delay and no
+  bandwidth limit, so LZ4 compressing every 64 KiB chunk on the send side and decompressing it on the receive side is pure
+  added CPU. The trade only pays where the bytes saved are bytes that would have queued:
+  `A_Chunked_Compressed_Body_Round_Trips_And_Shrinks_The_Wire` asserts the wire really shrinks (`StreamBytesSent` below
+  half the object), and it is a capped or metered link that turns that into time saved. The spread between jobs is larger
+  than the intervals, so it is run-to-run variation of the machine rather than a property of either toolchain.
+* **72–80 B per MiB is per *object*, not per byte**: one `BulkTransfer` and its `TaskCompletionSource` per 4 MiB transfer
+  (about 290–320 B), which amortises to the figure above. The streaming path itself allocates nothing, which
+  `BulkZeroAllocationTests` asserts over five windows of passes in the middle of a transfer, for the raw and the chunked
+  body alike. (The discarded busy run showed 89 B once, in process; no quiet run did.)
+* **The review fixes changed no hot path of this benchmark.** On this zero-delay link the transport reports a congestion
+  window with an RTT under a microsecond, which leaves the rate gate off exactly as before (session-layer.md §7.7: the
+  16 KiB/s floor now applies when the transport reports *no* window, which the simulator never does); a progress frame is
+  now bounded by the bytes handed to the transport, and the per-pass work is otherwise unchanged.
+* **Caveat: the control-message limit is part of this workload, and both peers keep the 2 000/s default.** The receiver
+  owes one `BulkProgress` per 64 KiB accepted (PROTOCOL.md §2.3), so the benchmark advances the virtual clock 4 ms per
+  pass and holds 256 KiB outstanding, which keeps that traffic near 1 000/s. The first run of this benchmark was
+  **discarded**: it gave each peer its own `VirtualClock`, copied from `GroupStreamBench` where it is harmless because
+  group streams send no control traffic at all. A peer whose clock never advances can never refill its control-message
+  bucket, so the session closed with `LimitExceeded` part way through and the remaining invocations measured a dead
+  session — `BulkRaw`, which sends the most progress frames, failed outright while `BulkCompressed` still reported a
+  number. Both peers now share the network's clock, and `Transfer` fails the run if a transfer ends in any state but
+  `Completed` or leaves its record behind, so a run that stopped transferring cannot produce numbers.
 
 ## Fragmentation and request/response (wave C2d)
 

@@ -39,6 +39,9 @@ namespace Tedd.Quicly.Testing.Simulation;
 /// refuses it (asynchronously): the call returns Success, then OnStreamStarted(StreamLimitReached), a canceled completion
 /// for a send made with the start and OnStreamShutdownComplete follow; the refused stream never starts. A lower
 /// <see cref="ITransport.UpdatePeerStreamLimits"/> is ignored once the old limit can have reached the peer.
+/// With <see cref="LinkOptions.IdealSendBufferReporting"/> each local stream is told the connection's ideal send buffer as
+/// MsQuic tells it with send buffering disabled: right after it starts, and again whenever a new maximum of the bytes in
+/// flight grows the ideal; otherwise <see cref="ITransportSink.OnIdealSendBufferSize"/> is never raised.
 /// </para>
 /// <para>
 /// Fault injection: <see cref="DropNextDatagrams"/> and <see cref="LoseNextStreamPackets"/> hit specific packets without
@@ -70,6 +73,12 @@ public sealed unsafe partial class SimulatedTransport : ITransport
     /// <summary>Longest close reason accepted by <see cref="Close"/>, in bytes.</summary>
     public const int MaxReasonBytes = 512;
 
+    /// <summary>The ideal send buffer a connection starts with (<see cref="LinkOptions.IdealSendBufferReporting"/>; MsQuic's <c>QUIC_DEFAULT_IDEAL_SEND_BUFFER_SIZE</c>).</summary>
+    public const ulong DefaultIdealSendBufferBytes = 128 * 1024;
+
+    /// <summary>The largest ideal send buffer reported (<see cref="LinkOptions.IdealSendBufferReporting"/>; MsQuic's <c>QUIC_MAX_IDEAL_SEND_BUFFER_SIZE</c>).</summary>
+    public const ulong MaxIdealSendBufferBytes = 128UL * 1024 * 1024;
+
     private readonly SimulatedNetwork _network;
     internal readonly SimulatedLink Link;
     internal SimulatedTransport? Peer;
@@ -84,6 +93,8 @@ public sealed unsafe partial class SimulatedTransport : ITransport
     private ulong _recvPackets;
     private ulong _suspectedLost;
     private long _bytesInFlight;
+    private long _bytesInFlightMax;
+    private ulong _idealSendBuffer = DefaultIdealSendBufferBytes;
     private int _forcedDatagramLosses;
     private int _forcedStreamLosses;
     internal SimulatedLinkStatistics LinkStats;
@@ -156,9 +167,7 @@ public sealed unsafe partial class SimulatedTransport : ITransport
             statistics.MinRttMicros = statistics.RttMicros;
             statistics.MaxRttMicros = ClampU32(2 * (o.DelayMicros + o.JitterMicros));
             statistics.RttVarianceMicros = ClampU32(o.JitterMicros);
-            statistics.CongestionWindowBytes = o.BandwidthBitsPerSecond == 0
-                ? 16u << 20
-                : ClampU32(Math.Max(2L * Link.MaxPayload, (long)(o.BandwidthBitsPerSecond / 8.0 * Math.Max(2 * o.DelayMicros, 1000) / 1_000_000)));
+            statistics.CongestionWindowBytes = CongestionWindow();
             statistics.BytesInFlight = (ulong)_bytesInFlight;
             statistics.PathMtu = (ushort)Math.Min(ushort.MaxValue, Link.MaxPayload + PathOverheadBytes);
             statistics.SendTotalBytes = _sendBytes;
@@ -167,6 +176,15 @@ public sealed unsafe partial class SimulatedTransport : ITransport
             statistics.RecvTotalPackets = _recvPackets;
             statistics.SendSuspectedLostPackets = _suspectedLost;
         }
+    }
+
+    /// <summary>The congestion window <see cref="GetStatistics"/> reports: the bandwidth-delay product (at least two packets) under a bandwidth limit, else 16 MiB.</summary>
+    private uint CongestionWindow()
+    {
+        LinkOptions o = Link.Options;
+        return o.BandwidthBitsPerSecond == 0
+            ? 16u << 20
+            : ClampU32(Math.Max(2L * Link.MaxPayload, (long)(o.BandwidthBitsPerSecond / 8.0 * Math.Max(2 * o.DelayMicros, 1000) / 1_000_000)));
     }
 
     /// <summary>Copies the counters of the direction from this end to its peer.</summary>
@@ -372,6 +390,7 @@ public sealed unsafe partial class SimulatedTransport : ITransport
             MaxDatagramPayload = Link.MaxPayload,
             StreamPriority = true,
             CancelOnBlocked = true,
+            IdealSendBufferSize = o.IdealSendBufferReporting,
         };
     }
 

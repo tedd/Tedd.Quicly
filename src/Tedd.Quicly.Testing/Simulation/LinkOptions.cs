@@ -69,6 +69,19 @@ public sealed class LinkOptions
     /// </summary>
     public int StreamReceiveWindowBytes { get; set; }
 
+    /// <summary>
+    /// Whether each end reports its local streams' ideal send buffer the way MsQuic does with send buffering disabled
+    /// (<c>QUIC_STREAM_EVENT_IDEAL_SEND_BUFFER_SIZE</c>; <see cref="Core.Transport.TransportCapabilities.IdealSendBufferSize"/>
+    /// is then true). The ideal is one value per connection: it starts at <see cref="SimulatedTransport.DefaultIdealSendBufferBytes"/>
+    /// (128 KiB, MsQuic's default) and, whenever the bytes in flight — counted up to the congestion window
+    /// <see cref="SimulatedTransport.GetStatistics"/> reports, as MsQuic counts only bytes its congestion control let onto the
+    /// wire — reach a new maximum, becomes the first value of the series 128 KiB × 1.5ⁿ above that maximum, capped at
+    /// <see cref="SimulatedTransport.MaxIdealSendBufferBytes"/>; it never shrinks. A stream hears it at the next step after it starts (after <c>OnStreamStarted</c>), and every started stream
+    /// that can still send hears it again each time it grows; a stream is never told the same value twice. Default false,
+    /// which keeps <see cref="Core.Transport.ITransportSink.OnIdealSendBufferSize"/> silent.
+    /// </summary>
+    public bool IdealSendBufferReporting { get; set; }
+
     /// <summary>Unidirectional streams each endpoint initially lets its peer have open. Default 0 (MsQuic before admission).</summary>
     public ushort PeerUnidiStreams { get; set; }
 

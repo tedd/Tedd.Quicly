@@ -181,6 +181,22 @@ public sealed class CompletionTable : IDisposable
     public void Release(SendToken token)
         => GetSlot(token).Release(token.Generation);
 
+    /// <summary>
+    /// Completes every outstanding wait with <paramref name="status"/> (owner thread, teardown only). A peer disposed
+    /// without being closed first gets no further completions from the transport and nobody drains its completion ring
+    /// again, so a <see cref="WaitAsync"/> on a tracked send would never finish. Free slots, and stages that already
+    /// completed, are left alone.
+    /// </summary>
+    /// <param name="status">The outcome reported to the waiters.</param>
+    public void CompleteAll(DeliveryStatus status)
+    {
+        Slot[] slots = _slots;
+        for (int i = 0; i < slots.Length; i++)
+        {
+            slots[i].ReleaseLive(status);
+        }
+    }
+
     /// <summary>Frees the native memory of the free list. Call it once, after no thread can complete a send any more.</summary>
     public void Dispose() => _free.Dispose();
 
@@ -305,6 +321,20 @@ public sealed class CompletionTable : IDisposable
 
             Volatile.Read(ref _event)?.Set();
             ReleaseIfDone(next);
+        }
+
+        /// <summary>Owner thread, teardown: completes a live occupant's remaining stages with <paramref name="status"/>.</summary>
+        public void ReleaseLive(DeliveryStatus status)
+        {
+            long s = Volatile.Read(ref _state);
+            if ((s & Allocated) == 0)
+            {
+                return;
+            }
+
+            uint generation = GenerationOf(s);
+            Complete(generation, 0, status);
+            Complete(generation, 1, status);
         }
 
         /// <summary>Owner thread. Completes the remaining stages with the known status (or Canceled) and thereby releases the slot.</summary>

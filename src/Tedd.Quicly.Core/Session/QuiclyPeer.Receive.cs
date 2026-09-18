@@ -1189,7 +1189,24 @@ public sealed unsafe partial class QuiclyPeer
 
         public void OnIdealSendBufferSize(TransportStreamId id, ulong bytes)
         {
-            // Consumed by the bulk engine (wave C2).
+            if (peer.IsFreed)
+            {
+                return;
+            }
+
+            // Broadcast like the other local-stream events: the bulk engine windows its transfers on it and every other
+            // engine ignores ids it does not own (docs/design/session-layer.md §7.7).
+            try
+            {
+                foreach (ChannelEngine engine in peer._core.ActiveEngines)
+                {
+                    engine.OnIdealSendBufferSize(id, bytes);
+                }
+            }
+            catch (Exception exception)
+            {
+                peer.OnCallbackFault(exception);
+            }
         }
 
         public void OnStreamsAvailable(ushort bidirectional, ushort unidirectional)

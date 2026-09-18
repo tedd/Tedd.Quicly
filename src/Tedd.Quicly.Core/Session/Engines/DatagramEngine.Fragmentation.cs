@@ -321,8 +321,9 @@ internal abstract unsafe partial class DatagramEngine
 
         if ((fragment.Aux1 & FragmentPayloadReleased) == 0)
         {
-            // A fragment that travelled inside a packed container gets no Sent notice of its own (the container's notice only
-            // reaches tracked members), so its payload reference is given back here.
+            // No Sent notice reached this fragment: it travelled in a packed container none of whose members was tracked (a
+            // container forwards its notice to every member only when one of them is — a fragment never is itself), or it
+            // never reached the transport at all. Its payload reference goes back here; the bit makes it exactly once either way.
             fragment.Aux1 |= FragmentPayloadReleased;
             ReleaseOwnerPayload(owner);
         }
@@ -923,7 +924,7 @@ internal abstract unsafe partial class DatagramEngine
     [StructLayout(LayoutKind.Explicit, Size = 64)]
     private struct Reassembly
     {
-        /// <summary>The message's key (0 on unkeyed channels, where a channel reassembles one message at a time).</summary>
+        /// <summary>The message's key (0 on unkeyed channels, whose messages differ only in their sequence).</summary>
         [FieldOffset(0)] public ulong Key;
 
         /// <summary>The buffer the fragments are copied into; it becomes the message's payload.</summary>
@@ -932,7 +933,7 @@ internal abstract unsafe partial class DatagramEngine
         /// <summary>Clock micros of the first fragment (the expiry and eviction order).</summary>
         [FieldOffset(24)] public long StartedMicros;
 
-        /// <summary>The message's sequence (its reassembly id).</summary>
+        /// <summary>The message's sequence: with the channel and the key, the reassembly scope of PROTOCOL.md §2.1.</summary>
         [FieldOffset(32)] public uint Sequence;
 
         /// <summary>Size of fragment 0, which every fragment but the last has; 0 until a non-last fragment arrived.</summary>

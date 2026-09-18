@@ -1179,9 +1179,9 @@ Two features that ride on engines that already exist: fragmentation is the secon
 * **Expiry is swept lazily.** 2 × RTT + 100 ms (PROTOCOL.md §7). The window is recomputed by the engine's `Tick` on the
   game thread and read by the transport thread; the sweep itself runs when a fragment of the channel arrives, because the
   table belongs to the transport thread (ADR 0008 invariant 4) and a deadline for it would be a timer nothing else
-  needs. A channel that goes quiet therefore holds its partials' buffers until it hears from the peer again, until the
-  epoch resets, or until the peer is closed or disposed — bounded by `MaxReassemblies × MaxMessageSize` per channel,
-  which is the sizing rule in ARCHITECTURE.md §9.
+  needs. A channel that goes quiet therefore holds its partials' buffers until a fragment of it arrives again, until the
+  engine consumes an epoch reset (below), or until the peer reconnects or is disposed — a close alone does not free them —
+  bounded by `MaxReassemblies × MaxMessageSize` per channel, which is the sizing rule in ARCHITECTURE.md §9.
 * **Epoch reset.** `OnEpochReset(resumed: true)` restarts the send counters and asks the transport thread to forget its
   receive tables before the next datagram; the partials go with them (their buffers are returned), because their
   sequences belong to the epoch that ended. The request is a flag, not work: the reset happens inside the *next* datagram
@@ -1218,7 +1218,10 @@ Two features that ride on engines that already exist: fragmentation is the secon
   flushes (ADR 0008 invariant 9). The engine keeps the earliest deadline and publishes it only while it is **in the
   future**: a deadline at or before `now` would make a host that sleeps on `NextPollDeadlineMicros` spin. A timeout
   faults the value task with `TimeoutException` and counts `RequestsTimedOut`; `timeout` 0 means "wait until the response
-  arrives, the wait is canceled or the session ends".
+  arrives, the wait is canceled or the session ends". A positive timeout is never that sentinel: `PeerOptions.ToMicros`
+  rounds any positive duration up to at least one microsecond, for every caller — each of them reads 0 as "off" or
+  "none" (a disabled heartbeat or stream-idle check, no linger, no group interval, immediate acks), so a truncated
+  500 ns value would have switched the feature off rather than made it short.
 * **Where a response is matched.** On the game thread, where the message is dispatched: `QuiclyPeer.Poll` (and `Drain`)
   offer every message flagged `IsResponse` to the channel's engine through `ChannelEngine.TryTakeResponse(in
   ReceiveLease)` *before* a handler or a drain queue sees it — a compressed response is decoded first, exactly as a
@@ -1228,20 +1231,28 @@ Two features that ride on engines that already exist: fragmentation is the secon
 * **Cancellation, close, reconnect, dispose.** Cancelling the wait never cancels the send (ADR 0004): the request still
   goes out and its response is dropped and counted when it arrives. `OnPeerClosed`, `OnReconnecting` and `Dispose` fail
   every outstanding request with a clear reason (`InvalidOperationException` for a closed or lost session,
-  `ObjectDisposedException` for a disposed peer), so a request never hangs on a session that ended. `Dispose` fails them
-  **synchronously**, through `ChannelEngine.FailWaitsOnDispose` next to the peer's own send and flush waiters: the engine's
-  `Dispose` would fail them too, but that runs from `FreeResources`, which waits until the transport has reported its close
-  — for a peer disposed without being closed first (ordinary teardown) that is much later, and for a transport that reports
-  no close it is never. An `await` must not outlive the peer that handed it out.
-* **Shared seams added for it** (one region each): `ChannelEngine.RunPollDeadlines`, `ChannelEngine.TryTakeResponse` and
-  `ChannelEngine.FailWaitsOnDispose` (all virtual no-ops), the engine loop in `QuiclyPeer.RunTimers`,
-  `QuiclyPeer.TakeResponse` in the Poll/Drain paths, the engine loop in `QuiclyPeer.FailWaitersOnDispose`, and ten counters
-  in `PeerCounters`/`PeerStatistics` (seven for fragmentation, three for requests).
+  `ObjectDisposedException` for a disposed peer), so a request never hangs on a session that ended. `QuiclyPeer.Dispose`
+  fails them **synchronously**: its first step after marking the peer disposed (`FailWaitersOnDispose`) calls
+  `QuiclyPeer.FailRequestsOnDispose` (in the Poll path, next to `TakeResponse`), which hands the request table of the
+  ordered engine its `ObjectDisposedException`. The engine's own `Dispose` would fail them too, but that runs from
+  `FreeResources`, which waits until the transport has reported its close — for a peer disposed without being closed first
+  (ordinary teardown) that is much later, and for a transport that reports no close it is never; and after `Dispose` no
+  Poll, Flush or Drain runs that could match a response or serve a timeout. An `await` must not outlive the peer that
+  handed it out. The request table is the only wait this feature hands out: a tracked fragmented message's
+  `WaitAsync`/`Wait` is a wait on the peer's completion table like every tracked send's, with nothing specific to
+  fragmentation.
+* **Shared seams added for it** (one region each): `ChannelEngine.RunPollDeadlines` and `ChannelEngine.TryTakeResponse`
+  (virtual no-ops), the engine loop in `QuiclyPeer.RunTimers`, `QuiclyPeer.TakeResponse` in the Poll/Drain paths,
+  `QuiclyPeer.FailRequestsOnDispose` (one call from `FailWaitersOnDispose`), and ten counters in
+  `PeerCounters`/`PeerStatistics` (seven for fragmentation, three for requests).
 * **Where responses are intercepted.** Two places, not five: `Route` (Poll) and the ring loop of `Drain`. Those are the only
   paths that take a message out of the receive ring, and everything else the peer holds — a per-channel queue, the single
   held entry — can only receive what already passed one of them, so neither can ever contain a response. The queue and held
   paths assert that invariant (`Debug.Assert`) instead of testing it again, which is why no channel handler and no `Drain`
-  caller can see a response even though only two checks exist.
+  caller can see a response even though only two checks exist. Two tests pin it with both of those structures really in
+  use: the drain queues full, a plain message held and the response waiting in the ring behind it, then `Drain` (queue →
+  held → ring) and, separately, `Poll` with a newly registered handler (handler-queue loop → held → ring) must hand over
+  only the plain messages while the response completes its request.
 * **Statistics.** `RequestsSent`, `RequestsTimedOut`, `ResponsesUnmatched`; a request and its response also count as
   ordinary messages of their channel.
 
@@ -1250,21 +1261,29 @@ small-limit, two-reassembly and coalescing channels, a hand-written fragment wri
 splitter that produces a sender's own fragments): `FragmentDeliveryTests` (every fragment count 2 … 8 byte-exact, a lost
 fragment dropping only its own message, reordering and duplicates, the last fragment arriving first, partials of
 different keys side by side, the newer-sequence abandon on a sequenced channel, compression on top of fragmentation, a
-reassembled message in a coalescing mailbox, and 80 messages over a reordering, jittering link with the losses **chosen**,
-so the set that must arrive is exact — a tolerance would not tell link loss from a reassembly bug); `FragmentEdgeTests`
-(hostile `FragCount`/`FragIndex`/empty-payload/oversized-bound frames dropped without closing the connection, fragments
-that disagree about their message, a bound above what the receive budget could ever hold, the cap evicting the oldest
-partial, the expiry sweep, a message that would need more than eight fragments refused, every send path fragmenting —
-including a `SendShared` block retained and released exactly once — a tracked message ending `Delivered` and, with one
-fragment lost, `Lost`, a carrier without per-datagram send states ending it `Sent`, a message the send cap splits across
-passes, cancel, expiry at scheduling time, close, an epoch reset returning a partial's buffer, and a resume that fragments
-again after the owner map was reset); `RequestResponseTests` (the happy path, keyed and compressed requests, 64 concurrent
-requests answered in reverse order, 32 of them over a lossy, jittering link with plain messages interleaved, timeouts
-served by Poll and by Flush, a response after the timeout, cancellation that does not cancel the send, an unmatched
-response, a response drained rather than polled — which is also what reclaims a canceled slot — a `Drain` that hands the
-caller the plain message and not the response, close, a lost connection followed by a resume, dispose, the refusal matrix
-and the table's bound); `ReviewFragmentRequestTests` (the review's own three: the real total against `MaxMessageSize`,
-interleaved messages both reassembled, and a sub-microsecond timeout that still elapses); and
+reassembled message in a coalescing mailbox, 80 messages over a reordering, jittering link with the losses **chosen**,
+and 150 tracked messages of 2 … 6 fragments over a link that loses 3 % of datagrams from a **fixed seed**, where the
+link itself says which messages were whole — `Delivered` versus `Lost` — and the receiver must deliver exactly that set,
+byte-exact: in neither test can a tolerance hide a reassembly bug behind link loss); `FragmentEdgeTests` (hostile
+`FragCount`/`FragIndex`/empty-payload/oversized-bound frames dropped without closing the connection, fragments that
+disagree about their message, a bound above what the receive budget could ever hold, a fragment whose size × count is
+above the limit while its own bound is not — the rent is clamped, nothing counts `OutOfReceiveBuffers`, the message that
+fits is delivered and the one whose exact total does not is dropped — the cap evicting the oldest partial, the expiry
+sweep, a message that would need more than eight fragments refused, every send path fragmenting — including a
+`SendShared` block retained and released exactly once, alone and packed beside a tracked message whose container forwards
+its `Sent` notice — a tracked message ending `Delivered` and, with one fragment lost, `Lost`, a carrier without
+per-datagram send states ending it `Sent`, a message the send cap splits across passes, a refusal for the tracking token
+leaving no owner marks, cancel, expiry at scheduling time, close, an epoch reset returning a partial's buffer, a quiet
+engine keeping the closed epoch's partial until its next datagram, and a resume that fragments again after the owner map
+was reset); `RequestResponseTests` (the happy path, keyed and compressed requests, 64 concurrent requests answered in
+reverse order, 32 of them over a lossy, jittering link with plain messages interleaved, timeouts served by Poll and by
+Flush, a response after the timeout, cancellation that does not cancel the send, an unmatched response, a response
+drained rather than polled — which is also what reclaims a canceled slot — a `Drain` that hands the caller the plain
+message and not the response, a response waiting in the ring behind full drain queues and a held message, taken by
+`Drain` and by `Poll`, close, a lost connection followed by a resume, a dispose that fails every request synchronously
+with `ObjectDisposedException`, a positive sub-microsecond duration that never becomes the zero sentinel, the refusal
+matrix and the table's bound); `ReviewFragmentRequestTests` (the review's own three: the real total against
+`MaxMessageSize`, interleaved messages both reassembled, and a sub-microsecond timeout that still elapses); and
 `FragmentRequestZeroAllocationTests` (fragmented traffic at 60 Hz, and four request round trips per cycle, 0 B per
 window).
 

@@ -1,6 +1,9 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 using Tedd.Quicly.Core.Framing;
 using Tedd.Quicly.Core.Memory;
+using Tedd.Quicly.Core.Primitives;
 using Tedd.Quicly.Core.Session.Engines;
 using Tedd.Quicly.Core.State;
 using Tedd.Quicly.Core.Transport;
@@ -63,8 +66,9 @@ internal enum PackResult : byte
 /// scheduler pass the engines hand it filled send entries (header block + payload segment) in schedule order. Buffered
 /// messages are packed into one container whenever at least two fit; a message that fits next to nothing else is sent
 /// alone, zero copy. A container is its own send entry on channel 1 (<see cref="SendEntryFlags.Container"/>) whose lease is
-/// sized from the <em>current</em> maximum datagram payload (read once per pass), written with a
-/// <see cref="PackedContainerWriter"/> and stamped with the tick of <see cref="QuiclyPeer.Flush"/> when it is not 0.
+/// sized from the <em>current</em> maximum datagram payload (read once per pass), written in the
+/// <see cref="PackedContainer"/> format (header, then one (Length varint, message) entry per member, written in place) and
+/// stamped with the tick of <see cref="QuiclyPeer.Flush"/> when it is not 0.
 /// Members join the container with <see cref="SendEntryTable.AddToBatch"/>, stay <c>Filling</c> and are never submitted
 /// themselves; their payload is returned as soon as it has been copied. The container's completion fans out to them
 /// (<see cref="OnContainerCompleted"/>). Game thread only; no allocation.
@@ -77,6 +81,9 @@ internal sealed unsafe class DatagramPacker
     // A container entry's Aux1: whether every member carried DatagramHints.DirectCompletion (Aux0 counts tracked members).
     private const long RoutedMembers = 0;
     private const long DirectMembers = 1;
+
+    // Headers up to this size are copied into a container with one unaligned vector move (Append).
+    private const int HeaderMove = 16;
 
     private readonly PeerCore _core;
     private int _maxPayload;
@@ -330,17 +337,37 @@ internal sealed unsafe class DatagramPacker
         ref SendEntry entry = ref entries[member];
         int headerLength = entry.HeaderLength;
         int payloadLength = (int)entry.Payload.Length;
-        PackedContainerWriter writer = new(new Span<byte>(_buffer, _maxPayload), _length, _count);
-        bool reserved = writer.TryReserve(headerLength + payloadLength, out Span<byte> target);
-        Debug.Assert(reserved, "the caller checked that the message fits");
-        entries.GetHeaderBlock(member).Slice(0, headerLength).CopyTo(target);
-        if (payloadLength > 0)
+        int messageLength = headerLength + payloadLength;
+        byte* header = entry.Header.Buffer;
+
+        // The (Length varint, message) entry is written in place: the caller already checked what PackedContainerWriter
+        // would check again (CanAppend, or the size check before TryOpenContainer: it fits, and fewer than MaxMessages are
+        // in), and a message is never empty and never starts with the container's channel id (it has its own channel id).
+        Debug.Assert(messageLength >= 1 && _count < PackedContainer.MaxMessages, "the caller checked the message count");
+        Debug.Assert(PackedContainer.GetEntryLength(messageLength) <= _maxPayload - _length, "the caller checked that the message fits");
+        Debug.Assert(*header != PackedContainer.ChannelId, "a container member is a channel-0 or channel->=2 frame");
+        Debug.Assert(SendEntryTable.HeaderBlockSize >= HeaderMove, "the header block holds the bytes of one vector move");
+        byte* target = _buffer + _length;
+        target += VarInt.Write(target, (uint)messageLength);
+        if (headerLength <= HeaderMove && _maxPayload - (int)(target - _buffer) >= HeaderMove)
         {
-            new ReadOnlySpan<byte>(entry.Payload.Buffer, payloadLength).CopyTo(target.Slice(headerLength));
+            // One 16-byte move instead of a Memmove call for a header of a few bytes. The header block always holds
+            // SendEntryTable.HeaderBlockSize readable bytes, and the bytes written past the header stay inside the container's
+            // buffer: the payload below overwrites them, or a later entry does, or they lie past the container's length.
+            Unsafe.WriteUnaligned(target, Unsafe.ReadUnaligned<Vector128<byte>>(header));
+        }
+        else
+        {
+            new ReadOnlySpan<byte>(header, headerLength).CopyTo(new Span<byte>(target, headerLength));
         }
 
-        _length = writer.Length;
-        _count = writer.Count;
+        if (payloadLength > 0)
+        {
+            new ReadOnlySpan<byte>(entry.Payload.Buffer, payloadLength).CopyTo(new Span<byte>(target + headerLength, payloadLength));
+        }
+
+        _length = (int)(target - _buffer) + messageLength;
+        _count++;
         entries.AddToBatch(_container, member);
         _containerPriority |= (hints & DatagramHints.Priority) != 0;
         _containerUnreliable &= (hints & DatagramHints.Unreliable) != 0;

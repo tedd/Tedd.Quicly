@@ -36,6 +36,6 @@ cobertura); the Core rows were re-measured at the same merge, identically on bot
 
 | Wave | Content |
 |---|---|
-| C5 | End-to-end tests over real MsQuic loopback with the session layer, samples, end-to-end benchmarks |
+| C5 | End-to-end tests over real MsQuic loopback with the session layer, samples, end-to-end benchmarks; plan and verified warnings in [design/wave-c5-plan.md](design/wave-c5-plan.md) |
 | C4 | WebTransport-over-HTTP/3 carrier (opt-in) |
 | later | Browser (WebAssembly) transport — deferred: optional, waits for .NET 11 browser tooling to mature |

@@ -1030,6 +1030,7 @@ public sealed unsafe partial class QuiclyPeer
                 return;
             }
 
+            peer._core.BeginTransportCallback();
             try
             {
                 peer.HandleDatagram(payload);
@@ -1037,6 +1038,10 @@ public sealed unsafe partial class QuiclyPeer
             catch (Exception exception)
             {
                 peer.OnCallbackFault(exception);
+            }
+            finally
+            {
+                peer._core.EndTransportCallback();
             }
         }
 
@@ -1081,6 +1086,7 @@ public sealed unsafe partial class QuiclyPeer
                 return ReceiveResult.Consumed(TotalLength(segments));
             }
 
+            peer._core.BeginTransportCallback();
             try
             {
                 return peer.HandleStreamReceived(id, segments, fin);
@@ -1089,6 +1095,10 @@ public sealed unsafe partial class QuiclyPeer
             {
                 peer.OnCallbackFault(exception);
                 return ReceiveResult.Consumed(TotalLength(segments));
+            }
+            finally
+            {
+                peer._core.EndTransportCallback();
             }
         }
 
@@ -1099,6 +1109,7 @@ public sealed unsafe partial class QuiclyPeer
                 return;
             }
 
+            peer._core.BeginTransportCallback();
             try
             {
                 peer._core.OnTransportStreamCompleted(context, canceled);
@@ -1106,6 +1117,10 @@ public sealed unsafe partial class QuiclyPeer
             catch (Exception exception)
             {
                 peer.OnCallbackFault(exception);
+            }
+            finally
+            {
+                peer._core.EndTransportCallback();
             }
         }
 
@@ -1116,6 +1131,7 @@ public sealed unsafe partial class QuiclyPeer
                 return;
             }
 
+            peer._core.BeginTransportCallback();
             try
             {
                 peer.HandleDatagramState(context, state);
@@ -1123,6 +1139,10 @@ public sealed unsafe partial class QuiclyPeer
             catch (Exception exception)
             {
                 peer.OnCallbackFault(exception);
+            }
+            finally
+            {
+                peer._core.EndTransportCallback();
             }
         }
 

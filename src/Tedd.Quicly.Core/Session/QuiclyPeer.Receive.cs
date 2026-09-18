@@ -710,6 +710,7 @@ public sealed unsafe partial class QuiclyPeer
         // phase, header and payload. Bulk is valid only in the BulkHeader phase.
         scoped StreamMessageContext context = default;
         ChannelEngine? engine = null;
+        bool wholeFrames = false;
         for (int i = 0; i < segments.Length; i++)
         {
             ReadOnlySpan<byte> segment = segments[i].AsSpan();
@@ -725,8 +726,23 @@ public sealed unsafe partial class QuiclyPeer
                     snapshot = record.Parser;
                 }
 
+                // Once the engine is known to take whole messages, a frame that lies wholly in the segment is read without the
+                // parser's general state machine; everything else (and the first event of a callback) goes through Read.
                 int before = segment.Length - input.Length;
-                StreamEvent streamEvent = record.Parser.Read(table, ref input, out ReadOnlySpan<byte> payload);
+                StreamEvent streamEvent;
+                ReadOnlySpan<byte> payload;
+                bool whole;
+                if (wholeFrames && record.Parser.TryReadWholeMessage(ref input, out payload))
+                {
+                    whole = true;
+                    streamEvent = StreamEvent.MessageStart;
+                }
+                else
+                {
+                    whole = false;
+                    streamEvent = record.Parser.Read(table, ref input, out payload);
+                }
+
                 if (streamEvent == StreamEvent.NeedMore)
                 {
                     break;
@@ -762,6 +778,7 @@ public sealed unsafe partial class QuiclyPeer
                     context.GroupId = record.Parser.GroupId;
                     context.Cookie = ref record.Cookie;
                     context.NowMicros = now;
+                    wholeFrames = engine.AcceptsWholeMessages;
                 }
 
                 context.Header = record.Parser.Message;
@@ -770,7 +787,7 @@ public sealed unsafe partial class QuiclyPeer
                     case StreamEvent.MessageStart:
                         // A message whose payload lies wholly in this segment goes to an engine that takes it in one event
                         // instead of Start, Chunk, End; the mark taken before the header un-reads all of it on Pend.
-                        if (engine.AcceptsWholeMessages && record.Parser.TryTakeWholePayload(ref input, out payload))
+                        if (whole || (engine.AcceptsWholeMessages && record.Parser.TryTakeWholePayload(ref input, out payload)))
                         {
                             context.Phase = StreamMessagePhase.Whole;
                             context.Chunk = payload;

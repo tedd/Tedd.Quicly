@@ -209,6 +209,36 @@ public struct StreamFrameParser
         return true;
     }
 
+    /// <summary>
+    /// The message-stream fast path: when the parser stands at a message boundary of an ordered or group stream (no partial
+    /// header buffered) and <paramref name="input"/> holds the next frame's header and its whole payload, parses both and
+    /// completes the message in one step — the state <see cref="Read"/> (<see cref="StreamEvent.MessageStart"/>) followed by
+    /// <see cref="TryTakeWholePayload"/> would leave, without the general state machine. <see cref="Message"/> is the frame's
+    /// header, and a <see cref="Rewind"/> to a mark taken before the call un-reads the message. Otherwise nothing changes:
+    /// a frame that is incomplete, invalid or not wholly in the input is left to <see cref="Read"/>.
+    /// </summary>
+    /// <param name="input">The unconsumed bytes of the current receive segment; advanced past the frame on success.</param>
+    /// <param name="payload">The whole payload (empty for an empty message), or empty.</param>
+    /// <returns><see langword="true"/> when a whole message was read.</returns>
+    internal bool TryReadWholeMessage(scoped ref ReadOnlySpan<byte> input, out ReadOnlySpan<byte> payload)
+    {
+        if (_state == State.Header && _bufferLength == 0 && (_role == StreamRole.Ordered || _role == StreamRole.Group)
+            && StreamFraming.ParseMessageHeader(input, _shape, _limit, out StreamMessageHeader header, out int consumed) == ParseStatus.Ok
+            && (uint)header.Length <= (uint)(input.Length - consumed)
+            && (!_latest || header.Sequence == (uint)_groupId))
+        {
+            _message = header;
+            payload = input.Slice(consumed, header.Length);
+            input = input.Slice(consumed + header.Length);
+            _remaining = 0;
+            _state = _latest ? State.Done : State.Header;
+            return true;
+        }
+
+        payload = default;
+        return false;
+    }
+
     /// <summary>Prepares the parser for a new stream.</summary>
     /// <param name="role">
     /// <see cref="StreamRole.Control"/> for the control stream (preamble must be 0); <see cref="StreamRole.Unknown"/>

@@ -291,6 +291,12 @@ internal sealed unsafe partial class ReliableOrderedEngine
     /// <summary>Notes that a wait was canceled from another thread, so the game thread takes its slot out of the live set.</summary>
     private void NoteCanceledRequest() => Interlocked.Increment(ref _canceledRequests);
 
+    /// <summary>
+    /// Whether a canceled wait still holds its request slot until the next pass sweeps it (any thread may cancel; read on the
+    /// game thread by the peer's flush gate, since a cancellation raises no work signal and changes no other level).
+    /// </summary>
+    internal bool HasCanceledRequests => Volatile.Read(ref _canceledRequests) != 0;
+
     /// <summary>Takes the slots of canceled waits out of the live set (game thread).</summary>
     private void SweepCanceledRequests()
     {

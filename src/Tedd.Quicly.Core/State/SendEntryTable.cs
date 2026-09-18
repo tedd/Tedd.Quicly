@@ -146,6 +146,11 @@ public sealed unsafe class SendEntryTable : IDisposable
     /// </summary>
     /// <param name="slot">The allocated slot, or -1 when the table is exhausted.</param>
     /// <returns><see langword="false"/> when every slot is in use.</returns>
+    /// <remarks>
+    /// Inlined into <see cref="Session.PeerCore.TryAllocateEntry"/> (and from there into the engines' admission), so the slot
+    /// stays in a register instead of being written back through the <see langword="out"/> parameter and reloaded per use.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryAllocate(out int slot)
     {
         if (_freeCount == 0)

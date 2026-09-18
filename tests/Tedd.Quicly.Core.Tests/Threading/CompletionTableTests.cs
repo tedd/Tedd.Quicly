@@ -60,7 +60,8 @@ public class CompletionTableTests
     [Theory]
     [InlineData(0)]
     [InlineData(-1)]
-    [InlineData((1 << 30) + 1)]
+    [InlineData(CompletionTable.MaxCapacity + 1)]
+    [InlineData(1 << 30)]
     public void Constructor_Rejects_Invalid_Capacity(int capacity)
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => new CompletionTable(capacity));
@@ -493,9 +494,9 @@ public class CompletionTableTests
     {
         // A peer disposed without being closed completes every tracked send's wait (CompleteAll) and disposes the table once
         // its transport has reported the close, and the application may consume such a wait only afterwards. Consuming the
-        // last one releases the slot, and that release must not write into the freed free list. 65 536 slots make the ring a
-        // 1 MiB block, which the allocator hands back to the OS when it is freed, so a write into it faults instead of
-        // silently corrupting the heap.
+        // last one releases the slot, and that release writes into the free list, which must therefore still exist. 65 536
+        // slots make the free list a 1 MiB block: a native one freed by Dispose (the table before 68035f8) goes back to the
+        // OS, so the write faults instead of silently corrupting the heap.
         var table = new CompletionTable(1 << 16);
         Assert.True(table.TryAllocate(out SendToken token));
         ValueTask<DeliveryStatus> buffer = table.WaitAsync(token, Buffer);
@@ -508,6 +509,59 @@ public class CompletionTableTests
         Assert.Equal(DeliveryStatus.Disconnected, buffer.Result);
         Assert.Equal(DeliveryStatus.Disconnected, remote.Result);
         Assert.Equal(DeliveryStatus.Disconnected, table.GetStatus(token));
+
+        // The late release went back to the (GC-managed) free list like any other.
+        Assert.Equal(table.Capacity, table.Available);
+    }
+
+    [Fact]
+    public void Late_Releases_Racing_Dispose_Never_Fault()
+    {
+        // Waits released on teardown and consumed on other threads while the owner disposes the table (a thread-pool
+        // continuation running during teardown). Each round uses a fresh table of 32 768 slots, whose free list as a native
+        // block (512 KiB) would go back to the OS when Dispose freed it, so a release that raced Dispose would fault.
+        for (int round = 0; round < 10; round++)
+        {
+            var table = new CompletionTable(1 << 15);
+            var waits = new ValueTask<DeliveryStatus>[64];
+            for (int i = 0; i < waits.Length; i++)
+            {
+                Assert.True(table.TryAllocate(out SendToken token));
+                waits[i] = table.WaitAsync(token, Remote);
+                table.Complete(token, Buffer, DeliveryStatus.Pending);
+            }
+
+            table.CompleteAll(DeliveryStatus.Disconnected);
+            using var start = new Barrier(3);
+            var consumers = new Thread[2];
+            int wrong = 0;
+            for (int c = 0; c < consumers.Length; c++)
+            {
+                int first = c;
+                consumers[c] = new Thread(() =>
+                {
+                    start.SignalAndWait();
+                    for (int i = first; i < waits.Length; i += 2)
+                    {
+                        if (waits[i].Result != DeliveryStatus.Disconnected)
+                        {
+                            Interlocked.Increment(ref wrong);
+                        }
+                    }
+                });
+                consumers[c].Start();
+            }
+
+            start.SignalAndWait();
+            table.Dispose();
+            foreach (Thread consumer in consumers)
+            {
+                consumer.Join();
+            }
+
+            Assert.Equal(0, wrong);
+            Assert.Equal(table.Capacity, table.Available);
+        }
     }
 
     [Fact]

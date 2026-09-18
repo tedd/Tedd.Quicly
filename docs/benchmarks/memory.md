@@ -164,3 +164,25 @@ Per-thread magazines with SPSC return rings (ADR 0008) would turn the remaining 
 thread-local hit with no atomic at all, at the cost of blocks parked in magazines and a return ring per
 thread pair. At 29 ns per operation that is not yet the bottleneck of a send (the MsQuic call is
 microseconds); it stays on the list until a profile of a full peer says otherwise.
+
+## Hot-path pass (2026-09-18): what the allocator's atomics cost a message, and chained returns
+
+Method: the paired in-process comparison of the [ADR 0007 addendum](../adr/0007-measurement-method.md) (.NET 10.0.12).
+
+**Share of the atomics.** A 64-byte message end to end does 10 `lock`-prefixed instructions in the allocator and the budgets
+(Tier-1 disassembly, lease validation off): send rent 2 (`cmpxchg` on the shard head, `xadd` on the shard's rented count), send
+return 2, receive rent 2 + the receive budget's `xadd`, receive return 2 + the budget. Replacing every allocator atomic with a plain
+operation (a diagnostic ablation, single thread, uncontended) moved `stages.Ordered64` 0.968 [0.946 .. 0.991] and `stages.Packed`
+0.963 [0.938 .. 0.988] (6 launches each; send −3.7 / −4.8 ns, the rest in deliver and spoll): 3–4 % of a message. **The game-thread
+magazine suggested above stays rejected**: it could remove only the send side's share (≤ 4 ns, ≤ 2 %) and would need a new owner
+API, statistics that count cached blocks, a `ThreadSafeSend` bypass and a flush on teardown. The cross-core cost of the same lines
+is larger (docs/benchmarks/threading.md §6).
+
+**Kept: `ReturnMany`.** The packer used to return each member's payload lease the moment it copied it into a container: about 17 ×
+(counter decrement + CAS) per container. `SlabAllocator.ReturnMany` returns a run of same-class, same-shard blocks with one
+validation pass, one counter add and one CAS; the packer releases each member's *send budget* when it copies the member in (so the
+budget looks exactly as before to anything renting in the same pass) and returns the blocks in one chain when the container
+closes, on `Reset` and on `Dispose`. `stages.Packed` flush fell from 47.6 to 41.4 ns per message (0.962 [0.947 .. 0.976] total, 10
+launches). With `ValidateLeases`, a stale or double-returned lease rejects its whole run and leaves every lease of it rented.
+Side effect: until the container closes, the member blocks are still out of the pool, so a same-class rent in that window sees a
+slightly emptier pool than before (it matters only when that class is exhausted).

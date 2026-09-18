@@ -47,6 +47,11 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         _inPoll = true;
+        if (_inFlush)
+        {
+            _gate.Touched = true; // nested in a Flush (a continuation): its pass may have run already (QuiclyPeer.FlushGate.cs)
+        }
+
         EnterCall();
         NoteGameThread();
         // The host is here now: the next work published raises a fresh signal (IPeerWorkSignal is an edge).
@@ -56,7 +61,7 @@ public sealed unsafe partial class QuiclyPeer
         {
             long now = _clock.NowMicros;
             _core.NotePass(now);
-            DrainCompletions();
+            DrainCompletionsMarking(); // a completion that reaches an engine here is the next Flush's to follow up
             bool immediate = DrainForeignSends();
             RetrySendWaiters();
             if (immediate && _state == PeerState.Connected)

@@ -4,5 +4,7 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Tedd.Quicly.Core.Tests" />
+    <!-- The server's FlushAll gate (QuiclyPeer.CanSkipFlush / SkipFlush / EnableFlushGate). -->
+    <InternalsVisibleTo Include="Tedd.Quicly.Server" />
   </ItemGroup>
 </Project>

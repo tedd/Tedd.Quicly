@@ -1,6 +1,9 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 using Tedd.Quicly.Core.Framing;
 using Tedd.Quicly.Core.Memory;
+using Tedd.Quicly.Core.Primitives;
 using Tedd.Quicly.Core.Session.Engines;
 using Tedd.Quicly.Core.State;
 using Tedd.Quicly.Core.Transport;
@@ -27,6 +30,15 @@ internal enum DatagramHints : byte
     /// unreliable and the pass allows the flag (<see cref="FlushContext.CancelBlockedDatagrams"/>).
     /// </summary>
     Unreliable = 2,
+
+    /// <summary>
+    /// The owner finishes a final, non-local completion of the entry with exactly
+    /// <see cref="PeerCore.CompleteEntry"/>(slot, <see cref="PeerCore.MapCompletion"/>(completion)) and keeps no per-entry
+    /// state of its own (an unfragmented message of a <see cref="DatagramEngine"/>). When every member of a container
+    /// carries it, <see cref="DatagramPacker.OnContainerCompleted"/> finishes the members itself instead of routing each one
+    /// back through its engine; the outcome is the same.
+    /// </summary>
+    DirectCompletion = 4,
 }
 
 /// <summary>What <see cref="DatagramPacker.Add"/> did with an entry.</summary>
@@ -54,16 +66,26 @@ internal enum PackResult : byte
 /// scheduler pass the engines hand it filled send entries (header block + payload segment) in schedule order. Buffered
 /// messages are packed into one container whenever at least two fit; a message that fits next to nothing else is sent
 /// alone, zero copy. A container is its own send entry on channel 1 (<see cref="SendEntryFlags.Container"/>) whose lease is
-/// sized from the <em>current</em> maximum datagram payload (read once per pass), written with a
-/// <see cref="PackedContainerWriter"/> and stamped with the tick of <see cref="QuiclyPeer.Flush"/> when it is not 0.
+/// sized from the <em>current</em> maximum datagram payload (read once per pass), written in the
+/// <see cref="PackedContainer"/> format (header, then one (Length varint, message) entry per member, written in place) and
+/// stamped with the tick of <see cref="QuiclyPeer.Flush"/> when it is not 0.
 /// Members join the container with <see cref="SendEntryTable.AddToBatch"/>, stay <c>Filling</c> and are never submitted
-/// themselves; their payload is returned as soon as it has been copied. The container's completion fans out to them
+/// themselves. A member's payload lease leaves the send budget as soon as its bytes are copied in, exactly as if it were
+/// returned then; its block goes back to the pool with the other members' when the container closes
+/// (<see cref="ReturnCopied"/>). The container's completion fans out to them
 /// (<see cref="OnContainerCompleted"/>). Game thread only; no allocation.
 /// </summary>
 internal sealed unsafe class DatagramPacker
 {
     /// <summary>Channel priority from which datagrams are sent with <see cref="TransportSendFlags.Priority"/> (PROTOCOL.md §4.5).</summary>
     public const int PriorityThreshold = 192;
+
+    // A container entry's Aux1: whether every member carried DatagramHints.DirectCompletion (Aux0 counts tracked members).
+    private const long RoutedMembers = 0;
+    private const long DirectMembers = 1;
+
+    // Headers up to this size are copied into a container with one unaligned vector move (Append).
+    private const int HeaderMove = 16;
 
     private readonly PeerCore _core;
     private int _maxPayload;
@@ -78,7 +100,13 @@ internal sealed unsafe class DatagramPacker
     private int _count;
     private bool _containerPriority;
     private bool _containerUnreliable;
+    private bool _containerDirect;
     private int _trackedMembers;
+    // Payload leases of the open container's members, copied in and out of the send budget already: their blocks go back to
+    // the pool together when the container closes (one push per run instead of one per member). On the pinned object heap
+    // (ADR 0008 §12).
+    private readonly BufferLease[] _copied = GC.AllocateUninitializedArray<BufferLease>(PackedContainer.MaxMessages, pinned: true);
+    private int _copiedCount;
 
     /// <summary>Creates the packer of <paramref name="core"/>.</summary>
     /// <param name="core">The peer's shared state.</param>
@@ -93,6 +121,7 @@ internal sealed unsafe class DatagramPacker
     /// </summary>
     public void Reset()
     {
+        ReturnCopied();
         _pending = -1;
         _container = -1;
         _buffer = null;
@@ -101,6 +130,7 @@ internal sealed unsafe class DatagramPacker
         _trackedMembers = 0;
         _containerPriority = false;
         _containerUnreliable = false;
+        _containerDirect = false;
     }
 
     /// <summary>Starts a pass: the current datagram limit, the tick and the send-flag policy (scheduler).</summary>
@@ -209,7 +239,9 @@ internal sealed unsafe class DatagramPacker
     /// The completion of a container entry (game thread, from the completion routing): the early Sent notice returns the
     /// container's lease (the transport no longer needs the bytes; the slot stays reserved until the final state, ADR 0008
     /// invariant 1) and, when a member is tracked, passes the notice on; the final completion goes to every member's owner
-    /// with the container's outcome, then the container entry is finished.
+    /// with the container's outcome — or, when every member is a plain datagram message
+    /// (<see cref="DatagramHints.DirectCompletion"/>) and the completion came from the transport, finishes the members here
+    /// exactly as their owner would — then the container entry is finished.
     /// </summary>
     /// <param name="container">The container entry.</param>
     /// <param name="completion">What the transport (or the game thread, for a refused submission) reported.</param>
@@ -235,12 +267,31 @@ internal sealed unsafe class DatagramPacker
 
         int m = entries.BatchHead[container];
         entries.ClearBatch(container);
-        while (m >= 0)
+        if (entries[container].Aux1 == DirectMembers && completion.Kind != CompletionKind.Local)
         {
-            // Read the link first: finishing a member frees its slot, which a continuation may reuse at once.
-            int next = entries.Next[m];
-            RouteMember(m, in completion);
-            m = next;
+            // Every member is a plain datagram message whose owner would do exactly this (DatagramHints.DirectCompletion),
+            // so the per-member routing (entry → channel → engine → virtual call → fragment check) is skipped. The status is
+            // still mapped per member, as the owner would: a continuation of an earlier member may start closing the
+            // transport, which changes the mapping of a canceled datagram. A local completion (refused submission) still
+            // goes to the owners, which correct their counters.
+            NativeArray<int> links = entries.Next;
+            while (m >= 0)
+            {
+                // Read the link first: finishing a member frees its slot, which a continuation may reuse at once.
+                int next = links[m];
+                _core.CompleteEntry(m, _core.MapCompletion(in completion));
+                m = next;
+            }
+        }
+        else
+        {
+            while (m >= 0)
+            {
+                // Read the link first: finishing a member frees its slot, which a continuation may reuse at once.
+                int next = entries.Next[m];
+                RouteMember(m, in completion);
+                m = next;
+            }
         }
 
         _core.CompleteEntry(container, _core.MapCompletion(in completion));
@@ -283,6 +334,7 @@ internal sealed unsafe class DatagramPacker
         _container = slot;
         _containerPriority = false;
         _containerUnreliable = true;
+        _containerDirect = true;
         _trackedMembers = 0;
         return true;
     }
@@ -293,38 +345,87 @@ internal sealed unsafe class DatagramPacker
         ref SendEntry entry = ref entries[member];
         int headerLength = entry.HeaderLength;
         int payloadLength = (int)entry.Payload.Length;
-        PackedContainerWriter writer = new(new Span<byte>(_buffer, _maxPayload), _length, _count);
-        bool reserved = writer.TryReserve(headerLength + payloadLength, out Span<byte> target);
-        Debug.Assert(reserved, "the caller checked that the message fits");
-        entries.GetHeaderBlock(member).Slice(0, headerLength).CopyTo(target);
-        if (payloadLength > 0)
+        int messageLength = headerLength + payloadLength;
+        byte* header = entry.Header.Buffer;
+
+        // The (Length varint, message) entry is written in place: the caller already checked what PackedContainerWriter
+        // would check again (CanAppend, or the size check before TryOpenContainer: it fits, and fewer than MaxMessages are
+        // in), and a message is never empty and never starts with the container's channel id (it has its own channel id).
+        Debug.Assert(messageLength >= 1 && _count < PackedContainer.MaxMessages, "the caller checked the message count");
+        Debug.Assert(PackedContainer.GetEntryLength(messageLength) <= _maxPayload - _length, "the caller checked that the message fits");
+        Debug.Assert(*header != PackedContainer.ChannelId, "a container member is a channel-0 or channel->=2 frame");
+        Debug.Assert(SendEntryTable.HeaderBlockSize >= HeaderMove, "the header block holds the bytes of one vector move");
+        byte* target = _buffer + _length;
+        target += VarInt.Write(target, (uint)messageLength);
+        if (headerLength <= HeaderMove && _maxPayload - (int)(target - _buffer) >= HeaderMove)
         {
-            new ReadOnlySpan<byte>(entry.Payload.Buffer, payloadLength).CopyTo(target.Slice(headerLength));
+            // One 16-byte move instead of a Memmove call for a header of a few bytes. The header block always holds
+            // SendEntryTable.HeaderBlockSize readable bytes, and the bytes written past the header stay inside the container's
+            // buffer: the payload below overwrites them, or a later entry does, or they lie past the container's length.
+            Unsafe.WriteUnaligned(target, Unsafe.ReadUnaligned<Vector128<byte>>(header));
+        }
+        else
+        {
+            new ReadOnlySpan<byte>(header, headerLength).CopyTo(new Span<byte>(target, headerLength));
         }
 
-        _length = writer.Length;
-        _count = writer.Count;
+        if (payloadLength > 0)
+        {
+            new ReadOnlySpan<byte>(entry.Payload.Buffer, payloadLength).CopyTo(new Span<byte>(target + headerLength, payloadLength));
+        }
+
+        _length = (int)(target - _buffer) + messageLength;
+        _count++;
         entries.AddToBatch(_container, member);
         _containerPriority |= (hints & DatagramHints.Priority) != 0;
         _containerUnreliable &= (hints & DatagramHints.Unreliable) != 0;
+        _containerDirect &= (hints & DatagramHints.DirectCompletion) != 0;
         if ((entry.Flags & SendEntryFlags.Tracked) != 0)
         {
             _trackedMembers++;
         }
 
-        // The bytes live in the container now; the member only waits for the container's outcome.
+        // The bytes live in the container now; the member only waits for the container's outcome. A plain send lease leaves
+        // the send budget here, as a return would, and its block goes back with the container's others when it closes
+        // (ReturnCopied); a pin or a shared reference is released here.
+        BufferLease lease = entries.Leases[member];
+        if (!lease.IsEmpty)
+        {
+            entries.Leases[member] = BufferLease.Empty;
+            _core.ReleaseSendBudget(in lease);
+            _copied[_copiedCount++] = lease;
+        }
+
         _core.ReleasePayload(member);
         _core.Counters.MessagesPacked++;
     }
 
+    /// <summary>
+    /// Returns the blocks of the members copied into the container since it opened to the pool, in one call (at most
+    /// <see cref="PackedContainer.MaxMessages"/>); their send budget was released when each was copied. Game thread;
+    /// idempotent. Called when the container closes, and by <see cref="Reset"/> and <see cref="PeerCore.Dispose"/> for a
+    /// container a pass never closed.
+    /// </summary>
+    public void ReturnCopied()
+    {
+        int count = _copiedCount;
+        if (count != 0)
+        {
+            _copiedCount = 0;
+            _core.ReturnSendBlocks(new ReadOnlySpan<BufferLease>(_copied, 0, count));
+        }
+    }
+
     private void SubmitContainer(ref FlushContext flush)
     {
+        ReturnCopied();
         int slot = _container;
         _container = -1;
         int size = _length;
         ref SendEntry entry = ref _core.Entries[slot];
         entry.Payload.Length = (uint)size;
         entry.Aux0 = _trackedMembers;
+        entry.Aux1 = _containerDirect ? DirectMembers : RoutedMembers;
         TransportStatus status = _core.SubmitDatagram(slot, SendFlags(_containerPriority, _containerUnreliable));
         if (status != TransportStatus.Success)
         {

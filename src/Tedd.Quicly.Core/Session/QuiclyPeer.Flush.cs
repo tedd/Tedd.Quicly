@@ -45,6 +45,7 @@ public sealed unsafe partial class QuiclyPeer
         {
             long now = _clock.NowMicros;
             _core.NotePass(now);
+            OpenFlushGate();
             DrainCompletions();
             DrainForeignSends();
             RetrySendWaiters();
@@ -59,8 +60,11 @@ public sealed unsafe partial class QuiclyPeer
                     engines[i].Tick(now, ref flush.NextDeadline);
                 }
 
+                // Everything admitted or routed up to here is this pass's to serve (no continuation runs before it ends).
+                NoteFlushGatePass();
                 FlushEngines(ref flush);
                 engineDeadline = flush.NextDeadline;
+                CloseFlushGate();
             }
 
             _engineDeadline = engineDeadline;
@@ -271,6 +275,13 @@ public sealed unsafe partial class QuiclyPeer
         finally
         {
             _inScheduler = false;
+        }
+
+        if (_core.LocalCompletionsQueued != 0)
+        {
+            // Routed after the pass computed its deadlines (an engine may re-queue or re-arm on them): the next FlushAll
+            // must not skip this peer (QuiclyPeer.FlushGate.cs).
+            _gate.Touched = true;
         }
 
         DrainLocalCompletions();

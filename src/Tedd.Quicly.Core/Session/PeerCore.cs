@@ -58,6 +58,7 @@ internal sealed unsafe class PeerCore : IDisposable
     public const uint EngineStreamSerialMask = 0xFF_FFFF;
 
     private readonly SlabAllocator _allocator;
+    private TransportCallbackState _callback;
     private readonly bool _ownsAllocator;
     private readonly int[] _indexById;
     private readonly ChannelDefinition[] _channels;
@@ -808,6 +809,32 @@ internal sealed unsafe class PeerCore : IDisposable
     }
 
     /// <summary>
+    /// Releases the send budget of a lease whose bytes were copied away, exactly as <see cref="ReturnSend"/> would, while its
+    /// block stays rented until <see cref="ReturnSendBlocks"/> gives it back to the pool together with others (the threads
+    /// of <see cref="TryRentSend"/>). The lease must not be empty and must not be returned any other way.
+    /// </summary>
+    /// <param name="lease">The lease.</param>
+    public void ReleaseSendBudget(in BufferLease lease)
+    {
+        if (_atomicSendBudget)
+        {
+            Interlocked.Add(ref _sendBytes, -lease.Length);
+        }
+        else
+        {
+            _sendBytes -= lease.Length;
+        }
+    }
+
+    /// <summary>
+    /// Returns the blocks of send leases whose budget <see cref="ReleaseSendBudget"/> already released, with one pool push
+    /// per run of blocks of one class and shard (<see cref="SlabAllocator.ReturnMany"/>; the threads of
+    /// <see cref="TryRentSend"/>). No lease may be empty.
+    /// </summary>
+    /// <param name="leases">The leases.</param>
+    public void ReturnSendBlocks(ReadOnlySpan<BufferLease> leases) => _allocator.ReturnMany(leases);
+
+    /// <summary>
     /// Rents a receive lease of at least <paramref name="length"/> bytes within the receive budget (transport thread; the
     /// game thread when decoding). The caller counts a failure (<see cref="PeerCounters.OutOfReceiveBuffers"/>).
     /// </summary>
@@ -872,7 +899,7 @@ internal sealed unsafe class PeerCore : IDisposable
         }
 
         NoteRingUse(ring.CachedCount + _receiveReserved);
-        NoteWork();
+        NoteTransportWork();
         return true;
     }
 
@@ -881,6 +908,45 @@ internal sealed unsafe class PeerCore : IDisposable
     /// non-blocking, and at most once between two <see cref="QuiclyPeer.Poll"/> calls, so a burst costs one call.
     /// </summary>
     public void NoteWork() => Peer.NoteWork();
+
+    /// <summary>
+    /// Opens a transport callback (transport thread; nests, for callbacks MsQuic delivers re-entrantly): until the matching
+    /// <see cref="EndTransportCallback"/>, the work the transport thread publishes through this core (received messages,
+    /// pended streams, completions) tells the host once, at the end, instead of once per publication.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="QuiclyPeer.NoteWork"/> is an <see cref="Interlocked.Exchange(ref int, int)"/>: a full fence per published
+    /// message, which also waits for the message's own stores (payload, ring slot) to leave the store buffer — on another
+    /// core than the game thread's, for the lines the game thread last read. Deferring it to the end of the callback keeps
+    /// the fence after every publication (the host still cannot miss work: the game thread clears the signal, fences, then
+    /// drains), but pays it once per callback.
+    /// </remarks>
+    public void BeginTransportCallback() => _callback.Depth++;
+
+    /// <summary>Closes a <see cref="BeginTransportCallback"/> and tells the host about work published inside it (transport thread).</summary>
+    public void EndTransportCallback()
+    {
+        if (--_callback.Depth == 0 && _callback.WorkPending)
+        {
+            _callback.WorkPending = false;
+            NoteWork();
+        }
+    }
+
+    /// <summary>
+    /// <see cref="NoteWork"/> for work the transport thread published: deferred to <see cref="EndTransportCallback"/> while
+    /// a callback is open (transport thread only).
+    /// </summary>
+    public void NoteTransportWork()
+    {
+        if (_callback.Depth != 0)
+        {
+            _callback.WorkPending = true;
+            return;
+        }
+
+        NoteWork();
+    }
 
     /// <summary>
     /// Reserves one receive-ring slot for a message that is still arriving (a stream message), so that publishing it at its
@@ -908,7 +974,7 @@ internal sealed unsafe class PeerCore : IDisposable
         _receiveReserved--;
         bool enqueued = ReceiveRing.TryEnqueue(in entry);
         Debug.Assert(enqueued, "a reserved receive slot must be free");
-        NoteWork();
+        NoteTransportWork();
     }
 
     /// <summary>Gives back a reservation that will not be published (transport thread).</summary>
@@ -974,7 +1040,7 @@ internal sealed unsafe class PeerCore : IDisposable
             Counters.CallbackFaults++;
         }
 
-        NoteWork();
+        NoteTransportWork();
     }
 
     // ------------------------------------------------------------------ streams (game thread)
@@ -1430,7 +1496,7 @@ internal sealed unsafe class PeerCore : IDisposable
             Counters.CallbackFaults++;
         }
 
-        NoteWork();
+        NoteTransportWork();
     }
 
     // ------------------------------------------------------------------ reconnect (game thread)
@@ -1474,6 +1540,7 @@ internal sealed unsafe class PeerCore : IDisposable
         _maxDatagramPayload = 0;
         _closeRequest = 0;
         _receiveReserved = 0;
+        _callback = default;
         CurrentSenderTick = 0;
         if (Role == PeerRole.Client)
         {
@@ -1532,6 +1599,7 @@ internal sealed unsafe class PeerCore : IDisposable
             ReturnReceive(in entry.Lease);
         }
 
+        Packer.ReturnCopied();
         for (int slot = 0; slot < Entries.Capacity; slot++)
         {
             if (Entries.GetState(slot) != SendEntryState.Free)
@@ -1555,5 +1623,16 @@ internal sealed unsafe class PeerCore : IDisposable
         {
             _allocator.Dispose();
         }
+    }
+
+    /// <summary>Transport-thread state of <see cref="BeginTransportCallback"/>, padded off every game-thread line.</summary>
+    [StructLayout(LayoutKind.Explicit, Size = CacheLine.Stride * 2)]
+    private struct TransportCallbackState
+    {
+        /// <summary>Open callbacks (re-entrant nesting).</summary>
+        [FieldOffset(CacheLine.Stride)] public int Depth;
+
+        /// <summary>Work was published inside the open callback and the host was not told yet.</summary>
+        [FieldOffset(CacheLine.Stride + 4)] public bool WorkPending;
     }
 }

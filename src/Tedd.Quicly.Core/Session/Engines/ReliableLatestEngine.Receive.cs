@@ -862,6 +862,12 @@ internal sealed unsafe partial class ReliableLatestEngine
 
     // ------------------------------------------------------------------ acks this end owes (game thread)
 
+    /// <summary>
+    /// Whether the transport thread left work only a scheduler pass consumes: acks or rejects this end owes, or LatestAck /
+    /// LatestReject / stream notices to apply (game thread; the peer's flush gate). Neither raises the work signal.
+    /// </summary>
+    internal bool HasUnsentControl => !_notices.IsEmpty || HasPendingAcks();
+
     private bool HasPendingAcks()
     {
         if (_heldAck.Local >= 0 || _heldReject.Channel != 0 || !_ackQueue.IsEmpty || !_rejectQueue.IsEmpty || _sweepLocal >= 0)

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Paired in-process A/B host: loads two frozen builds of Tedd.Quicly.Benchmarks into one process and alternates measurement windows (docs/adr/0007-measurement-method.md).</Description>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>PairHost</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+    <NoWarn>$(NoWarn);CA1303;CA1305;CA1307;CA1310;CA2201</NoWarn>
+  </PropertyGroup>
+</Project>

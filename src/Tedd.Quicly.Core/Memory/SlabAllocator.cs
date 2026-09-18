@@ -379,6 +379,106 @@ public sealed unsafe class SlabAllocator : IDisposable
             PushSlow(shard, block, index, seen);
     }
 
+    /// <summary>
+    /// Returns several rented blocks, as <see cref="Return"/> does for each of them, with one push per run of consecutive
+    /// leases of the same class and shard: the run is linked into a chain through the blocks' own free-list links and
+    /// pushed with a single compare-exchange, and the shard's rented count drops by the run's length in one atomic add.
+    /// Blocks rented by one thread from one class — a send path's payloads — form one run.
+    /// </summary>
+    /// <param name="leases">Leases obtained from this allocator, each returned exactly once (no duplicates).</param>
+    /// <exception cref="ArgumentException">A lease is empty or does not address a block of this allocator; the leases before its run were returned, the leases of its run were not (they are still rented).</exception>
+    /// <exception cref="InvalidOperationException">Lease validation is enabled and a lease is stale or its block is not rented; the leases before its run were returned, the leases of its run were not (they are still rented).</exception>
+    /// <exception cref="ObjectDisposedException">The allocator has been disposed.</exception>
+    public void ReturnMany(ReadOnlySpan<BufferLease> leases)
+    {
+        int i = 0;
+        while (i < leases.Length)
+        {
+            ref readonly BufferLease first = ref leases[i];
+            ref SizeClass c = ref ResolveClass(in first);
+            int ci = first.ClassIndex;
+            int s = first.Shard;
+            BlockMeta* blocks = c.Blocks;
+            int end = i + 1;
+            while (end < leases.Length && leases[end].ClassIndex == ci && leases[end].Shard == s)
+            {
+                ResolveClass(in leases[end]);
+                end++;
+            }
+
+            if (_validateLeases)
+            {
+                ValidateRun(blocks, leases[i..end]);
+            }
+
+            // Link the run top-down in the order given; the last block will point at the current head.
+            int top = first.BlockIndex;
+            int last = top;
+            for (int k = i + 1; k < end; k++)
+            {
+                int index = leases[k].BlockIndex;
+                blocks[last].Next = index;
+                last = index;
+            }
+
+            ShardHeader* shard = c.Shards + s;
+            Interlocked.Add(ref shard->Rented, i - end);
+            long head = Volatile.Read(ref shard->Head);
+            BlockMeta* tail = blocks + last;
+            tail->Next = (int)head;
+            long newHead = (long)((((ulong)head + TagIncrement) & TagMask) | (uint)top);
+            long seen = Interlocked.CompareExchange(ref shard->Head, newHead, head);
+            if (seen != head)
+                PushChainSlow(shard, tail, top, seen);
+            i = end;
+        }
+    }
+
+    // Validates a run and marks its blocks free, all or nothing: when a lease is stale or its block is not rented (a double
+    // return, or the same lease twice in the run), the blocks of the run marked free before it are marked rented again
+    // before the exception, so every lease of the rejected run is still rented and can be returned later.
+    private static void ValidateRun(BlockMeta* blocks, ReadOnlySpan<BufferLease> run)
+    {
+        for (int k = 0; k < run.Length; k++)
+        {
+            ref readonly BufferLease lease = ref run[k];
+            BlockMeta* block = blocks + lease.BlockIndex;
+            if (block->Generation != lease.Generation)
+                RejectRun(blocks, run[..k], in lease, stale: true, block->Generation);
+            if (Interlocked.Exchange(ref block->State, StateFree) != StateRented)
+                RejectRun(blocks, run[..k], in lease, stale: false, block->Generation);
+        }
+    }
+
+    /// <summary>Slow path of <see cref="ValidateRun"/>: marks the blocks of <paramref name="validated"/> rented again, then throws for <paramref name="lease"/>.</summary>
+    [DoesNotReturn]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void RejectRun(BlockMeta* blocks, ReadOnlySpan<BufferLease> validated, in BufferLease lease, bool stale, ushort currentGeneration)
+    {
+        foreach (ref readonly BufferLease done in validated)
+            Volatile.Write(ref blocks[done.BlockIndex].State, StateRented);
+        if (stale)
+            ThrowStaleLease(in lease, currentGeneration);
+        ThrowDoubleReturn(in lease);
+    }
+
+    /// <summary>Slow path of <see cref="ReturnMany"/>: retry pushing the chain with back-off after a lost CAS.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void PushChainSlow(ShardHeader* shard, BlockMeta* tail, int top, long head)
+    {
+        int backoff = 1;
+        while (true)
+        {
+            Backoff(ref backoff);
+            tail->Next = (int)head;
+            long newHead = (long)((((ulong)head + TagIncrement) & TagMask) | (uint)top);
+            long seen = Interlocked.CompareExchange(ref shard->Head, newHead, head);
+            if (seen == head)
+                return;
+            head = seen;
+        }
+    }
+
     /// <summary>The block's bytes as a span of <see cref="BufferLease.Length"/> bytes.</summary>
     /// <exception cref="ArgumentException">The lease is empty or does not address a block of this allocator.</exception>
     /// <exception cref="ObjectDisposedException">The allocator has been disposed.</exception>

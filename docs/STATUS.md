@@ -1,8 +1,10 @@
 # Implementation status
 
 Last updated 2026-09-18. Test counts are totals across both target frameworks (net11.0 + net10.0), measured on `main` after
-the wave C2 merge. Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.CodeCoverage,
-cobertura); the Core rows were re-measured at the same merge, identically on both target frameworks.
+the hot-path performance pass (docs/benchmarks/session.md, "Hot-path pass"). Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.CodeCoverage,
+cobertura; the Core rows were re-measured at the wave C2 merge) and were not re-measured after the hot-path pass. On 2026-09-18 the
+certificate/TLS tests (Server `AcmeProvisioningTests.TlsAlpn01…`, 5–7 of the EndToEnd suite) fail on this machine for an
+environmental reason — on 691f20d as well, before the pass — and are counted in the totals below.
 
 ## Merged into `main`
 
@@ -11,17 +13,17 @@ cobertura); the Core rows were re-measured at the same merge, identically on bot
 | Core · Transport | `ITransport` / `ITransportSink` contract, `TransportSegment` (QUIC_BUFFER layout) | in Core | 100 % | — |
 | Core · Primitives | QUIC varints (minimal-encoding check), RFC 1982 serials, xxHash64, LZ4 block codec | in Core | ~100 % (big-endian arms unreachable on x64) | [primitives](benchmarks/primitives.md) |
 | Core · Memory | lock-free sharded slab allocator, `BufferLease`, shared leases | in Core | 99.1 % | [memory](benchmarks/memory.md) |
-| Core · Threading / Time | SPSC and MPSC rings (native memory), `CompletionTable` (a wait may be consumed after the table is disposed), clocks | in Core | 99.4 % (two layout accessors of `MpscRing`) | [threading](benchmarks/threading.md) |
+| Core · Threading / Time | SPSC and MPSC rings (native memory), `CompletionTable` (a wait may be consumed after the table is disposed; its free list lives on the pinned object heap), clocks | in Core | 99.4 % (two layout accessors of `MpscRing`) | [threading](benchmarks/threading.md) |
 | Core · State | native arrays, send-entry table, key tables, mailboxes, channel state, segment arena | in Core | 99.8 % | [state](benchmarks/state.md) |
 | Core · Channels / Framing | channel table + canonical hash, datagram/container/stream framing, incremental stream parser | in Core | 99.9 % | [framing](benchmarks/framing.md) |
 | Core · Control | control-protocol codec, session tokens, auth-failure limiter | in Core | 100 % | control numbers in the module notes |
 | Core · Session | `QuiclyPeer`, handshake and admission, control stream, ping and clock sync, scheduler and packer; engines for all six delivery modes (unreliable, sequenced, ordered, group-stream, latest-value, bulk); datagram fragmentation with bounded reassembly; correlated request/response; bulk transfers with progress, cancel, resume and whole-object hash; async completion APIs, thread-safe send, Poll/Drain, per-stream idle timeout; one dispose sequence that releases every await exactly once; plus the host hooks (work signal and `HasPendingWork`, peer-level `SendShared`, split poll/flush deadlines, in-place reconnect with session resume, re-armable after a failed attempt and probed with `CanReconnect` — `PeerOptions.Clone`/`Validate`, `IsDisposed`) | in Core | 97.1 % | [session](benchmarks/session.md) |
-| **Core total** | | **3 756** | | |
+| **Core total** | | **3 826** | | |
 | Http3 | HTTP/3 frames, QPACK (static + Huffman), HTTP datagrams, WebTransport framing and capsules | 504 | 100 % | [http3](benchmarks/http3.md) |
 | Transport.MsQuic | layout-validated MsQuic interop and wrappers; MsQuic-backed `ITransport`, connector, listener with reference-counted certificate hot swap | 722 (4 skipped here: one test needs machine-key rights, one runs off Windows only) | 98.4 % bindings, 93.5 % transport | [msquic-transport](benchmarks/msquic-transport.md) |
 | Testing | deterministic simulated network and transport (with the ideal-send-buffer model MsQuic reports), recording sink, test certificates, in-process fake ACME CA, transport conformance suite (24 scenarios, run against the simulator and MsQuic) | 374 | 97.6 % | [simulation](benchmarks/simulation.md) |
 | Acme | RFC 8555 client for any CA, EAB, http-01 / dns-01 / tls-alpn-01, renewal (ARI aware) | 430 | ~98 % (Unix-only branches) | [acme](benchmarks/acme.md) |
-| Server | certificate provisioning (static, file, ACME) with consumer binding and grace-period disposal; admission with per-address limits and an auth-failure limiter; sessions with token resume, a grace-period replay guard and epoch bumps; dense peer table, peer sets and shared broadcast; work-signal driven `PollAll`; graceful shutdown; optional HTTP side endpoint | 664 | 99.6 % | — |
+| Server | certificate provisioning (static, file, ACME) with consumer binding and grace-period disposal; admission with per-address limits and an auth-failure limiter; sessions with token resume, a grace-period replay guard and epoch bumps; dense peer table, peer sets and shared broadcast; work-signal driven `PollAll` and a `FlushAll` that skips peers whose Flush would do nothing; activation marks the peer's slot (a work bit taken before the peer was queued is no longer lost); graceful shutdown; optional HTTP side endpoint | 694 | 99.6 % | — |
 | Client | connect with cancellation, reconnect with back-off and jitter, in-place session resume on the same peer (gated on `QuiclyPeer.CanReconnect`, so an attempt whose connector failed is retried in place), fresh-session fallback when the server refuses the resume; a positive sub-microsecond auto-flush interval rounds up instead of switching auto-flush off | 104 | 100 % | — |
 | EndToEnd · Certificates | real-network suite: fake ACME CA to provisioner to MsQuic listener to TLS 1.3 handshake; hot swap, SPKI pinning, tls-alpn-01, restart reuse | 30 | — | — |
 | Http | hardened HTTP/1.1 server, ACME responders, ClientHello peek for tls-alpn-01, separate TLS handshake timeout, cached certificate contexts, static files | 788 (2 skipped) | 99.7 % | [http](benchmarks/http.md) |

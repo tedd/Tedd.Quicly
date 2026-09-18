@@ -27,7 +27,11 @@
    completion through the `CompletionRing`; it never polls `State`.
 5. **Rings are SPSC** per peer (`ReceiveRing`, `CompletionRing`, slab return ring): cached remote index,
    `Volatile.Read/Write` acquire/release, 128-byte padding between head, tail and entries, elements in a
-   `NativeArray<T>` like every other hot struct array (invariant 12). Genuinely multi-producer paths
+   `NativeArray<T>` like every other hot struct array (invariant 12). One deliberate exception (2026-09-18): the
+   `CompletionTable` free list (an `MpscRing<int>`) lives in one 64-byte aligned block on the **pinned object heap**, not in
+   native memory, because a slot may be returned by whichever thread consumes the last wait on it — after `Dispose` too — and
+   the returning thread reaches the ring through that slot, so reachability keeps the memory valid for the return without the
+   Dekker handshake the native list needed. Its capacity is therefore bounded by the largest array (2^26 slots). Genuinely multi-producer paths
    (`ThreadSafeSend`, the server's "peers with work" queue) use the Vyukov bounded MPMC algorithm so a stalled
    producer never blocks the consumer. `CompletionRing` capacity = **two per send entry** (one early `Sent`
    notice plus one final completion, so `2 × send table`; capacity is already a power of two, and asking for one

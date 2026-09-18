@@ -256,6 +256,50 @@ public class OrderedStreamTests
     }
 
     [Fact]
+    public void An_Exhausted_Receive_Budget_Holds_Back_Small_Messages_Without_Keeping_Their_Ring_Slots()
+    {
+        // 300-byte messages mostly arrive whole in one segment (one engine event each). A message that finds the budget
+        // exhausted is un-read after its ring slot was reserved, so the reservation must be handed back: with a four-slot
+        // ring, a few leaked reservations would stall the stream for good.
+        using SessionHarness h = new(table: Table, server: o =>
+        {
+            o.ReceiveBudgetBytes = 2 * 1024;
+            o.ReceiveRingCapacity = 4;
+        });
+        List<ReceiveLease> kept = [];
+        List<byte[]> payloads = [];
+        h.Server!.RegisterHandler(4, (QuiclyPeer peer, in ReceiveHeader header, ReadOnlySpan<byte> payload) =>
+        {
+            payloads.Add(payload.ToArray());
+            kept.Add(peer.Retain(in header));
+        });
+        for (int i = 0; i < 40; i++)
+        {
+            Assert.True(h.Client.SendCopy(new SendHeader(4), OrderedKit.Payload(i, 300)).IsAdmitted);
+        }
+
+        h.Run(50_000);
+        Assert.InRange(payloads.Count, 1, 39);
+        Assert.True(DatagramKit.Statistics(h.Server).StreamReceivePends > 0);
+        Assert.True(h.RunUntil(() =>
+        {
+            foreach (ReceiveLease lease in kept)
+            {
+                h.Server.Release(in lease);
+            }
+
+            kept.Clear();
+            return payloads.Count == 40;
+        }));
+        for (int i = 0; i < 40; i++)
+        {
+            Assert.Equal(OrderedKit.Payload(i, 300), payloads[i]);
+        }
+
+        Assert.Equal(0, DatagramKit.Statistics(h.Server).ReceiveRingDrops);
+    }
+
+    [Fact]
     public void A_Message_Larger_Than_The_Receive_Budget_Closes_The_Connection_With_LimitExceeded()
     {
         using SessionHarness h = new(table: Table, server: o => o.ReceiveBudgetBytes = 8 * 1024);

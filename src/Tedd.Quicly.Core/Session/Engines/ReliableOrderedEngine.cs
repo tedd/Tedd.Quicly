@@ -155,6 +155,7 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
         _carrierReserve = count + 1;
         _maxReceiveMessage = Math.Min(core.ReceiveBudgetBytes, core.Allocator.MaxBlockSize);
         _maxSegments = Math.Min(MaxSegmentsPerSend, core.Segments.Capacity);
+        AcceptsWholeMessages = true;
     }
 
     /// <summary>The lifecycle phase of a channel's send stream (game thread; tests).</summary>
@@ -172,7 +173,12 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
     /// <inheritdoc/>
     public override SendStatus Admit(ref SendRequest request)
     {
-        DrainNotices();
+        // The notice ring is almost always empty: check it inline and call the drain only when a notice is waiting.
+        if (!_notices.IsEmpty)
+        {
+            DrainNotices();
+        }
+
         ChannelDefinition channel = request.Channel;
         int dense = request.ChannelIndex;
         int local = _localOf[dense];
@@ -1049,9 +1055,66 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
                 return StreamConsume.Continue;
             }
 
+            case StreamMessagePhase.Whole:
+                return OnWholeMessage(ref message);
+
             default:
                 return StreamConsume.CloseConnection(QuiclyErrorCode.ProtocolViolation);
         }
+    }
+
+    /// <summary>
+    /// <see cref="StreamMessagePhase.Whole"/>: Start, Chunk and End of a message that arrived in one receive segment, in one
+    /// call — the same size check, the same reservation-then-lease order (a <see cref="StreamConsume.Pend"/> leaves nothing
+    /// held) and the same entry, without staging the message in the channel's receive state.
+    /// </summary>
+    private StreamConsume OnWholeMessage(ref StreamMessageContext message)
+    {
+        int length = message.Header.Length;
+        if (length > _maxReceiveMessage)
+        {
+            _core.RecvCounters(message.ChannelIndex).TooLarge++;
+            return StreamConsume.CloseConnection(QuiclyErrorCode.LimitExceeded);
+        }
+
+        if (!_core.TryReserveReceive())
+        {
+            return StreamConsume.Pend;
+        }
+
+        BufferLease lease = BufferLease.Empty;
+        if (length > 0)
+        {
+            if (!_core.TryRentReceive(length, out lease))
+            {
+                _core.CancelReservation();
+                return StreamConsume.Pend;
+            }
+
+            message.Chunk.CopyTo(new Span<byte>(_core.GetPointer(in lease), length));
+        }
+
+        ReceiveEntry entry = default;
+        entry.Channel = message.Channel;
+        int rawLength = message.Header.RawLength;
+        uint requestId = message.Header.RequestId;
+        entry.Flags = rawLength > 0 ? ReceiveFlags.Compressed : ReceiveFlags.None;
+        if (requestId != 0)
+        {
+            entry.Flags |= (requestId & 1) != 0 ? ReceiveFlags.IsRequest : ReceiveFlags.IsResponse;
+        }
+
+        entry.Key = message.Header.Key;
+        entry.Lease = lease;
+        entry.Length = length;
+        entry.RawLength = rawLength;
+        entry.RequestId = requestId;
+        entry.ReceivedMicrosDelta = PeerCore.StampReceive(message.NowMicros);
+        _core.PublishReserved(in entry);
+        ref ChannelRecvCounters counters = ref _core.RecvCounters(message.ChannelIndex);
+        counters.Received++;
+        counters.Bytes += length;
+        return StreamConsume.Continue;
     }
 
     /// <inheritdoc/>

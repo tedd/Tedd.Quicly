@@ -258,6 +258,41 @@ public class DatagramSendPathTests
     }
 
     [Fact]
+    public void Members_Of_A_Lost_Container_End_Lost_Whichever_Unreliable_Engine_Owns_Them()
+    {
+        // The container's fan-out finishes plain datagram members itself (DatagramHints.DirectCompletion): the outcome must be
+        // exactly what each owner engine would have given, for tracked and untracked members of both unreliable modes.
+        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 2_000 }, table: Table, client: DatagramKit.Quiet, server: DatagramKit.Quiet);
+        QuiclyPeer client = h.Client;
+        long containersBefore = DatagramKit.Statistics(client).ContainersSent;
+        DatagramKit.TransportOf(client).DropNextDatagrams(1);
+        SendResult unordered = client.SendCopy(new SendHeader(2), [1], SendOptions.Tracked);
+        SendResult sequenced = client.SendCopy(new SendHeader(3, 7), [2], SendOptions.Tracked);
+        Assert.True(client.SendCopy(new SendHeader(2), [3]).IsAdmitted);
+        Assert.True(client.SendCopy(new SendHeader(3, 8), [4]).IsAdmitted);
+        client.Flush();
+        Assert.Equal(containersBefore + 1, DatagramKit.Statistics(client).ContainersSent);
+        Assert.True(h.RunUntil(() => client.GetDeliveryStatus(sequenced.Token) != DeliveryStatus.Pending));
+        Assert.Equal(DeliveryStatus.Lost, client.GetDeliveryStatus(unordered.Token));
+        Assert.Equal(DeliveryStatus.Lost, client.GetDeliveryStatus(sequenced.Token));
+        Assert.True(h.RunUntil(() => DatagramKit.Statistics(client).SendEntriesInUse == 0));
+        Assert.Equal(0, DatagramKit.Statistics(client).SendBytesOutstanding);
+
+        // Lost, not refused: the messages were sent and stay counted.
+        Assert.Equal(2, DatagramKit.ChannelStats(client, 2).Sent);
+        Assert.Equal(2, DatagramKit.ChannelStats(client, 3).Sent);
+
+        // The next container arrives, and its members end Delivered.
+        SendResult next = client.SendCopy(new SendHeader(3, 7), [5], SendOptions.Tracked);
+        SendResult other = client.SendCopy(new SendHeader(2), [6], SendOptions.Tracked);
+        client.Flush();
+        Assert.True(h.RunUntil(() => client.GetDeliveryStatus(other.Token) != DeliveryStatus.Pending));
+        Assert.Equal(DeliveryStatus.Delivered, client.GetDeliveryStatus(next.Token));
+        Assert.Equal(DeliveryStatus.Delivered, client.GetDeliveryStatus(other.Token));
+        Assert.True(h.RunUntil(() => DatagramKit.Statistics(client).SendEntriesInUse == 0));
+    }
+
+    [Fact]
     public void Compressible_Payloads_Travel_Compressed_And_Arrive_Decoded_On_Every_Path()
     {
         using SessionHarness h = new(table: Table, client: DatagramKit.Quiet, server: DatagramKit.Quiet);

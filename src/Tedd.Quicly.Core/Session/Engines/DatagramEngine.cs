@@ -79,7 +79,10 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
             send.QueueHead = -1;
             send.QueueTail = -1;
             _expiryMicros[local] = channel.ResolveExpiryMicros(core.FlushIntervalMicros);
-            _hints[local] = channel.Priority >= DatagramPacker.PriorityThreshold ? DatagramHints.Unreliable | DatagramHints.Priority : DatagramHints.Unreliable;
+            // DirectCompletion: OnSendCompleted finishes an unfragmented message with CompleteEntry(MapCompletion) and nothing
+            // else unless the completion is local (FlushChannel clears the hint for fragments, which fold into their owner).
+            _hints[local] = (channel.Priority >= DatagramPacker.PriorityThreshold ? DatagramHints.Unreliable | DatagramHints.Priority : DatagramHints.Unreliable)
+                | DatagramHints.DirectCompletion;
             if (TracksKeys(channel))
             {
                 _keys[local] = new ReceiveKeyTracker(channel);
@@ -308,6 +311,11 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
             else
             {
                 DatagramHints hints = (entry.Flags & SendEntryFlags.Immediate) != 0 ? channelHints | DatagramHints.Priority : channelHints;
+                if (IsFragment(slot))
+                {
+                    hints &= ~DatagramHints.DirectCompletion;
+                }
+
                 long payloadLength = entry.Payload.Length;
                 PackResult result = packer.Add(slot, hints, ref flush);
                 if (result == PackResult.Accepted)
@@ -593,7 +601,7 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
             }
 
             // A mailbox bypasses the receive ring, so the peer's work signal is raised here instead (ADR 0008 §6).
-            _core.NoteWork();
+            _core.NoteTransportWork();
         }
         else if (!_core.TryEnqueueReceive(in entry))
         {

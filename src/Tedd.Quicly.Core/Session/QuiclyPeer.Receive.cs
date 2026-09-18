@@ -298,7 +298,7 @@ public sealed unsafe partial class QuiclyPeer
             _core.Counters.PongSamplesDropped++;
         }
 
-        NoteWork();
+        _core.NoteTransportWork();
     }
 
     private bool RouteControl(ChannelMode mode, ControlType type, ReadOnlySpan<byte> body, bool onStream, long now)
@@ -681,7 +681,7 @@ public sealed unsafe partial class QuiclyPeer
             _core.Counters.PingsIgnored++;
         }
 
-        NoteWork();
+        _core.NoteTransportWork();
     }
 
     private void HandlePeerClose(ReadOnlySpan<byte> body)
@@ -755,10 +755,22 @@ public sealed unsafe partial class QuiclyPeer
                 context.Cookie = ref record.Cookie;
                 context.NowMicros = now;
                 context.Header = record.Parser.Message;
+                ChannelEngine engine = _core.GetEngine(record.ChannelIndex);
                 switch (streamEvent)
                 {
                     case StreamEvent.MessageStart:
-                        context.Phase = StreamMessagePhase.Start;
+                        // A message whose payload lies wholly in this segment goes to an engine that takes it in one event
+                        // instead of Start, Chunk, End; the mark taken before the header un-reads all of it on Pend.
+                        if (engine.AcceptsWholeMessages && record.Parser.TryTakeWholePayload(ref input, out payload))
+                        {
+                            context.Phase = StreamMessagePhase.Whole;
+                            context.Chunk = payload;
+                        }
+                        else
+                        {
+                            context.Phase = StreamMessagePhase.Start;
+                        }
+
                         break;
                     case StreamEvent.PayloadChunk:
                         context.Phase = StreamMessagePhase.Chunk;
@@ -773,7 +785,7 @@ public sealed unsafe partial class QuiclyPeer
                         break;
                 }
 
-                StreamConsume result = _core.GetEngine(record.ChannelIndex).OnStreamMessage(ref context);
+                StreamConsume result = engine.OnStreamMessage(ref context);
                 switch (result.Action)
                 {
                     case StreamConsumeAction.Pend:
@@ -801,7 +813,7 @@ public sealed unsafe partial class QuiclyPeer
                 // PROTOCOL.md §7 "stream idle mid-message": watch the stream while a message is only half received (its
                 // staging lease and ring reservation are held), and stop watching when the message is complete. Refreshed
                 // by every accepted event, so only a peer that really stopped sending times out.
-                StreamTable.NoteProgress(ref record, context.Phase == StreamMessagePhase.End ? 0 : now);
+                StreamTable.NoteProgress(ref record, context.Phase is StreamMessagePhase.End or StreamMessagePhase.Whole ? 0 : now);
             }
 
             consumed += segment.Length;
@@ -1030,6 +1042,7 @@ public sealed unsafe partial class QuiclyPeer
                 return;
             }
 
+            peer._core.BeginTransportCallback();
             try
             {
                 peer.HandleDatagram(payload);
@@ -1037,6 +1050,10 @@ public sealed unsafe partial class QuiclyPeer
             catch (Exception exception)
             {
                 peer.OnCallbackFault(exception);
+            }
+            finally
+            {
+                peer._core.EndTransportCallback();
             }
         }
 
@@ -1081,6 +1098,7 @@ public sealed unsafe partial class QuiclyPeer
                 return ReceiveResult.Consumed(TotalLength(segments));
             }
 
+            peer._core.BeginTransportCallback();
             try
             {
                 return peer.HandleStreamReceived(id, segments, fin);
@@ -1089,6 +1107,10 @@ public sealed unsafe partial class QuiclyPeer
             {
                 peer.OnCallbackFault(exception);
                 return ReceiveResult.Consumed(TotalLength(segments));
+            }
+            finally
+            {
+                peer._core.EndTransportCallback();
             }
         }
 
@@ -1099,6 +1121,7 @@ public sealed unsafe partial class QuiclyPeer
                 return;
             }
 
+            peer._core.BeginTransportCallback();
             try
             {
                 peer._core.OnTransportStreamCompleted(context, canceled);
@@ -1106,6 +1129,10 @@ public sealed unsafe partial class QuiclyPeer
             catch (Exception exception)
             {
                 peer.OnCallbackFault(exception);
+            }
+            finally
+            {
+                peer._core.EndTransportCallback();
             }
         }
 
@@ -1116,6 +1143,7 @@ public sealed unsafe partial class QuiclyPeer
                 return;
             }
 
+            peer._core.BeginTransportCallback();
             try
             {
                 peer.HandleDatagramState(context, state);
@@ -1123,6 +1151,10 @@ public sealed unsafe partial class QuiclyPeer
             catch (Exception exception)
             {
                 peer.OnCallbackFault(exception);
+            }
+            finally
+            {
+                peer._core.EndTransportCallback();
             }
         }
 

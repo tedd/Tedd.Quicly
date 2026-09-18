@@ -27,6 +27,9 @@ internal sealed class SimStream
     /// <summary>The start was refused for the peer's stream limit: the stream never starts (it is dead until closed).</summary>
     public bool StartRefused;
 
+    /// <summary>The ideal send buffer this stream was last told (<see cref="LinkOptions.IdealSendBufferReporting"/>), or 0.</summary>
+    public ulong LastIdealSendBuffer;
+
     // Send direction.
     public bool CanSend;
     public bool FinQueued;
@@ -82,6 +85,7 @@ internal sealed class SimStream
         ShutdownDelivered = false;
         CountsTowardLimit = false;
         StartRefused = false;
+        LastIdealSendBuffer = 0;
         CanSend = false;
         FinQueued = false;
         SendDone = false;

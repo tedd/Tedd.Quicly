@@ -49,9 +49,10 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     private const int MaxPrefixBytes = 128;
 
     /// <summary>
-    /// Floor of a <em>derived</em> bulk rate, so a tiny bandwidth estimate still moves a transfer. It floors an estimate,
-    /// not the absence of one: with no congestion window, no usable RTT and no <see cref="PeerOptions.MaxSendBytesPerSecond"/>
-    /// there is nothing to derive a rate from and the bucket stays off (see <see cref="RefillBudget"/>).
+    /// Floor of the bulk rate whenever it is not an explicit <see cref="PeerOptions.BulkMaxBytesPerSecond"/>: a tiny
+    /// bandwidth estimate still moves a transfer, and a transport that reports no congestion window at all (with no
+    /// <see cref="PeerOptions.MaxSendBytesPerSecond"/> to fall back on) moves bulk at exactly this rate rather than unmetered
+    /// — an unmeasured link is not assumed to be a fast one (docs/design/session-layer.md §7.7, see <see cref="RefillBudget"/>).
     /// </summary>
     private const long MinBulkBytesPerSecond = 16 * 1024;
 
@@ -65,6 +66,12 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
 
     /// <summary>The peer's <c>BulkProgress</c> claimed the whole range at least once (PROTOCOL.md §4.3's <c>Delivered</c>).</summary>
     private const byte SendPeerClaimedAll = 64;
+
+    /// <summary>
+    /// The transfer answers the peer's <c>BulkRequest</c> (its id is in <see cref="_servedRequests"/>): abandoned before any
+    /// stream of it exists, it is answered <c>BulkReject</c>, because no stream reset can tell the peer (PROTOCOL.md §3.4).
+    /// </summary>
+    private const byte SendRequested = 128;
 
     /// <summary>A transfer whose stream was never refused: it may open one as soon as a pass reaches it.</summary>
     private const int CreditUnrefused = int.MinValue;
@@ -82,6 +89,9 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     private IBulkSource?[] _sources = [];
     private BulkTransfer?[] _transfers = [];
     private byte[] _sendHashes = [];
+
+    /// <summary>The peer's request id of a transfer flagged <see cref="SendRequested"/> (game thread).</summary>
+    private ulong[] _servedRequests = [];
     private TransportStreamId[] _txStreams = [];
     private uint[] _txSerials = [];
     private SpscRing<StreamNotice> _notices = null!;
@@ -150,13 +160,14 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
 
     /// <summary>
     /// <c>BulkProgress</c> frames claiming more bytes than this end ever handed to the transport (tests, and
-    /// <see cref="PeerStatistics.BulkProgressOverClaims"/>): a hostile peer under ADR 0009, counted and clamped.
+    /// <see cref="PeerStatistics.BulkProgressOverClaims"/>): a hostile peer under ADR 0009, counted, and dropped or closed on
+    /// exactly as a sibling control frame with an impossible field is (PROTOCOL.md §3.4).
     /// </summary>
     internal long ProgressOverClaims { get; private set; }
 
     /// <summary>
-    /// The rate the bulk bucket runs at in bytes per second as of the last pass, or 0 when no rate could be derived and the
-    /// gate is off (tests; see <see cref="RefillBudget"/>).
+    /// The rate the bulk bucket runs at in bytes per second as of the last pass, or 0 when the gate is off because the
+    /// estimate has no bound (a window with no measurable RTT; tests; see <see cref="RefillBudget"/>).
     /// </summary>
     internal long RatePerSecond => _rate;
 
@@ -212,6 +223,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         _sources = new IBulkSource?[transfers];
         _transfers = new BulkTransfer?[transfers];
         _sendHashes = new byte[transfers * StreamFraming.BulkHashLength];
+        _servedRequests = new ulong[transfers];
         for (int record = transfers - 1; record >= 0; record--)
         {
             ref BulkSend send = ref _records[record];
@@ -329,7 +341,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             throw new ArgumentException($"A bulk object hash is {StreamFraming.BulkHashLength} bytes or empty.", nameof(descriptor));
         }
 
-        BulkTransfer transfer = StartSend(local, dense, in descriptor, length, source, hash, out bool started);
+        BulkTransfer transfer = StartSend(local, dense, in descriptor, length, source, hash, requestId: null, out bool started);
         if (!started)
         {
             // Not connected, or the peer-wide / per-channel limit is reached: the transfer is finished before it began and
@@ -341,8 +353,17 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     }
 
     /// <summary>Registers a send transfer, or answers a finished, rejected one when it cannot start now.</summary>
+    /// <param name="local">Engine-local index of the channel.</param>
+    /// <param name="dense">Dense index of the channel.</param>
+    /// <param name="descriptor">The validated range.</param>
+    /// <param name="length">Bytes the transfer carries.</param>
+    /// <param name="source">Where its bytes come from.</param>
+    /// <param name="hash">The whole-object hash, or empty.</param>
+    /// <param name="requestId">The peer's request id when the transfer answers a <c>BulkRequest</c>, else null.</param>
+    /// <param name="started">Whether the transfer was registered.</param>
     private BulkTransfer StartSend(
-        int local, int dense, in BulkDescriptor descriptor, long length, IBulkSource source, ReadOnlySpan<byte> hash, out bool started)
+        int local, int dense, in BulkDescriptor descriptor, long length, IBulkSource source, ReadOnlySpan<byte> hash, ulong? requestId,
+        out bool started)
     {
         DrainNotices();
         started = false;
@@ -379,6 +400,12 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         {
             send.Flags |= SendHasHash;
             hash.CopyTo(_sendHashes.AsSpan(record * StreamFraming.BulkHashLength));
+        }
+
+        if (requestId is { } id)
+        {
+            send.Flags |= SendRequested;
+            _servedRequests[record] = id;
         }
 
         BulkTransfer transfer = new(in descriptor, send.TransferId, length, this, record, serial);
@@ -511,7 +538,9 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
                 }
             }
 
-            ReleaseIfDone(record, ref state);
+            // No ReleaseIfDone here: a record becomes releasable only when it finishes (TerminateSend), when its last piece
+            // completes (OnSendCompleted) or when its stream's close notice returns the slot (DrainNotices), and each of
+            // those releases it itself — one call per event, not a second one per pass.
             record = next;
         }
     }
@@ -804,26 +833,32 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     }
 
     /// <summary>
-    /// Bulk's share of the estimated bandwidth (PROTOCOL.md §4.5): the congestion window divided by the RTT, or
-    /// <see cref="PeerOptions.MaxSendBytesPerSecond"/> when the transport reports no usable window, floored at
-    /// <see cref="MinBulkBytesPerSecond"/> so a tiny estimate still moves a transfer. An explicit
-    /// <see cref="PeerOptions.BulkMaxBytesPerSecond"/> is taken as it is — an explicit cap is not floored.
-    /// <para>
-    /// When there is no rate information at all — no congestion window, or an RTT the transport reports as under a
-    /// microsecond, and no send cap — there is nothing to derive a rate from and the bucket stays off. The pass's send cap
-    /// and the transfer's send window still bound the traffic; flooring an unmetered link at 16 KiB/s would be orders of
-    /// magnitude slower than the link (docs/design/session-layer.md §7.7).
-    /// </para>
+    /// Bulk's share of the estimated bandwidth (PROTOCOL.md §4.5, docs/design/session-layer.md §7.7). An explicit
+    /// <see cref="PeerOptions.BulkMaxBytesPerSecond"/> is taken as it is — an explicit cap is not floored. Otherwise:
+    /// <list type="bullet">
+    /// <item>With a congestion window and an RTT, the estimate is the window divided by the RTT; bulk gets
+    /// <see cref="PeerOptions.BulkShareOfEstimatedBandwidth"/> of it, floored at <see cref="MinBulkBytesPerSecond"/> so a
+    /// tiny estimate still moves a transfer.</item>
+    /// <item>With <b>no</b> congestion window, the estimate falls back to <see cref="PeerOptions.MaxSendBytesPerSecond"/>;
+    /// with no send cap either there is no estimate at all, and the floor is the rate: a transport that measures nothing is
+    /// not assumed to be fast, and a transfer still always progresses.</item>
+    /// <item>A window with an RTT under a microsecond (a loopback or in-memory link) is an estimate without a bound — the
+    /// window crosses in no time — so no rate is derived and the gate is off; the pass's send cap and the transfer's send
+    /// window still bound the traffic.</item>
+    /// </list>
+    /// Every rate is clamped to <see cref="TokenBucket.MaxRatePerSecond"/>, far above any real link, so the bucket's integer
+    /// arithmetic stays in range.
     /// </summary>
     private void RefillBudget(long now)
     {
         long rate = _rateCap;
-        if (rate == 0)
+        if (rate == 0 && !(_cwnd > 0 && _rttMicros <= 0))
         {
-            long estimate = _cwnd > 0 && _rttMicros > 0 ? _cwnd * 1_000_000 / _rttMicros : _core.MaxSendBytesPerSecond;
-            rate = estimate <= 0 ? 0 : Math.Max(MinBulkBytesPerSecond, (long)(estimate * _rateShare));
+            long estimate = _cwnd > 0 ? _cwnd * 1_000_000 / _rttMicros : _core.MaxSendBytesPerSecond;
+            rate = Math.Max(MinBulkBytesPerSecond, (long)(estimate * _rateShare));
         }
 
+        rate = Math.Min(rate, TokenBucket.MaxRatePerSecond);
         if (rate == _rate)
         {
             return;
@@ -1018,6 +1053,16 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             AbortSendStream(ref send, code);
         }
 
+        if ((send.Flags & (SendRequested | SendHeaderWritten)) == SendRequested && send.Phase != BulkPhase.Finished
+            && status is BulkStatus.Canceled or BulkStatus.Failed)
+        {
+            // PROTOCOL.md §3.4: the peer asked for this range and no stream of it exists — the header never went out, or
+            // its start was refused and rewound — so no reset can tell the peer. Its request is answered BulkReject
+            // instead; otherwise it would wait for an answer for the life of the connection. A disconnect sends nothing.
+            send.Flags = (byte)(send.Flags & ~SendRequested);
+            SendBulkReject(_servedRequests[record], code);
+        }
+
         FinishSend(local, record, status, code);
         ReleaseIfDone(record, ref _send[local]);
     }
@@ -1153,6 +1198,34 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
 
         ClosePendingRequests(BulkStatus.Disconnected);
         OnPeerClosedReceive();
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Every <see cref="BulkTransfer"/> this end is sending ends <see cref="BulkStatus.Disconnected"/>, so an
+    /// <c>await transfer.Completion</c> is released (ADR 0008; PROTOCOL.md §4.3 gives a transfer terminal states so that its
+    /// caller always is). Only game-thread state is touched: the streams are forgotten rather than reset (the transport is
+    /// closed right after this), the pieces still in flight keep their blocks until the transport is done with them, and the
+    /// receive records — the transport thread's — are finished by <see cref="Dispose"/>, once the transport has reported its
+    /// close. Pending range requests are dropped without calling the router back: nothing awaits them, and a disposed peer
+    /// makes no more callbacks than it must.
+    /// </remarks>
+    public override void OnDisposing()
+    {
+        DrainNotices();
+        for (int local = 0; local < _channels.Length; local++)
+        {
+            int record = _send[local].ListHead;
+            while (record >= 0)
+            {
+                int next = _records[record].Next;
+                _records[record].Stream = default;
+                TerminateSend(local, record, BulkStatus.Disconnected, QuiclyErrorCode.NoError);
+                record = next;
+            }
+        }
+
+        Array.Clear(_requests);
     }
 
     /// <inheritdoc/>
@@ -1348,6 +1421,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
                 notice.Kind = ControlKind.Progress;
                 notice.Id = progress.TransferId;
                 notice.Offset = (long)progress.BytesAccepted;
+                notice.OnStream = onStream;
                 break;
             }
 
@@ -1426,7 +1500,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             switch (notice.Kind)
             {
                 case ControlKind.Progress:
-                    ApplyProgress(notice.Id, notice.Offset);
+                    ApplyProgress(notice.Id, notice.Offset, notice.OnStream);
                     break;
                 case ControlKind.Cancel:
                     ApplyCancel(notice.Id, (QuiclyErrorCode)notice.Code);
@@ -1446,23 +1520,30 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     /// <c>Delivered</c>). The claim is the peer's, so it is bounded by what this end really did, with two different bounds
     /// for two different questions (ADR 0009: a client parses hostile servers too).
     /// <para>
-    /// <b>What is reported</b> is clamped to <c>BytesCompleted</c> — the bytes whose sends completed are the bytes the peer
-    /// can have seen — so <see cref="BulkTransfer.BytesTransferred"/> never counts a byte this end did not send.
     /// <b>What is a violation</b> is measured against <c>BytesRead</c>, the bytes handed to the transport: a peer cannot
-    /// possibly have accepted bytes that were never submitted, while a claim that merely runs ahead of a completion still
-    /// in flight is ordinary (both are triggered by the same round trip). A violation is counted, never a close: the frame
-    /// is well formed, and it arrives on the datagram carrier where PROTOCOL.md §6 drops and counts. That the peer claimed
-    /// the whole range is remembered, so the transfer can complete once this end's own send side is finished too — which is
-    /// <see cref="TryCompleteSend"/>, and the reason a claim alone completes nothing.
+    /// possibly have accepted bytes that were never submitted, so such a frame carries an impossible field and is treated
+    /// exactly as its sibling control frames with impossible fields are (PROTOCOL.md §3.4, control-message bounds): on the
+    /// control stream it closes the connection <see cref="QuiclyErrorCode.ProtocolViolation"/>, as a control datagram it
+    /// is dropped whole and counted (<see cref="PeerStatistics.BulkProgressOverClaims"/>). Dropped means nothing of it
+    /// applies — neither the bytes nor the "whole range confirmed" it would imply. A claim that merely runs ahead of a
+    /// completion still in flight is ordinary (both are triggered by the same round trip) and is no violation.
+    /// </para>
+    /// <para>
+    /// <b>What is reported</b> is clamped to <c>BytesCompleted</c> — the bytes whose sends completed are the bytes the peer
+    /// can have seen — so <see cref="BulkTransfer.BytesTransferred"/> never counts a byte this end did not see complete.
+    /// That the peer confirmed the whole range is remembered, so the transfer completes once this end's own send side is
+    /// finished too — which is <see cref="TryCompleteSend"/>, and the reason a confirmation alone completes nothing.
     /// </para>
     /// </summary>
     /// <param name="transferId">The transfer the peer named.</param>
     /// <param name="bytesAccepted">Bytes it claims to have accepted.</param>
-    private void ApplyProgress(ulong transferId, long bytesAccepted)
+    /// <param name="onStream">The frame came on the control stream (a violation closes) rather than as a datagram (dropped).</param>
+    private void ApplyProgress(ulong transferId, long bytesAccepted, bool onStream)
     {
         int record = FindSend(transferId);
         if (record < 0)
         {
+            // A transfer that already ended, or one this end never sent: a late or stray frame, ignored.
             return;
         }
 
@@ -1471,14 +1552,21 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         {
             ProgressOverClaims++;
             _core.Counters.BulkProgressOverClaims++;
+            if (onStream)
+            {
+                _core.RequestClose(QuiclyErrorCode.ProtocolViolation);
+            }
+
+            return;
         }
 
-        if (bytesAccepted >= send.Length)
+        // BytesRead never exceeds Length, so an honest claim of the whole range is exactly Length.
+        if (bytesAccepted == send.Length)
         {
             send.Flags |= SendPeerClaimedAll;
         }
 
-        long credited = Math.Min(Math.Min(bytesAccepted, send.Length), send.BytesCompleted);
+        long credited = Math.Min(bytesAccepted, send.BytesCompleted);
 
         // A progress frame is cumulative; an older, torn or over-stated one never moves the count backwards.
         if (credited > send.BytesAcked)
@@ -1500,11 +1588,16 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     private void ApplyCancel(ulong transferId, QuiclyErrorCode code)
     {
         int record = FindSend(transferId);
-        if (record < 0)
+        if (record < 0 || _records[record].Phase == BulkPhase.Finished)
         {
+            // PROTOCOL.md §3.4: a BulkCancel naming no transfer this end is sending is ignored and counted. One that crossed
+            // its transfer's completion on the wire lands here as well.
+            _core.Counters.BulkCancelsIgnored++;
             return;
         }
 
+        // The peer asked for the stop, so it needs no BulkReject for a range it requested: the reset below is the answer.
+        _records[record].Flags = (byte)(_records[record].Flags & ~SendRequested);
         TerminateSend(_records[record].Local, record, BulkStatus.Canceled, code);
     }
 
@@ -1564,7 +1657,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             return;
         }
 
-        StartSend(local, dense, in descriptor, length, source, descriptor.Sha256.Span, out bool started);
+        StartSend(local, dense, in descriptor, length, source, descriptor.Sha256.Span, notice.Id, out bool started);
         if (!started)
         {
             SendBulkReject(notice.Id, QuiclyErrorCode.BulkRejected);
@@ -1754,6 +1847,9 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
 
         /// <summary>Bulk channel (requests only).</summary>
         public ushort Channel;
+
+        /// <summary>The frame came on the control stream rather than as a control datagram (progress only).</summary>
+        public bool OnStream;
 
         /// <summary>Error code (cancel and reject).</summary>
         public uint Code;

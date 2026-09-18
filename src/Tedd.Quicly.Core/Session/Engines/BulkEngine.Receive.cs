@@ -814,6 +814,14 @@ internal sealed unsafe partial class BulkEngine
         Array.Clear(_idealSendBuffer);
     }
 
+    /// <summary>
+    /// Finishes what the transport left half received and returns its staging leases. The peer frees its memory only once
+    /// the transport has reported its close and no Poll or Flush is running, so nothing else can touch a receive record now:
+    /// this is the one place a <em>disposed</em> peer can keep <see cref="IBulkSink.Finish"/>'s "exactly once per accepted
+    /// transfer" promise, because the dispose hook itself runs while the transport thread may still own these records
+    /// (<see cref="OnDisposing"/>). On the close path <see cref="OnPeerClosed"/> has finished them already and this finds
+    /// nothing left to do.
+    /// </summary>
     private void DisposeReceive()
     {
         if (_recv is not null && !_recv.IsDisposed)
@@ -821,11 +829,12 @@ internal sealed unsafe partial class BulkEngine
             for (int record = 0; record < _recv.Length; record++)
             {
                 ref BulkRecv recv = ref _recv[record];
-                if (!recv.Lease.IsEmpty)
+                if ((recv.Flags & RecvAccepted) != 0)
                 {
-                    _core.ReturnReceive(in recv.Lease);
-                    recv.Lease = BufferLease.Empty;
+                    FinishReceive(record, ref recv, BulkStatus.Disconnected, QuiclyErrorCode.NoError);
                 }
+
+                ReleaseStaging(ref recv);
             }
 
             _recv.Dispose();

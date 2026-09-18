@@ -90,10 +90,17 @@ internal sealed class PeerCounters
     public long DecodeFailures;
 
     /// <summary>
-    /// Peer <c>BulkProgress</c> frames claiming more bytes than this end handed to the transport (PROTOCOL.md §2.3,
-    /// ADR 0009): the claim is clamped to what was really sent and counted, never a close — the frame is well formed.
+    /// Peer <c>BulkProgress</c> frames claiming more bytes than this end handed to the transport (PROTOCOL.md §2.3, §3.4
+    /// control-message bounds, ADR 0009): an impossible field, so the frame is dropped whole (datagram) or closes the
+    /// connection <c>ProtocolViolation</c> (control stream). Game thread.
     /// </summary>
     public long BulkProgressOverClaims;
+
+    /// <summary>
+    /// Peer <c>BulkCancel</c> frames naming no transfer this end is sending (PROTOCOL.md §3.4: ignored and counted). A cancel
+    /// that crosses its transfer's completion lands here too. Game thread.
+    /// </summary>
+    public long BulkCancelsIgnored;
 
     /// <summary>Control messages (Ping, Pong, Hello, HelloAck, Close) the game thread could not hand to the transport.</summary>
     public long ControlSendFailures;

@@ -37,8 +37,12 @@ public readonly record struct BulkProgress(ulong TransferId, ulong BytesAccepted
 /// <param name="Length">Length of the requested range; <c>Offset + Length</c> must not exceed 2^62 − 1.</param>
 public readonly record struct BulkRequest(ulong RequestId, ushort Channel, ulong ObjectId, ulong ObjectVersion, ulong Offset, ulong Length);
 
-/// <summary>BulkCancel (type 0x14, PROTOCOL.md §3.4).</summary>
-/// <param name="TransferId">The transfer to cancel, at most 2^62 − 1.</param>
+/// <summary>
+/// BulkCancel (type 0x14, PROTOCOL.md §3.4). Receiver-to-sender only: "stop sending the transfer you are sending to me".
+/// Transfer ids are scoped per direction and the frame has no direction field, so it always names a transfer of the
+/// <em>recipient's</em> send side; a sender signals its own cancellation by resetting the transfer's stream.
+/// </summary>
+/// <param name="TransferId">The recipient's transfer to cancel, at most 2^62 − 1.</param>
 /// <param name="Code">Error code; carried as a 32-bit field, so at most <see cref="uint.MaxValue"/>.</param>
 public readonly record struct BulkCancel(ulong TransferId, QuiclyErrorCode Code);
 

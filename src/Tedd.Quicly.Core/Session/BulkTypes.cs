@@ -163,7 +163,10 @@ public sealed class BulkTransfer
 
     /// <summary>
     /// Asks for the transfer to be cancelled (any thread, idempotent): the next scheduler pass resets the transfer's
-    /// stream, sends <c>BulkCancel</c> and completes the transfer <see cref="BulkStatus.Canceled"/>.
+    /// stream with <see cref="QuiclyErrorCode.BulkCanceled"/> — the reset is what tells the receiver — and completes the
+    /// transfer <see cref="BulkStatus.Canceled"/>. No <c>BulkCancel</c> frame goes out: that frame is receiver-to-sender only
+    /// (PROTOCOL.md §3.4). A transfer answering the peer's range request whose stream does not exist yet is answered
+    /// <c>BulkReject</c> instead, since there is no stream to reset.
     /// </summary>
     public void Cancel()
     {

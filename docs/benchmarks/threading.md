@@ -233,3 +233,50 @@ between runtimes (`ConcurrentQueue` is slower and `Channel` faster on net10.0 th
   `ManualResetValueTaskSourceCore` queues the continuation to the thread pool, which allocates a work item.
   That never happens when completions are delivered on the owner thread through `Poll()`, which is the design
   in ARCHITECTURE section 3.
+
+## 6. Hot-path pass (2026-09-18): the completion table's dispose guard, and what crossing a core costs
+
+Measured on the machine above (.NET 10.0.12, Release, TieredPGO) with the paired in-process method of the
+[ADR 0007 addendum](../adr/0007-measurement-method.md): both builds in one pinned process, alternating 0.4 s windows, repeated over
+launches; *B/A* is the geometric mean of the per-launch ratios with its 95 % interval.
+
+**The dispose guard of `68035f8`.** That commit fixed a use-after-free (a wait consumed after `Dispose` returned its slot into the
+freed native free list) with a Dekker handshake: two `lock`-prefixed increments/decrements and two volatile reads per slot return.
+Tier-1 disassembly: `ReturnToFreeList` carried 3 `lock` instructions (2 `xadd`, 1 `cmpxchg`), the ring's own CAS included.
+Removing only the guard (a diagnostic ablation, same source otherwise) moved `CompletionTableRoundTripBench` complete-then-await
+from 16.5 to 14.5 ns (0.857 [0.788 .. 0.933], 4 launches) — about 2 ns per released slot — and a whole tracked send not
+measurably (`TrackedSendBench.TrackedOrdered64` 0.986 [0.951 .. 1.022], `AwaitedOrdered64` 0.971 [0.954 .. 0.988], 6 launches).
+
+**Kept: the free list on the pinned object heap.** `MpscRing<T>` gained a pinned-object-heap storage mode (one 64-byte aligned
+reference-free block that `Dispose` leaves alone), and `CompletionTable` uses it: a late return reaches the ring through the slot
+it releases, so the memory is alive for as long as such a return can happen and the return is a plain enqueue again. It is as
+fast as having no guard (micro 0.992 [0.948 .. 1.037] against the ablation; `AwaitedOrdered64` 0.971 [0.931 .. 1.013], 10 launches)
+and simpler to reason about; the cost is 16 B per slot on the pinned heap (64 KiB at 4 096 slots) released by the GC rather than
+by `Dispose`, and a capacity bounded by the largest array (2^26 slots; ADR 0008 invariant 5). The tests fault (access violation)
+against a native list freed by `Dispose` without the guard.
+
+**Crossing a core.** `CrossCoreHandoffBench` passes received 64-byte messages from a producer thread to a consumer in lockstep
+(each side's busy time timed separately; consumer on CPU 4, producer on CPU 6 = same CCD or CPU 20 = other CCD). Extra busy ns per
+message over the single-core figure:
+
+| Kernel | Batch | Single-core busy | + same CCD | + other CCD |
+|---|---|---|---|---|
+| Ring only (`Ring64`) | 10 | 8 | 10–18 | 34–55 |
+| Ring only | 100 | 4 | 3–4 | 14–15 |
+| Ring + receive lease path (`RingLease`) | 10 | 38 | 44–53 | 154–180 |
+| Ring + receive lease path | 100 | 33 | 23–27 | 82–83 |
+
+The ring itself is cheap at batch 100 (cached indices on separate lines, no false sharing); the lease path — the allocator's shard
+line and the receive-budget word written by both threads per message — is what crosses. Lockstep hands the lines over once per
+pass and understates contention: `Session/PeerReceiveHandoffBench` replays real packed containers into a peer's transport sink on
+one thread while the game thread polls, and its *Pipelined* mode (both threads at once, as in a real peer) is the one to quote.
+There, one work signal per transport callback instead of one per published message (session-layer.md §4.7) took the busy time per
+message to 0.712 [0.681 .. 0.744] of 691f20d on one CCD and 0.692 [0.665 .. 0.720] across CCDs (wall 195 → 162 and 556 → 435 ns/msg;
+3 ABBA rounds of separate processes), and the work signals from ~5 M to ~0.5 M per run.
+
+**Rejected after review: receive-lease recycling.** Letting dispatch park a received lease for the transport thread to reissue
+(no pool or budget atomics per message) cut the pipelined figures further (same CCD wall 158 → 106 ns/msg with the signal change,
+cross-CCD busy 0.53×), but parked leases can only be reclaimed by the transport thread: two adversarial reviews showed a send from
+the same private pool refused `OutOfBuffers` and a compressed reliable message lost at decode near a full budget, and on a server's
+shared pool one peer's parked blocks cannot be reclaimed by another. It was reverted; a design that returns dispatched leases in one
+chain per Poll (before any game-thread rent) is the open follow-up.

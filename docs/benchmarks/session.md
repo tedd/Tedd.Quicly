@@ -533,3 +533,99 @@ receive paths are measured too.
 * `OrderedZeroAllocationTests.Admitting_Sends_Queued_By_Another_Thread_Does_Not_Allocate_On_The_Game_Thread`: a producer thread
   queues 10 sends per cycle through `ThreadSafeSend`; the game thread's `Poll`/`Flush` admits them; windows of 200 cycles.
 * The datagram and idle paths: `DatagramZeroAllocationTests` and `SessionZeroAllocationTests` (steps 1 and 2).
+
+## Hot-path pass (2026-09-18): main before and after
+
+A pass run by the OPTIMIZE handbook's method: profile and stage-time the session, assign one specialist per area (admission,
+ordered-stream receive, datagram path, atomics and cross-thread hand-off, real-MsQuic attribution, then the server's `FlushAll`
+and the cross-core receive path), keep a mechanism only on paired evidence, review the result adversarially (three reviewers,
+ten failing tests), fix, and measure **main before (`691f20d`) against main after** on every session benchmark. The method is the
+[ADR 0007 addendum](../adr/0007-measurement-method.md): both builds loaded into one pinned process, alternating 0.4 s windows, 12
+pairs per launch, launches alternating which build is loaded first; *B/A* is the geometric mean of the per-launch ratios with its
+95 % t interval (identical builds give 0.994 [0.962 .. 1.028] over six launches). `B/A < 1` means main after is faster. Same
+machine as above; .NET 10.0.12 (10 launches) and .NET 11 preview 7 (6 launches); other sessions' builds and tests ran on the box
+at times, which the pairing absorbs but which widens the per-launch spread.
+
+### Result
+
+| Benchmark | net10.0 B/A [95 % CI] | net11.0 B/A [95 % CI] |
+|---|---|---|
+| `SessionEndToEndBench.Unreliable64Packed` | **0.894** [0.862 .. 0.928] | **0.898** [0.867 .. 0.930] |
+| `SessionEndToEndBench.Ordered64` | **0.871** [0.850 .. 0.894] | **0.855** [0.835 .. 0.876] |
+| `SessionEndToEndBench.Sequenced64Keyed` | **0.924** [0.893 .. 0.956] | — |
+| `SessionEndToEndBench.Unreliable64Loose` | **0.941** [0.922 .. 0.959] | — |
+| `SessionEndToEndBench.Ordered4K` | 0.983 [0.956 .. 1.011] (no change) | — |
+| `GroupStreamBench.Group64` | **0.848** [0.813 .. 0.884] | **0.869** [0.850 .. 0.889] |
+| `RequestResponseBench.RequestRoundTrip` | **0.864** [0.849 .. 0.880] | — |
+| `RequestResponseBench.RequestSingle` | **0.951** [0.940 .. 0.962] | — |
+| `LatestBench.Latest1000Keys` | **0.974** [0.964 .. 0.984] | — |
+| `FragmentBench.Fragment3` | 1.006 [0.988 .. 1.025] (no change) | — |
+| `BulkBench.BulkRaw` | 0.997 [0.989 .. 1.005] (no change) | — |
+| `BulkBench.BulkCompressed` | 0.998 [0.995 .. 1.002] (no change) | — |
+
+Where it moved (stage timing, `stages.<workload>`, ns per 64-byte message, mean of the per-launch medians, net10.0):
+
+| Workload | send | flush | deliver | spoll | cpoll | total | B/A [95 % CI] |
+|---|---|---|---|---|---|---|---|
+| Packed | 78.3 → 70.3 | 56.1 → 38.8 | 59.6 → 59.8 | 22.9 → 21.5 | 27.0 → 14.2 | 244 → 205 | 0.839 [0.819 .. 0.860] |
+| Keyed | 79.8 → 71.2 | 57.4 → 39.9 | 81.1 → 81.2 | 26.1 → 21.7 | 27.4 → 14.8 | 272 → 229 | 0.843 [0.832 .. 0.854] |
+| Ordered64 | 71.4 → 66.8 | 22.8 → 22.9 | 104.3 → 73.7 | 25.3 → 21.5 | 25.7 → 25.3 | 250 → 211 | 0.849 [0.829 .. 0.869] |
+
+On net11.0 `stages.Packed` is 0.845 [0.836 .. 0.855] and `stages.Ordered64` 0.839 [0.821 .. 0.857]. Nothing allocates, before or
+after (the zero-allocation tests pass on both frameworks). The plain `Sequenced64Keyed` benchmark (0.924) gains less than the
+stage-timed Keyed cycle (0.843) for the same work; both are reported, the plain benchmark is the headline.
+
+### What changed
+
+| Mechanism | Commits | Phase | Its own evidence (paired, net10.0) |
+|---|---|---|---|
+| A container's plain datagram members are completed by the packer directly (`DatagramHints.DirectCompletion`) instead of each routed through channel, engine, virtual call and fragment check | 86ef092 | cpoll | cpoll 27.3 → 16.2 ns (−40 %) in every launch; `stages.Packed` 0.955 [0.939 .. 0.970] |
+| A container entry is written in place (the fit is already checked; one 16-byte vector move for the header); Tier-1 `Append` 1 341 → 587 bytes | 911a9ce | flush | flush 56.7 → 45.7 ns; `stages.Packed` 0.952 [0.928 .. 0.977] |
+| The packer returns its members' blocks in one chain (`SlabAllocator.ReturnMany`) and releases each member's send budget when it copies it | 3cd268e, 77f465c, 549cc2c | flush | flush 47.6 → 41.4 ns; `stages.Packed` 0.962 [0.947 .. 0.976] |
+| Admission: the uncompressed `SendCopy` path inlined into the engines' `Admit` (one lease address lookup), `SendEntryTable.TryAllocate` inlined, the stream engines' notice ring checked inline | 9f6c058, 944ec1a, c0b8a80 | send | send −10 % Packed, −6 % Ordered64, −12 % Keyed; `Unreliable64Packed` 0.960 [0.947 .. 0.973], `Ordered64` 0.969 [0.965 .. 0.973] |
+| A stream message whose payload lies wholly in the segment is **one** engine event (`StreamMessagePhase.Whole`) for the ordered and group engines instead of Start, Chunk, End | 3c57427 | deliver | deliver −31 %; `Ordered64` 0.883 [0.858 .. 0.909], `Group64` 0.894 [0.872 .. 0.916], `RequestRoundTrip` 0.874 [0.821 .. 0.931]; `Ordered4K` and `BulkRaw` unchanged |
+| One work signal per transport callback instead of one per published message (`PeerCore.Begin/EndTransportCallback`, `NoteTransportWork`) | 2536ce3, c2e7c2c, 9a79b72 | two threads | invisible single-core (no signal configured); `PeerReceiveHandoffBench` *Pipelined* busy 0.712 [0.681 .. 0.744] same CCD, 0.692 [0.665 .. 0.720] across CCDs (docs/benchmarks/threading.md §6) |
+| The `CompletionTable` free list on the pinned object heap (no Dekker guard on dispose) | b480f19, b8db68e, d0f821d | tracked sends | ~2 ns per released slot; a whole tracked send within noise (threading.md §6) |
+| `QuiclyServer.FlushAll` skips peers whose Flush would do nothing | c4dbefe, aa73c6a, f9bf52f | server tick | real MsQuic loopback, 60 Hz, 1 000 idle peers: ~1.0–1.5 → ~0.3–0.4 µs per peer per tick (session-layer.md §4.7) |
+
+`StreamReceiveLoopBench` (the ADR 0007 loop above) gained a V2 (the whole-message event), with V1 archived as
+`benchmarks/Tedd.Quicly.Archive/Session/StreamReceiveLoopV1.cs`: 33.9 / 28.0 / 21.7 ns per message for V0 / V1 / V2 out of process
+(ShortRun, so V1 and V2 are within noise of each other): the loop's parser share is small, and the end-to-end gain comes from the
+engine-side per-event work.
+
+A correctness fix came out of the pass as well: `QuiclyServer.ActivatePending` marks every slot it activates (e827203). A work
+bit taken before the peer was queued was lost, so such a peer was polled only at its admission deadline and its client timed out
+in connection storms. It is a defect of the unchanged code, not of this pass.
+
+### Tried and not kept
+
+* **Receive-lease recycling** (dispatch parks a lease for the transport thread to reissue): the largest two-thread gain
+  (cross-CCD busy 0.53×), reverted after review because parked leases starve game-thread rents (sends refused `OutOfBuffers`, a
+  compressed reliable message lost at decode). threading.md §6.
+* **Reading a whole frame without the parser's state machine**: `Ordered64` deliver 0.898, but `Ordered4K` deliver +4–6 % with the
+  cause not found; rejected.
+* **Filling the stream event context once per callback**: no measurable effect once the whole-message event existed (0.9999).
+* **Sizing a datagram header exactly only near the limit**: no effect (PGO had already inlined the sizing).
+* **A game-thread block magazine in the allocator**: at most 2 % available, protocol cost too high (memory.md).
+* **"Read the work flag before exchanging"**: rejected without measuring; a plain read can pass the ring store and lose a wake-up.
+
+### What a real peer gets out of it
+
+The figures above are single-core simulator figures (both peers on one thread). A profile over **real MsQuic loopback** (two
+processes, per-thread cycle counts; the harness is not in the repo) put QUICLY at 20–30 % of the machine's CPU per 64-byte message
+and MsQuic plus the kernel at 70–80 %: a 15 % cheaper QUICLY is a few percent of machine CPU per message, and a connection's
+message rate is limited by the sender's MsQuic worker, not by QUICLY. Where it counts is the **game thread**: QUICLY is 82–95 % of
+the sender game thread's networking time (186–295 ns per message), and at 60 Hz with 1 000 peers the game thread spent 9.4–9.6 ms
+of the 16.7 ms tick on networking before the pass, about half of it QUICLY and about 1 ms of it `FlushAll` over idle peers.
+Placement matters more than any of this: a game thread on the other CCD from the MsQuic workers costs ~50 % more QUICLY time than
+one on the same CCD.
+
+### Hand-over items of the C2 wave
+
+* The `CompletionTable` dispose guard of 68035f8 costs ~2 ns per released slot and nothing measurable per tracked send; the
+  pinned free list above replaced it.
+* The rings' `TryDequeue` contract (`out` undefined on false, ADR 0008 invariant 5) is unchanged.
+* Bulk on a quiet machine (load 10–14 %, `InProcessMeasuredConfig`, net10.0, main 691f20d): `BulkRaw` 950.6 µs/MiB out of process
+  (±9.7 µs, ≈ 1 103 MB/s) and 988.9 in process (≈ 1 060 MB/s); `BulkCompressed` 1 135.2 / 1 153.0 µs/MiB (≈ 924 / 909 MB/s). That is
+  10–30 % above the Bulk section's figures, which were taken at up to 73 % machine load: the difference is the machine, not the code.
+  The pass left both unchanged (table above).

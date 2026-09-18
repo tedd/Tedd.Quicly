@@ -225,7 +225,11 @@ is back in `Filling` and still owned by the caller.
     parser is restored from a `StreamFrameParser.Mark` taken before the event, a whole copy on bulk streams; the call returns `PendingAfter(bytes before the event)`, the stream id goes to
     `PendedStreams` and Poll calls `ResumeStreamReceive(id, 0)`), `ResetStream(code)` or `CloseConnection(code)`.
     The context (`Chunk`, `Header`, `Bulk` and the `Cookie` ref) is valid only during the call (the peer declares it `scoped`);
-    copy what you keep.
+    copy what you keep. An engine that sets `ChannelEngine.AcceptsWholeMessages` (the ordered and group engines) gets a message
+    whose payload lies wholly in the current segment as **one** `Whole` event instead of `Start`, `Chunk`, `End`
+    (`StreamFrameParser.TryTakeWholePayload` right after the header): the same size check, reservation-then-lease order and ring
+    entry as the three events, and a `Pend` rewinds to the mark taken before the header, so the whole message is un-read. The
+    ReliableLatest and bulk engines keep the three-event path (docs/benchmarks/session.md, "Hot-path pass").
   * A parser error or a FIN inside a message: ordered stream ⇒ connection `ProtocolViolation`; group/bulk ⇒ reset `ProtocolViolation`.
     The owning engine gets `OnStreamClosed` **exactly once per stream**, peer-opened or locally opened (reset by either side,
     error, or shutdown complete); events of locally opened streams (peer STOP_SENDING, shutdown complete) are broadcast to every
@@ -340,7 +344,13 @@ is back in `Filling` and still owned by the caller.
   game thread by `SetState` (a queued `StateChanged` is work, which covers `Close` and `CompleteAdmission` without a hook of their
   own), `QueueLocalCompletion` and a send queued by another thread. Allocation-free — two field reads when no signal is configured —
   and a host exception is wrapped like a transport callback fault (counted, kept in `LastCallbackFault`, turned into a queued
-  `InternalError` close), so it never reaches the transport.
+  `InternalError` close), so it never reaches the transport. **Inside a transport callback the signal is raised once per
+  callback, not once per publication**: the sink's receive and completion callbacks are wrapped in
+  `PeerCore.BeginTransportCallback`/`EndTransportCallback` (nesting counted, `End` in a `finally`), transport-thread publications
+  call `NoteTransportWork`, which only sets a pending flag while a callback is open, and `EndTransportCallback` makes the one
+  `NoteWork` after the last publication. Every publication still precedes the exchange, so the game thread's re-arm-then-probe
+  handshake is unchanged; a plain-read "exchange only when clear" shortcut was rejected because the read could pass the ring store
+  (x86 store-load reordering) and lose a wake-up. Outside a callback `NoteTransportWork` is `NoteWork`.
 * **`HasPendingWork`** answers whether anything is really waiting: the signal word, the completion ring and the local completions,
   the receive ring, the per-channel drain queues and the held entry, the mailbox dirty bitsets (`Mailboxes.HasDirty`),
   `PendedStreams`, the pong and stream-ping rings, the `ThreadSafeSend` front, a state transition that has not been raised, and a due
@@ -352,6 +362,22 @@ is back in `Filling` and still owned by the caller.
   the send cap's refill time), and is `long.MaxValue` unless the session is `Connected`. `NextDeadline`/`NextDeadlineMicros` stay the
   minimum of both, so a host with one loop is unaffected; a host that polls on network wake-ups and flushes on its own tick sleeps
   the polling loop on the poll deadline and brings a flush forward to the flush deadline, because `Poll` does not run the scheduler.
+* **Flush gate (`QuiclyServer.FlushAll`).** A Flush of an idle peer costs about a microsecond of cache misses at 60 Hz, so the
+  server asks each peer first (`QuiclyPeer.CanSkipFlush`, internal, `QuiclyPeer.FlushGate.cs`). Every Flush records whether its
+  scheduler pass left every engine empty and the admission stamp it saw; the peer is skipped only when since then nothing was
+  admitted, no completion reached an engine outside a Flush, no local completion, send from another thread, `SendAsync`/`FlushAsync`
+  waiter, queued transition, due deadline, ReliableLatest ack/reject/notice (`ReliableLatestEngine.HasUnsentControl`) or canceled
+  request (`ReliableOrderedEngine.HasCanceledRequests`) is pending, the caller is the game thread already, and a fragmenting
+  table's RTT has not moved. A peer whose only pending item is the completion ring gets it drained first (its own ping traffic
+  touches no engine) and is asked again. A skipped peer still records the tick, the pass clock and the ping clock's slew — the only
+  things an empty Flush changes. The gate is off for tables with a Bulk channel and when `StreamIdleTimeout` is under twice the
+  `PingInterval`. A send returned before `FlushAll` is transmitted by that call; a send racing it from another thread goes out in
+  this call or the next, as with an unconditional Flush. On real MsQuic loopback with 1 000 idle peers `FlushAll` fell from
+  ~1.0–1.5 µs to ~0.3–0.4 µs per peer per tick.
+* **Activation marks the slot.** `QuiclyServer.ActivatePending` marks every slot it activates: a `PollAll` that read the activation
+  count just before the listener queued a peer, then took the slot's work bit, found an empty slot and dropped the bit — and the
+  peer's work signal fires only once until its first Poll, so it was then polled only at its admission deadline, after the client's
+  own admission timeout (seen as connection-storm timeouts).
 * **`IsDisposed`** lets a host skip a peer it disposed from inside a handler without catching `ObjectDisposedException`.
 * **A throwing `StateChanged` handler** cannot stall the state machine: `RaiseTransitions` takes a transition out of the queue
   *before* invoking the handlers, so the same change can never be raised again by the next `Poll`; the exception is counted as

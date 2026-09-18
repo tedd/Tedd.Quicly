@@ -229,7 +229,12 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     /// <inheritdoc/>
     public override SendStatus Admit(ref SendRequest request)
     {
-        DrainNotices();
+        // The notice ring is almost always empty: check it inline and call the drain only when a notice is waiting.
+        if (!_notices.IsEmpty)
+        {
+            DrainNotices();
+        }
+
         ChannelDefinition channel = request.Channel;
         int dense = request.ChannelIndex;
         int local = _localOf[dense];

@@ -121,26 +121,41 @@ public class BulkLimitTests
 
     /// <summary>
     /// The receiving end's counterpart under the same loss (PROTOCOL.md §3.4: <c>BulkCancel</c> is receiver-to-sender, and
-    /// it travels on the control stream, so loss delays it but never drops it).
+    /// it travels on the control stream, so loss delays it but never drops it). The object carries a whole-object hash that
+    /// the receiver was hashing as it arrived, so this also covers a hashed transfer that ends without completing: the hash
+    /// is reset rather than compared, because a cancelled transfer has nothing to verify (PROTOCOL.md §3.3).
     /// </summary>
     [Fact]
     public async Task A_Receivers_Cancel_Racing_Loss_Stops_The_Sender()
     {
-        AcceptRouter router = AcceptRouter.Pattern();
+        byte[] payload = Compressible(512 * Kib);
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
         using SessionHarness h = new(
             link: Hostile(),
             table: BulkTables.Main,
             client: BulkKit.Quiet,
             server: BulkKit.Receiver(router));
 
-        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, 4 * Mib), new PatternSource(4 * Mib));
-        Assert.True(h.RunUntil(() => router.Accepted.Count == 1 && router.Sink<PatternSink>().BytesWritten > 0, 30_000_000), "nothing arrived");
+        BulkDescriptor descriptor = new(5, 1, 1, payload.Length)
+        {
+            Sha256 = BulkKit.Hash(payload),
+        };
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(descriptor, new MemorySource(payload));
+        Assert.True(
+            h.RunUntil(() => router.Accepted.Count == 1 && router.Sink<MemorySink>().BytesWritten > 0, 30_000_000),
+            "nothing arrived");
+        Assert.True(router.Accepted[0].HasHash && router.Accepted[0].IsWholeObject, "the receiver was not hashing the object");
 
         Assert.True(h.Server!.CancelBulk(5, router.Accepted[0].TransferId));
         Assert.True(h.RunUntil(() => transfer.IsFinished, 30_000_000), "the sender was never told");
 
         Assert.Equal(BulkStatus.Canceled, transfer.Status);
-        Assert.Equal(BulkStatus.Canceled, router.Sink<PatternSink>().Result!.Value.Status);
+        MemorySink sink = router.Sink<MemorySink>();
+        Assert.True(h.RunUntil(() => sink.IsFinished, 30_000_000), "the receiver never finished");
+        Assert.Equal(BulkStatus.Canceled, sink.Result!.Value.Status);
+
+        // Nothing to verify: a transfer that did not complete reports no verdict on the sender's hash.
+        Assert.Equal(BulkHashState.None, sink.Result!.Value.Hash);
         Assert.Equal(PeerState.Connected, h.Client.State);
         Assert.Equal(PeerState.Connected, h.Server!.State);
     }
@@ -230,7 +245,8 @@ public class BulkLimitTests
         byte[] payload = Compressible(256 * Kib);
         AcceptRouter router = AcceptRouter.Memory(payload.Length);
         using SessionHarness h = new(
-            link: new LinkOptions { DelayMicros = 5_000, BandwidthBitsPerSecond = 16_000_000 },
+            // Delay only, so the window really is the configured 256 KiB and the *budget* is what refuses the second piece.
+            link: new LinkOptions { DelayMicros = 5_000 },
             table: BulkTables.Main,
             client: o =>
             {
@@ -514,6 +530,142 @@ public class BulkLimitTests
 
         Assert.True(wait.IsCompleted, "the wait on a tracked send outlived the peer that was disposed");
         Assert.Equal(DeliveryStatus.Disconnected, await wait);
+    }
+
+    /// <summary>
+    /// The <em>synchronous</em> stream-limit refusal (docs/design/session-layer.md §7.7): the open succeeded and the send
+    /// that carries <see cref="TransportSendFlags.Start"/> came back <see cref="TransportStatus.StreamLimitReached"/>, so
+    /// nothing reached the peer. The transfer must park on the current stream-credit generation — spinning on a limit the
+    /// peer has not raised would burn every pass — and go out on a new stream when credit arrives.
+    /// </summary>
+    [Fact]
+    public async Task A_Start_Send_The_Stream_Limit_Refuses_Waits_For_Credit()
+    {
+        byte[] payload = Compressible(128 * Kib);
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
+        BulkRefusalConnector? connector = null;
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 1_000 },
+            table: BulkTables.Main,
+            client: BulkKit.Quiet,
+            server: BulkKit.Receiver(router),
+            connector: inner => connector = new BulkRefusalConnector(inner));
+
+        connector!.Transport!.FailStarts = 1;
+        connector.Transport!.StartStatus = TransportStatus.StreamLimitReached;
+
+        BulkEngine engine = BulkKit.Engine(h.Client);
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, payload.Length), new MemorySource(payload));
+        Assert.True(h.RunUntil(() => engine.StreamsRefused > 0, 30_000_000), "the refused start was never counted");
+        Assert.Equal(1, connector.Transport!.FailedStarts);
+        Assert.False(transfer.IsFinished);
+
+        // The peer raises its limit: the transfer opens a *new* stream and starts over from its last completed byte.
+        connector.Transport!.GrantCredit();
+        Assert.True(h.RunUntil(() => transfer.IsFinished, 30_000_000), "the transfer never went out on a new stream");
+
+        Assert.Equal(BulkStatus.Completed, transfer.Status);
+        Assert.Equal(payload, router.Sink<MemorySink>().Bytes);
+        Assert.Equal(PeerState.Connected, h.Client.State);
+    }
+
+    /// <summary>
+    /// The other order of the two halves of <c>Delivered</c> (PROTOCOL.md §4.3): the peer's confirmation of the whole range
+    /// arrives <em>before</em> this end has seen its own last send complete. Both are triggered by the same round trip, so
+    /// either may land first, and the transfer must complete on whichever is last — here the completion — rather than
+    /// waiting for a progress frame the peer has already sent and will never repeat.
+    /// </summary>
+    [Fact]
+    public async Task A_Progress_Frame_That_Beats_The_Last_Completion_Still_Completes_The_Transfer()
+    {
+        byte[] payload = Compressible(32 * Kib);
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 50_000 },
+            table: BulkTables.Main,
+            client: BulkKit.Quiet,
+            server: BulkKit.Receiver(router));
+
+        BulkEngine engine = BulkKit.Engine(h.Client);
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, payload.Length), new MemorySource(payload));
+
+        // One pass puts the whole object on the wire with FIN; its completion is a round trip away.
+        h.Client.Flush();
+        Assert.True(engine.OnControl(ControlType.BulkProgress, Progress(transfer.TransferId, (ulong)payload.Length), onStream: false, 0));
+        h.Client.Flush();
+
+        // The claim covers only bytes that really went to the transport, so it is honest — and it alone delivers nothing.
+        Assert.Equal(0, engine.ProgressOverClaims);
+        Assert.Equal(BulkStatus.Running, transfer.Status);
+
+        Assert.True(h.RunUntil(() => transfer.IsFinished, 30_000_000), "the completion did not finish the confirmed transfer");
+        Assert.Equal(BulkStatus.Completed, transfer.Status);
+        Assert.Equal(payload.Length, transfer.BytesTransferred);
+    }
+
+    /// <summary>
+    /// PROTOCOL.md §3.4 and §7: a request is served only if the provider hands back a descriptor that fits what was asked
+    /// on the channel it was asked on. A provider that answers with another channel's descriptor is refused
+    /// <c>BulkReject</c> like any other bad answer, rather than starting a transfer on a channel the peer never named.
+    /// </summary>
+    [Fact]
+    public void A_Provider_That_Answers_With_The_Wrong_Descriptor_Is_Rejected()
+    {
+        AcceptRouter router = AcceptRouter.Memory(1024);
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 1_000 },
+            table: BulkTables.Main,
+            client: BulkKit.Receiver(router),
+            server: o =>
+            {
+                BulkKit.Quiet(o);
+                o.BulkAuthorizer = new AllowAll();
+                o.BulkProvider = new WrongChannelProvider();
+            });
+
+        h.Client.RequestBulk(new BulkRangeRequest(5, 1, 1, 0, 1024));
+        Assert.True(h.RunUntil(() => router.Rejections.Count > 0), "the mismatched descriptor was not refused");
+
+        Assert.Equal(QuiclyErrorCode.BulkRejected, router.Rejections[0].Code);
+        Assert.Empty(router.Accepted);
+        Assert.Equal(PeerState.Connected, h.Server!.State);
+    }
+
+    /// <summary>
+    /// <c>OnIdealSendBufferSize</c> is broadcast to every engine for every local stream, so it must ignore what it does not
+    /// own: an id belonging to another engine's stream finds no match, and an <em>invalid</em> id is refused before the
+    /// match is even attempted, because a cleared slot of this engine's own stream table holds exactly that and would
+    /// otherwise match record zero and write a window onto an unrelated transfer.
+    /// </summary>
+    [Fact]
+    public void An_Ideal_Send_Buffer_Notice_This_Engine_Does_Not_Own_Changes_Nothing()
+    {
+        AcceptRouter router = new(_ => new CountingSink());
+        using ServerHarness h = new(link: new LinkOptions { DelayMicros = 1_000 }, table: BulkTables.Main, server: BulkKit.Receiver(router));
+        Assert.True(h.Admit(), "the raw client was not admitted");
+
+        BulkHeader header = new() { TransferId = 1, ObjectId = 1, ObjectVersion = 1, TotalLength = 64, Offset = 0, Length = 64 };
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(BulkKit.BulkStream(5, in header, new byte[64]), out TransportStreamId peerStream, fin: true));
+        Assert.True(h.RunUntil(() => router.Accepted.Count == 1), "the transfer was not accepted");
+
+        BulkEngine engine = BulkKit.Engine(h.Server!);
+        engine.OnIdealSendBufferSize(peerStream, 64 * Kib);
+        engine.OnIdealSendBufferSize(TransportStreamId.None, 64 * Kib);
+
+        Assert.Equal(BulkStatus.Completed, ((CountingSink)router.Sinks[0]).Result!.Value.Status);
+        Assert.Equal(PeerState.Connected, h.Server!.State);
+    }
+
+    /// <summary>A provider that answers a request with a descriptor for another channel than the one asked on.</summary>
+    private sealed class WrongChannelProvider : IBulkProvider
+    {
+        public bool TryGetObject(in BulkRequestInfo request, out BulkDescriptor descriptor, out IBulkSource? source)
+        {
+            // Channel 6 is a Bulk channel of the table, but not the channel the peer asked on.
+            descriptor = new BulkDescriptor(6, request.ObjectId, request.ObjectVersion, 1024, 0, 1024);
+            source = new MemorySource(new byte[1024]);
+            return true;
+        }
     }
 
     /// <summary>A bulk stream of one chunked body: the §3.3 header, then one chunk header and <paramref name="bodyBytes"/> of it.</summary>

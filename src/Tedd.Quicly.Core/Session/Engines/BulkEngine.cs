@@ -791,15 +791,14 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     /// </summary>
     private void ReadTransport()
     {
+        // A transport that is gone reports nothing, which leaves both at zero: no window to share and no rate to derive.
         ITransport? transport = _core.Transport;
-        if (transport is null || _core.IsTransportClosed)
+        TransportStatistics statistics = default;
+        if (transport is not null && !_core.IsTransportClosed)
         {
-            _cwnd = 0;
-            _rttMicros = 0;
-            return;
+            transport.GetStatistics(out statistics);
         }
 
-        transport.GetStatistics(out TransportStatistics statistics);
         _cwnd = statistics.CongestionWindowBytes;
         _rttMicros = statistics.RttMicros;
     }

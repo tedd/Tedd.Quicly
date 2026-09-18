@@ -715,6 +715,64 @@ public unsafe class SlabAllocatorTests
         Assert.Equal(0, allocator.GetStatistics().TotalRentedBytes);
     }
 
+    [Fact]
+    public void ReturnMany_Returns_Every_Run_And_Keeps_The_Free_List_LIFO()
+    {
+        using var allocator = new SlabAllocator(new SlabAllocatorOptions
+        {
+            FreeListShards = 1,
+            SizeClasses = [new(64, 8), new(256, 4)],
+            ValidateLeases = true,
+        });
+        var leases = new BufferLease[7];
+        for (int i = 0; i < leases.Length; i++)
+        {
+            // Classes 0, 0, 1, 0, 0, 1, 1: four runs.
+            Assert.True(allocator.TryRent(i is 2 or 5 or 6 ? 100 : 10, out leases[i]));
+        }
+
+        Assert.Equal(4, allocator.GetClassStatistics(0).Rented);
+        Assert.Equal(3, allocator.GetClassStatistics(1).Rented);
+        allocator.ReturnMany(leases);
+        Assert.Equal(0, allocator.GetStatistics().TotalRentedBytes);
+
+        // The last run pushed is on top, in the order given: 64-byte blocks 3, 4, then 0, 1.
+        Assert.True(allocator.TryRent(10, out BufferLease a));
+        Assert.True(allocator.TryRent(10, out BufferLease b));
+        Assert.True(allocator.TryRent(10, out BufferLease c));
+        Assert.True(allocator.TryRent(10, out BufferLease d));
+        Assert.Equal([leases[3].BlockIndex, leases[4].BlockIndex, leases[0].BlockIndex, leases[1].BlockIndex], new[] { a.BlockIndex, b.BlockIndex, c.BlockIndex, d.BlockIndex });
+
+        // Every block of both classes can still be rented exactly once.
+        var more = new List<BufferLease> { a, b, c, d };
+        while (allocator.TryRent(10, out BufferLease x))
+            more.Add(x);
+        while (allocator.TryRent(100, out BufferLease y))
+            more.Add(y);
+        Assert.Equal(12, more.Count);
+        Assert.Equal(12, more.Select(l => (l.ClassIndex, l.BlockIndex)).Distinct().Count());
+        allocator.ReturnMany(more.ToArray());
+        Assert.Equal(0, allocator.GetStatistics().TotalRentedBytes);
+    }
+
+    [Fact]
+    public void ReturnMany_Detects_Stale_And_Duplicate_Leases_When_Validating()
+    {
+        using var allocator = new SlabAllocator(SmallOptions());
+        Assert.True(allocator.TryRent(10, out BufferLease a));
+        Assert.True(allocator.TryRent(10, out BufferLease b));
+        Assert.Throws<InvalidOperationException>(() => allocator.ReturnMany([a, b, a]));
+
+        using var other = new SlabAllocator(new SlabAllocatorOptions { FreeListShards = 1, SizeClasses = [new(64, 8)], ValidateLeases = true });
+        Assert.True(other.TryRent(10, out BufferLease c));
+        other.Return(c);
+        Assert.True(other.TryRent(10, out BufferLease c2));
+        Assert.Equal(c.BlockIndex, c2.BlockIndex);
+        Assert.Throws<InvalidOperationException>(() => other.ReturnMany([c]));
+        other.ReturnMany([c2]);
+        Assert.Equal(0, other.GetStatistics().TotalRentedBytes);
+    }
+
     private static BufferLease Forge(int classIndex, ushort generation, int blockIndex, int offset, int length, int shard = 0)
     {
         // Same layout as BufferLease: class (1) + shard (1) + generation (2) + block (4) + offset (4) + length (4).

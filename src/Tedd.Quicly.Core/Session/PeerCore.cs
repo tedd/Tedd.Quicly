@@ -844,6 +844,36 @@ internal sealed unsafe class PeerCore : IDisposable
     }
 
     /// <summary>
+    /// Returns several send leases at once (the threads of <see cref="TryRentSend"/>): one budget update and one pool push
+    /// per run of blocks of one class (<see cref="SlabAllocator.ReturnMany"/>). No lease may be empty.
+    /// </summary>
+    /// <param name="leases">The leases.</param>
+    public void ReturnSendMany(ReadOnlySpan<BufferLease> leases)
+    {
+        if (leases.IsEmpty)
+        {
+            return;
+        }
+
+        long bytes = 0;
+        foreach (ref readonly BufferLease lease in leases)
+        {
+            bytes += lease.Length;
+        }
+
+        if (_atomicSendBudget)
+        {
+            Interlocked.Add(ref _sendBytes, -bytes);
+        }
+        else
+        {
+            _sendBytes -= bytes;
+        }
+
+        _allocator.ReturnMany(leases);
+    }
+
+    /// <summary>
     /// Rents a receive lease of at least <paramref name="length"/> bytes within the receive budget (transport thread only:
     /// it is the consumer of the recycle ring; the game thread uses <see cref="TryRentReceiveFromPool"/>). The caller counts
     /// a failure (<see cref="PeerCounters.OutOfReceiveBuffers"/>).
@@ -1658,6 +1688,7 @@ internal sealed unsafe class PeerCore : IDisposable
 
         // Neither thread runs any more, so the recycle ring can be drained from here (its consumer's role).
         DrainRecycled();
+        Packer.ReturnCopied();
         for (int slot = 0; slot < Entries.Capacity; slot++)
         {
             if (Entries.GetState(slot) != SendEntryState.Free)

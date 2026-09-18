@@ -230,4 +230,62 @@ public class WorkSignalTests
         Assert.True(received > 1_000);
         Assert.True(serverSignal.Calls > 1_000);
     }
+
+    [Fact]
+    public void Work_Published_Inside_A_Transport_Callback_Signals_Once_When_The_Outermost_Callback_Ends()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        using SessionHarness h = NewPair(clientSignal, serverSignal);
+        h.Server!.Poll();
+        serverSignal.Take();
+        PeerCore core = h.Server.Core;
+
+        core.BeginTransportCallback();
+        core.BeginTransportCallback(); // a callback MsQuic delivered re-entrantly
+        core.NoteTransportWork();
+        core.NoteTransportWork();
+        core.EndTransportCallback();
+        Assert.Equal(0, serverSignal.Calls);
+        core.EndTransportCallback();
+        Assert.Equal(1, serverSignal.Calls);
+
+        // Outside a callback it is NoteWork itself: set-once until the next Poll.
+        core.NoteTransportWork();
+        Assert.Equal(1, serverSignal.Calls);
+        h.Server.Poll();
+        core.NoteTransportWork();
+        Assert.Equal(2, serverSignal.Calls);
+
+        // A callback that published nothing tells the host nothing.
+        h.Server.Poll();
+        core.BeginTransportCallback();
+        core.EndTransportCallback();
+        Assert.Equal(2, serverSignal.Calls);
+    }
+
+    [Fact]
+    public void A_Container_Of_Messages_Signals_Once_Before_Its_Receive_Callback_Returns()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        using SessionHarness h = NewPair(clientSignal, serverSignal);
+        int received = 0;
+        h.Server!.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
+        h.Client.Poll();
+        h.Server.Poll();
+        serverSignal.Take();
+        for (int i = 0; i < 30; i++)
+        {
+            h.Client.SendCopy(new SendHeader(2), new byte[40]);
+        }
+
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        Assert.Equal(1, serverSignal.Calls);
+        Assert.True(h.Server.HasPendingWork);
+        h.Server.Poll();
+        Assert.Equal(30, received);
+        Assert.False(h.Server.HasPendingWork);
+    }
 }

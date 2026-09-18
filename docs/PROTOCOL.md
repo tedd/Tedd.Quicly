@@ -245,6 +245,11 @@ a cancelled transfer through that stream's single close notice, and which is als
 abandons a *peer-requested* transfer before any stream exists answers `BulkReject` (0x15) instead. A `BulkCancel` naming a
 transfer the recipient is not sending is ignored and counted.
 
+A `BulkRequest` is answered either by `BulkReject` carrying its `requestId`, or by a bulk stream on the named channel whose
+`ObjectId`, `ObjectVersion` and `Offset` are the request's. The bulk header carries no request id, so the requester matches
+the answer on those fields; the server MAY shorten `Length`, never move `Offset`, and the requester then asks again for the
+rest.
+
 `flags` bit0 = request the channel table in the ack. `caps` bit0 = datagrams supported, bit1 = datagram
 send-state (transport loss/ack) available, bit2 = LZ4. Datagrams are **required**: if either side lacks
 them and the table contains any channel of mode 0, 1 or 4 the server rejects with status 7.
@@ -284,6 +289,10 @@ Control-message bounds (clarifications; they apply to both endpoints, and a viol
   `LatestReject.reason` values other than 1–4 are malformed.
 * BulkRequest: `offset + length` MUST NOT exceed 2^62−1 (range semantics such as `length > 0` belong to the bulk
   engine). `code` fields (Close, BulkCancel, BulkReject) accept any u32.
+* BulkProgress: `bytesAccepted` MUST NOT exceed the bytes of that transfer the recipient has handed to its transport — a
+  peer cannot have accepted bytes that were never sent, so a larger value is malformed (and it confirms nothing: a transfer
+  is `Delivered` only once the recipient's own sends of it have completed as well, §4.3). A `BulkProgress` naming a
+  transfer the recipient is not sending — typically a late frame for one that already finished — is ignored.
 * Types 0x10–0x17 inside a control datagram, and undefined types (0x00, 0x06–0x0F, 0x18–0xFF) anywhere, are
   malformed. Channel 0 written as a non-minimal varint (`0x40 0x00`) is malformed, not another channel.
 * Before logging a peer-supplied `reason` or channel name, invalid UTF-8 sequences and every character of
@@ -529,3 +538,8 @@ Byte-exact examples are in [protocol-vectors.md](protocol-vectors.md).
   the decoded sizes of all chunks sum to exactly `Length`. Bytes after the body are malformed. The session cap
   `HelloAck.maxMessageSize` bounds message frames only (datagram messages, ordered and group stream frames); it does
   not apply to Bulk transfers, whose `Length` is bounded by the Bulk channel's own `MaxMessageSize` alone.
+* **§3.3 transfer ids.** A receiver enforces the uniqueness of `TransferId` per (peer, direction) over every transfer it
+  still holds state for — one that is running, and one that has finished but whose final `BulkProgress` has not gone out
+  yet. Beyond that it MAY accept an id again within the epoch: remembering every id an epoch has seen would be unbounded
+  state that the peer controls. A sender never reuses an id within an epoch (the reference implementation numbers its
+  transfers upward from 1), so a reuse can only confuse the peer that made it.

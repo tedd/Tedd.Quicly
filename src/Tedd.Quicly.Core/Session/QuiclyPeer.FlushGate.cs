@@ -24,6 +24,7 @@ public sealed unsafe partial class QuiclyPeer
 {
     private FlushGate _gate;
     private ReliableLatestEngine? _gateLatest;
+    private ReliableOrderedEngine? _gateOrdered;
 
     /// <summary>
     /// Turns the flush gate on (host, game thread, once; the server when it activates the peer). From then on every
@@ -52,6 +53,12 @@ public sealed unsafe partial class QuiclyPeer
             {
                 _gateLatest = latest;
             }
+            else if (engines[i] is ReliableOrderedEngine ordered)
+            {
+                // A canceled request keeps its slot until a pass sweeps it (RunPollDeadlines); the cancel itself is invisible
+                // to every other level.
+                _gateOrdered = ordered;
+            }
         }
 
         foreach (ChannelDefinition channel in _core.Table.All)
@@ -71,7 +78,7 @@ public sealed unsafe partial class QuiclyPeer
     /// <see cref="SendAsync"/>/<see cref="FlushAsync"/> is pending, no deadline (<see cref="NextDeadlineMicros"/>: timers
     /// and engine work) is due, the session is still Connected with no transition queued, the calling thread is the game
     /// thread already (<see cref="PeerOptions.ThreadSafeSend"/> records it in Flush), no ack, reject or notice the transport
-    /// thread left for a ReliableLatest pass is waiting, the RTT a fragmenting channel's reassembly window follows has not
+    /// thread left for a ReliableLatest pass is waiting, no canceled request waits for the pass that frees its slot, the RTT a fragmenting channel's reassembly window follows has not
     /// moved, and the transport's completion ring is empty. When the ring is the only thing waiting the answer is
     /// <see cref="FlushGateDecision.Drain"/>: most completions of an idle peer are its own control traffic (pings), which
     /// touch no engine.
@@ -96,6 +103,7 @@ public sealed unsafe partial class QuiclyPeer
             || _sendWaiters.Count != 0
             || _flushWaiters.Count != 0
             || (_gateLatest is not null && _gateLatest.HasUnsentControl)
+            || (_gateOrdered is not null && _gateOrdered.HasCanceledRequests)
             || (_gate.RttMatters && _ping.SmoothedRtt != _gate.Rtt))
         {
             return FlushGateDecision.Flush;

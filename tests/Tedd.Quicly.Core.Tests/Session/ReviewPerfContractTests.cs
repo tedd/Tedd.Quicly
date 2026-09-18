@@ -127,4 +127,47 @@ public class ReviewPerfContractTests
             Assert.True(result.IsAdmitted, $"send {i} of 8: {result.Status}");
         }
     }
+
+    /// <summary>
+    /// <see cref="PeerOptions.SendBudgetBytes"/> bounds the send leases the peer holds. A datagram packed into a container
+    /// is copied into the container's lease, and its own lease is no longer needed from that moment; the packer's contract
+    /// (<c>PackedPayloadReturnTests</c>: "the send budget and the pool must look exactly as if each had been returned when
+    /// it was copied") says so too. Since 3cd268e the member leases go back only when the container closes, and a Bulk
+    /// channel rents its piece's lease <em>before</em> it closes the open container (<c>SubmitPiece</c> →
+    /// <c>SubmitPending</c>). With a send budget that fits the container and the piece but not also the copied-away member
+    /// leases, the pass that carries both sends no bulk piece.
+    /// </summary>
+    [Fact]
+    public async Task A_Bulk_Piece_Fits_The_Send_Budget_Next_To_A_Container_Of_Datagrams_Sent_In_The_Same_Pass()
+    {
+        // Budget: one container (1 536) + one 4 KiB bulk piece + 320 bytes. Ten 60-byte datagrams hold 640 bytes until
+        // they are copied into the container.
+        AcceptRouter router = AcceptRouter.Pattern();
+        using SessionHarness h = new(
+            table: BulkTables.Main,
+            client: o =>
+            {
+                BulkKit.Quiet(o);
+                o.SendBudgetBytes = 1536 + 4096 + 320;
+                o.BulkChunkBytes = 4096;
+            },
+            server: BulkKit.Receiver(router));
+        h.Run(20_000);
+        Assert.Equal(0, DatagramKit.Statistics(h.Client).SendBytesOutstanding);
+
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, 64 * 1024), new PatternSource(64 * 1024));
+        for (int i = 0; i < 10; i++)
+        {
+            Assert.True(h.Client.SendCopy(new SendHeader(2), DatagramKit.Payload(i, 60)).IsAdmitted);
+        }
+
+        long streamSends = DatagramKit.Statistics(h.Client).StreamSends;
+        long containers = DatagramKit.Statistics(h.Client).ContainersSent;
+        h.Client.Flush();
+
+        // One pass: the datagrams (higher priority) went out packed, and the bulk piece went out after them.
+        Assert.Equal(containers + 1, DatagramKit.Statistics(h.Client).ContainersSent);
+        Assert.Equal(streamSends + 1, DatagramKit.Statistics(h.Client).StreamSends);
+        Assert.False(transfer.IsFinished);
+    }
 }

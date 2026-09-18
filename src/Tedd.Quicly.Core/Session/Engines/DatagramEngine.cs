@@ -204,8 +204,13 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
         header.Key = channel.Keyed ? request.Key : 0;
         header.FragCount = 1;
         header.RawLength = payload.RawLength;
-        int headerLength = DatagramFraming.GetHeaderLength(channel, in header);
-        if (_core.DatagramsEnabled && headerLength + payload.Length > _core.MaxDatagramPayload)
+
+        // The exact header length only matters near the datagram limit: a payload that fits with the largest possible header
+        // (DatagramFraming.MaxHeaderLength) fits with this one, so small messages skip the key's varint sizing here.
+        int maxDatagramPayload = _core.MaxDatagramPayload;
+        if (_core.DatagramsEnabled
+            && payload.Length > maxDatagramPayload - DatagramFraming.MaxHeaderLength
+            && DatagramFraming.GetHeaderLength(channel, in header) + payload.Length > maxDatagramPayload)
         {
             _core.DiscardEntry(slot);
             if (channel.Fragmentation)

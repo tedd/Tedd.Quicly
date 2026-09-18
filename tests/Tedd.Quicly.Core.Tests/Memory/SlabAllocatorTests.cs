@@ -655,6 +655,66 @@ public unsafe class SlabAllocatorTests
         Assert.True(stats.Peak >= 8);
     }
 
+    [Fact]
+    public void TryReissue_Is_A_Return_And_Rent_Of_The_Same_Block_That_Leaves_The_Counters_Alone()
+    {
+        using var allocator = new SlabAllocator(SmallOptions());
+        Assert.True(allocator.TryRent(40, out BufferLease lease));
+        SizeClassStatistics before = allocator.GetClassStatistics(0);
+
+        Assert.True(allocator.TryReissue(lease, 64, out BufferLease reissued));
+        Assert.Equal(lease.ClassIndex, reissued.ClassIndex);
+        Assert.Equal(lease.BlockIndex, reissued.BlockIndex);
+        Assert.Equal(lease.Offset, reissued.Offset);
+        Assert.Equal(lease.Shard, reissued.Shard);
+        Assert.Equal(64, reissued.Length);
+        Assert.Equal((ushort)(lease.Generation + 1), reissued.Generation);
+        Assert.Equal(before, allocator.GetClassStatistics(0));
+
+        // The old lease is stale now, exactly as after a return and a rent of the same block.
+        Assert.Throws<InvalidOperationException>(() => allocator.Return(lease));
+        allocator.Return(reissued);
+        Assert.Equal(0, allocator.GetClassStatistics(0).Rented);
+        Assert.Throws<InvalidOperationException>(() => allocator.TryReissue(reissued, 64, out _));
+    }
+
+    [Theory]
+    [InlineData(0, 0, true)]      // TryRent(0) chooses the smallest class
+    [InlineData(0, 65, false)]    // too large for the block
+    [InlineData(1, 64, false)]    // TryRent would choose the 64-byte class
+    [InlineData(1, 65, true)]
+    [InlineData(1, 256, true)]
+    [InlineData(1, 0, false)]
+    [InlineData(2, 257, true)]
+    [InlineData(2, 256, false)]
+    [InlineData(1, -1, false)]
+    public void TryReissue_Succeeds_Only_For_The_Class_TryRent_Would_Choose(int classIndex, int minimumLength, bool expected)
+    {
+        using var allocator = new SlabAllocator(SmallOptions());
+        int size = allocator.SizeClasses[classIndex].BlockSize;
+        Assert.True(allocator.TryRent(size, out BufferLease lease));
+        Assert.Equal(classIndex, lease.ClassIndex);
+        if (minimumLength >= 0)
+        {
+            Assert.True(allocator.TryRent(minimumLength, out BufferLease probe));
+            Assert.Equal(expected, probe.ClassIndex == classIndex);
+            allocator.Return(probe);
+        }
+
+        Assert.Equal(expected, allocator.TryReissue(lease, minimumLength, out BufferLease reissued));
+        if (expected)
+        {
+            allocator.Return(reissued);
+        }
+        else
+        {
+            Assert.True(reissued.IsEmpty);
+            allocator.Return(lease); // unchanged and still rented
+        }
+
+        Assert.Equal(0, allocator.GetStatistics().TotalRentedBytes);
+    }
+
     private static BufferLease Forge(int classIndex, ushort generation, int blockIndex, int offset, int length, int shard = 0)
     {
         // Same layout as BufferLease: class (1) + shard (1) + generation (2) + block (4) + offset (4) + length (4).

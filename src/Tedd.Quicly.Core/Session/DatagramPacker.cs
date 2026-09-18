@@ -27,6 +27,15 @@ internal enum DatagramHints : byte
     /// unreliable and the pass allows the flag (<see cref="FlushContext.CancelBlockedDatagrams"/>).
     /// </summary>
     Unreliable = 2,
+
+    /// <summary>
+    /// The owner finishes a final, non-local completion of the entry with exactly
+    /// <see cref="PeerCore.CompleteEntry"/>(slot, <see cref="PeerCore.MapCompletion"/>(completion)) and keeps no per-entry
+    /// state of its own (an unfragmented message of a <see cref="DatagramEngine"/>). When every member of a container
+    /// carries it, <see cref="DatagramPacker.OnContainerCompleted"/> finishes the members itself instead of routing each one
+    /// back through its engine; the outcome is the same.
+    /// </summary>
+    DirectCompletion = 4,
 }
 
 /// <summary>What <see cref="DatagramPacker.Add"/> did with an entry.</summary>
@@ -65,6 +74,10 @@ internal sealed unsafe class DatagramPacker
     /// <summary>Channel priority from which datagrams are sent with <see cref="TransportSendFlags.Priority"/> (PROTOCOL.md §4.5).</summary>
     public const int PriorityThreshold = 192;
 
+    // A container entry's Aux1: whether every member carried DatagramHints.DirectCompletion (Aux0 counts tracked members).
+    private const long RoutedMembers = 0;
+    private const long DirectMembers = 1;
+
     private readonly PeerCore _core;
     private int _maxPayload;
     private uint _tick;
@@ -78,6 +91,7 @@ internal sealed unsafe class DatagramPacker
     private int _count;
     private bool _containerPriority;
     private bool _containerUnreliable;
+    private bool _containerDirect;
     private int _trackedMembers;
 
     /// <summary>Creates the packer of <paramref name="core"/>.</summary>
@@ -101,6 +115,7 @@ internal sealed unsafe class DatagramPacker
         _trackedMembers = 0;
         _containerPriority = false;
         _containerUnreliable = false;
+        _containerDirect = false;
     }
 
     /// <summary>Starts a pass: the current datagram limit, the tick and the send-flag policy (scheduler).</summary>
@@ -209,7 +224,9 @@ internal sealed unsafe class DatagramPacker
     /// The completion of a container entry (game thread, from the completion routing): the early Sent notice returns the
     /// container's lease (the transport no longer needs the bytes; the slot stays reserved until the final state, ADR 0008
     /// invariant 1) and, when a member is tracked, passes the notice on; the final completion goes to every member's owner
-    /// with the container's outcome, then the container entry is finished.
+    /// with the container's outcome — or, when every member is a plain datagram message
+    /// (<see cref="DatagramHints.DirectCompletion"/>) and the completion came from the transport, finishes the members here
+    /// exactly as their owner would — then the container entry is finished.
     /// </summary>
     /// <param name="container">The container entry.</param>
     /// <param name="completion">What the transport (or the game thread, for a refused submission) reported.</param>
@@ -235,12 +252,31 @@ internal sealed unsafe class DatagramPacker
 
         int m = entries.BatchHead[container];
         entries.ClearBatch(container);
-        while (m >= 0)
+        if (entries[container].Aux1 == DirectMembers && completion.Kind != CompletionKind.Local)
         {
-            // Read the link first: finishing a member frees its slot, which a continuation may reuse at once.
-            int next = entries.Next[m];
-            RouteMember(m, in completion);
-            m = next;
+            // Every member is a plain datagram message whose owner would do exactly this (DatagramHints.DirectCompletion),
+            // so the per-member routing (entry → channel → engine → virtual call → fragment check) is skipped. The status is
+            // still mapped per member, as the owner would: a continuation of an earlier member may start closing the
+            // transport, which changes the mapping of a canceled datagram. A local completion (refused submission) still
+            // goes to the owners, which correct their counters.
+            NativeArray<int> links = entries.Next;
+            while (m >= 0)
+            {
+                // Read the link first: finishing a member frees its slot, which a continuation may reuse at once.
+                int next = links[m];
+                _core.CompleteEntry(m, _core.MapCompletion(in completion));
+                m = next;
+            }
+        }
+        else
+        {
+            while (m >= 0)
+            {
+                // Read the link first: finishing a member frees its slot, which a continuation may reuse at once.
+                int next = entries.Next[m];
+                RouteMember(m, in completion);
+                m = next;
+            }
         }
 
         _core.CompleteEntry(container, _core.MapCompletion(in completion));
@@ -283,6 +319,7 @@ internal sealed unsafe class DatagramPacker
         _container = slot;
         _containerPriority = false;
         _containerUnreliable = true;
+        _containerDirect = true;
         _trackedMembers = 0;
         return true;
     }
@@ -307,6 +344,7 @@ internal sealed unsafe class DatagramPacker
         entries.AddToBatch(_container, member);
         _containerPriority |= (hints & DatagramHints.Priority) != 0;
         _containerUnreliable &= (hints & DatagramHints.Unreliable) != 0;
+        _containerDirect &= (hints & DatagramHints.DirectCompletion) != 0;
         if ((entry.Flags & SendEntryFlags.Tracked) != 0)
         {
             _trackedMembers++;
@@ -325,6 +363,7 @@ internal sealed unsafe class DatagramPacker
         ref SendEntry entry = ref _core.Entries[slot];
         entry.Payload.Length = (uint)size;
         entry.Aux0 = _trackedMembers;
+        entry.Aux1 = _containerDirect ? DirectMembers : RoutedMembers;
         TransportStatus status = _core.SubmitDatagram(slot, SendFlags(_containerPriority, _containerUnreliable));
         if (status != TransportStatus.Success)
         {

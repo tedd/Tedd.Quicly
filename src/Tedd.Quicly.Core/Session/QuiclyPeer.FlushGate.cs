@@ -128,7 +128,7 @@ public sealed unsafe partial class QuiclyPeer
         /// <summary>The last Flush's pass left every engine empty (reset when a Flush starts).</summary>
         public bool Quiescent;
 
-        /// <summary>A Poll ran since the last Flush started.</summary>
+        /// <summary>A Poll ran, or a pass routed completions after computing its deadlines, since the last Flush started.</summary>
         public bool Polled;
     }
 }

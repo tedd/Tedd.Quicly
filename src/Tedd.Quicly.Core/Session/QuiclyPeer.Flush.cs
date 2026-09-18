@@ -277,6 +277,13 @@ public sealed unsafe partial class QuiclyPeer
             _inScheduler = false;
         }
 
+        if (_core.LocalCompletionsQueued != 0)
+        {
+            // Routed after the pass computed its deadlines (an engine may re-queue or re-arm on them): the next FlushAll
+            // must not skip this peer (QuiclyPeer.FlushGate.cs).
+            _gate.Polled = true;
+        }
+
         DrainLocalCompletions();
     }
 

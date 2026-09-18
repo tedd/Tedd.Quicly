@@ -57,7 +57,11 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>Mask of the stream serial carried in an engine stream context (24 bits; it wraps).</summary>
     public const uint EngineStreamSerialMask = 0xFF_FFFF;
 
-    /// <summary>Most bytes of receive leases parked for reuse (<see cref="RecycleReceive"/>); an eighth of the receive budget when that is smaller.</summary>
+    /// <summary>
+    /// Most bytes of receive leases parked for reuse (<see cref="RecycleReceive"/>); an eighth of the receive budget when that
+    /// is smaller. Only a peer that owns its allocator parks: on a supplied (shared) pool a parked block would be one no other
+    /// peer could reclaim, so such a peer returns every lease to the pool as before.
+    /// </summary>
     public const int MaxRecycledBytes = 32 * 1024;
 
     /// <summary>Largest block parked for reuse (and at most a quarter of the peer's recycle limit).</summary>
@@ -151,9 +155,10 @@ internal sealed unsafe class PeerCore : IDisposable
 
         _sendBudget = options.SendBudgetBytes;
         _receiveBudget = options.ReceiveBudgetBytes;
-        _recycleLimit = (int)Math.Min(MaxRecycledBytes, _receiveBudget / 8);
+        // Only with a private pool: blocks parked by an idle peer on a shared pool would be lost to every other peer.
+        _recycleLimit = _ownsAllocator ? (int)Math.Min(MaxRecycledBytes, _receiveBudget / 8) : 0;
         _recycleMaxBlock = Math.Min(MaxRecycledBlock, _recycleLimit / 4);
-        _recycled = new SpscRing<BufferLease>(RecycleRingCapacity);
+        _recycled = new SpscRing<BufferLease>(_recycleLimit != 0 ? RecycleRingCapacity : 2);
         Entries = new SendEntryTable(options.SendTableCapacity);
         int capacity = Entries.Capacity;
         Segments = new SegmentArena(options.SegmentArenaCapacity);
@@ -887,7 +892,7 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <returns><see langword="false"/> when the budget or the pool is exhausted.</returns>
     public bool TryRentReceive(int length, out BufferLease lease)
     {
-        if (_recycled.TryDequeue(out BufferLease parked))
+        if (_recycleLimit != 0 && _recycled.TryDequeue(out BufferLease parked))
         {
             Volatile.Write(ref _recycle.Out, _recycle.Out + parked.Length);
             if (_allocator.TryReissue(in parked, length, out lease))
@@ -947,7 +952,8 @@ internal sealed unsafe class PeerCore : IDisposable
     /// the receive budget (<see cref="ReceiveBytesOutstanding"/> leaves it out) until it is reissued or given back: by the
     /// transport thread before a rent would fail, when its class does not fit, or when the peer's memory is freed. At most
     /// <see cref="MaxRecycledBytes"/> (an eighth of the budget when that is smaller) are parked, in blocks of at most
-    /// <see cref="MaxRecycledBlock"/> bytes and a quarter of that limit; anything else goes back to the pool as
+    /// <see cref="MaxRecycledBlock"/> bytes and a quarter of that limit, and only by a peer that owns its allocator (a peer on
+    /// a supplied pool never parks); anything else goes back to the pool as
     /// <see cref="ReturnReceive"/> does.
     /// </summary>
     /// <param name="lease">The lease (empty is ignored).</param>

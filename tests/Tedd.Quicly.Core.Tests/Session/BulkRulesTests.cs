@@ -52,6 +52,53 @@ public class BulkRulesTests
     }
 
     /// <summary>
+    /// A transfer's outcome, byte count included, is published once, when it finishes. A cancelled transfer keeps its record
+    /// until its reset stream closes, and a progress frame the peer sent before it saw the reset can still arrive in that
+    /// window: honest as it is, it must not move <see cref="BulkTransfer.BytesTransferred"/> away from
+    /// <see cref="BulkTransfer.Result"/> after the fact.
+    /// </summary>
+    [Fact]
+    public async Task A_Late_Progress_Frame_For_A_Finished_Transfer_Changes_Nothing()
+    {
+        // The receiving client's progress frames are refused on the way out, so the sending server has confirmed nothing
+        // (its count stays 0) while its sends complete: a late honest frame then has something it could wrongly move.
+        AcceptRouter atClient = AcceptRouter.Pattern();
+        BulkRefusalConnector? connector = null;
+        using SessionHarness h = new(
+            link: Slow(),
+            table: BulkTables.Main,
+            client: BulkKit.Receiver(atClient),
+            server: BulkKit.Quiet,
+            connector: inner => connector = new BulkRefusalConnector(inner));
+        connector!.Transport!.FailProgressDatagrams = true;
+        BulkEngine engine = BulkKit.Engine(h.Server!);
+
+        BulkTransfer transfer = await h.Server!.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, 4 * Mib), new PatternSource(4 * Mib));
+        Assert.True(
+            h.RunUntil(() => atClient.Accepted.Count == 1 && atClient.Sink<PatternSink>().BytesWritten > 128 * 1024),
+            "the transfer never started moving");
+        h.Run(50_000);
+        Assert.Equal(0, transfer.BytesTransferred);
+
+        transfer.Cancel();
+        h.Server!.Flush();
+        Assert.Equal(BulkStatus.Canceled, transfer.Status);
+        Assert.Equal(0, transfer.Result.BytesTransferred);
+        Assert.Equal(1, BulkKit.SendTransfers(h.Server!, 5));
+
+        // Before the reset stream closes, a frame the client sent earlier arrives: 64 KiB, well within the 128 KiB it had
+        // received, and within what completed — honest, so no violation, and still it must not move the published count.
+        Assert.True(engine.OnControl(ControlType.BulkProgress, Progress(transfer.TransferId, 64 * 1024), onStream: false, 0));
+        h.Server!.Flush();
+
+        Assert.Equal(0, engine.ProgressOverClaims);
+        Assert.Equal(0, transfer.BytesTransferred);
+        Assert.Equal(0, transfer.Result.BytesTransferred);
+        Assert.Equal(BulkStatus.Canceled, transfer.Status);
+        Assert.True(h.RunUntil(() => BulkKit.SendTransfers(h.Server!, 5) == 0), "the cancelled transfer's record was not released");
+    }
+
+    /// <summary>
     /// B2 (PROTOCOL.md §3.4): <c>BulkCancel</c> is receiver-to-sender, so the recipient resolves it against its own
     /// <em>send</em> records, and one that names nothing there is ignored and counted. The id it carries here is the id of
     /// the transfer this end is <em>receiving</em> — ids are scoped per direction, so that transfer must not be touched.

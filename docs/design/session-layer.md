@@ -1322,7 +1322,8 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   on the asynchronous path in the order the simulator does not produce by itself; a provider answering with the wrong
   descriptor; an overflowing notice ring; the structs' declared layout; and a tracked send's wait released on
   `Dispose`), `BulkRulesTests` (the rules the review tightened: an over-claim on the control stream closing
-  `ProtocolViolation`; a `BulkCancel` naming nothing this end sends ignored and counted; a served range whose source runs
+  `ProtocolViolation`; a late progress frame for a finished transfer leaving its published count alone; a `BulkCancel`
+  naming nothing this end sends ignored and counted; a served range whose source runs
   dry before its stream exists answered `BulkReject`; a disposed receiver finishing its sink once the transport closed; a
   transfer id held until its record is recycled and free after; the request table's size; a served request leaving the
   table; and a resumable request cut by a disconnect asked again, after a real resume, for exactly the missing part) and

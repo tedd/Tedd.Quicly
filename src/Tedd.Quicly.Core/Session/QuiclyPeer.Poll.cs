@@ -493,21 +493,6 @@ public sealed unsafe partial class QuiclyPeer
         _core.ReturnReceive(in entry.Lease);
     }
 
-    /// <summary>
-    /// Fails every request still waiting for its response with <see cref="ObjectDisposedException"/> (game thread, from
-    /// <see cref="Dispose"/>, right after the peer is marked disposed). A response is only ever matched here, in Poll or Drain,
-    /// and neither runs after Dispose — so without this, a peer disposed without being closed first would leave each
-    /// <see cref="SendRequestAsync"/> awaiting the transport's close callback, which may come much later or never
-    /// (docs/design/session-layer.md §7.8).
-    /// </summary>
-    private void FailRequestsOnDispose()
-    {
-        if (_core.GetEngine(Tedd.Quicly.Core.Channels.ChannelMode.ReliableOrdered) is ReliableOrderedEngine ordered)
-        {
-            ordered.FailRequestsOnDispose();
-        }
-    }
-
     private void Emit(ref ReceiveEntry entry, long now, Span<ReceivedMessage> into, ref int written)
     {
         if ((entry.Flags & ReceiveFlags.Compressed) != 0 && !TryDecode(ref entry, now))
@@ -600,11 +585,14 @@ public sealed unsafe partial class QuiclyPeer
     /// Releases the promises a <see cref="Dispose"/> would otherwise leave outstanding for good (ADR 0008). Disposing
     /// without closing first is ordinary teardown — a host shutting down, a <c>using</c> block left on an exception — and no
     /// <see cref="Poll"/> will ever run <see cref="FinishClosed"/> afterwards. Every await the session layer hands out is
-    /// released on this path: <see cref="SendAsync"/> and <see cref="FlushAsync"/> waiters were failed by
-    /// <c>FailWaitersOnDispose</c> just before, every outstanding <see cref="WaitAsync"/> on a tracked send completes here
-    /// (nothing drains the completion ring after this), and each engine releases its own (<see cref="ChannelEngine.OnDisposing"/>:
-    /// a bulk transfer this end is sending ends <see cref="BulkStatus.Disconnected"/>). A <c>ForeignSendRetry</c> wait
-    /// ends on its next attempt, which finds the peer disposed.
+    /// released on this path, once, in this order: <see cref="SendAsync"/> and <see cref="FlushAsync"/> waiters were failed
+    /// by <c>FailWaitersOnDispose</c> just before; then each engine releases its own, in mode order
+    /// (<see cref="ChannelEngine.OnDisposing"/>: a <see cref="SendRequestAsync"/> still waiting for its response fails with
+    /// <see cref="ObjectDisposedException"/>, and a bulk transfer this end is sending ends
+    /// <see cref="BulkStatus.Disconnected"/>); last, every outstanding <see cref="WaitAsync"/> on a tracked send completes
+    /// <see cref="DeliveryStatus.Disconnected"/> (nothing drains the completion ring after this). A <c>ForeignSendRetry</c>
+    /// wait ends on its next attempt, which finds the peer disposed. A peer already polled to <see cref="PeerState.Closed"/>
+    /// skips all of it: <see cref="FinishClosed"/> released the same awaits then, and a closed peer hands out no new ones.
     /// <para>
     /// This is deliberately <em>not</em> <see cref="ChannelEngine.OnPeerClosed"/>: that hook runs once the transport has
     /// reported its close, and it completes in-flight entries and returns their payloads. Here the transport is still live —

@@ -566,8 +566,6 @@ public sealed unsafe partial class QuiclyPeer
     /// <summary>The waiters of <see cref="SendAsync"/> and <see cref="FlushAsync"/> fail with <see cref="ObjectDisposedException"/> (Dispose).</summary>
     private void FailWaitersOnDispose()
     {
-        // And the requests still waiting for a response (QuiclyPeer.Poll.cs, docs/design/session-layer.md §7.8).
-        FailRequestsOnDispose();
         if (_sendWaiters.Count == 0 && _flushWaiters.Count == 0)
         {
             return;

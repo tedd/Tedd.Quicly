@@ -37,13 +37,20 @@ namespace Tedd.Quicly.Core.Threading;
 /// <para>
 /// Cancelling a wait only cancels the wait: the slot stays alive and the send is not affected. Every
 /// <see cref="ValueTask{TResult}"/> returned by <see cref="WaitAsync"/> must be consumed exactly once (awaited
-/// or its result read); an unconsumed one keeps its slot alive.
+/// or its result read); an unconsumed one keeps its slot alive. It may be consumed after the table was disposed —
+/// a wait that <see cref="CompleteAll"/> released on teardown and that the application awaits later — and then
+/// still yields its status; only the slot's return to the free list is skipped (see <see cref="Dispose"/>).
 /// </para>
 /// </remarks>
 public sealed class CompletionTable : IDisposable
 {
     private readonly Slot[] _slots;
     private readonly MpscRing<int> _free;
+
+    // Dispose against a late ReturnToFreeList (see Dispose): set once, returns in progress, the ring freed once.
+    private int _disposed;
+    private int _returning;
+    private int _freeListReleased;
 
     /// <summary>Creates a table with <paramref name="capacity"/> slots.</summary>
     /// <param name="capacity">Number of sends that can be tracked at the same time (1 … 2^30).</param>
@@ -197,8 +204,32 @@ public sealed class CompletionTable : IDisposable
         }
     }
 
-    /// <summary>Frees the native memory of the free list. Call it once, after no thread can complete a send any more.</summary>
-    public void Dispose() => _free.Dispose();
+    /// <summary>
+    /// Frees the native memory of the free list. Call it after no thread can complete a send any more; a second call is a
+    /// no-op.
+    /// </summary>
+    /// <remarks>
+    /// A slot also returns itself to the free list when the last <see cref="ValueTask{TResult}"/> on it is consumed, on
+    /// whichever thread consumes it, and that can be after this call: a wait released by <see cref="CompleteAll"/> on
+    /// teardown and awaited later, or a continuation queued to the thread pool that runs while the owner disposes. Such a
+    /// return is skipped once the table is disposed (nothing allocates from it any more), and the ring is freed by
+    /// whichever finishes last, this call or a return already in progress, so no return ever writes into freed memory.
+    /// </remarks>
+    public void Dispose()
+    {
+        // Both sides publish their own flag with a full fence before reading the other's (Dekker), so at least one of them
+        // sees the other: either the return sees the table disposed and skips the ring, or this call sees the return in
+        // progress and leaves the free to it.
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        if (Volatile.Read(ref _returning) == 0)
+        {
+            ReleaseFreeList();
+        }
+    }
 
     private Slot GetSlot(SendToken token)
     {
@@ -208,7 +239,29 @@ public sealed class CompletionTable : IDisposable
         return slots[token.Slot];
     }
 
-    private void ReturnToFreeList(int index) => _free.TryEnqueue(index);
+    /// <summary>Puts a released slot back on the free list (any thread), unless the table is disposed (see <see cref="Dispose"/>).</summary>
+    private void ReturnToFreeList(int index)
+    {
+        Interlocked.Increment(ref _returning);
+        if (Volatile.Read(ref _disposed) == 0)
+        {
+            _free.TryEnqueue(index);
+        }
+
+        if (Interlocked.Decrement(ref _returning) == 0 && Volatile.Read(ref _disposed) != 0)
+        {
+            ReleaseFreeList();
+        }
+    }
+
+    /// <summary>Frees the ring once, whichever of <see cref="Dispose"/> and the last return in progress gets here.</summary>
+    private void ReleaseFreeList()
+    {
+        if (Interlocked.Exchange(ref _freeListReleased, 1) == 0)
+        {
+            _free.Dispose();
+        }
+    }
 
     private sealed class Slot : IValueTaskSource<DeliveryStatus>
     {

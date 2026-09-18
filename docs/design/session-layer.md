@@ -1283,7 +1283,14 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   peer frees its memory, which it does only once the transport has reported its close and no Poll or Flush is running:
   the engine's `Dispose` then finishes each such sink `Disconnected`, keeping `IBulkSink.Finish`'s "exactly once".
   Tracked sends' `WaitAsync` complete `Disconnected` from the peer's completion table, and `SendAsync`/`FlushAsync`
-  waiters were failed just before.
+  waiters were failed just before. The ordered engine uses the same hook to fail a pending `SendRequestAsync` with
+  `ObjectDisposedException` (§7.8); engines run in mode order, so requests fail before bulk transfers finish, and each
+  await completes exactly once. `DisposingPeerTests` disposes an unclosed peer with a bulk transfer, a request and a
+  tracked send all pending at once. A wait released this way may be consumed only after the peer has freed its memory
+  (awaited late, or a thread-pool continuation racing the transport's close callback); consuming it releases its slot,
+  and the completion table then skips the return to its already freed free list instead of writing into it
+  (`CompletionTable.Dispose`: a return in progress and the dispose agree on which of them frees the ring). The merge of
+  waves C2c and C2d found that use-after-free with the test above.
 * **Statistics.** Per channel: `Sent`/`BytesSent` per piece (object bytes), `Received`/`BytesReceived` as bytes reach the
   application, `Dropped` (a refused, duplicate or corrupt transfer), `TooLarge`, `QueueFull` (a transfer or request the
   limits refused), `ReceiveTooLarge`, `OutOfBuffers`, and `QueuedBytes`/`InFlightBytes` from the live transfers. Per peer:
@@ -1473,9 +1480,11 @@ Two features that ride on engines that already exist: fragmentation is the secon
   goes out and its response is dropped and counted when it arrives. `OnPeerClosed`, `OnReconnecting` and `Dispose` fail
   every outstanding request with a clear reason (`InvalidOperationException` for a closed or lost session,
   `ObjectDisposedException` for a disposed peer), so a request never hangs on a session that ended. `QuiclyPeer.Dispose`
-  fails them **synchronously**: its first step after marking the peer disposed (`FailWaitersOnDispose`) calls
-  `QuiclyPeer.FailRequestsOnDispose` (in the Poll path, next to `TakeResponse`), which hands the request table of the
-  ordered engine its `ObjectDisposedException`. The engine's own `Dispose` would fail them too, but that runs from
+  fails them **synchronously**, through the same `ChannelEngine.OnDisposing` hook the bulk engine uses (§7.7): the
+  ordered engine's override hands its request table an `ObjectDisposedException`. The sequence is one for every await:
+  `SendAsync`/`FlushAsync` waiters first, then each engine's `OnDisposing` in mode order (requests, then bulk
+  transfers), then every tracked send's wait from the completion table; a peer already polled to `Closed` skips it all,
+  because `OnPeerClosed` released the same awaits. The engine's own `Dispose` would fail them too, but that runs from
   `FreeResources`, which waits until the transport has reported its close — for a peer disposed without being closed first
   (ordinary teardown) that is much later, and for a transport that reports no close it is never; and after `Dispose` no
   Poll, Flush or Drain runs that could match a response or serve a timeout. An `await` must not outlive the peer that
@@ -1484,7 +1493,7 @@ Two features that ride on engines that already exist: fragmentation is the secon
   fragmentation.
 * **Shared seams added for it** (one region each): `ChannelEngine.RunPollDeadlines` and `ChannelEngine.TryTakeResponse`
   (virtual no-ops), the engine loop in `QuiclyPeer.RunTimers`, `QuiclyPeer.TakeResponse` in the Poll/Drain paths,
-  `QuiclyPeer.FailRequestsOnDispose` (one call from `FailWaitersOnDispose`), and ten counters in
+  the ordered engine's override of `ChannelEngine.OnDisposing` (the hook wave C2c added), and ten counters in
   `PeerCounters`/`PeerStatistics` (seven for fragmentation, three for requests).
 * **Where responses are intercepted.** Two places, not five: `Route` (Poll) and the ring loop of `Drain`. Those are the only
   paths that take a message out of the receive ring, and everything else the peer holds — a per-channel queue, the single

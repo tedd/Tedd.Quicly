@@ -117,8 +117,11 @@ internal abstract class ChannelEngine : IDisposable
     /// out whose state belongs to the game thread, and nothing else: unlike <see cref="OnPeerClosed"/>, the transport is
     /// still live here — it may call back, and it may still be reading a payload it was handed — so an entry the transport
     /// holds, and any state the transport thread owns, is left alone. That is released by <see cref="Dispose"/>, which the
-    /// peer runs only once the transport has reported its close. Default: nothing (an engine whose only awaits are tracked
-    /// sends is covered by the peer's completion table).
+    /// peer runs only once the transport has reported its close. The peer calls it once, before it completes every tracked
+    /// send's wait from the completion table, and not at all when the peer was polled to <see cref="PeerState.Closed"/>
+    /// first (then <see cref="OnPeerClosed"/> released the same awaits). The ordered engine fails its outstanding requests
+    /// here and the bulk engine finishes the transfers it is sending. Default: nothing (an engine whose only awaits are
+    /// tracked sends is covered by the peer's completion table).
     /// </summary>
     public virtual void OnDisposing()
     {

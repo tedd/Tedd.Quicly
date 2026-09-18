@@ -464,6 +464,53 @@ public class CompletionTableTests
     }
 
     [Fact]
+    public void CompleteAll_Completes_Every_Live_Occupant_And_Leaves_Free_Slots_Alone()
+    {
+        var table = new CompletionTable(3);
+        table.TryAllocate(out SendToken waited);
+        table.TryAllocate(out SendToken quiet);
+        ValueTask<DeliveryStatus> wait = table.WaitAsync(waited, Remote);
+        table.Complete(quiet, Buffer, DeliveryStatus.Pending);
+
+        table.CompleteAll(DeliveryStatus.Disconnected);
+
+        // The waited slot stays allocated until its wait is consumed; the other one is released at once.
+        Assert.Equal(2, table.Available);
+        Assert.True(wait.IsCompletedSuccessfully);
+        Assert.Equal(DeliveryStatus.Disconnected, wait.Result);
+        Assert.Equal(3, table.Available);
+        Assert.Equal(DeliveryStatus.Disconnected, table.GetStatus(waited));
+        Assert.Equal(DeliveryStatus.Disconnected, table.GetStatus(quiet));
+
+        // Nothing is live any more, so a second teardown pass finds nothing to complete.
+        table.CompleteAll(DeliveryStatus.Canceled);
+        Assert.Equal(DeliveryStatus.Disconnected, table.GetStatus(waited));
+        Assert.Equal(3, table.Available);
+    }
+
+    [Fact]
+    public void A_Wait_Released_On_Teardown_Can_Be_Consumed_After_The_Table_Is_Disposed()
+    {
+        // A peer disposed without being closed completes every tracked send's wait (CompleteAll) and disposes the table once
+        // its transport has reported the close, and the application may consume such a wait only afterwards. Consuming the
+        // last one releases the slot, and that release must not write into the freed free list. 65 536 slots make the ring a
+        // 1 MiB block, which the allocator hands back to the OS when it is freed, so a write into it faults instead of
+        // silently corrupting the heap.
+        var table = new CompletionTable(1 << 16);
+        Assert.True(table.TryAllocate(out SendToken token));
+        ValueTask<DeliveryStatus> buffer = table.WaitAsync(token, Buffer);
+        ValueTask<DeliveryStatus> remote = table.WaitAsync(token, Remote);
+        table.CompleteAll(DeliveryStatus.Disconnected);
+
+        table.Dispose();
+        table.Dispose();
+
+        Assert.Equal(DeliveryStatus.Disconnected, buffer.Result);
+        Assert.Equal(DeliveryStatus.Disconnected, remote.Result);
+        Assert.Equal(DeliveryStatus.Disconnected, table.GetStatus(token));
+    }
+
+    [Fact]
     public void Tokens_Outside_The_Table_Are_Rejected()
     {
         var table = new CompletionTable(2);

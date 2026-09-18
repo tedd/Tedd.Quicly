@@ -184,19 +184,20 @@ internal sealed unsafe partial class ReliableOrderedEngine
         }
     }
 
-    /// <summary>
-    /// The peer is being disposed (game thread, from <see cref="QuiclyPeer.Dispose"/>): every outstanding request fails with
-    /// <see cref="ObjectDisposedException"/> now.
-    /// </summary>
+    /// <inheritdoc/>
     /// <remarks>
-    /// The only wait this engine hands out is <see cref="SendRequestAsync"/>, and only an arriving response, a timeout, a
-    /// close or a cancellation completes it — none of which can happen after the peer is disposed, because no Poll, Flush or
-    /// Drain runs any more. <see cref="Dispose"/> fails them too, but it runs from the peer's <c>FreeResources</c>, which
-    /// waits for the transport's close callback, so a peer disposed without being closed first (ordinary teardown) would leave
-    /// every outstanding request awaiting until that callback arrives — much later, or for a transport that reports no close,
-    /// never. <see cref="FailRequests"/> is idempotent, so failing them again in <see cref="Dispose"/> is a no-op.
+    /// Every outstanding request fails with <see cref="ObjectDisposedException"/> now, synchronously inside
+    /// <see cref="QuiclyPeer.Dispose"/>. The only wait this engine hands out is <see cref="SendRequestAsync"/>, and only an
+    /// arriving response, a timeout, a close or a cancellation completes it — none of which can happen after the peer is
+    /// disposed, because no Poll, Flush or Drain runs any more. <see cref="Dispose"/> fails them too, but it runs from the
+    /// peer's <c>FreeResources</c>, which waits for the transport's close callback, so a peer disposed without being closed
+    /// first (ordinary teardown) would leave every outstanding request awaiting until that callback arrives — much later, or
+    /// for a transport that reports no close, never. The request table is game-thread state, so this is exactly the work the
+    /// hook allows. A peer already polled to <see cref="PeerState.Closed"/> skips the hook: <see cref="OnPeerClosed"/>
+    /// failed its requests then, and a closed peer admits none. Each slot completes once (<c>RequestSlot.TryBeginComplete</c>),
+    /// and <see cref="FailRequests"/> finds the table empty afterwards, so failing them again in <see cref="Dispose"/> is a no-op.
     /// </remarks>
-    internal void FailRequestsOnDispose()
+    public override void OnDisposing()
     {
         if (_hasRequestResponse && _requestCount != 0)
         {

@@ -97,4 +97,34 @@ public class ReviewPerfContractTests
             server.Release(in lease);
         }
     }
+
+    /// <summary>
+    /// A peer without <see cref="PeerOptions.Allocator"/> gets a private allocator sized by
+    /// <see cref="PeerOptions.AllocatorOptions"/> that serves its send leases and its receive leases. Once the handlers of
+    /// received messages have returned, their blocks belong to the pool again, so a burst of received messages must not
+    /// leave the send path short of blocks. With receive-lease recycling (45d6d1f, 7988e70) up to an eighth of the receive
+    /// budget (32 KiB by default) of dispatched receive blocks stays parked until the <em>transport</em> thread's next receive
+    /// reissues them; nothing else can reclaim them, so on an otherwise idle pool a send is refused
+    /// <see cref="SendStatus.OutOfBuffers"/>.
+    /// </summary>
+    [Fact]
+    public void Blocks_Of_Handled_Received_Messages_Are_Available_To_The_Send_Path_Of_A_Private_Pool()
+    {
+        // Eight 64-byte blocks shared by both directions.
+        using SessionHarness h = Harness(o => o.AllocatorOptions = Pool(smallBlocks: 8));
+        QuiclyPeer server = h.Server!;
+        int received = 0;
+        server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
+
+        int next = 0;
+        SendAndDeliver(h, ref next, 4, 64, () => received);
+        Assert.Equal(0, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+
+        // Nothing is held on the receive side, so all eight blocks can carry sends.
+        for (int i = 0; i < 8; i++)
+        {
+            SendResult result = server.SendCopy(new SendHeader(2), DatagramKit.Payload(1000 + i, 40));
+            Assert.True(result.IsAdmitted, $"send {i} of 8: {result.Status}");
+        }
+    }
 }

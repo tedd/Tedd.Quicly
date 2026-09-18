@@ -5,9 +5,11 @@ using Tedd.Quicly.Core.Session;
 namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
-/// The packer returns the payload leases of a container's members together when the container closes
-/// (<see cref="DatagramPacker.ReturnCopied"/>, <see cref="SlabAllocator.ReturnMany"/>): the send budget and the pool must
-/// look exactly as if each had been returned when it was copied.
+/// The packer releases the send budget of a container member's payload lease when it copies the member in, and returns
+/// the blocks of the members together when the container closes (<see cref="DatagramPacker.ReturnCopied"/>,
+/// <see cref="SlabAllocator.ReturnMany"/>): the send budget must look exactly as if each lease had been returned when it
+/// was copied, and the pool too once the pass is over (the budget within a pass:
+/// <c>ReviewPerfContractTests.A_Bulk_Piece_Fits_The_Send_Budget_Next_To_A_Container_Of_Datagrams_Sent_In_The_Same_Pass</c>).
 /// </summary>
 public class PackedPayloadReturnTests
 {

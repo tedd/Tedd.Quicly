@@ -809,34 +809,30 @@ internal sealed unsafe class PeerCore : IDisposable
     }
 
     /// <summary>
-    /// Returns several send leases at once (the threads of <see cref="TryRentSend"/>): one budget update and one pool push
-    /// per run of blocks of one class (<see cref="SlabAllocator.ReturnMany"/>). No lease may be empty.
+    /// Releases the send budget of a lease whose bytes were copied away, exactly as <see cref="ReturnSend"/> would, while its
+    /// block stays rented until <see cref="ReturnSendBlocks"/> gives it back to the pool together with others (the threads
+    /// of <see cref="TryRentSend"/>). The lease must not be empty and must not be returned any other way.
     /// </summary>
-    /// <param name="leases">The leases.</param>
-    public void ReturnSendMany(ReadOnlySpan<BufferLease> leases)
+    /// <param name="lease">The lease.</param>
+    public void ReleaseSendBudget(in BufferLease lease)
     {
-        if (leases.IsEmpty)
-        {
-            return;
-        }
-
-        long bytes = 0;
-        foreach (ref readonly BufferLease lease in leases)
-        {
-            bytes += lease.Length;
-        }
-
         if (_atomicSendBudget)
         {
-            Interlocked.Add(ref _sendBytes, -bytes);
+            Interlocked.Add(ref _sendBytes, -lease.Length);
         }
         else
         {
-            _sendBytes -= bytes;
+            _sendBytes -= lease.Length;
         }
-
-        _allocator.ReturnMany(leases);
     }
+
+    /// <summary>
+    /// Returns the blocks of send leases whose budget <see cref="ReleaseSendBudget"/> already released, with one pool push
+    /// per run of blocks of one class and shard (<see cref="SlabAllocator.ReturnMany"/>; the threads of
+    /// <see cref="TryRentSend"/>). No lease may be empty.
+    /// </summary>
+    /// <param name="leases">The leases.</param>
+    public void ReturnSendBlocks(ReadOnlySpan<BufferLease> leases) => _allocator.ReturnMany(leases);
 
     /// <summary>
     /// Rents a receive lease of at least <paramref name="length"/> bytes within the receive budget (transport thread; the

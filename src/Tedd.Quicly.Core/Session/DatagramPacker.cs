@@ -70,7 +70,8 @@ internal enum PackResult : byte
 /// <see cref="PackedContainer"/> format (header, then one (Length varint, message) entry per member, written in place) and
 /// stamped with the tick of <see cref="QuiclyPeer.Flush"/> when it is not 0.
 /// Members join the container with <see cref="SendEntryTable.AddToBatch"/>, stay <c>Filling</c> and are never submitted
-/// themselves; their payload leases go back to the pool together when the container closes, copied in by then
+/// themselves. A member's payload lease leaves the send budget as soon as its bytes are copied in, exactly as if it were
+/// returned then; its block goes back to the pool with the other members' when the container closes
 /// (<see cref="ReturnCopied"/>). The container's completion fans out to them
 /// (<see cref="OnContainerCompleted"/>). Game thread only; no allocation.
 /// </summary>
@@ -101,8 +102,9 @@ internal sealed unsafe class DatagramPacker
     private bool _containerUnreliable;
     private bool _containerDirect;
     private int _trackedMembers;
-    // Payload leases of the open container's members, copied in and not yet returned: they go back to the pool together
-    // when the container closes (one push per run instead of one per member). On the pinned object heap (ADR 0008 §12).
+    // Payload leases of the open container's members, copied in and out of the send budget already: their blocks go back to
+    // the pool together when the container closes (one push per run instead of one per member). On the pinned object heap
+    // (ADR 0008 §12).
     private readonly BufferLease[] _copied = GC.AllocateUninitializedArray<BufferLease>(PackedContainer.MaxMessages, pinned: true);
     private int _copiedCount;
 
@@ -383,12 +385,14 @@ internal sealed unsafe class DatagramPacker
             _trackedMembers++;
         }
 
-        // The bytes live in the container now; the member only waits for the container's outcome. A plain send lease goes
-        // back with the container's others when it closes (ReturnCopied); a pin or a shared reference is released here.
+        // The bytes live in the container now; the member only waits for the container's outcome. A plain send lease leaves
+        // the send budget here, as a return would, and its block goes back with the container's others when it closes
+        // (ReturnCopied); a pin or a shared reference is released here.
         BufferLease lease = entries.Leases[member];
         if (!lease.IsEmpty)
         {
             entries.Leases[member] = BufferLease.Empty;
+            _core.ReleaseSendBudget(in lease);
             _copied[_copiedCount++] = lease;
         }
 
@@ -397,9 +401,10 @@ internal sealed unsafe class DatagramPacker
     }
 
     /// <summary>
-    /// Returns the payload leases of the members copied into the container since it opened, in one call (at most
-    /// <see cref="PackedContainer.MaxMessages"/>). Game thread; idempotent. Called when the container closes, and by
-    /// <see cref="Reset"/> and <see cref="PeerCore.Dispose"/> for a container a pass never closed.
+    /// Returns the blocks of the members copied into the container since it opened to the pool, in one call (at most
+    /// <see cref="PackedContainer.MaxMessages"/>); their send budget was released when each was copied. Game thread;
+    /// idempotent. Called when the container closes, and by <see cref="Reset"/> and <see cref="PeerCore.Dispose"/> for a
+    /// container a pass never closed.
     /// </summary>
     public void ReturnCopied()
     {
@@ -407,7 +412,7 @@ internal sealed unsafe class DatagramPacker
         if (count != 0)
         {
             _copiedCount = 0;
-            _core.ReturnSendMany(new ReadOnlySpan<BufferLease>(_copied, 0, count));
+            _core.ReturnSendBlocks(new ReadOnlySpan<BufferLease>(_copied, 0, count));
         }
     }
 

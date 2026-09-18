@@ -24,8 +24,11 @@ namespace Tedd.Quicly.Benchmarks.Session;
 /// simulated second, comfortably inside the 2 000/s control-message default that both peers keep
 /// (<see cref="PeerOptions.ControlMessagesPerSecond"/>). Raising that default would measure a configuration no host
 /// should run.</para>
+/// <para>Measured with <see cref="InProcessMeasuredConfig"/> (30 iterations): the short-run config's three iterations gave a
+/// confidence half-interval near the mean on this benchmark, which made its headline figure unreproducible
+/// (docs/benchmarks/session.md).</para>
 /// </remarks>
-[Config(typeof(InProcessShortRunConfig))]
+[Config(typeof(InProcessMeasuredConfig))]
 public class BulkBench
 {
     private const int Mib = 1024 * 1024;

@@ -184,8 +184,10 @@ public sealed class PeerOptions
     /// <summary>
     /// Bulk traffic's share of the estimated bandwidth (PROTOCOL.md §4.5): the rate at which the bulk engine hands
     /// stream bytes to the transport, so real-time traffic keeps flowing. The estimate is the transport's congestion
-    /// window divided by its RTT, or <see cref="MaxSendBytesPerSecond"/> when the transport reports no window.
-    /// Default 0.5.
+    /// window divided by its RTT, or <see cref="MaxSendBytesPerSecond"/> when the transport reports no window. A derived
+    /// rate is floored at 16 KiB/s, and with neither a window nor a send cap the floor is the rate: an unmeasured link is
+    /// not assumed to be a fast one. A window reported with an RTT under a microsecond (a loopback or in-memory link) has no
+    /// bound, and bulk is then limited by its send window alone. Default 0.5.
     /// </summary>
     public double BulkShareOfEstimatedBandwidth { get; set; } = 0.5;
 

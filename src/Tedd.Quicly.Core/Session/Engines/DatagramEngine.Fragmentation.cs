@@ -107,6 +107,13 @@ internal abstract unsafe partial class DatagramEngine
         }
     }
 
+    /// <summary>
+    /// Whether a queued entry is a fragment (game thread): its completion must reach <see cref="TryCompleteFragment"/>, so
+    /// the packer may not finish it directly (<see cref="DatagramHints.DirectCompletion"/>).
+    /// </summary>
+    /// <param name="slot">An entry of this engine's channel queues.</param>
+    private bool IsFragment(int slot) => _partials is not null && _fragmentOwner[slot] >= 0;
+
     /// <summary>Refreshes the reassembly window from the application RTT (game thread, once per flush).</summary>
     /// <param name="nowMicros">Clock micros of this flush (unused; the window is time-independent).</param>
     private void RefreshReassemblyWindow(long nowMicros)

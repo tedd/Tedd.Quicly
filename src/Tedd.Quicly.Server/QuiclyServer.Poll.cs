@@ -15,6 +15,7 @@ public sealed partial class QuiclyServer
     private long _pollAllCalls;
     private long _peersPolled;
     private long _peersFlushed;
+    private long _peersDrained;
     private long _earliestFlushDeadline = long.MaxValue;
 
     /// <summary>
@@ -26,6 +27,9 @@ public sealed partial class QuiclyServer
 
     /// <summary>Peers <see cref="FlushAll"/> really flushed (the others its gate proved idle); for tests and measurements.</summary>
     internal long PeersFlushed => _peersFlushed;
+
+    /// <summary>Peers whose completions <see cref="FlushAll"/> drained without a Flush first; for tests and measurements.</summary>
+    internal long PeersDrained => _peersDrained;
 
     /// <summary>
     /// Clock micros (<see cref="PeerOptions.Clock"/>) of the earliest deadline <see cref="PollAll"/> has to serve: the
@@ -175,16 +179,30 @@ public sealed partial class QuiclyServer
                     continue;
                 }
 
-                bool skip = peer.CanSkipFlush(now, thread);
-                if (skip && stale)
+                FlushGateDecision decision = peer.CanSkipFlush(now, thread);
+                if (decision != FlushGateDecision.Flush && stale)
                 {
                     now = _clock.NowMicros;
                     stale = false;
                     sinceClock = 0;
-                    skip = peer.CanSkipFlush(now, thread);
+                    decision = peer.CanSkipFlush(now, thread);
                 }
 
-                if (skip)
+                if (decision == FlushGateDecision.Drain)
+                {
+                    _peersDrained++;
+                    // Only transport completions wait: route them as the Flush would first. The peer's own control traffic
+                    // (pings) touches no engine and leaves the peer skippable; anything else asks for the rest of the Flush.
+                    peer.DrainForFlushGate(tick, now);
+                    if (!ReferenceEquals(_slots[slot].Peer, peer) || peer.IsDisposed)
+                    {
+                        continue; // released or disposed by a completion continuation
+                    }
+
+                    decision = peer.CanSkipFlush(now, thread) == FlushGateDecision.Skip ? FlushGateDecision.Skip : FlushGateDecision.Flush;
+                }
+
+                if (decision == FlushGateDecision.Skip)
                 {
                     peer.SkipFlush(tick, now);
                     stale = ++sinceClock == 64;

@@ -1,6 +1,7 @@
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Threading;
+using Tedd.Quicly.Testing.Simulation;
 
 namespace Tedd.Quicly.Server.Tests;
 
@@ -325,5 +326,55 @@ public class FlushAllGateTests
         long before = f.Server.PeersFlushed;
         f.Server.FlushAll(++tick);
         Assert.Equal(before + 1, f.Server.PeersFlushed);
+    }
+
+    [Fact]
+    public async Task Pings_Pongs_And_Their_Completions_Do_Not_Make_FlushAll_Flush_An_Idle_Peer()
+    {
+        await using ServerFixture f = new();
+        f.ConnectAdmitted();
+        f.ConnectAdmitted();
+        uint tick = 0;
+        Ticks(f, 300, ref tick); // past the fast lock: one ping a second per peer from here on
+        long before = f.Server.PeersFlushed;
+        f.Server.GetStatistics(out ServerStatistics polledBefore);
+        Ticks(f, 250, ref tick); // four seconds: pings sent, completed and answered
+        f.Server.GetStatistics(out ServerStatistics polledAfter);
+        Assert.True(polledAfter.PeersPolled - polledBefore.PeersPolled >= 8, "the peers were polled for their pings");
+        Assert.Equal(before, f.Server.PeersFlushed);
+    }
+
+    [Fact]
+    public async Task A_Loss_Notice_Drained_By_PollAll_Is_Retried_By_The_Next_FlushAll()
+    {
+        // The transport reports the lost ReliableLatest datagram one round trip later; the engine queues an immediate retry
+        // when the completion is routed, which PollAll does. The retry must go out with the next FlushAll, not with the
+        // timer backstop (clamp(1.5 x RTT, 20 ms, 1 s)).
+        await using ServerFixture f = new(o => o.Channels = LatestTable);
+        SimulatedConnector lossy = new(f.Network, new LinkOptions { DelayMicros = 1_000, LossPercent = 100 });
+        QuiclyPeer client = f.Connect(connector: lossy, table: LatestTable);
+        Assert.True(f.RunUntil(() => client.State == PeerState.Connected), "not admitted: " + client.State);
+        QuiclyPeer peer = f.ServerPeerOf(client);
+        uint tick = 0;
+        Ticks(f, 30, ref tick);
+
+        Assert.True(peer.SendCopy(new SendHeader(6, 7), [1, 2, 3]).IsAdmitted);
+        long sent = f.Network.NowMicros;
+        long retried = -1;
+        while (f.Network.NowMicros < sent + 30_000)
+        {
+            f.Network.Advance(500);
+            f.PumpClients();
+            f.Server.PollAll();
+            f.Server.FlushAll(++tick);
+            Assert.True(peer.GetChannelStatistics(6, out ChannelStatistics statistics));
+            if (statistics.Retries > 0)
+            {
+                retried = f.Network.NowMicros;
+                break;
+            }
+        }
+
+        Assert.InRange(retried - sent, 1_000, 10_000);
     }
 }

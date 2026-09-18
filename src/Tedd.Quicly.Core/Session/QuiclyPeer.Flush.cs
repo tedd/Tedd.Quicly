@@ -60,8 +60,8 @@ public sealed unsafe partial class QuiclyPeer
                     engines[i].Tick(now, ref flush.NextDeadline);
                 }
 
-                // Everything admitted up to here is offered to this pass (no continuation runs before the pass ends).
-                _gate.Stamp = _core.LastAdmissionStamp;
+                // Everything admitted or routed up to here is this pass's to serve (no continuation runs before it ends).
+                NoteFlushGatePass();
                 FlushEngines(ref flush);
                 engineDeadline = flush.NextDeadline;
                 CloseFlushGate();
@@ -281,7 +281,7 @@ public sealed unsafe partial class QuiclyPeer
         {
             // Routed after the pass computed its deadlines (an engine may re-queue or re-arm on them): the next FlushAll
             // must not skip this peer (QuiclyPeer.FlushGate.cs).
-            _gate.Polled = true;
+            _gate.Touched = true;
         }
 
         DrainLocalCompletions();

@@ -378,7 +378,7 @@ internal sealed unsafe partial class BulkEngine
         ref ChannelRecvCounters counters = ref _core.RecvCounters(message.ChannelIndex);
         counters.Received++;
         counters.Bytes += data.Length;
-        _core.NoteWork();
+        _core.NoteTransportWork();
         if (accepted >= recv.Length)
         {
             FinishReceive(record, ref recv, BulkStatus.Completed, QuiclyErrorCode.NoError);
@@ -475,7 +475,7 @@ internal sealed unsafe partial class BulkEngine
                 RecycleDirect(record);
             }
 
-            _core.NoteWork();
+            _core.NoteTransportWork();
             return;
         }
 

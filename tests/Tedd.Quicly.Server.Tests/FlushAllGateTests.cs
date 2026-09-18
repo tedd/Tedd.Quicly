@@ -226,7 +226,9 @@ public class FlushAllGateTests
         client.RegisterHandler(4, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => received.Add(payload.Length));
         QuiclyPeer peer = f.ServerPeerOf(client);
         uint tick = 0;
+        Assert.True(peer.SendCopy(new SendHeader(4), [1]).IsAdmitted); // opens the channel's stream (a start counts as queued)
         Ticks(f, 300, ref tick);
+        received.Clear();
 
         Assert.True(peer.SendCopy(new SendHeader(4), new byte[100]).IsAdmitted);
         ValueTask<SendResult> waiting = peer.SendAsync(new SendHeader(4), new byte[50]);

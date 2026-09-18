@@ -440,7 +440,10 @@ public sealed unsafe partial class QuiclyPeer
         _dispatching = true;
         try
         {
-            handler(this, in _dispatchHeader, new ReadOnlySpan<byte>(data, entry.Length));
+            if (Diag.Mode != 22)
+            {
+                handler(this, in _dispatchHeader, new ReadOnlySpan<byte>(data, entry.Length));
+            }
         }
         finally
         {

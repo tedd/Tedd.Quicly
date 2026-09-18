@@ -821,6 +821,12 @@ internal sealed unsafe class PeerCore : IDisposable
             return false;
         }
 
+        if (Diag.Mode == 20)
+        {
+            _receiveBytes += lease.Length;
+            return true;
+        }
+
         if (Interlocked.Add(ref _receiveBytes, lease.Length) > _receiveBudget)
         {
             Interlocked.Add(ref _receiveBytes, -lease.Length);
@@ -841,7 +847,15 @@ internal sealed unsafe class PeerCore : IDisposable
             return;
         }
 
-        Interlocked.Add(ref _receiveBytes, -lease.Length);
+        if (Diag.Mode == 20)
+        {
+            _receiveBytes -= lease.Length;
+        }
+        else
+        {
+            Interlocked.Add(ref _receiveBytes, -lease.Length);
+        }
+
         _allocator.Return(in lease);
     }
 
@@ -1129,7 +1143,9 @@ internal sealed unsafe class PeerCore : IDisposable
         entry.Flags |= SendEntryFlags.Datagram;
         ulong context = Entries.Contexts[slot];
         Entries.Publish(slot);
+        long t0 = Diag.Mode == 14 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         TransportStatus status = transport.SendDatagram(segments, count, context, flags);
+        if (Diag.Mode == 14) { Diag.T2 += System.Diagnostics.Stopwatch.GetTimestamp() - t0; Diag.N2++; }
         if (status != TransportStatus.Success)
         {
             Unpublish(slot);

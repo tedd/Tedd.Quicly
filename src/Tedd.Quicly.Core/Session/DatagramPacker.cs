@@ -235,6 +235,17 @@ internal sealed unsafe class DatagramPacker
 
         int m = entries.BatchHead[container];
         entries.ClearBatch(container);
+        if (Diag.Mode == 30)
+        {
+            Tedd.Quicly.Core.Threading.DeliveryStatus st = _core.MapCompletion(in completion);
+            while (m >= 0)
+            {
+                int nx = entries.Next[m];
+                _core.CompleteEntry(m, st);
+                m = nx;
+            }
+        }
+
         while (m >= 0)
         {
             // Read the link first: finishing a member frees its slot, which a continuation may reuse at once.
@@ -297,10 +308,12 @@ internal sealed unsafe class DatagramPacker
         bool reserved = writer.TryReserve(headerLength + payloadLength, out Span<byte> target);
         Debug.Assert(reserved, "the caller checked that the message fits");
         entries.GetHeaderBlock(member).Slice(0, headerLength).CopyTo(target);
-        if (payloadLength > 0)
+        if (payloadLength > 0 && Diag.Mode != 10)
         {
             new ReadOnlySpan<byte>(entry.Payload.Buffer, payloadLength).CopyTo(target.Slice(headerLength));
         }
+
+        Diag.Msgs++;
 
         _length = writer.Length;
         _count = writer.Count;
@@ -313,7 +326,10 @@ internal sealed unsafe class DatagramPacker
         }
 
         // The bytes live in the container now; the member only waits for the container's outcome.
-        _core.ReleasePayload(member);
+        if (Diag.Mode != 11)
+        {
+            _core.ReleasePayload(member);
+        }
         _core.Counters.MessagesPacked++;
     }
 

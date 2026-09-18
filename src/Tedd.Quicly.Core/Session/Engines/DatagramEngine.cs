@@ -548,7 +548,13 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
             return;
         }
 
-        if (!Accept(local, in header, out int keySlot, ref counters))
+        int keySlot = -1;
+        if (Diag.Mode != 5 && !Accept(local, in header, out keySlot, ref counters))
+        {
+            return;
+        }
+
+        if (Diag.Mode == 4)
         {
             return;
         }
@@ -563,7 +569,10 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
                 return;
             }
 
-            payload.CopyTo(_core.GetSpan(in lease));
+            if (Diag.Mode != 6)
+            {
+                payload.CopyTo(_core.GetSpan(in lease));
+            }
         }
 
         ReceiveEntry entry = default;

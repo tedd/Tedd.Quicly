@@ -163,6 +163,12 @@ public sealed unsafe partial class QuiclyPeer
 
         _core.CurrentSenderTick = reader.HasTick ? reader.Tick : 0;
         bool accepted = false;
+        if (Diag.Mode == 2)
+        {
+            _core.CurrentSenderTick = 0;
+            return true;
+        }
+
         foreach (ReadOnlySpan<byte> message in reader)
         {
             if (_ignoreIncoming)
@@ -171,6 +177,12 @@ public sealed unsafe partial class QuiclyPeer
             }
 
             ParseStatus status = DatagramFraming.TryParse(message, _core.Table, _core.SessionMaxMessageSize, out MessageHeader header, out int offset);
+            if (Diag.Mode == 3)
+            {
+                accepted |= status == ParseStatus.Ok;
+                continue;
+            }
+
             if (status == ParseStatus.Ok)
             {
                 accepted |= DeliverDatagram(in header, message.Slice(offset), now);
@@ -1032,7 +1044,10 @@ public sealed unsafe partial class QuiclyPeer
 
             try
             {
+                if (Diag.Mode == 1) { return; }
+                long t0 = Diag.Mode == 14 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 peer.HandleDatagram(payload);
+                if (Diag.Mode == 14) { Diag.T0 += System.Diagnostics.Stopwatch.GetTimestamp() - t0; Diag.N0++; }
             }
             catch (Exception exception)
             {
@@ -1118,7 +1133,9 @@ public sealed unsafe partial class QuiclyPeer
 
             try
             {
+                long t0 = Diag.Mode == 14 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                 peer.HandleDatagramState(context, state);
+                if (Diag.Mode == 14) { Diag.T1 += System.Diagnostics.Stopwatch.GetTimestamp() - t0; Diag.N1++; }
             }
             catch (Exception exception)
             {

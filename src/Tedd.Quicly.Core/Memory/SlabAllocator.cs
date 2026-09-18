@@ -216,6 +216,12 @@ public sealed unsafe class SlabAllocator : IDisposable
         {
             int next = blocks[index].Next;
             long newHead = (long)((((ulong)head + TagIncrement) & TagMask) | (uint)next);
+            if (Diag.Mode == 40)
+            {
+                shard->Head = newHead;
+                return CompleteRent(ref c, ci, s, shard, blocks + index, index, out lease);
+            }
+
             if (Interlocked.CompareExchange(ref shard->Head, newHead, head) == head)
                 return CompleteRent(ref c, ci, s, shard, blocks + index, index, out lease);
         }
@@ -231,7 +237,7 @@ public sealed unsafe class SlabAllocator : IDisposable
         if (_validateLeases)
             block->State = StateRented;
 
-        int rented = Interlocked.Increment(ref shard->Rented);
+        int rented = Diag.Mode == 40 ? ++shard->Rented : Interlocked.Increment(ref shard->Rented);
         if (rented > Volatile.Read(ref shard->Peak))
             RaisePeak(shard, rented);
 
@@ -366,6 +372,15 @@ public sealed unsafe class SlabAllocator : IDisposable
                 ThrowStaleLease(in lease, block->Generation);
             if (Interlocked.Exchange(ref block->State, StateFree) != StateRented)
                 ThrowDoubleReturn(in lease);
+        }
+
+        if (Diag.Mode == 40)
+        {
+            shard->Rented--;
+            long h = shard->Head;
+            block->Next = (int)h;
+            shard->Head = (long)((((ulong)h + TagIncrement) & TagMask) | (uint)index);
+            return;
         }
 
         Interlocked.Decrement(ref shard->Rented);

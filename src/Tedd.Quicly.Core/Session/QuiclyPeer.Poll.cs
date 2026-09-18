@@ -447,7 +447,9 @@ public sealed unsafe partial class QuiclyPeer
             _dispatching = false;
             if (!_dispatchRetained && Volatile.Read(ref _freed) == 0)
             {
-                _core.ReturnReceive(in entry.Lease);
+                // Inside Poll on the game thread: the lease is parked for the transport thread to reuse. A retained lease
+                // is released later with Release (any thread), which returns it to the pool instead.
+                _core.RecycleReceive(in entry.Lease);
             }
         }
     }
@@ -512,7 +514,7 @@ public sealed unsafe partial class QuiclyPeer
     {
         BufferLease compressed = entry.Lease;
         int rawLength = entry.RawLength;
-        if (rawLength <= 0 || compressed.IsEmpty || !_decodeBucket.TryTake(now, rawLength) || !_core.TryRentReceive(rawLength, out BufferLease decoded))
+        if (rawLength <= 0 || compressed.IsEmpty || !_decodeBucket.TryTake(now, rawLength) || !_core.TryRentReceiveFromPool(rawLength, out BufferLease decoded))
         {
             _core.ReturnReceive(in compressed);
             _core.Counters.DecodeFailures++;

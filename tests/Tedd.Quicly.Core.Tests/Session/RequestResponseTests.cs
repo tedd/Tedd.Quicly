@@ -562,6 +562,67 @@ public class RequestResponseTests
     }
 
     [Fact]
+    public void The_Next_Deadline_Moves_To_The_Request_That_Times_Out_Next()
+    {
+        // A host that only polls sleeps on NextPollDeadlineMicros (ADR 0008 invariant 9), so when one request times out the
+        // published deadline must move to the next request's timeout — not stay at the one that passed (a spin) and not
+        // vanish (a request that never times out).
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        List<(ReceiveHeader Header, byte[] Payload)> requests = [];
+        h.Server!.RegisterHandler(10, Handlers.Collect(requests));
+
+        ValueTask<ReceiveLease> patient = client.SendRequestAsync(new SendHeader(10), new byte[] { 1 }, TimeSpan.Zero);
+        ValueTask<ReceiveLease> soon = client.SendRequestAsync(new SendHeader(10), new byte[] { 2 }, TimeSpan.FromMilliseconds(50));
+        ValueTask<ReceiveLease> later = client.SendRequestAsync(new SendHeader(10), new byte[] { 3 }, TimeSpan.FromMilliseconds(400));
+        long soonDeadline = OrderedKit.Engine(client).RequestDeadlineMicros;
+        Assert.True(h.RunUntil(() => requests.Count == 3), "the requests did not arrive");
+
+        h.Network.Advance(60_000);
+        client.Poll();
+        Assert.Throws<TimeoutException>(() => _ = soon.Result);
+        long laterDeadline = OrderedKit.Engine(client).RequestDeadlineMicros;
+        Assert.Equal(soonDeadline + 350_000, laterDeadline);
+        Assert.True(client.NextPollDeadlineMicros <= laterDeadline, "the poll deadline does not cover the next request's timeout");
+        Assert.True(client.NextPollDeadlineMicros > h.Clock.NowMicros, "the published deadline is not in the future");
+        Assert.False(later.IsCompleted, "a request timed out before its own timeout");
+
+        h.Network.AdvanceTo(laterDeadline);
+        client.Poll();
+        Assert.Throws<TimeoutException>(() => _ = later.Result);
+        Assert.False(patient.IsCompleted, "the request without a timeout timed out");
+        Assert.Equal(long.MaxValue, OrderedKit.Engine(client).RequestDeadlineMicros);
+        Assert.Equal(2, DatagramKit.Statistics(client).RequestsTimedOut);
+    }
+
+    [Fact]
+    public void Cancelling_After_The_Response_Arrived_Does_Not_Undo_It()
+    {
+        // The response completed the wait first; a cancellation that comes afterwards — before the caller read the result —
+        // loses that race and must leave the response in place (the registration is only dropped once the value task is
+        // consumed, so the callback does run).
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        Echo(h.Server!, 10);
+        using CancellationTokenSource cts = new();
+
+        ValueTask<ReceiveLease> pending = client.SendRequestAsync(new SendHeader(10), new byte[] { 4, 5 }, TimeSpan.Zero, cts.Token);
+        Assert.True(h.RunUntil(() => pending.IsCompleted), "no response arrived");
+        cts.Cancel();
+        ReceiveLease response = pending.Result;
+        Assert.Equal(new byte[] { 5, 4 }, response.Payload.ToArray());
+        client.Release(in response);
+        Assert.Equal(0, OrderedKit.Engine(client).OutstandingRequests);
+
+        // The slot went back to the pool whole: the next request reuses it and is answered normally.
+        ValueTask<ReceiveLease> next = client.SendRequestAsync(new SendHeader(10), new byte[] { 6, 7 }, TimeSpan.Zero);
+        Assert.True(h.RunUntil(() => next.IsCompleted), "the next request was not answered");
+        ReceiveLease nextResponse = next.Result;
+        Assert.Equal(new byte[] { 7, 6 }, nextResponse.Payload.ToArray());
+        client.Release(in nextResponse);
+    }
+
+    [Fact]
     public void Requests_Are_Answered_On_A_Lossy_Reordering_Link()
     {
         // Requests ride the channel's persistent ordered stream, so the loss of PROTOCOL.md §3.1 is a retransmission delay and

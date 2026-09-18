@@ -463,52 +463,6 @@ public sealed unsafe class SlabAllocator : IDisposable
         }
     }
 
-    /// <summary>
-    /// Hands a rented block back to its holder under a new generation, exactly as if it had been returned with
-    /// <see cref="Return"/> and rented again with <see cref="TryRent"/>(<paramref name="minimumLength"/>) — except that the
-    /// block never visits the free list, so the shard's head, rented count and peak are not touched and the call contains
-    /// no lock-prefixed instruction. It succeeds only when the block's class is the one <see cref="TryRent"/> would choose
-    /// for <paramref name="minimumLength"/> (the smallest class whose blocks hold that many bytes); otherwise nothing
-    /// changes and the lease is still rented under its old generation.
-    /// </summary>
-    /// <remarks>
-    /// The caller must own the block exclusively (it holds the lease and nobody else will return it), as for
-    /// <see cref="Return"/>. Copies of the old lease become stale: with <see cref="ValidateLeases"/> on, returning one
-    /// throws exactly as returning a lease of a block that was returned and rented again does.
-    /// </remarks>
-    /// <param name="lease">A lease obtained from this allocator and not yet returned.</param>
-    /// <param name="minimumLength">Bytes the new holder needs.</param>
-    /// <param name="reissued">The lease under the new generation, or <see cref="BufferLease.Empty"/> on failure.</param>
-    /// <returns><see langword="false"/> when <see cref="TryRent"/> would choose another class for <paramref name="minimumLength"/> (or it is negative).</returns>
-    /// <exception cref="ArgumentException">The lease is empty or does not address a block of this allocator.</exception>
-    /// <exception cref="InvalidOperationException">Lease validation is enabled and the lease is stale or its block is not rented.</exception>
-    /// <exception cref="ObjectDisposedException">The allocator has been disposed.</exception>
-    public bool TryReissue(in BufferLease lease, int minimumLength, out BufferLease reissued)
-    {
-        ref SizeClass c = ref ResolveClass(in lease);
-        int ci = lease.ClassIndex;
-        if ((uint)minimumLength > (uint)c.BlockSize || (ci > 0 && _classes[ci - 1].BlockSize >= minimumLength))
-        {
-            reissued = default;
-            return false;
-        }
-
-        int index = lease.BlockIndex;
-        BlockMeta* block = c.Blocks + index;
-        if (_validateLeases)
-        {
-            if (block->Generation != lease.Generation)
-                ThrowStaleLease(in lease, block->Generation);
-            if (Volatile.Read(ref block->State) != StateRented)
-                ThrowDoubleReturn(in lease);
-        }
-
-        ushort generation = (ushort)(block->Generation + 1);
-        block->Generation = generation;
-        reissued = new BufferLease((byte)ci, (byte)lease.Shard, generation, index, lease.Offset, c.BlockSize);
-        return true;
-    }
-
     /// <summary>The block's bytes as a span of <see cref="BufferLease.Length"/> bytes.</summary>
     /// <exception cref="ArgumentException">The lease is empty or does not address a block of this allocator.</exception>
     /// <exception cref="ObjectDisposedException">The allocator has been disposed.</exception>

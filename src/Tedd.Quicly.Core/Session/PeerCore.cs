@@ -57,25 +57,7 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>Mask of the stream serial carried in an engine stream context (24 bits; it wraps).</summary>
     public const uint EngineStreamSerialMask = 0xFF_FFFF;
 
-    /// <summary>
-    /// Most bytes of receive leases parked for reuse (<see cref="RecycleReceive"/>); an eighth of the receive budget when that
-    /// is smaller. Only a peer that owns its allocator parks: on a supplied (shared) pool a parked block would be one no other
-    /// peer could reclaim, so such a peer returns every lease to the pool as before.
-    /// </summary>
-    public const int MaxRecycledBytes = 32 * 1024;
-
-    /// <summary>Largest block parked for reuse (and at most a quarter of the peer's recycle limit).</summary>
-    public const int MaxRecycledBlock = 4096;
-
-    /// <summary>Slots of the recycle ring: <see cref="MaxRecycledBytes"/> in blocks of the smallest default class (64 bytes).</summary>
-    private const int RecycleRingCapacity = MaxRecycledBytes / 64;
-
     private readonly SlabAllocator _allocator;
-    // Receive-lease recycling (RecycleReceive → TryRentReceive): game thread → transport thread.
-    private readonly SpscRing<BufferLease> _recycled;
-    private readonly int _recycleLimit;
-    private readonly int _recycleMaxBlock;
-    private RecycleCounters _recycle;
     private TransportCallbackState _callback;
     private readonly bool _ownsAllocator;
     private readonly int[] _indexById;
@@ -155,10 +137,6 @@ internal sealed unsafe class PeerCore : IDisposable
 
         _sendBudget = options.SendBudgetBytes;
         _receiveBudget = options.ReceiveBudgetBytes;
-        // Only with a private pool: blocks parked by an idle peer on a shared pool would be lost to every other peer.
-        _recycleLimit = _ownsAllocator ? (int)Math.Min(MaxRecycledBytes, _receiveBudget / 8) : 0;
-        _recycleMaxBlock = Math.Min(MaxRecycledBlock, _recycleLimit / 4);
-        _recycled = new SpscRing<BufferLease>(_recycleLimit != 0 ? RecycleRingCapacity : 2);
         Entries = new SendEntryTable(options.SendTableCapacity);
         int capacity = Entries.Capacity;
         Segments = new SegmentArena(options.SegmentArenaCapacity);
@@ -543,22 +521,8 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>Send lease bytes held now (game thread; any thread with <see cref="PeerOptions.ThreadSafeSend"/>).</summary>
     public long SendBytesOutstanding => Volatile.Read(ref _sendBytes);
 
-    /// <summary>
-    /// Receive lease bytes held now (any thread): rented and not released, so leases parked for reuse
-    /// (<see cref="RecycleReceive"/>) do not count. Advisory while the transport thread is receiving (three counters, each
-    /// read once, ADR 0008 invariant 13); exact when it is idle.
-    /// </summary>
-    public long ReceiveBytesOutstanding
-    {
-        get
-        {
-            long parked = Volatile.Read(ref _recycle.In) - Volatile.Read(ref _recycle.Out);
-            return Volatile.Read(ref _receiveBytes) - Math.Max(0, parked);
-        }
-    }
-
-    /// <summary>Bytes of receive leases parked for reuse now (<see cref="RecycleReceive"/>; advisory like <see cref="ReceiveBytesOutstanding"/>).</summary>
-    public long RecycledBytes => Math.Max(0, Volatile.Read(ref _recycle.In) - Volatile.Read(ref _recycle.Out));
+    /// <summary>Receive lease bytes held now (any thread).</summary>
+    public long ReceiveBytesOutstanding => Volatile.Read(ref _receiveBytes);
 
     /// <summary>The receive budget (<see cref="PeerOptions.ReceiveBudgetBytes"/>).</summary>
     public long ReceiveBudgetBytes => _receiveBudget;
@@ -875,45 +839,13 @@ internal sealed unsafe class PeerCore : IDisposable
     }
 
     /// <summary>
-    /// Rents a receive lease of at least <paramref name="length"/> bytes within the receive budget (transport thread only:
-    /// it is the consumer of the recycle ring; the game thread uses <see cref="TryRentReceiveFromPool"/>). The caller counts
-    /// a failure (<see cref="PeerCounters.OutOfReceiveBuffers"/>).
+    /// Rents a receive lease of at least <paramref name="length"/> bytes within the receive budget (transport thread; the
+    /// game thread when decoding). The caller counts a failure (<see cref="PeerCounters.OutOfReceiveBuffers"/>).
     /// </summary>
-    /// <remarks>
-    /// A lease the game thread parked with <see cref="RecycleReceive"/> is reissued first when its block is of the class the
-    /// pool would choose for <paramref name="length"/> (<see cref="SlabAllocator.TryReissue"/>): the block was counted in
-    /// the budget and rented from the pool while parked and still is, so the reuse is exactly a return followed by a rent
-    /// that could not fail, and costs no atomic operation. A parked lease of another class goes back to the pool. Before a
-    /// rent fails on the budget or an empty pool, every parked lease is given back and the rent is tried once more, so
-    /// parking never makes a rent fail that would have succeeded without it.
-    /// </remarks>
     /// <param name="length">Bytes needed.</param>
     /// <param name="lease">The lease, or empty.</param>
     /// <returns><see langword="false"/> when the budget or the pool is exhausted.</returns>
     public bool TryRentReceive(int length, out BufferLease lease)
-    {
-        if (_recycleLimit != 0 && _recycled.TryDequeue(out BufferLease parked))
-        {
-            Volatile.Write(ref _recycle.Out, _recycle.Out + parked.Length);
-            if (_allocator.TryReissue(in parked, length, out lease))
-            {
-                return true;
-            }
-
-            ReturnReceive(in parked);
-        }
-
-        return TryRentReceiveFromPool(length, out lease) || (DrainRecycled() && TryRentReceiveFromPool(length, out lease));
-    }
-
-    /// <summary>
-    /// Rents a receive lease from the pool within the receive budget, never from the parked leases (any thread: the game
-    /// thread's decoder; the transport thread through <see cref="TryRentReceive"/>). Parked leases count as held here.
-    /// </summary>
-    /// <param name="length">Bytes needed.</param>
-    /// <param name="lease">The lease, or empty.</param>
-    /// <returns><see langword="false"/> when the budget or the pool is exhausted.</returns>
-    public bool TryRentReceiveFromPool(int length, out BufferLease lease)
     {
         if (!_allocator.TryRent(length, out lease))
         {
@@ -931,7 +863,7 @@ internal sealed unsafe class PeerCore : IDisposable
         return true;
     }
 
-    /// <summary>Returns a receive lease to the pool (any thread; normally the game thread). Empty leases are ignored.</summary>
+    /// <summary>Returns a receive lease (any thread; normally the game thread). Empty leases are ignored.</summary>
     /// <param name="lease">The lease.</param>
     public void ReturnReceive(in BufferLease lease)
     {
@@ -942,62 +874,6 @@ internal sealed unsafe class PeerCore : IDisposable
 
         Interlocked.Add(ref _receiveBytes, -lease.Length);
         _allocator.Return(in lease);
-    }
-
-    /// <summary>
-    /// Gives back the lease of a message the game thread finished dispatching (game thread, from <see cref="QuiclyPeer.Poll"/>'s
-    /// dispatch only: the single producer of the recycle ring). The lease is parked for <see cref="TryRentReceive"/> to
-    /// reissue to the next received message, so the pool's shard head and counters and the budget word, which the transport
-    /// thread writes on every rent, are not written from this thread per message. A parked lease stays rented and counted in
-    /// the receive budget (<see cref="ReceiveBytesOutstanding"/> leaves it out) until it is reissued or given back: by the
-    /// transport thread before a rent would fail, when its class does not fit, or when the peer's memory is freed. At most
-    /// <see cref="MaxRecycledBytes"/> (an eighth of the budget when that is smaller) are parked, in blocks of at most
-    /// <see cref="MaxRecycledBlock"/> bytes and a quarter of that limit, and only by a peer that owns its allocator (a peer on
-    /// a supplied pool never parks); anything else goes back to the pool as
-    /// <see cref="ReturnReceive"/> does.
-    /// </summary>
-    /// <param name="lease">The lease (empty is ignored).</param>
-    public void RecycleReceive(in BufferLease lease)
-    {
-        if (lease.IsEmpty)
-        {
-            return;
-        }
-
-        int length = lease.Length;
-        long parked = _recycle.In + length;
-        if (length <= _recycleMaxBlock
-            && (parked - _recycle.OutSeen <= _recycleLimit || parked - (_recycle.OutSeen = Volatile.Read(ref _recycle.Out)) <= _recycleLimit))
-        {
-            // Counted before it is visible to the transport thread, so In - Out never goes negative.
-            Volatile.Write(ref _recycle.In, parked);
-            if (_recycled.TryEnqueue(in lease))
-            {
-                return;
-            }
-
-            Volatile.Write(ref _recycle.In, parked - length);
-        }
-
-        ReturnReceive(in lease);
-    }
-
-    /// <summary>
-    /// Gives every parked lease back to the pool (the recycle ring's consumer: the transport thread, or whoever frees the
-    /// peer once neither thread can run).
-    /// </summary>
-    /// <returns><see langword="true"/> when at least one lease was given back.</returns>
-    private bool DrainRecycled()
-    {
-        bool any = false;
-        while (_recycled.TryDequeue(out BufferLease parked))
-        {
-            Volatile.Write(ref _recycle.Out, _recycle.Out + parked.Length);
-            ReturnReceive(in parked);
-            any = true;
-        }
-
-        return any;
     }
 
     /// <summary>Native address of a lease's first byte.</summary>
@@ -1727,8 +1603,6 @@ internal sealed unsafe class PeerCore : IDisposable
             ReturnReceive(in entry.Lease);
         }
 
-        // Neither thread runs any more, so the recycle ring can be drained from here (its consumer's role).
-        DrainRecycled();
         Packer.ReturnCopied();
         for (int slot = 0; slot < Entries.Capacity; slot++)
         {
@@ -1741,7 +1615,6 @@ internal sealed unsafe class PeerCore : IDisposable
         Entries.Dispose();
         Segments.Dispose();
         ReceiveRing.Dispose();
-        _recycled.Dispose();
         CompletionRing.Dispose();
         PendedStreams.Dispose();
         Completions.Dispose();
@@ -1754,25 +1627,6 @@ internal sealed unsafe class PeerCore : IDisposable
         {
             _allocator.Dispose();
         }
-    }
-
-    /// <summary>
-    /// Byte counters of the recycle ring (<see cref="RecycleReceive"/>), split by writer: <see cref="In"/> and the game
-    /// thread's snapshot <see cref="OutSeen"/> on the game thread's lines, <see cref="Out"/> on the transport thread's.
-    /// The parked bytes are <c>In - Out</c>; the game thread reads <see cref="Out"/> only when its snapshot says the limit
-    /// is reached, so a recycled lease costs no coherence traffic on these lines (ADR 0008 invariant 5).
-    /// </summary>
-    [StructLayout(LayoutKind.Explicit, Size = CacheLine.Stride * 3)]
-    private struct RecycleCounters
-    {
-        /// <summary>Bytes ever parked. Written by the game thread.</summary>
-        [FieldOffset(CacheLine.Stride)] public long In;
-
-        /// <summary>The game thread's snapshot of <see cref="Out"/>. Game-thread private.</summary>
-        [FieldOffset(CacheLine.Stride + 8)] public long OutSeen;
-
-        /// <summary>Bytes ever taken back out (reissued or returned). Written by the recycle ring's consumer.</summary>
-        [FieldOffset(CacheLine.Stride * 2)] public long Out;
     }
 
     /// <summary>Transport-thread state of <see cref="BeginTransportCallback"/>, padded off every game-thread line.</summary>

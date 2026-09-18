@@ -486,6 +486,58 @@ public unsafe class FragmentEdgeTests
     }
 
     [Fact]
+    public void A_Fragmented_Message_Refused_For_Its_Token_Leaves_No_Owner_Marks()
+    {
+        // AdmitFragmented takes the owner entry and every fragment entry *before* the tracking token, so a refusal there gives
+        // back entries it never filled. Each of them carries the empty owner marker from its allocation, because a slot that
+        // kept a stale mark would have a later message's completion folded into a message that no longer exists
+        // (docs/design/session-layer.md §7.8). The refusal is provoked without touching the send table: a tracked send whose
+        // wait nobody consumes keeps its completion slot after its entry has gone back, so the completion table runs out while
+        // the send table is empty.
+        using SessionHarness h = new(
+            table: Table,
+            client: o =>
+            {
+                DatagramKit.Quiet(o);
+                o.SendTableCapacity = 16;
+            },
+            server: DatagramKit.Quiet);
+        QuiclyPeer client = h.Client;
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(2, Handlers.Collect(got));
+
+        List<ValueTask<DeliveryStatus>> waits = [];
+        for (int i = 0; i < 24; i++)
+        {
+            SendResult small = client.SendCopy(new SendHeader(7), DatagramKit.Payload(i, 64), SendOptions.Tracked);
+            if (small.Status != SendStatus.Admitted)
+            {
+                break;
+            }
+
+            waits.Add(client.WaitAsync(small.Token, CompletionStage.RemoteAccepted));
+            Assert.True(
+                h.RunUntil(() => client.GetDeliveryStatus(small.Token) != DeliveryStatus.Pending),
+                $"tracked send {i} did not complete");
+        }
+
+        Assert.True(waits.Count >= 8, $"only {waits.Count} tracked sends were admitted, so the completion table was never filled");
+        SendResult refused = client.SendCopy(new SendHeader(2), DatagramKit.Payload(99, 4_000), SendOptions.Tracked);
+        Assert.Equal(SendStatus.QueueFull, refused.Status);
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 2).QueuedMessages);
+        Assert.Equal(0, DatagramKit.Statistics(client).FragmentedMessagesSent);
+
+        // The very slots that refusal gave back now carry another fragmented message, which must arrive whole and complete.
+        byte[] payload = DatagramKit.Payload(98, 4_000);
+        Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(2), payload).Status);
+        Assert.True(h.RunUntil(() => got.Count == 1), "the message that reused the refused entries did not arrive");
+        Assert.Equal(payload, got[0].Payload);
+        Assert.Equal(1, DatagramKit.Statistics(client).FragmentedMessagesSent);
+        Assert.Equal(1, DatagramKit.ChannelStats(client, 2).QueueFull);
+        Assert.Equal(0, DatagramKit.Statistics(client).SendBytesOutstanding);
+    }
+
+    [Fact]
     public void A_Fragmented_Message_Needs_A_Payload_Buffer()
     {
         using SessionHarness h = new(

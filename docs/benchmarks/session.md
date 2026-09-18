@@ -320,39 +320,81 @@ on the same machine and with the same `InProcessShortRunConfig` as the tables ab
 As everywhere in this file both peers and the simulator share one thread, so these are single-core figures with no
 cross-thread coherence cost, and another agent was building and testing on the machine throughout.
 
+Re-measured after the wave C2d review fixes (2026-09-16, same machine and config; the pre-fix numbers are in the A/B below):
+
 | Method           | Toolchain              | Mean       | Error      | StdDev    | Derived              | Allocated |
 |----------------- |----------------------- |-----------:|-----------:|----------:|---------------------:|----------:|
-| Fragment3        | Default                |   2.416 µs | 1.4401 µs  | 0.0789 µs | 0.81 µs per fragment, 993 MB/s | - |
-| Fragment8        | Default                |   8.231 µs | 7.2771 µs  | 0.3989 µs | 1.03 µs per fragment, 1.02 GB/s | - |
-| Fragment3        | InProcessEmitToolchain |   3.137 µs | 0.5479 µs  | 0.0300 µs | 1.05 µs per fragment, 765 MB/s | - |
-| Fragment8        | InProcessEmitToolchain |   7.634 µs | 0.7838 µs  | 0.0430 µs | 0.95 µs per fragment, 1.10 GB/s | - |
-| RequestRoundTrip | Default                |   811.6 ns |   827.5 ns |  45.36 ns | 1.23 M requests/s    |         - |
-| RequestSingle    | Default                | 2,171.6 ns | 6,678.6 ns | 366.08 ns |   460 k requests/s   |         - |
-| RequestRoundTrip | InProcessEmitToolchain |   971.5 ns |   269.2 ns |  14.76 ns | 1.03 M requests/s    |         - |
-| RequestSingle    | InProcessEmitToolchain | 2,528.4 ns | 2,051.0 ns | 112.42 ns |   396 k requests/s   |         - |
+| Fragment3        | Default                |   2.245 µs | 2.7241 µs  | 0.1493 µs | 0.75 µs per fragment, 1.07 GB/s | - |
+| Fragment8        | Default                |   6.565 µs | 1.9214 µs  | 0.1053 µs | 0.82 µs per fragment, 1.28 GB/s | - |
+| Fragment3        | InProcessEmitToolchain |   2.286 µs | 0.1129 µs  | 0.0062 µs | 0.76 µs per fragment, 1.05 GB/s | - |
+| Fragment8        | InProcessEmitToolchain |   7.293 µs | 1.7963 µs  | 0.0985 µs | 0.91 µs per fragment, 1.15 GB/s | - |
+| RequestRoundTrip | Default                |   647.8 ns |   149.3 ns |   8.19 ns | 1.54 M requests/s    |         - |
+| RequestSingle    | Default                | 1,882.3 ns | 1,149.3 ns |  62.99 ns |   531 k requests/s   |         - |
+| RequestRoundTrip | InProcessEmitToolchain |   704.1 ns |   402.5 ns |  22.06 ns | 1.42 M requests/s    |         - |
+| RequestSingle    | InProcessEmitToolchain | 1,754.2 ns |   294.8 ns |  16.16 ns |   570 k requests/s   |         - |
 
-ShortRun is N = 3, and two of these rows have an *Error* wider than their own mean (`Fragment8` out of process,
-`RequestSingle`), so read the means and StdDevs and treat anything under ~20 % as noise — the same rule as the tables
-above.
+ShortRun is N = 3, and two of these rows have an *Error* wider than their own mean (`Fragment3` out of process,
+`RequestSingle` out of process at 61 %), so read the means and StdDevs and treat anything under ~20 % as noise — the same
+rule as the tables above. The request rows moved by 15 … 30 % between the two recorded sessions although **nothing on that
+path changed** (only the timeout conversion, which `TimeSpan.Zero` does not reach), which is the honest measure of how much
+ambient load on this machine is worth: cross-session comparisons of a single row mean little, and that is why the change
+below was measured as an A/B minutes apart instead.
+
+### Preparing a fragmented message's payload once (ADR 0007)
+
+**V0** (`git show HEAD~1 -- src/Tedd.Quicly.Core/Session/Engines/DatagramEngine*.cs`): `Admit` prepares the payload for its
+single-datagram attempt, finds that the message does not fit, **releases** that payload and gives up its entry, and
+`AdmitFragmented` prepares the payload all over again. For `SendCopy` that is two rents of a send lease and two copies of the
+whole message; for a compressed channel two LZ4 passes; for `SendBorrowed` two `GCHandle` pin/unpin cycles.
+
+**Hypothesis.** Nothing about the payload depends on the fragment layout — the fragments point into those bytes and only the
+header differs — so handing the prepared payload to `AdmitFragmented` should remove one full payload copy per fragmented
+message, which is 2 400 or 8 375 bytes here and should show up as a fixed saving per message rather than per fragment.
+
+**Measurement.** `FragmentBench` (`--filter '*Fragment*'`, net10.0, `InProcessShortRunConfig`), run twice in the same session
+minutes apart: once with the two engine files checked out from the parent commit, once with the fix. Same machine, same
+process shape, another agent building and testing on the box throughout both arms.
+
+**Result.**
+
+| Method    | Toolchain              | V0 (prepared twice) | V1 (prepared once) | Ratio |
+|---------- |----------------------- |--------------------:|-------------------:|------:|
+| Fragment3 | Default                |            2.783 µs |           2.245 µs |  0.81 |
+| Fragment8 | Default                |            7.697 µs |           6.565 µs |  0.85 |
+| Fragment3 | InProcessEmitToolchain |            2.402 µs |           2.286 µs |  0.95 |
+| Fragment8 | InProcessEmitToolchain |            7.382 µs |           7.293 µs |  0.99 |
+
+Out of process the saving is **0.54 µs on a three-fragment message and 1.13 µs on an eight-fragment one**, which is the right
+shape: it tracks the payload size (2 400 → 8 375 bytes), not the fragment count, exactly as one memcpy of the message would.
+In process the same two rows move 1 … 5 %, inside their own error, so that arm neither confirms nor contradicts it.
+
+**Decision.** Keep V1. It is the cheaper path *and* the simpler contract — one owner of the prepared payload, released on
+exactly one failure path — and it removes the second LZ4 pass and the second pin that no benchmark here measures (no
+compressed or borrowed fragmenting channel is benchmarked; `FragmentEdgeTests.Every_Send_Path_Can_Fragment` covers them
+functionally). **No Archive copy:** the superseded code is an internal hand-off between two private methods of
+`DatagramEngine` over `PeerCore` state, not a standalone unit like `Lz4Block` or `StreamFrameParser`, so it cannot be lifted
+into `Tedd.Quicly.Archive` without duplicating the engine and its peer state there — and `Tedd.Quicly.Core` exposes its
+internals only to its test project, so the archive could not even compile against them. `FragmentBench` itself is the
+runnable guard, and the V0 arm is reproducible from git as the command above shows.
 
 ### Reading
 
-* **A fragment costs about what a datagram of its size costs: 0.8 … 1.05 µs.** Three fragments take 2.4 … 3.1 µs and
-  eight take 7.6 … 8.2 µs, so the per-fragment cost is flat in the count — there is no per-message penalty that grows
+* **A fragment costs about what a datagram of its size costs: 0.75 … 0.91 µs.** Three fragments take 2.2 … 2.3 µs and
+  eight take 6.6 … 7.3 µs, so the per-fragment cost is flat in the count — there is no per-message penalty that grows
   with the number of fragments. Against `Unreliable64Loose` (624 ns for one 64-byte datagram) a fragment costs
-  200 … 400 ns more, which is the larger copy on each side: the sender's `SendCopy` into the owner's lease and the
-  receiver's copy of each fragment into the partial message's buffer.
-* **About 1 GB/s of fragmented payload on one core** (993 MB/s … 1.10 GB/s), with both peers and the simulator on that
+  130 … 290 ns more, which is the larger copy on each side: the sender's `SendCopy` into the owner's lease (now exactly
+  one copy, see the A/B above) and the receiver's copy of each fragment into the partial message's buffer.
+* **More than 1 GB/s of fragmented payload on one core** (1.05 … 1.28 GB/s), with both peers and the simulator on that
   same core. The fragments of one message are never packed together — by construction two of them cannot share a
   datagram — so this is one `SendDatagram` and one completion per fragment.
 * **Nothing allocates**, in either job, for either feature: the owner entry, the fragment entries, the reassembly
   records and the request table's value-task sources are all pooled. `FragmentRequestZeroAllocationTests` asserts the
   same thing over five windows of 60 Hz traffic and of request round trips.
-* **A request round trip costs 0.81 … 0.97 µs with 16 in flight** — roughly what two `Ordered64` messages cost
-  (262 ns each in the end-to-end table) plus ~290 ns for the request id, the table slot, the pooled value-task source
+* **A request round trip costs 0.65 … 0.70 µs with 16 in flight** — roughly what two `Ordered64` messages cost
+  (262 ns each in the end-to-end table) plus ~120 … 180 ns for the request id, the table slot, the pooled value-task source
   and the matching scan. It is *one* round trip, not two messages: the application learns that the peer applied the
   message, which is the only application-level acknowledgement v1 has (PROTOCOL.md §4.3).
-* **One request at a time costs 2.2 … 2.5 µs**, about 1.4 … 1.6 µs more. That difference is the per-pass cost of the
+* **One request at a time costs 1.75 … 1.88 µs**, about 1.05 … 1.2 µs more. That difference is the per-pass cost of the
   cycle (both peers' `Flush`/`Poll`, the simulator's delivery) which 16 requests share and one request pays alone — the
   same shape as the packing difference between `Unreliable64Packed` and `Unreliable64Loose`. A game that issues its
   requests together per tick gets the first number.

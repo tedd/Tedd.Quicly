@@ -59,6 +59,10 @@ public sealed unsafe class MpscRing<T> : IDisposable where T : unmanaged
     /// Keep the slots in GC-managed memory (a reference-free byte array on the pinned object heap) whose lifetime is the
     /// ring's reachability: <see cref="Dispose"/> frees nothing, and an enqueue after it is harmless.
     /// </param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="minimumCapacity"/> is not positive or exceeds 2^30, or, on the pinned object heap, the slots need a
+    /// block longer than the largest array (<see cref="PinnedBlockLength"/>).
+    /// </exception>
     internal MpscRing(int minimumCapacity, bool pinnedObjectHeap)
     {
         int capacity = SpscRing<T>.RoundUpCapacity(minimumCapacity);
@@ -66,7 +70,7 @@ public sealed unsafe class MpscRing<T> : IDisposable where T : unmanaged
         {
             // Pinned-heap objects never move, so the aligned start computed once stays valid for the array's lifetime,
             // and the array lives as long as this ring references it.
-            _pinned = GC.AllocateUninitializedArray<byte>(capacity * sizeof(Slot) + CacheLine.Size - 1, pinned: true);
+            _pinned = GC.AllocateUninitializedArray<byte>(PinnedBlockLength(capacity), pinned: true);
             nint start = (nint)Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(_pinned));
             _slots = (Slot*)((start + (CacheLine.Size - 1)) & ~(nint)(CacheLine.Size - 1));
         }
@@ -86,6 +90,28 @@ public sealed unsafe class MpscRing<T> : IDisposable where T : unmanaged
 
     /// <summary>Size of one slot in bytes (the sequence word plus the element).</summary>
     public static int SlotSize => sizeof(Slot);
+
+    /// <summary>
+    /// Bytes of the pinned-object-heap block that holds <paramref name="capacity"/> slots from a 64-byte aligned start:
+    /// the slots plus the slack for aligning the start. Computed in 64 bits, so a large capacity is rejected instead of
+    /// wrapping around to a short block.
+    /// </summary>
+    /// <param name="capacity">Number of slots.</param>
+    /// <returns>The block length in bytes.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">The block would be longer than the largest array (<see cref="Array.MaxLength"/>), or <paramref name="capacity"/> is negative.</exception>
+    internal static int PinnedBlockLength(int capacity)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(capacity);
+        long length = (long)capacity * sizeof(Slot) + (CacheLine.Size - 1);
+        if (length > Array.MaxLength)
+            ThrowPinnedBlockTooLong(capacity, length);
+        return (int)length;
+    }
+
+    [DoesNotReturn]
+    private static void ThrowPinnedBlockTooLong(int capacity, long length) =>
+        throw new ArgumentOutOfRangeException(nameof(capacity), capacity,
+            $"{capacity} slots of {sizeof(Slot)} bytes need a {length}-byte block on the pinned object heap, longer than the largest array ({Array.MaxLength} bytes).");
 
     /// <summary>Address of the first slot (64-byte aligned); for layout assertions.</summary>
     internal nint Address => (nint)_slots;

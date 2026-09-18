@@ -225,4 +225,42 @@ public class MpscRingTests
         Assert.Equal(7, late);
         Assert.True(ring.IsEmpty);
     }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(128)]
+    [InlineData(1 << 20)]
+    [InlineData(1 << 26)] // 1 GiB of 16-byte slots: the largest power of two whose block is an array
+    public void Pinned_Heap_Block_Holds_The_Slots_Plus_The_Alignment_Slack(int capacity)
+    {
+        Assert.Equal((long)capacity * MpscRing<int>.SlotSize + CacheLine.Size - 1, MpscRing<int>.PinnedBlockLength(capacity));
+    }
+
+    [Fact]
+    public void Pinned_Heap_Block_Length_Is_Accepted_Up_To_The_Largest_Array()
+    {
+        // The exact boundary, for two slot sizes (int: 16 bytes, Guid: 24 bytes).
+        int maxInt = (int)((Array.MaxLength - (CacheLine.Size - 1L)) / MpscRing<int>.SlotSize);
+        Assert.Equal((long)maxInt * 16 + 63, MpscRing<int>.PinnedBlockLength(maxInt));
+        Assert.True(MpscRing<int>.PinnedBlockLength(maxInt) > Array.MaxLength - 16);
+        Assert.Throws<ArgumentOutOfRangeException>(() => MpscRing<int>.PinnedBlockLength(maxInt + 1));
+
+        int maxGuid = (int)((Array.MaxLength - (CacheLine.Size - 1L)) / MpscRing<Guid>.SlotSize);
+        Assert.True(MpscRing<Guid>.PinnedBlockLength(maxGuid) <= Array.MaxLength);
+        Assert.Throws<ArgumentOutOfRangeException>(() => MpscRing<Guid>.PinnedBlockLength(maxGuid + 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => MpscRing<int>.PinnedBlockLength(-1));
+    }
+
+    [Theory]
+    [InlineData(1 << 27)] // 2 GiB of 16-byte slots: past the largest array
+    [InlineData(1 << 28)] // 4 GiB: computed in 32 bits this wrapped to a 63-byte block
+    [InlineData(1 << 30)] // the largest capacity a ring accepts (CompletionTable documents it): 16 GiB, also wrapped to 63 bytes
+    public void Pinned_Heap_Ring_Longer_Than_The_Largest_Array_Is_Rejected_Instead_Of_Wrapping(int capacity)
+    {
+        Assert.Equal(16, MpscRing<int>.SlotSize);
+        Assert.Throws<ArgumentOutOfRangeException>(() => MpscRing<int>.PinnedBlockLength(capacity));
+
+        // The constructor sizes the block before it allocates anything, so this allocates nothing.
+        Assert.Throws<ArgumentOutOfRangeException>(() => new MpscRing<int>(capacity, pinnedObjectHeap: true));
+    }
 }

@@ -1,3 +1,4 @@
+using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
 
 namespace Tedd.Quicly.Core.Tests.Session;
@@ -9,6 +10,12 @@ namespace Tedd.Quicly.Core.Tests.Session;
 /// </summary>
 public class ReviewThreadingTests
 {
+    // 2: unreliable datagrams (the parking traffic). 6: a reliable ordered stream channel with LZ4.
+    private static readonly ChannelTable DecodeTable = ChannelTable.Create()
+        .Add(2, "events", ChannelMode.UnreliableUnordered)
+        .Add(6, "packed", ChannelMode.ReliableOrdered, o => { o.Compression = ChannelCompression.Lz4; o.MinCompressSize = 16; })
+        .Build();
+
     /// <summary>
     /// Receive-lease recycling (45d6d1f) keeps up to 32 KiB of dispatched receive blocks rented from a peer's private pool,
     /// and only the transport thread gives them back — when one of its own rents would fail. The game thread's send rents
@@ -61,5 +68,83 @@ public class ReviewThreadingTests
 
         Assert.Equal(SendStatus.Admitted, firstRefusal);
         Assert.Equal(1_000, admitted);
+    }
+
+    /// <summary>
+    /// The game thread decodes an LZ4 message into a receive lease rented with
+    /// <c>PeerCore.TryRentReceiveFromPool</c>, which counts parked leases as held and never drains them (only the
+    /// transport thread may: it is the recycle ring's consumer). So a decode that fits the receive budget without the parked
+    /// bytes fails with them, and the message is dropped (<see cref="PeerStatistics.DecodeFailures"/>) — here a message of a
+    /// reliable ordered channel that the transport already delivered, i.e. silent loss of reliable data. This contradicts
+    /// the stated rule "parking never makes a rent fail that would have succeeded without it".
+    /// Budget 8 KiB (recycle limit 1 KiB, blocks of at most 256 bytes): the application retains 4 × 1 536 bytes, 16 dispatched
+    /// 40-byte messages park 16 × 64 bytes, and a 1 000-byte compressible message on channel 6 arrives in one of the parked
+    /// blocks. Its decode needs a 1 536-byte block: 6 144 + 64 + 1 536 = 7 744 fits (691f20d); 6 144 + 1 024 + 1 536 = 8 704
+    /// does not (integration head).
+    /// </summary>
+    [Fact]
+    public void Parked_Receive_Bytes_Do_Not_Make_The_Decoder_Drop_A_Reliable_Message_That_Fits_The_Budget()
+    {
+        using SessionHarness h = new(table: DecodeTable, client: DatagramKit.Quiet, server: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.ReceiveBudgetBytes = 8 * 1024;
+        });
+        QuiclyPeer server = h.Server!;
+        List<ReceiveLease> retained = [];
+        int small = 0;
+        int decoded = 0;
+        byte[] packed = new byte[1_000];
+        BitConverter.TryWriteBytes(packed, 0x5EED);
+        server.RegisterHandler(2, (QuiclyPeer peer, in ReceiveHeader header, ReadOnlySpan<byte> payload) =>
+        {
+            if (payload.Length == 1_000)
+            {
+                retained.Add(peer.Retain(in header));
+            }
+            else
+            {
+                small++;
+            }
+        });
+        server.RegisterHandler(6, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) =>
+        {
+            Assert.True(payload.SequenceEqual(packed));
+            decoded++;
+        });
+        h.Run(10_000);
+
+        // Four 1 000-byte messages the application keeps (4 × 1 536 bytes of the budget).
+        for (int i = 0; i < 4; i++)
+        {
+            Assert.True(h.Client.SendCopy(new SendHeader(2), DatagramKit.Payload(i, 1_000)).IsAdmitted);
+        }
+
+        Assert.True(h.RunUntil(() => retained.Count == 4, 1_000_000), "the retained messages did not arrive");
+
+        // Sixteen small messages arrive before the server polls, then one Poll dispatches them.
+        h.StopPumpingServer();
+        for (int i = 0; i < 16; i++)
+        {
+            Assert.True(h.Client.SendCopy(new SendHeader(2), DatagramKit.Payload(100 + i, 40)).IsAdmitted);
+        }
+
+        Assert.True(h.RunUntil(() => DatagramKit.ChannelStats(server, 2).Received >= 20, 1_000_000), "the small messages did not arrive");
+        server.Poll();
+        Assert.Equal(16, small);
+        Assert.Equal(4 * 1536, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+
+        // A compressible 1 000-byte message on the reliable channel: tiny on the wire, 1 000 bytes once decoded.
+        Assert.True(h.Client.SendCopy(new SendHeader(6), packed).IsAdmitted);
+        Assert.True(h.RunUntil(() => DatagramKit.ChannelStats(server, 6).Received >= 1, 1_000_000), "the packed message did not arrive");
+        server.Poll();
+
+        Assert.Equal(0, DatagramKit.Statistics(server).DecodeFailures);
+        Assert.Equal(1, decoded);
+
+        foreach (ReceiveLease lease in retained)
+        {
+            server.Release(in lease);
+        }
     }
 }

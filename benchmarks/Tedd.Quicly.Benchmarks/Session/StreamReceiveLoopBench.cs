@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using BenchmarkDotNet.Attributes;
 using Tedd.Quicly.Archive.Session;
 using Tedd.Quicly.Core.Channels;
@@ -7,9 +8,12 @@ namespace Tedd.Quicly.Benchmarks.Session;
 
 /// <summary>
 /// ADR 0007 loop on the ordered receive path: the peer's engine-stream loop must be able to un-read any message event when
-/// an engine pends. V0 (archived) copies the whole <see cref="StreamFrameParser"/> before every event; V1 (current) takes a
-/// <see cref="StreamFrameParser.Mark"/> of the state a message event changes. Workload: 1 000 frames of 64 bytes on an
-/// unkeyed, uncompressed ordered channel, received in 1 200-byte segments (three events per message). Per message.
+/// an engine pends. V0 (archived) copies the whole <see cref="StreamFrameParser"/> before every event; V1 (archived) takes a
+/// <see cref="StreamFrameParser.Mark"/> of the state a message event changes and hands every message over as three events;
+/// V2 (current) hands a message whose payload lies wholly in the segment over as one event (<c>StreamMessagePhase.Whole</c>,
+/// via the parser's internal <c>TryTakeWholePayload</c>). Workload: 1 000 frames of 64 bytes on an unkeyed, uncompressed
+/// ordered channel, received in 1 200-byte segments (three events per message in V0 and V1; one for most messages in V2, three
+/// for the few that straddle a segment boundary). Per message.
 /// </summary>
 [Config(typeof(InProcessShortRunConfig))]
 public class StreamReceiveLoopBench
@@ -41,9 +45,10 @@ public class StreamReceiveLoopBench
         }
 
         _stream = [.. data];
-        if (V0_CopyParserPerEvent() != V1_MarkPerEvent())
+        long v0 = V0_CopyParserPerEvent();
+        if (v0 != V1_MarkPerEvent() || v0 != V2_WholeMessage())
         {
-            throw new InvalidOperationException("The two loops disagree.");
+            throw new InvalidOperationException("The loops disagree.");
         }
     }
 
@@ -73,14 +78,34 @@ public class StreamReceiveLoopBench
         for (int offset = 0; offset < _stream.Length; offset += SegmentSize)
         {
             ReadOnlySpan<byte> segment = _stream.AsSpan(offset, Math.Min(SegmentSize, _stream.Length - offset));
-            sum += RunV1(ref parser, Table, segment, -1, ref events);
+            sum += StreamReceiveLoopV1.Run(ref parser, Table, segment, -1, ref events);
         }
 
         return sum;
     }
 
-    /// <summary>The current loop's shape (QuiclyPeer.ReceiveEngineStream): a mark per event, a whole copy only on bulk streams.</summary>
-    private static long RunV1(ref StreamFrameParser parser, ChannelTable table, ReadOnlySpan<byte> segment, int pendAt, ref int events)
+    [Benchmark(OperationsPerInvoke = Messages)]
+    public long V2_WholeMessage()
+    {
+        StreamFrameParser parser = default;
+        parser.Reset(StreamRole.Unknown);
+        int events = 0;
+        long sum = 0;
+        for (int offset = 0; offset < _stream.Length; offset += SegmentSize)
+        {
+            ReadOnlySpan<byte> segment = _stream.AsSpan(offset, Math.Min(SegmentSize, _stream.Length - offset));
+            sum += RunV2(ref parser, Table, segment, -1, ref events);
+        }
+
+        return sum;
+    }
+
+    /// <summary>
+    /// The current loop's shape (QuiclyPeer.ReceiveEngineStream): a mark per event, a whole copy only on bulk streams, and a
+    /// message whose payload lies wholly in the segment taken in one event. The consumer adds what the three events it replaces
+    /// would have added, so all versions produce the same checksum.
+    /// </summary>
+    private static long RunV2(ref StreamFrameParser parser, ChannelTable table, ReadOnlySpan<byte> segment, int pendAt, ref int events)
     {
         ReadOnlySpan<byte> input = segment;
         StreamFrameParser snapshot = default;
@@ -105,6 +130,7 @@ public class StreamReceiveLoopBench
                 continue;
             }
 
+            bool whole = streamEvent == StreamEvent.MessageStart && TryTakeWholePayload(ref parser, ref input, out payload);
             if (events++ == pendAt)
             {
                 if (copy)
@@ -119,7 +145,13 @@ public class StreamReceiveLoopBench
                 return -1;
             }
 
-            sum += (long)streamEvent + parser.Message.Length + payload.Length;
+            int length = parser.Message.Length;
+            sum += whole
+                ? (long)StreamEvent.MessageStart + (long)StreamEvent.PayloadChunk + (long)StreamEvent.MessageEnd + (3L * length) + payload.Length
+                : (long)streamEvent + length + payload.Length;
         }
     }
+
+    [UnsafeAccessor(UnsafeAccessorKind.Method, Name = "TryTakeWholePayload")]
+    private static extern bool TryTakeWholePayload(ref StreamFrameParser parser, scoped ref ReadOnlySpan<byte> input, out ReadOnlySpan<byte> payload);
 }

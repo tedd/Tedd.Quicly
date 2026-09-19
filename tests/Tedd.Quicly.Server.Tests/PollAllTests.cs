@@ -176,17 +176,28 @@ public class PollAllTests
             $"the value was dispatched {(f.Clock.NowMicros - arrived) / 1000} ms after it arrived (received {received.Count})");
         Assert.False(IsMarked(f.Server, peer.Index), "PollAll re-marked the peer for work only a Flush does");
 
-        // The ack it owes is work only a Flush does: the Poll brought the peer's flush deadline forward, so the same PollAll
-        // flushed and the ack left without a FlushAll from the host. Further PollAll calls leave the peer alone.
-        Assert.False(peer.HasPendingWork, "the ack the value is owed is still waiting for a flush");
+        // The ack it owes is work only a Flush does: pending, but PollAll does not poll the peer again for it. The Poll brought
+        // the peer's flush deadline forward to AckDelay (5 ms) later, so without a FlushAll from the host PollAll flushes
+        // the peer then — and not before.
+        Assert.True(peer.HasPendingWork);
+        Assert.Equal(arrived + 5_000, peer.NextFlushDeadlineMicros);
         f.Server.GetStatistics(out ServerStatistics before);
-        for (int i = 0; i < 5; i++)
+        long flushed = f.Server.PeersFlushed;
+        for (int i = 0; i < 4; i++)
         {
+            f.Network.Advance(1_000);
             f.Server.PollAll();
         }
 
         f.Server.GetStatistics(out ServerStatistics after);
         Assert.Equal(before.PeersPolled, after.PeersPolled);
+        Assert.Equal(flushed, f.Server.PeersFlushed);
+        Assert.True(peer.HasPendingWork);
+
+        f.Network.Advance(1_000);
+        f.Server.PollAll();
+        Assert.Equal(flushed + 1, f.Server.PeersFlushed);
+        Assert.False(peer.HasPendingWork, "the ack the value is owed is still waiting for a flush");
 
         for (int i = 0; i < 3; i++)
         {
@@ -284,6 +295,10 @@ public class PollAllTests
         long flushed = f.Server.PeersFlushed;
         f.Server.PollAll();
         Assert.Equal(1, received);
+        Assert.Equal(flushed, f.Server.PeersFlushed); // the ack may wait AckDelay for the host's own flush
+
+        f.Network.Advance(5_000);
+        f.Server.PollAll();
         Assert.Equal(flushed + 1, f.Server.PeersFlushed);
         Assert.False(peers[1].HasPendingWork, "the ack was not flushed");
 

@@ -40,6 +40,9 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// bring the flush deadline forward for them (<see cref="LowerControlDeadline"/>). Game thread.
     /// </summary>
     private bool _acksStuck;
+
+    /// <summary>Clock micros of the first Poll that saw acks owed since the last transmission, or 0 (game thread).</summary>
+    private long _ackOwedSince;
     private TransportStreamId[] _txStreams = [];
     private int[] _txLocals = [];
 
@@ -819,6 +822,7 @@ internal sealed unsafe partial class ReliableLatestEngine
         _nextAckMicros = 0;
         _ackDatagramsRefused = false;
         _acksStuck = false;
+        _ackOwedSince = 0;
     }
 
     // ------------------------------------------------------------------ acks the peer sent us (game thread)
@@ -1016,45 +1020,38 @@ internal sealed unsafe partial class ReliableLatestEngine
             // nothing (no carrier, a datagram limit too small for any batch) would skip that window's acks silently, and
             // with AckDelay 0 it would also pin the flush deadline at the current time (LowerDeadline).
             _nextAckMicros = now + _ackDelayMicros;
+            _ackOwedSince = 0;
         }
 
         _acksStuck = !transmitted && HasPendingAcks();
     }
 
     /// <summary>
-    /// Lowers <paramref name="deadline"/> to when the next pass has the control work the transport thread left since the
-    /// last one (game thread, the end of a Poll; a pass computes its deadline from what it saw): now for LatestAck,
-    /// LatestReject and stream notices to apply; for acks and rejects owed, the end of the <see cref="PeerOptions.AckDelay"/>
-    /// window, or now once it is over. Acks the last due pass could not send at all are left out: that pass published their
-    /// time, or none (<see cref="LowerDeadline"/>), and now would make a host that sleeps until the deadline spin on a Flush
-    /// that cannot send them.
+    /// Lowers <paramref name="deadline"/> to the latest time the acks and rejects this end owes may go out (game thread, the
+    /// end of a Poll; a pass computes its deadline from what it saw, and acks a transport callback queued since are not in
+    /// it): <see cref="PeerOptions.AckDelay"/> after the first Poll that saw them owed — the longest delay the option allows —
+    /// and not before the current coalescing window ends. Any Flush before then (the host's own tick) sends them with its
+    /// other traffic, so the deadline only matters to a host whose next flush is further away. Acks the last due pass could
+    /// not send at all are left out: that pass published their time, or none (<see cref="LowerDeadline"/>), and bringing the
+    /// flush forward for them would make a host that sleeps until the deadline spin on a Flush that cannot send them.
+    /// LatestAck / LatestReject notices do not move the deadline: the pass that would retransmit a value applies them first,
+    /// so they wait for the host's next flush or the retry timer, whichever is first.
     /// </summary>
     /// <param name="now">Clock micros.</param>
     /// <param name="deadline">The flush deadline to lower.</param>
     internal void LowerControlDeadline(long now, ref long deadline)
     {
-        long due;
-        if (!_notices.IsEmpty)
-        {
-            due = now;
-        }
-        else if (!HasPendingAcks())
+        if (_acksStuck || !HasPendingAcks())
         {
             return;
-        }
-        else if (_nextAckMicros > now)
-        {
-            due = _nextAckMicros;
-        }
-        else if (_acksStuck)
-        {
-            return;
-        }
-        else
-        {
-            due = now;
         }
 
+        if (_ackOwedSince == 0)
+        {
+            _ackOwedSince = now;
+        }
+
+        long due = Math.Max(_nextAckMicros, _ackOwedSince + _ackDelayMicros);
         if (due < deadline)
         {
             deadline = due;

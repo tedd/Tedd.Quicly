@@ -66,9 +66,10 @@ public sealed unsafe partial class QuiclyPeer
     /// <summary>
     /// Brings the flush deadline forward to the engine work the transport thread (or the application) left since the last
     /// scheduler pass (game thread, the end of a Connected Poll). A pass computes <see cref="NextFlushDeadlineMicros"/> from
-    /// what it saw, so without this the acks a value received after it is owed, a LatestAck that completes a value, or a
-    /// bulk range request would wait for the host's next Flush however far off that is; a host that brings its flush forward
-    /// to the deadline (QuiclyServer.PollAll) serves them at once.
+    /// what it saw, so without this the acks a value received after it is owed, or a bulk range request, would wait for the
+    /// host's next Flush however far off that is; a host that brings its flush forward to the deadline (QuiclyServer.PollAll)
+    /// serves them in time — the acks within <see cref="PeerOptions.AckDelay"/>, leaving a sooner flush of the host's own to
+    /// carry them.
     /// </summary>
     /// <param name="now">Clock micros of the Poll.</param>
     private void LowerFlushDeadlineForPassWork(long now)

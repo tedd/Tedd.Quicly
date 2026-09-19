@@ -125,6 +125,12 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     /// </summary>
     private int _cancelRequested;
 
+    /// <summary>
+    /// 1 once the transport thread queued a <c>BulkRequest</c>, <c>BulkCancel</c> or <c>BulkReject</c> the next pass has not
+    /// drained: control that brings the flush deadline forward (<see cref="LowerPassDeadline"/>), unlike progress.
+    /// </summary>
+    private int _urgentControl;
+
     /// <summary>Where a send transfer is in its lifecycle (game thread).</summary>
     internal enum BulkPhase : byte
     {
@@ -495,15 +501,17 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
 
     /// <summary>
     /// Lowers <paramref name="deadline"/> to when the next pass has the work <see cref="HasPassWork"/> reports (game thread,
-    /// the end of a Poll): now for control frames, stream notices, a started or cancelled transfer and a retired transfer's
-    /// final progress; the progress window of a live transfer (<see cref="TickProgress"/>, never at or before now) for the
-    /// bytes it accepted.
+    /// the end of a Poll): now for a transfer's discrete events — a range request, cancel or reject from the peer, a notice
+    /// of one of this end's streams, a transfer started or cancelled by the application, a retired receive's final progress;
+    /// the progress window of a live receive (<see cref="TickProgress"/>, never at or before now) for the bytes it accepted.
+    /// The peer's <c>BulkProgress</c> frames (every 64 KiB) do not move it: the send pump does not wait on them, and a flush
+    /// per frame would cost a pass per 64 KiB; they are applied by the host's next flush.
     /// </summary>
     /// <param name="now">Clock micros.</param>
     /// <param name="deadline">The flush deadline to lower.</param>
     internal void LowerPassDeadline(long now, ref long deadline)
     {
-        if (!_control.IsEmpty || !_notices.IsEmpty || _sendsChanged || Volatile.Read(ref _cancelRequested) != 0
+        if (Volatile.Read(ref _urgentControl) != 0 || !_notices.IsEmpty || _sendsChanged || Volatile.Read(ref _cancelRequested) != 0
             || (_retiredPending < 0 && !_retired.IsEmpty))
         {
             if (now < deadline)
@@ -532,6 +540,11 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     public override void Flush(ref FlushContext flush)
     {
         DrainNotices();
+        if (Volatile.Read(ref _urgentControl) != 0)
+        {
+            Interlocked.Exchange(ref _urgentControl, 0); // before the drain: a frame queued after it keeps the flag
+        }
+
         DrainControl(ref flush);
         ReadTransport();
         RefillBudget(flush.NowMicros);
@@ -1580,6 +1593,11 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             // stream reset that accompanies it, and a dropped request or reject is the peer's to retry.
             ControlNoticesDropped++;
             return true;
+        }
+
+        if (notice.Kind != ControlKind.Progress)
+        {
+            Volatile.Write(ref _urgentControl, 1); // after the enqueue, so the pass that clears it drains the frame
         }
 
         // Transport thread: one signal for every frame a control-stream read or datagram callback carried.

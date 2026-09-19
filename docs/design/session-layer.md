@@ -375,18 +375,25 @@ is back in `Filling` and still owned by the caller.
   the mid-message stream idle sweep). `NextFlushDeadlineMicros` is the engine work only a scheduler pass can serve (retries, expiry,
   the send cap's refill time), and is `long.MaxValue` unless the session is `Connected`. A pass computes it from what it saw, so
   every `Poll` of a `Connected` peer brings it forward to the pass work left since (`ReliableLatestEngine.LowerControlDeadline`,
-  `BulkEngine.LowerPassDeadline`): now for notices, bulk control and a started or cancelled transfer; for owed acks the end of the
-  `AckDelay` window, or now once it is over; for bulk progress its window. Acks the last due pass could not send at all (no carrier
-  fits a batch) are left out, because now would make a host that sleeps until the deadline spin on a Flush that cannot send them.
-  Before this (up to 2026-09-18) owed acks and a LatestAck waited for the host's next `Flush`: at 60 Hz up to 16.7 ms, against a
-  20 ms minimum retry at the sender. `NextDeadline`/`NextDeadlineMicros` stay the minimum of both, so a host with one loop is
+  `BulkEngine.LowerPassDeadline`). Owed ReliableLatest acks and rejects are due `AckDelay` after the first Poll that saw them —
+  the longest delay `PeerOptions.AckDelay` allows — and not before the coalescing window of the last transmission ends, so a
+  host flush that comes sooner (its tick) still carries them with its other traffic instead of costing a packet of their own;
+  acks the last due pass could not send at all (no carrier fits a batch) are left out, because bringing the flush forward for
+  them would make a host that sleeps until the deadline spin on a Flush that cannot send them. A bulk transfer's discrete
+  events — a range request, cancel or reject from the peer, a stream notice, a transfer the application started or cancelled,
+  a retired receive's final progress — are due now, and a live receive's progress at its window; the peer's `BulkProgress`
+  frames (every 64 KiB) and LatestAck / LatestReject notices do not move it (the send pump does not wait on progress, and the
+  pass that would retransmit a value applies its ack first). Before this (up to 2026-09-18) owed acks waited for the host's
+  next `Flush` — at 60 Hz up to 16.7 ms, against `AckDelay` 5 ms and a 20 ms minimum retry at the sender — and a peer that only
+  polled never sent them. `NextDeadline`/`NextDeadlineMicros` stay the minimum of both, so a host with one loop is
   unaffected; a host that polls on network wake-ups and flushes on its own tick sleeps the polling loop on the poll deadline and
   brings a flush forward to the flush deadline, because `Poll` does not run the scheduler.
 * **`PollAll` flushes the due peers only.** The server keeps every slot's flush deadline in a dense array next to the poll
   deadlines (`UpdateDeadlines`); when the earliest is due, `PollAll` scans that array (vectorised, like the poll deadlines) and
   flushes just the peers whose deadline passed (`FlushDue`), with the tick the host last passed to `FlushAll`. Before, a due
-  deadline made `PollAll` call `FlushAll` — every peer through the gate — which was acceptable for rare retries but not once every
-  received ReliableLatest value makes an ack due. `FlushAll` itself (the host's tick, and `AutoFlushInterval`) is unchanged.
+  deadline made `PollAll` call `FlushAll` — every peer through the gate — which was acceptable for rare retries but not once a
+  received ReliableLatest value can make an ack due between two ticks. `FlushAll` itself (the host's tick, and
+  `AutoFlushInterval`) is unchanged.
 * **Flush gate (`QuiclyServer.FlushAll`).** A Flush of an idle peer costs about a microsecond of cache misses at 60 Hz, so the
   server asks each peer first (`QuiclyPeer.CanSkipFlush`, internal, `QuiclyPeer.FlushGate.cs`). Every Flush records whether its
   scheduler pass left every engine empty and the admission stamp it saw; the peer is skipped only when since then nothing was
@@ -1188,9 +1195,10 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   and this end's stream notices are handed over on the transport thread with one work signal per transport callback
   (`NoteTransportWork`); a transfer the application starts, a notice applied outside a pass (a completion routed by `Poll`
   drains the notices first, so a confirmed start there lets the body go), a cancel, and progress owed are in
-  `BulkEngine.HasPassWork`, and a `Poll` brings the flush deadline forward to them. The data pump itself — more pieces as the
-  transport completes earlier ones and the window reopens — stays driven by the host's flushes, as it was: a flush per
-  completion would cost a pass per piece. The `FlushAll` gate stays off for tables with a Bulk channel for the same reason.
+  `BulkEngine.HasPassWork`, and a `Poll` brings the flush deadline forward to all of them but the peer's `BulkProgress` frames
+  (`_urgentControl` marks the other control frames). The data pump itself — more pieces as the transport completes earlier ones
+  and the window reopens — stays driven by the host's flushes, as it was: a flush per completion, or per progress frame, would
+  cost a pass per piece. The `FlushAll` gate stays off for tables with a Bulk channel for the same reason.
 * **Three gates, and what they bound.** A piece goes out only while the pass's send cap (`FlushContext.BudgetBytes`), a
   per-peer rate bucket and the transfer's send window all allow it. The rate is
   `BulkMaxBytesPerSecond` — an explicit cap, taken as it is — or `BulkShareOfEstimatedBandwidth` × an estimate, with a

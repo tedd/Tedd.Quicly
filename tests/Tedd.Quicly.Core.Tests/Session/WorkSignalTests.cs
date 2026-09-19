@@ -559,51 +559,94 @@ public class WorkSignalTests
 
     /// <summary>
     /// A pass computes <see cref="QuiclyPeer.NextFlushDeadlineMicros"/> from what it saw, so the acks a value received after
-    /// it is owed must bring the deadline forward at the Poll that dispatches the value — to now while the AckDelay window is
-    /// open for a transmission, to the window's end while it is not — and a LatestAck reaching the sender brings the
-    /// sender's forward to now: a host that flushes on its own tick and brings that flush forward to the deadline sends the
-    /// ack, and completes the value, without waiting out its tick.
+    /// it is owed must bring the deadline forward at the Poll that dispatches the value: to <see cref="PeerOptions.AckDelay"/>
+    /// later, the longest delay the option allows (and not before the coalescing window of the last transmission ends). A
+    /// Flush before then — the host's own tick — sends the ack with its other traffic. A LatestAck reaching the sender does
+    /// not move the sender's deadline: the pass that would retransmit applies it first.
     /// </summary>
     [Fact]
-    public void Work_A_ReliableLatest_Pass_Owes_Brings_The_Flush_Deadline_Forward()
+    public void Acks_Owed_Bring_The_Flush_Deadline_Forward_To_AckDelay()
     {
         RecordingWorkSignal clientSignal = new();
         RecordingWorkSignal serverSignal = new();
         using SessionHarness h = NewPair(clientSignal, serverSignal, LatestTables.Single);
         QuiclyPeer client = h.Client;
         QuiclyPeer server = h.Server!;
+        long ackDelay = h.ServerOptions.AckDelay.Ticks / 10;
+        Assert.True(ackDelay > 2_000);
         server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => { });
         SettleLatest(h, clientSignal, serverSignal);
         server.Flush();
         Assert.Equal(long.MaxValue, server.NextFlushDeadlineMicros);
 
-        // No ack went out yet, so the window is open: the ack is due now.
         SendResult first = client.SendCopy(new SendHeader(2, 7), [1, 2, 3], SendOptions.Tracked);
         client.Flush();
         h.Network.Advance(1_000);
         server.Poll();
-        Assert.True(server.NextFlushDeadlineMicros <= h.Clock.NowMicros,
-            $"the ack the value is owed left the flush deadline at {server.NextFlushDeadlineMicros} (now {h.Clock.NowMicros})");
-        server.Flush(); // the LatestAck; its transmission opens the AckDelay window
+        long owed = h.Clock.NowMicros;
+        Assert.Equal(owed + ackDelay, server.NextFlushDeadlineMicros);
+
+        // A Poll later on keeps the deadline where the first one put it.
+        h.Network.Advance(1_000);
+        server.Poll();
+        Assert.Equal(owed + ackDelay, server.NextFlushDeadlineMicros);
+
+        // The host's own flush comes first and sends the ack; nothing is left for the deadline.
+        server.Flush();
         long ackSent = h.Clock.NowMicros;
         Assert.Equal(long.MaxValue, server.NextFlushDeadlineMicros);
+        Assert.False(server.HasPendingWork);
 
-        // The sender: the LatestAck is a notice only its next pass applies, due now.
+        // The sender: the LatestAck waits for its next pass, which the retry timer bounds; it does not move the deadline.
         client.Poll();
         long retry = client.NextFlushDeadlineMicros;
+        Assert.True(retry > h.Clock.NowMicros && retry < long.MaxValue, "no retry timer armed");
         h.Network.Advance(1_000);
         client.Poll();
-        Assert.True(client.NextFlushDeadlineMicros <= h.Clock.NowMicros,
-            $"the LatestAck left the sender's flush deadline at {client.NextFlushDeadlineMicros} (retry timer {retry}, now {h.Clock.NowMicros})");
+        Assert.True(client.HasPendingWork, "the LatestAck waits for the sender's next pass");
+        Assert.Equal(retry, client.NextFlushDeadlineMicros);
         client.Flush();
         Assert.Equal(DeliveryStatus.Delivered, client.GetDeliveryStatus(first.Token));
 
-        // A second value inside the window: its ack is due when the window closes.
+        // A second value right after the transmission: its ack may not leave before the coalescing window closes, and not
+        // later than AckDelay after it was first seen.
         client.SendCopy(new SendHeader(2, 8), [4, 5, 6]);
         client.Flush();
         h.Network.Advance(1_000);
         server.Poll();
-        Assert.Equal(ackSent + h.ServerOptions.AckDelay.Ticks / 10, server.NextFlushDeadlineMicros);
+        Assert.Equal(Math.Max(ackSent + ackDelay, h.Clock.NowMicros + ackDelay), server.NextFlushDeadlineMicros);
+    }
+
+    /// <summary>With <see cref="PeerOptions.AckDelay"/> 0 ("acknowledge at once") owed acks are due at the Poll that saw them.</summary>
+    [Fact]
+    public void With_No_AckDelay_Owed_Acks_Are_Due_At_Once()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        using SessionHarness h = new(table: LatestTables.Single,
+            client: o =>
+            {
+                QuietOptions.Apply(o);
+                o.WorkSignal = clientSignal;
+            },
+            server: o =>
+            {
+                QuietOptions.Apply(o);
+                o.WorkSignal = serverSignal;
+                o.AckDelay = TimeSpan.Zero;
+            });
+        QuiclyPeer server = h.Server!;
+        server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => { });
+        SettleLatest(h, clientSignal, serverSignal);
+        server.Flush();
+
+        h.Client.SendCopy(new SendHeader(2, 7), [1, 2, 3]);
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        server.Poll();
+        Assert.Equal(h.Clock.NowMicros, server.NextFlushDeadlineMicros);
+        server.Flush();
+        Assert.Equal(long.MaxValue, server.NextFlushDeadlineMicros);
     }
 
     /// <summary>

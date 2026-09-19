@@ -137,6 +137,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
 
         _latest = _core.GetEngine(ChannelMode.ReliableLatest) as ReliableLatestEngine;
         _bulk = _core.GetEngine(ChannelMode.Bulk) as BulkEngine;
+        _passEngines = _latest is not null || _bulk is not null;
     }
 
     /// <summary>

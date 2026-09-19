@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Tedd.Quicly.Core.Session.Engines;
 
 namespace Tedd.Quicly.Core.Session;
@@ -13,6 +14,9 @@ public sealed unsafe partial class QuiclyPeer
 
     /// <summary>The Bulk engine, whose work for its next pass (control frames, stream notices, progress owed, started and cancelled transfers) is part of <see cref="HasPendingWork"/>; null without such a channel.</summary>
     private readonly BulkEngine? _bulk;
+
+    /// <summary>The table has a ReliableLatest or Bulk channel: a Poll brings the flush deadline forward for their pass work.</summary>
+    private readonly bool _passEngines;
 
     /// <summary>
     /// Whether the peer has game-thread work waiting right now: a received message (ring, per-channel drain queues, a
@@ -72,6 +76,7 @@ public sealed unsafe partial class QuiclyPeer
     /// carry them.
     /// </summary>
     /// <param name="now">Clock micros of the Poll.</param>
+    [MethodImpl(MethodImplOptions.NoInlining)] // inlined into Poll, stages.Packed measured 1.7 % slower (client poll); out of line, no change
     private void LowerFlushDeadlineForPassWork(long now)
     {
         long deadline = _engineDeadline;

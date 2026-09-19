@@ -629,3 +629,52 @@ one on the same CCD.
   (±9.7 µs, ≈ 1 103 MB/s) and 988.9 in process (≈ 1 060 MB/s); `BulkCompressed` 1 135.2 / 1 153.0 µs/MiB (≈ 924 / 909 MB/s). That is
   10–30 % above the Bulk section's figures, which were taken at up to 73 % machine load: the difference is the machine, not the code.
   The pass left both unchanged (table above).
+
+## Engine pass work (2026-09-19): acks within AckDelay, Bulk level and signal
+
+Three gaps left after the hot-path pass, fixed on `fix/pass-work` (session-layer.md §4.7, §7.7): the Bulk engine raised the work
+signal once per control frame and stream notice instead of once per transport callback, and nothing it left for its next pass was
+in `HasPendingWork` (so `QuiclyServer.PollAll` probed such a peer on every call until its next ping); and a scheduler pass computed
+`NextFlushDeadlineMicros` from what it saw, so ReliableLatest acks a value received after it was owed waited for the host's next
+flush, however far off. Now a `Poll` makes owed acks due `AckDelay` after it first saw them (a sooner host flush still carries
+them), and `PollAll` flushes only the peers whose flush deadline is due instead of calling `FlushAll`.
+
+### What it does for a server
+
+`benchmarks/Tedd.Quicly.ServerTick` (in the repository): 50 clients, each sending one tracked ReliableLatest value per server
+tick; the server calls `PollAll` every 1 ms and `FlushAll` once per tick; the clients poll and flush every 1 ms and have a retry
+budget (`MaxRetryBytesPerSecond` 10 MB/s — the simulator reports no congestion window, so without one the senders never retry). A
+virtual clock, so the counts are exact. *Ack* is send → `Delivered` at the sender; *retries* are the senders' ReliableLatest
+retransmissions per value sent.
+
+| Server tick | One-way delay | Retries per value, main → branch | Ack p50 / p90 / max (ms), main → branch |
+|---|---|---|---|
+| 60 Hz | 1 ms | 0 → 0 | 10 / 16 / 18 → 7 / 7 / 7 |
+| 60 Hz | 5 ms | 0 → 0 | 18 / 24 / 26 → 15 / 15 / 15 |
+| 60 Hz | 15 ms | 0 → 0 | 38 / 45 / 46 → 35 / 35 / 35 |
+| 30 Hz | 5 ms | **0.073 → 0** | 26 / 39 / 50 → 15 / 15 / 15 |
+| 20 Hz | 1 ms | **0.220 → 0** | 27 / 47 / 51 → 7 / 7 / 7 |
+| 20 Hz | 5 ms | **0.380 → 0** | 34 / 54 / 59 → 15 / 15 / 15 |
+| 20 Hz | 15 ms | 0 → 0 | 54 / 74 / 79 → 35 / 35 / 35 |
+
+The ack now always arrives one round trip plus `AckDelay` (5 ms) after the value was sent. Before, it waited for the server's tick:
+at 60 Hz no value was retransmitted for it here (the sender's retry timer is at least 20 ms), at 30 Hz and
+20 Hz it does not, and up to 38 % of the values were sent twice. The server flushed the same number of peers per tick either way
+(46–47 of 50); a peer whose ack falls due before the tick is flushed then instead of at the tick, where the flush gate then skips
+it. `PollAll` scans a dense array of the peers' flush deadlines for that (`FlushDue`) rather than flushing every peer.
+
+### What it costs (paired, net10.0, main `b5fee05` → branch)
+
+| Benchmark | B/A [95 % CI] |
+|---|---|
+| `LatestBench.Latest1000Keys` | 0.997 [0.987 .. 1.008] |
+| `BulkBench.BulkRaw` (first build, before the step below) | 0.995 [0.983 .. 1.007] |
+| `stages.Packed` | 1.000 [0.981 .. 1.020] |
+| `SessionEndToEndBench.Unreliable64Packed`, interleaved with an A/A run | 1.013 [0.987 .. 1.039] |
+
+No measurable change. The first build of the branch had the new per-Poll deadline step inlined into `Poll`: `stages.Packed`
+1.017 [1.002 .. 1.032], all of it in the client's poll; out of line and skipped for tables without a ReliableLatest or Bulk
+channel it is 1.000. The machine was noisier than during the hot-path pass (other desktop load): an A/A run of
+`Unreliable64Packed` gave 1.031 [0.992 .. 1.071] over 10 launches and 1.022 [0.998 .. 1.047] over 20, so the plain
+`Unreliable64Packed` and `Ordered64` ratios of 1.03–1.04 measured then are within the method's own offset; the interleaved
+comparison (each branch launch paired with an A/A launch under the same load) is the one reported.

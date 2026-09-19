@@ -509,8 +509,9 @@ runnable from this page.
 ## Allocation
 
 Besides the *Allocated* columns, the steady-state tests assert zero bytes allocated with
-`GC.GetAllocatedBytesForCurrentThread` over five windows of work after a warm-up (`WindowedAllocation`: at most one window
-may show a one-off runtime event such as a tier-up). The simulator raises the transport callbacks on the test thread, so the
+`GC.GetAllocatedBytesForCurrentThread` over rounds of five windows of work after a warm-up (`WindowedAllocation`: at most
+one window of a round may show a one-off allocation by the runtime on the test thread, and a round with more is measured
+again, up to three rounds). The simulator raises the transport callbacks on the test thread, so the
 receive paths are measured too.
 
 * `OrderedZeroAllocationTests.Steady_Ordered_Traffic_Of_64_Byte_Messages_Does_Not_Allocate`: a **clean** 10 ms link (delay only);

@@ -133,7 +133,7 @@ public class FragmentRequestZeroAllocationTests
         }
 
         long before = answered;
-        WindowedAllocation.AssertNone(() =>
+        int windows = WindowedAllocation.AssertNone(() =>
         {
             for (int i = 0; i < 50; i++)
             {
@@ -142,7 +142,7 @@ public class FragmentRequestZeroAllocationTests
         });
 
         Assert.Equal(0, failures);
-        Assert.Equal(50 * Batch * WindowedAllocation.Windows, answered - before);
+        Assert.Equal(50 * Batch * windows, answered - before);
         Assert.Equal(0, DatagramKit.Statistics(client).ResponsesUnmatched);
         Assert.Equal(0, DatagramKit.Statistics(client).RequestsTimedOut);
     }

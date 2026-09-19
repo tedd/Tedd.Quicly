@@ -2,6 +2,7 @@ using System.Reflection;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Session;
+using Tedd.Quicly.Core.Session.Engines;
 using Tedd.Quicly.Core.State;
 using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Testing.Simulation;
@@ -554,6 +555,239 @@ public class WorkSignalTests
         Assert.True(received > 1_000);
         Assert.True(serverSignal.Calls > 1_000);
         Assert.True(clientSignal.Calls > 1_000);
+    }
+
+    /// <summary>
+    /// A pass computes <see cref="QuiclyPeer.NextFlushDeadlineMicros"/> from what it saw, so the acks a value received after
+    /// it is owed must bring the deadline forward at the Poll that dispatches the value — to now while the AckDelay window is
+    /// open for a transmission, to the window's end while it is not — and a LatestAck reaching the sender brings the
+    /// sender's forward to now: a host that flushes on its own tick and brings that flush forward to the deadline sends the
+    /// ack, and completes the value, without waiting out its tick.
+    /// </summary>
+    [Fact]
+    public void Work_A_ReliableLatest_Pass_Owes_Brings_The_Flush_Deadline_Forward()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        using SessionHarness h = NewPair(clientSignal, serverSignal, LatestTables.Single);
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => { });
+        SettleLatest(h, clientSignal, serverSignal);
+        server.Flush();
+        Assert.Equal(long.MaxValue, server.NextFlushDeadlineMicros);
+
+        // No ack went out yet, so the window is open: the ack is due now.
+        SendResult first = client.SendCopy(new SendHeader(2, 7), [1, 2, 3], SendOptions.Tracked);
+        client.Flush();
+        h.Network.Advance(1_000);
+        server.Poll();
+        Assert.True(server.NextFlushDeadlineMicros <= h.Clock.NowMicros,
+            $"the ack the value is owed left the flush deadline at {server.NextFlushDeadlineMicros} (now {h.Clock.NowMicros})");
+        server.Flush(); // the LatestAck; its transmission opens the AckDelay window
+        long ackSent = h.Clock.NowMicros;
+        Assert.Equal(long.MaxValue, server.NextFlushDeadlineMicros);
+
+        // The sender: the LatestAck is a notice only its next pass applies, due now.
+        client.Poll();
+        long retry = client.NextFlushDeadlineMicros;
+        h.Network.Advance(1_000);
+        client.Poll();
+        Assert.True(client.NextFlushDeadlineMicros <= h.Clock.NowMicros,
+            $"the LatestAck left the sender's flush deadline at {client.NextFlushDeadlineMicros} (retry timer {retry}, now {h.Clock.NowMicros})");
+        client.Flush();
+        Assert.Equal(DeliveryStatus.Delivered, client.GetDeliveryStatus(first.Token));
+
+        // A second value inside the window: its ack is due when the window closes.
+        client.SendCopy(new SendHeader(2, 8), [4, 5, 6]);
+        client.Flush();
+        h.Network.Advance(1_000);
+        server.Poll();
+        Assert.Equal(ackSent + h.ServerOptions.AckDelay.Ticks / 10, server.NextFlushDeadlineMicros);
+    }
+
+    /// <summary>
+    /// Acks a pass could not send at all (no carrier: a datagram limit too small for any batch) keep the time that pass
+    /// published, which is none: a Poll must not bring the flush deadline forward to now for them, or a host that sleeps
+    /// until the deadline spins on a Flush that cannot send.
+    /// </summary>
+    [Fact]
+    public void Acks_A_Pass_Could_Not_Send_Do_Not_Pin_The_Flush_Deadline_At_Now()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        LinkOptions link = new() { MtuChanges = { new MtuChange(200_000, 8) } };
+        using SessionHarness h = new(link: link, table: LatestTables.Single,
+            client: o =>
+            {
+                QuietOptions.Apply(o);
+                o.WorkSignal = clientSignal;
+            },
+            server: o =>
+            {
+                QuietOptions.Apply(o);
+                o.WorkSignal = serverSignal;
+            });
+        QuiclyPeer server = h.Server!;
+        int received = 0;
+        server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
+        SettleLatest(h, clientSignal, serverSignal);
+        Assert.True(h.Clock.NowMicros < 190_000);
+
+        h.Client.SendCopy(new SendHeader(2, 7), [1, 2, 3]);
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        server.Poll();
+        Assert.Equal(1, received);
+        h.Network.AdvanceTo(210_000); // datagrams now carry at most 8 bytes: no ack batch fits
+        server.Poll();
+        server.Flush();
+        Assert.True(server.HasPendingWork, "the ack is still owed");
+        Assert.Equal(long.MaxValue, server.NextFlushDeadlineMicros);
+
+        server.Poll();
+        Assert.Equal(long.MaxValue, server.NextFlushDeadlineMicros);
+    }
+
+    // ------------------------------------------------------------------ Bulk
+
+    /// <summary>
+    /// The Bulk engine hands the peer's control frames (BulkProgress, BulkRequest, BulkCancel, BulkReject) to its next pass
+    /// on the transport thread. Like every other publication inside a transport callback they raise the signal once, when the
+    /// callback ends: a control-stream read that carries a dozen frames costs one host call.
+    /// </summary>
+    [Fact]
+    public void Bulk_Control_Frames_Inside_A_Transport_Callback_Signal_Once_When_It_Ends()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        using SessionHarness h = NewPair(clientSignal, serverSignal, BulkTables.Main);
+        QuiclyPeer server = h.Server!;
+        h.Run(20_000);
+        server.Poll();
+        serverSignal.Take();
+
+        Span<byte> frame = stackalloc byte[32];
+        Assert.True(ControlCodec.TryWrite(frame, new BulkProgress(1, 100), ControlCarrier.Stream, out int written));
+        Assert.Equal(ControlParseStatus.Ok, ControlCodec.TryReadStream(frame.Slice(0, written), out ControlType type, out ReadOnlySpan<byte> body, out _));
+        BulkEngine bulk = BulkKit.Engine(server);
+        PeerCore core = server.Core;
+        core.BeginTransportCallback();
+        for (int i = 0; i < 3; i++)
+        {
+            Assert.True(bulk.OnControl(type, body, onStream: true, h.Clock.NowMicros));
+        }
+
+        Assert.Equal(0, serverSignal.Calls);
+        core.EndTransportCallback();
+        Assert.Equal(1, serverSignal.Calls);
+    }
+
+    /// <summary>
+    /// What the transport thread leaves for the Bulk engine's next pass — a range request from the peer, the start notice of
+    /// the stream the transfer opened, the progress the receiver owes for the bytes it accepted — raises the edge, so
+    /// <see cref="QuiclyPeer.HasPendingWork"/> reports it until a pass serves it: a host that woke on the edge and probes
+    /// the level must not go back to sleep with the work waiting. The flush deadline comes forward for it too.
+    /// </summary>
+    [Fact]
+    public void Bulk_Work_Only_A_Pass_Serves_Is_Pending_Work_Until_A_Flush_Serves_It()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        byte[] payload = new byte[3_000];
+        Random.Shared.NextBytes(payload);
+        MemoryProvider provider = new(payload);
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
+        using SessionHarness h = new(table: BulkTables.Main,
+            client: o =>
+            {
+                BulkKit.Receiver(router)(o);
+                o.WorkSignal = clientSignal;
+            },
+            server: o =>
+            {
+                BulkKit.Server(provider)(o);
+                o.WorkSignal = serverSignal;
+            });
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        SettleLatest(h, clientSignal, serverSignal);
+        Assert.False(server.HasPendingWork);
+
+        // The request reaches the provider's peer; only its pass asks the provider and starts the transfer.
+        client.RequestBulk(new BulkRangeRequest(5, 1, 1, 0, payload.Length));
+        client.Flush();
+        h.Network.Advance(1_000);
+        Assert.Equal(1, serverSignal.Calls);
+        server.Poll();
+        Assert.True(server.HasPendingWork, "the range request waits for the provider's next pass");
+        Assert.True(server.NextFlushDeadlineMicros <= h.Clock.NowMicros, "the range request did not bring the flush deadline forward");
+        server.Flush();
+        Assert.Single(provider.Requests);
+        Assert.Equal(1, BulkKit.SendTransfers(server, 5));
+        Assert.False(server.HasPendingWork);
+
+        // The transport reports the transfer's stream started: a notice the next pass applies.
+        h.Network.Advance(1_000);
+        server.Poll(); // the pieces' completions are the Poll's
+        Assert.True(server.HasPendingWork, "the stream's start notice waits for the next pass");
+        server.Flush();
+        Assert.False(server.HasPendingWork);
+
+        // The receiver accepted bytes whose progress it owes.
+        h.Network.Advance(1_000);
+        client.Poll();
+        Assert.True(router.Sinks.Count == 1 && router.Sink<MemorySink>().BytesWritten > 0, "no body reached the receiver");
+        Assert.True(client.HasPendingWork, "the progress the receiver owes waits for its next pass");
+
+        Assert.True(h.RunUntil(() => BulkKit.SendTransfers(server, 5) == 0 && BulkKit.ReceiveStreams(client, 5) == 0), "the transfer did not finish");
+        Assert.Equal(payload, router.Sink<MemorySink>().Bytes);
+        h.Run(200_000);
+        Assert.False(client.HasPendingWork);
+        Assert.False(server.HasPendingWork);
+    }
+
+    /// <summary>
+    /// A transfer the application starts, and a cancel it asks for from any thread, raise the edge and are pending work until
+    /// the next pass acts on them, so the level agrees with the edge.
+    /// </summary>
+    [Fact]
+    public async Task A_Bulk_Send_Started_Or_Canceled_By_The_Application_Is_Pending_Work_Until_A_Flush()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        byte[] payload = new byte[512 * 1024];
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
+        using SessionHarness h = new(table: BulkTables.Main,
+            client: o =>
+            {
+                BulkKit.Quiet(o);
+                o.WorkSignal = clientSignal;
+            },
+            server: o =>
+            {
+                BulkKit.Receiver(router)(o);
+                o.WorkSignal = serverSignal;
+            });
+        QuiclyPeer client = h.Client;
+        SettleLatest(h, clientSignal, serverSignal);
+        Assert.False(client.HasPendingWork);
+
+        BulkTransfer transfer = await client.BeginBulkSendAsync(new BulkDescriptor(5, 7, 1, payload.Length), new MemorySource(payload));
+        Assert.Equal(BulkStatus.Running, transfer.Status);
+        Assert.Equal(1, clientSignal.Calls);
+        Assert.True(client.HasPendingWork, "the new transfer waits for the next pass");
+        client.Flush();
+        Assert.False(client.HasPendingWork);
+
+        client.Poll();
+        clientSignal.Take();
+        await Task.Run(transfer.Cancel);
+        Assert.Equal(1, clientSignal.Calls);
+        Assert.True(client.HasPendingWork, "the cancel waits for the next pass");
+        client.Flush();
+        Assert.Equal(BulkStatus.Canceled, transfer.Status);
+        Assert.False(client.HasPendingWork);
     }
 
     /// <summary>Runs both ends until the link is quiet, polls them (re-arming both edges) and forgets the calls so far.</summary>

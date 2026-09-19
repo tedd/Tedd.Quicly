@@ -341,10 +341,12 @@ is back in `Filling` and still owned by the caller.
   message of a channel without a handler, engine work that needs a `Flush`) raises no second call, because `HasPendingWork` is the
   level. Raised from the transport thread by `Signal(bit)` (every handshake, close and table signal), `TryEnqueueReceive`,
   `PublishReserved`, a coalescing mailbox post (the datagram engine's and the ReliableLatest engine's: a value, whether it came
-  in a datagram or on a group stream, and a key retirement), `PushCompletion`, `NotePendedStream`, the pong / stream-ping rings
-  and the ReliableLatest engine's pass work (an ack or reject it owes, a LatestAck / LatestReject / stream notice to apply —
-  §7.6); and from the game thread by `SetState` (a queued `StateChanged` is work, which covers `Close` and `CompleteAdmission` without a hook of their
-  own), `QueueLocalCompletion` and a send queued by another thread. Allocation-free — two field reads when no signal is configured —
+  in a datagram or on a group stream, and a key retirement), `PushCompletion`, `NotePendedStream`, the pong / stream-ping rings,
+  the ReliableLatest engine's pass work (an ack or reject it owes, a LatestAck / LatestReject / stream notice to apply —
+  §7.6) and the Bulk engine's (a control frame from the peer, a notice of one of its own streams, bytes accepted, a retired
+  receive — §7.7); and from the game thread by `SetState` (a queued `StateChanged` is work, which covers `Close` and `CompleteAdmission` without a hook of their
+  own), `QueueLocalCompletion`, a send queued by another thread and a bulk transfer the application started; and from any thread by
+  `BulkTransfer.Cancel`. Allocation-free — two field reads when no signal is configured —
   and a host exception is wrapped like a transport callback fault (counted, kept in `LastCallbackFault`, turned into a queued
   `InternalError` close), so it never reaches the transport. **Inside a transport callback the signal is raised once per
   callback, not once per publication**: the sink's receive and completion callbacks are wrapped in
@@ -356,20 +358,42 @@ is back in `Filling` and still owned by the caller.
 * **`HasPendingWork`** answers whether anything is really waiting: the signal word, the completion ring and the local completions,
   the receive ring, the per-channel drain queues and the held entry, the mailbox dirty bitsets (`Mailboxes.HasDirty`),
   `PendedStreams`, the pong and stream-ping rings, the `ThreadSafeSend` front, a state transition that has not been raised, a due
-  timer (`NextDeadlineMicros` passed), and — while `Connected` — the ReliableLatest engine's pass work
-  (`ReliableLatestEngine.HasUnsentControl`: acks and rejects owed, notices to apply). `false` once the session is closed or the peer
-  disposed. The rings, the bitsets and the signal word are read with acquire semantics; the game thread's own bookkeeping is read
-  plainly, so a foreign caller gets an advisory answer — which is why a host wakes on the edge and decides on this probe from its
-  game thread. Every publication that raises the edge is in the level, so a host that woke never finds the probe clear with the
-  edge still set (it would then skip the `Poll` that re-arms it and sleep through the next publication). The pass work stays in
-  the level until a `Flush` consumes it (owed acks can wait out `AckDelay` there); `QuiclyServer.PollAll` therefore keeps a peer
-  marked after its Poll only for the rest (`HasPendingPollWork`), and its next `FlushAll` — whose gate reads the same
-  `HasUnsentControl` — serves the pass work.
+  deadline (`NextDeadlineMicros` passed), and — while `Connected` — the engines' pass work: the ReliableLatest engine's
+  (`ReliableLatestEngine.HasUnsentControl`: acks and rejects owed, notices to apply) and the Bulk engine's
+  (`BulkEngine.HasPassWork`: control frames and stream notices to apply, a transfer started or a notice applied since the pass
+  last served the send lists, a cancel asked for, progress owed for bytes accepted or for a retired receive). `false` once the
+  session is closed or the peer disposed. The rings, the bitsets and the signal word are read with acquire semantics; the game
+  thread's own bookkeeping is read plainly, so a foreign caller gets an advisory answer — which is why a host wakes on the edge and
+  decides on this probe from its game thread. Every publication that raises the edge is in the level, so a host that woke never
+  finds the probe clear with the edge still set (it would then skip the `Poll` that re-arms it and sleep through the next
+  publication; `QuiclyServer.PollAll` instead keeps such a slot marked and probes it on every call until the peer's next poll
+  deadline, which is what a Bulk peer did before 2026-09-19). The pass work stays in the level until a `Flush` consumes it (owed
+  acks can wait out `AckDelay` there, owed bulk progress its 100 ms window); `QuiclyServer.PollAll` therefore keeps a peer marked
+  after its Poll only for what a Poll serves (`HasPendingPollWork`: the queues, and the *poll* deadline only), and the flush
+  deadline that Poll brought forward (below) gets the pass work served.
 * **Split deadlines.** `NextPollDeadlineMicros` is the peer's own timers (ping schedule, heartbeat, admission timeout, close linger,
   the mid-message stream idle sweep). `NextFlushDeadlineMicros` is the engine work only a scheduler pass can serve (retries, expiry,
-  the send cap's refill time), and is `long.MaxValue` unless the session is `Connected`. `NextDeadline`/`NextDeadlineMicros` stay the
-  minimum of both, so a host with one loop is unaffected; a host that polls on network wake-ups and flushes on its own tick sleeps
-  the polling loop on the poll deadline and brings a flush forward to the flush deadline, because `Poll` does not run the scheduler.
+  the send cap's refill time), and is `long.MaxValue` unless the session is `Connected`. A pass computes it from what it saw, so
+  every `Poll` of a `Connected` peer brings it forward to the pass work left since (`ReliableLatestEngine.LowerControlDeadline`,
+  `BulkEngine.LowerPassDeadline`). Owed ReliableLatest acks and rejects are due `AckDelay` after the first Poll that saw them —
+  the longest delay `PeerOptions.AckDelay` allows — and not before the coalescing window of the last transmission ends, so a
+  host flush that comes sooner (its tick) still carries them with its other traffic instead of costing a packet of their own;
+  acks the last due pass could not send at all (no carrier fits a batch) are left out, because bringing the flush forward for
+  them would make a host that sleeps until the deadline spin on a Flush that cannot send them. A bulk transfer's discrete
+  events — a range request, cancel or reject from the peer, a stream notice, a transfer the application started or cancelled,
+  a retired receive's final progress — are due now, and a live receive's progress at its window; the peer's `BulkProgress`
+  frames (every 64 KiB) and LatestAck / LatestReject notices do not move it (the send pump does not wait on progress, and the
+  pass that would retransmit a value applies its ack first). Before this (up to 2026-09-18) owed acks waited for the host's
+  next `Flush` — at 60 Hz up to 16.7 ms, against `AckDelay` 5 ms and a 20 ms minimum retry at the sender — and a peer that only
+  polled never sent them. `NextDeadline`/`NextDeadlineMicros` stay the minimum of both, so a host with one loop is
+  unaffected; a host that polls on network wake-ups and flushes on its own tick sleeps the polling loop on the poll deadline and
+  brings a flush forward to the flush deadline, because `Poll` does not run the scheduler.
+* **`PollAll` flushes the due peers only.** The server keeps every slot's flush deadline in a dense array next to the poll
+  deadlines (`UpdateDeadlines`); when the earliest is due, `PollAll` scans that array (vectorised, like the poll deadlines) and
+  flushes just the peers whose deadline passed (`FlushDue`), with the tick the host last passed to `FlushAll`. Before, a due
+  deadline made `PollAll` call `FlushAll` — every peer through the gate — which was acceptable for rare retries but not once a
+  received ReliableLatest value can make an ack due between two ticks. `FlushAll` itself (the host's tick, and
+  `AutoFlushInterval`) is unchanged.
 * **Flush gate (`QuiclyServer.FlushAll`).** A Flush of an idle peer costs about a microsecond of cache misses at 60 Hz, so the
   server asks each peer first (`QuiclyPeer.CanSkipFlush`, internal, `QuiclyPeer.FlushGate.cs`). Every Flush records whether its
   scheduler pass left every engine empty and the admission stamp it saw; the peer is skipped only when since then nothing was
@@ -1167,6 +1191,14 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   handed over first so datagrams never queue behind bulk bytes. Each piece is one send entry with one pooled block: the
   first carries the preamble and the §3.3 header, the last carries FIN. No segment arena run is needed, because a piece is
   a single buffer rather than a gather.
+* **What wakes the pass.** The engine's discrete events are level, edge and flush deadline (§4.7): the peer's control frames
+  and this end's stream notices are handed over on the transport thread with one work signal per transport callback
+  (`NoteTransportWork`); a transfer the application starts, a notice applied outside a pass (a completion routed by `Poll`
+  drains the notices first, so a confirmed start there lets the body go), a cancel, and progress owed are in
+  `BulkEngine.HasPassWork`, and a `Poll` brings the flush deadline forward to all of them but the peer's `BulkProgress` frames
+  (`_urgentControl` marks the other control frames). The data pump itself — more pieces as the transport completes earlier ones
+  and the window reopens — stays driven by the host's flushes, as it was: a flush per completion, or per progress frame, would
+  cost a pass per piece. The `FlushAll` gate stays off for tables with a Bulk channel for the same reason.
 * **Three gates, and what they bound.** A piece goes out only while the pass's send cap (`FlushContext.BudgetBytes`), a
   per-peer rate bucket and the transfer's send window all allow it. The rate is
   `BulkMaxBytesPerSecond` — an explicit cap, taken as it is — or `BulkShareOfEstimatedBandwidth` × an estimate, with a
@@ -1283,8 +1315,8 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   **only** emitter: the receiving end stops the peer's sending side with STOP_SENDING and sends the frame so the peer also
   stops reading its source. Stopping a peer's stream comes back to *this* end as an ordinary shutdown rather than an abort,
   so the record remembers the code we cancelled with; without that the transfer we cancelled ourselves would end `Failed`.
-  `BulkTransfer.Cancel()` (the **sending** end, any thread) sets the flag the application's own transfer object holds and
-  wakes the host; the next pass resets the stream with `BulkCanceled` and completes the transfer `Canceled`, and the reset
+  `BulkTransfer.Cancel()` (the **sending** end, any thread) sets the flag the application's own transfer object holds, sets the
+  engine's cancel level (exchanged back by the next pass before it reads the flags) and wakes the host; the next pass resets the stream with `BulkCanceled` and completes the transfer `Canceled`, and the reset
   *is* the signal — the receiver turns it into a cancelled transfer through that stream's single close notice, and no
   control frame is needed or sent. A sender that abandons a peer-requested transfer before any stream exists — its header
   never went out, or its start was refused and rewound; in practice a provider's source that runs dry on the first read,

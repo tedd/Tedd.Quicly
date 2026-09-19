@@ -645,6 +645,30 @@ internal sealed unsafe partial class BulkEngine
         return ControlCodec.TryWrite(frame, in progress, carrier, out int written) && _core.SendControlFrame(frame.Slice(0, written), carrier);
     }
 
+    /// <summary>
+    /// Whether this end owes the peer progress: a retired transfer's final <c>BulkProgress</c>, or bytes a live transfer
+    /// accepted since it last reported (the records <see cref="TickProgress"/> gives a deadline). Game thread; advisory from
+    /// another thread.
+    /// </summary>
+    private bool OwesProgress()
+    {
+        if (Volatile.Read(ref _recvLive) != 0)
+        {
+            for (int record = 0; record < _recv.Length; record++)
+            {
+                ref BulkRecv recv = ref _recv[record];
+                if (TryReadProgress(ref recv, out _, out long accepted) && accepted > recv.ReportedBytes)
+                {
+                    return true;
+                }
+            }
+        }
+
+        // A transfer leaves the live records before it is retired (OnStreamClosed); a probe that falls between the two is not
+        // lost work, because the retirement raises the signal after it is published.
+        return _retiredPending >= 0 || !_retired.IsEmpty;
+    }
+
     /// <summary>Lowers the flush deadline to the next progress frame a transfer owes (never to a time at or before now).</summary>
     private void TickProgress(long nowMicros, ref long nextDeadline)
     {

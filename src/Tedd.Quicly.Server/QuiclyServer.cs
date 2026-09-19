@@ -181,6 +181,8 @@ public sealed partial class QuiclyServer : IAsyncDisposable
             _info = new SlotInfo?[capacity];
             _deadlines = new long[capacity];
             Array.Fill(_deadlines, long.MaxValue);
+            _flushDeadlines = new long[capacity];
+            Array.Fill(_flushDeadlines, long.MaxValue);
             _workBits = new long[(capacity + 63) >> 6];
             _generations = new uint[capacity];
             Array.Fill(_generations, 1u);

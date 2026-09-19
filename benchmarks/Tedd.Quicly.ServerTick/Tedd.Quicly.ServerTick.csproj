@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>A game server's tick over the simulated network: ReliableLatest values from many clients, PollAll every millisecond and FlushAll every tick; reports ack latency, spurious retransmissions and flushes per tick (docs/benchmarks/session.md).</Description>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>ServerTick</AssemblyName>
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CA1303;CA1305;CA1307;CA1310;CA2201;CA1852</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Server\Tedd.Quicly.Server.csproj" />
+    <ProjectReference Include="..\..\src\Tedd.Quicly.Testing\Tedd.Quicly.Testing.csproj" />
+  </ItemGroup>
+</Project>

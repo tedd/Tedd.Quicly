@@ -113,6 +113,24 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     private long _rttMicros;
     private bool _bucketStarted;
 
+    /// <summary>
+    /// Since the last pass began serving the send lists, a transfer was registered or a stream notice was applied (game
+    /// thread): the next pass may have something to send that no other level shows.
+    /// </summary>
+    private bool _sendsChanged;
+
+    /// <summary>
+    /// 1 once <see cref="BulkTransfer.Cancel"/> was called for a transfer the next pass has not looked at (any thread sets it,
+    /// the pass exchanges it back to 0 before it reads the transfers' flags).
+    /// </summary>
+    private int _cancelRequested;
+
+    /// <summary>
+    /// 1 once the transport thread queued a <c>BulkRequest</c>, <c>BulkCancel</c> or <c>BulkReject</c> the next pass has not
+    /// drained: control that brings the flush deadline forward (<see cref="LowerPassDeadline"/>), unlike progress.
+    /// </summary>
+    private int _urgentControl;
+
     /// <summary>Where a send transfer is in its lifecycle (game thread).</summary>
     internal enum BulkPhase : byte
     {
@@ -363,6 +381,12 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             // the application may retry (PROTOCOL.md §7 answers a peer's request the same way, with BulkReject).
             _core.SendCounters(dense).QueueFull++;
         }
+        else
+        {
+            // The next pass opens its stream. (A transfer answering the peer's request starts inside a pass, which serves it
+            // at once: no signal there.)
+            _core.NoteWork();
+        }
 
         return ValueTask.FromResult(transfer);
     }
@@ -429,7 +453,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         Link(local, record);
         _liveSends++;
         started = true;
-        _core.NoteWork();
+        _sendsChanged = true;
         return transfer;
     }
 
@@ -455,9 +479,53 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     /// <inheritdoc/>
     void IBulkCancelSink.RequestCancel(int slot, uint serial)
     {
-        // Any thread: the flag itself lives in the BulkTransfer the application holds, so the next pass sees it. Waking a
-        // sleeping host is all that is needed here.
+        // Any thread: the flag itself lives in the BulkTransfer the application holds (set before this call), so the next pass
+        // sees it. The engine-wide flag is the level behind the signal (HasPassWork) until that pass.
+        Volatile.Write(ref _cancelRequested, 1);
         _core.NoteWork();
+    }
+
+    // ------------------------------------------------------------------ work for the next pass (level and deadline)
+
+    /// <summary>
+    /// Whether this engine has work only its next scheduler pass does, every piece of which raised the work signal when it
+    /// was published: the peer's control frames (<c>BulkProgress</c>, <c>BulkRequest</c>, <c>BulkCancel</c>,
+    /// <c>BulkReject</c>) and the notices of this end's own streams, handed over by the transport thread; a transfer the
+    /// application started, or asked to cancel, since the pass last served the send lists; and the progress this end owes
+    /// for bytes it accepted (which may wait out the 100 ms progress window, as ReliableLatest acks wait out AckDelay).
+    /// <see cref="QuiclyPeer.HasPendingWork"/> reports it. Game thread; from another thread the answer is advisory (the
+    /// started flag and the progress bookkeeping are the game thread's own).
+    /// </summary>
+    internal bool HasPassWork =>
+        !_control.IsEmpty || !_notices.IsEmpty || _sendsChanged || Volatile.Read(ref _cancelRequested) != 0 || OwesProgress();
+
+    /// <summary>
+    /// Lowers <paramref name="deadline"/> to when the next pass has the work <see cref="HasPassWork"/> reports (game thread,
+    /// the end of a Poll): now for a transfer's discrete events — a range request, cancel or reject from the peer, a notice
+    /// of one of this end's streams, a transfer started or cancelled by the application, a retired receive's final progress;
+    /// the progress window of a live receive (<see cref="TickProgress"/>, never at or before now) for the bytes it accepted.
+    /// The peer's <c>BulkProgress</c> frames (every 64 KiB) do not move it: the send pump does not wait on them, and a flush
+    /// per frame would cost a pass per 64 KiB; they are applied by the host's next flush.
+    /// </summary>
+    /// <param name="now">Clock micros.</param>
+    /// <param name="deadline">The flush deadline to lower.</param>
+    internal void LowerPassDeadline(long now, ref long deadline)
+    {
+        if (Volatile.Read(ref _urgentControl) != 0 || !_notices.IsEmpty || _sendsChanged || Volatile.Read(ref _cancelRequested) != 0
+            || (_retiredPending < 0 && !_retired.IsEmpty))
+        {
+            if (now < deadline)
+            {
+                deadline = now;
+            }
+
+            return;
+        }
+
+        if (_retiredPending >= 0 || Volatile.Read(ref _recvLive) != 0)
+        {
+            TickProgress(now, ref deadline);
+        }
     }
 
     // ------------------------------------------------------------------ scheduling (game thread)
@@ -472,9 +540,23 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     public override void Flush(ref FlushContext flush)
     {
         DrainNotices();
+        if (Volatile.Read(ref _urgentControl) != 0)
+        {
+            Interlocked.Exchange(ref _urgentControl, 0); // before the drain: a frame queued after it keeps the flag
+        }
+
         DrainControl(ref flush);
         ReadTransport();
         RefillBudget(flush.NowMicros);
+
+        // Every live transfer is looked at below (a transfer a request just started included), and so is every cancel asked
+        // for before this point: the exchange is a full fence, so the transfers' own flags are read after it.
+        _sendsChanged = false;
+        if (Volatile.Read(ref _cancelRequested) != 0)
+        {
+            Interlocked.Exchange(ref _cancelRequested, 0);
+        }
+
         for (int local = 0; local < _channels.Length; local++)
         {
             FlushTransfers(local, ref flush);
@@ -1513,7 +1595,13 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             return true;
         }
 
-        _core.NoteWork();
+        if (notice.Kind != ControlKind.Progress)
+        {
+            Volatile.Write(ref _urgentControl, 1); // after the enqueue, so the pass that clears it drains the frame
+        }
+
+        // Transport thread: one signal for every frame a control-stream read or datagram callback carried.
+        _core.NoteTransportWork();
         return true;
     }
 
@@ -1759,14 +1847,19 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             _core.Counters.CallbackFaults++;
         }
 
-        _core.NoteWork();
+        _core.NoteTransportWork(); // transport thread (stream events only)
     }
 
-    /// <summary>Applies the transport-thread notices of this engine's own streams (game thread).</summary>
+    /// <summary>
+    /// Applies the transport-thread notices of this engine's own streams (game thread). A notice applied outside a pass (a
+    /// completion routed by Poll drains them first) can leave a transfer something to send — a confirmed start lets its body
+    /// go — so it counts as work for the next pass (<see cref="_sendsChanged"/>).
+    /// </summary>
     private void DrainNotices()
     {
         while (_notices.TryDequeue(out StreamNotice notice))
         {
+            _sendsChanged = true;
             int record = notice.Record;
             ref BulkSend send = ref _records[record];
             if (notice.Serial != send.Serial || (send.Flags & SendFreed) != 0)

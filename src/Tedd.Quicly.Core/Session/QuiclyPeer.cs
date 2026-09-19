@@ -136,6 +136,8 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         }
 
         _latest = _core.GetEngine(ChannelMode.ReliableLatest) as ReliableLatestEngine;
+        _bulk = _core.GetEngine(ChannelMode.Bulk) as BulkEngine;
+        _passEngines = _latest is not null || _bulk is not null;
     }
 
     /// <summary>
@@ -433,9 +435,13 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     /// <summary>
     /// Clock micros of the next deadline only a <see cref="Flush"/> can serve: engine work as the last scheduler pass
     /// computed it (retries, expiry, the refill time of the <see cref="PeerOptions.MaxSendBytesPerSecond"/> cap that held a
-    /// pass back), or <see cref="long.MaxValue"/> when nothing is held back or the session is not
-    /// <see cref="PeerState.Connected"/>. <see cref="Poll"/> never serves it, because Poll does not run the scheduler: a
-    /// host that flushes on its own tick brings the next flush forward to this time instead of waiting out its tick.
+    /// pass back), brought forward by every <see cref="Poll"/> to the engine work left since that pass (the ReliableLatest
+    /// acks and rejects this end owes, at most <see cref="PeerOptions.AckDelay"/> after the Poll that first saw them; a bulk
+    /// range request, cancel or reject from the peer, a notice of one of this end's bulk streams, a bulk transfer the
+    /// application started or cancelled, and the progress a bulk receive owes), or <see cref="long.MaxValue"/> when nothing is held back or the session is not
+    /// <see cref="PeerState.Connected"/>. It may lie in the past: the work is due. <see cref="Poll"/> never serves it,
+    /// because Poll does not run the scheduler: a host that flushes on its own tick brings the next flush forward to this
+    /// time instead of waiting out its tick.
     /// </summary>
     public long NextFlushDeadlineMicros => _state == PeerState.Connected ? _engineDeadline : long.MaxValue;
 

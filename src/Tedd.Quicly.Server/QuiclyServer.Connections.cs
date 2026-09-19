@@ -28,6 +28,9 @@ public sealed partial class QuiclyServer
     private readonly PeerSlot[] _slots;
     private readonly SlotInfo?[] _info;
     private readonly long[] _deadlines;
+
+    /// <summary>Each slot's <see cref="QuiclyPeer.NextFlushDeadlineMicros"/> as last seen, for <see cref="FlushDue"/>.</summary>
+    private readonly long[] _flushDeadlines;
     private readonly long[] _workBits;
     private readonly PeerSet _admittedSet;
     private readonly List<WeakReference<PeerSet>> _trackedSets = [];
@@ -402,6 +405,7 @@ public sealed partial class QuiclyServer
 
             _slots[slot] = new PeerSlot(null, generation, PeerSlotState.Free);
             _deadlines[slot] = long.MaxValue;
+            _flushDeadlines[slot] = long.MaxValue;
             info.Reset();
             while (_highWater > 0 && _slots[_highWater - 1].Peer is null)
             {

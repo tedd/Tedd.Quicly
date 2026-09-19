@@ -1,0 +1,118 @@
+name: NuGet
+
+# Every push to `deploy` builds and tests the solution, gives all packages the next
+# automatic version and pushes them to nuget.org. See docs/DEVELOPMENT.md, "Releasing".
+on:
+  push:
+    branches: [deploy]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nuget-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Keep the SDK in step with global.json. The net10.0 tests need the .NET 10 runtime.
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            10.0.x
+            11.0.100-preview.7.26381.103
+
+      - name: Restore
+        run: dotnet restore Tedd.Quicly.slnx
+
+      - name: Build
+        run: dotnet build Tedd.Quicly.slnx --no-restore --configuration Release
+
+      - name: Test
+        run: dotnet test Tedd.Quicly.slnx --no-build --configuration Release
+
+  publish:
+    needs: build-test
+    runs-on: windows-latest
+    permissions:
+      contents: write # push the version tag
+      id-token: write # NuGet trusted publishing (OIDC)
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            10.0.x
+            11.0.100-preview.7.26381.103
+
+      - name: Set automatic package version
+        id: version
+        shell: pwsh
+        run: |
+          $propsPath = 'Directory.Build.props'
+          $props = [xml](Get-Content -LiteralPath $propsPath)
+          $versionNode = $props.SelectSingleNode('/Project/PropertyGroup/Version')
+          if ($null -eq $versionNode) {
+            throw "No Version element found in $propsPath."
+          }
+          $baseVersion = [version]$versionNode.InnerText
+          # A workflow rerun retains its version; every new run advances the patch.
+          $patch = [Math]::Max($baseVersion.Build, 0) + [int]$env:GITHUB_RUN_NUMBER
+          $packageVersion = '{0}.{1}.{2}' -f $baseVersion.Major, $baseVersion.Minor, $patch
+          "version=$packageVersion" >> $env:GITHUB_OUTPUT
+          Write-Host "Publishing Tedd.QUICLY $packageVersion"
+
+      # Packs every IsPackable project (the src/ projects, see Directory.Build.props),
+      # each with a .snupkg symbol package. The version flows to the project references.
+      - name: Pack
+        shell: pwsh
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: dotnet pack Tedd.Quicly.slnx --configuration Release --output artifacts/packages -p:Version=$env:PACKAGE_VERSION
+
+      - name: Log in to NuGet.org with OIDC
+        id: nuget_login
+        uses: NuGet/login@v1
+        with:
+          user: tedd
+
+      # The key is valid for one hour, so it is requested right before the push.
+      - name: Publish to NuGet.org and tag
+        shell: pwsh
+        env:
+          NUGET_KEY: ${{ steps.nuget_login.outputs.NUGET_API_KEY }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # nuget.org also takes the .snupkg that sits next to each .nupkg.
+          # --skip-duplicate lets a rerun of the same run push only what is missing.
+          # The wildcard needs back slashes: on Windows dotnet does not expand it with forward slashes.
+          dotnet nuget push 'artifacts\packages\*.nupkg' --source https://api.nuget.org/v3/index.json --api-key $env:NUGET_KEY --skip-duplicate
+          if ($LASTEXITCODE -ne 0) {
+            throw "NuGet publish failed with exit code $LASTEXITCODE."
+          }
+
+          $tag = "v$env:PACKAGE_VERSION"
+          if (git tag --list $tag) {
+            Write-Host "Tag $tag already exists."
+          }
+          else {
+            git tag $tag
+            if ($LASTEXITCODE -ne 0) {
+              throw "Creating tag $tag failed."
+            }
+            git push origin $tag
+            if ($LASTEXITCODE -ne 0) {
+              throw "Pushing tag $tag failed."
+            }
+          }

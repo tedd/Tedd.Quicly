@@ -11,15 +11,20 @@ public sealed unsafe partial class QuiclyPeer
     /// <summary>The ReliableLatest engine, whose transport-thread control work (acks owed, notices) is part of <see cref="HasPendingWork"/>; null without such a channel.</summary>
     private readonly ReliableLatestEngine? _latest;
 
+    /// <summary>The Bulk engine, whose work for its next pass (control frames, stream notices, progress owed, started and cancelled transfers) is part of <see cref="HasPendingWork"/>; null without such a channel.</summary>
+    private readonly BulkEngine? _bulk;
+
     /// <summary>
     /// Whether the peer has game-thread work waiting right now: a received message (ring, per-channel drain queues, a
     /// coalescing mailbox), a send completion (the transport's completion ring or one the game thread queued itself), a
     /// control signal from the transport thread (connect, Hello, HelloAck, close, table), a pong or stream-ping sample, a
     /// stream held back by back-pressure, a send queued by another thread, a <see cref="StateChanged"/> transition that has
-    /// not been raised, a timer that is due (<see cref="NextDeadlineMicros"/> has passed), or engine work a transport
-    /// callback left for the next <see cref="Flush"/> (the ReliableLatest acks and rejects this end owes, and the LatestAck
-    /// and LatestReject entries the peer sent, which complete or retry values). <see langword="false"/> once the session is
-    /// closed or the peer is disposed.
+    /// not been raised, a deadline that is due (<see cref="NextDeadlineMicros"/> has passed), or engine work left for the
+    /// next <see cref="Flush"/>: the ReliableLatest acks and rejects this end owes and the LatestAck and LatestReject entries
+    /// the peer sent, which complete or retry values; the Bulk control frames the peer sent (progress, a range request, a
+    /// cancel, a reject), the notices of this end's bulk streams, the progress this end owes for bulk bytes it accepted, and
+    /// a transfer the application started or asked to cancel. <see langword="false"/> once the session is closed or the
+    /// peer is disposed.
     /// </summary>
     /// <remarks>
     /// The rings, the mailbox bitsets and the transport signal word are read with acquire semantics, so a call from a
@@ -27,32 +32,12 @@ public sealed unsafe partial class QuiclyPeer
     /// (queued transitions, drain queues, the held entry) is read without synchronisation: for a foreign caller those parts
     /// are advisory, which is why a host wakes on the edge (<see cref="IPeerWorkSignal"/>) and decides on this probe from
     /// the game thread. It is the level behind every publication that raises the edge, so a host that woke and finds it
-    /// set polls (re-arming the edge) and flushes; the part that needs a Flush stays set until one runs, and ack work may
-    /// wait out <see cref="PeerOptions.AckDelay"/> in it. A Flush-only deadline that has not passed is not work: use
-    /// <see cref="NextFlushDeadlineMicros"/> for that.
+    /// set polls (re-arming the edge) and flushes; the part that needs a Flush stays set until one runs, and ack and
+    /// progress work may wait out <see cref="PeerOptions.AckDelay"/> or the bulk progress window in it. A Flush-only
+    /// deadline that has not passed is not work: use <see cref="NextFlushDeadlineMicros"/> for that, which a
+    /// <see cref="Poll"/> brings forward to the engine work above.
     /// </remarks>
     public bool HasPendingWork
-    {
-        get
-        {
-            if (HasPendingPollWork)
-            {
-                return true;
-            }
-
-            // Engine work only a scheduler pass consumes, which a transport callback published (and signalled); only a
-            // Connected peer runs a pass, and a disposed one may have freed the engine's rings.
-            return _state == PeerState.Connected && !_disposed && !IsFreed && _latest is { HasUnsentControl: true };
-        }
-    }
-
-    /// <summary>
-    /// <see cref="HasPendingWork"/> without the engine work a transport callback left for the next scheduler pass: what a
-    /// <see cref="Poll"/> (or a due timer) still has to serve. A host that polls a marked peer and flushes on its own tick
-    /// (QuiclyServer.PollAll) keeps the peer marked after its Poll only for this, because polling it again cannot consume
-    /// the rest; the edge was re-armed by that Poll and the host's next Flush serves the rest.
-    /// </summary>
-    internal bool HasPendingPollWork
     {
         get
         {
@@ -61,34 +46,72 @@ public sealed unsafe partial class QuiclyPeer
                 return false;
             }
 
-            PeerCore core = _core;
-            if (Volatile.Read(ref _signals) != 0
-                || !core.CompletionRing.IsEmpty
-                || core.LocalCompletionsQueued != 0
-                || !core.ReceiveRing.IsEmpty
-                || !core.PendedStreams.IsEmpty
-                || !_pongs.IsEmpty
-                || !_streamPings.IsEmpty
-                || _transitionCount != 0
-                || _queuedWithHandler != 0
-                || _hasHeld
-                || _hasHeldForeign
-                || _front is { IsEmpty: false })
+            // Engine work only a scheduler pass consumes: only a Connected peer runs a pass.
+            return HasQueuedPollWork()
+                || (_state == PeerState.Connected && (_latest is { HasUnsentControl: true } || _bulk is { HasPassWork: true }))
+                || _nextDeadlineMicros <= _clock.NowMicros;
+        }
+    }
+
+    /// <summary>
+    /// What a <see cref="Poll"/> still has to serve: <see cref="HasPendingWork"/> without the engine work left for the next
+    /// scheduler pass and without a due flush deadline (<see cref="NextPollDeadlineMicros"/> is the only deadline here). A
+    /// host that polls a marked peer and flushes on its own tick (QuiclyServer.PollAll) keeps the peer marked after its Poll
+    /// only for this, because polling it again cannot consume the rest; the edge was re-armed by that Poll, and the flush
+    /// deadline the Poll brought forward is the host's to serve.
+    /// </summary>
+    internal bool HasPendingPollWork =>
+        !_disposed && !IsFreed && !_closedRaised && (HasQueuedPollWork() || _timerDeadline <= _clock.NowMicros);
+
+    /// <summary>
+    /// Brings the flush deadline forward to the engine work the transport thread (or the application) left since the last
+    /// scheduler pass (game thread, the end of a Connected Poll). A pass computes <see cref="NextFlushDeadlineMicros"/> from
+    /// what it saw, so without this the acks a value received after it is owed, a LatestAck that completes a value, or a
+    /// bulk range request would wait for the host's next Flush however far off that is; a host that brings its flush forward
+    /// to the deadline (QuiclyServer.PollAll) serves them at once.
+    /// </summary>
+    /// <param name="now">Clock micros of the Poll.</param>
+    private void LowerFlushDeadlineForPassWork(long now)
+    {
+        long deadline = _engineDeadline;
+        _latest?.LowerControlDeadline(now, ref deadline);
+        _bulk?.LowerPassDeadline(now, ref deadline);
+        _engineDeadline = deadline;
+    }
+
+    /// <summary>
+    /// The queues and signals a Poll consumes (not the deadlines): <see cref="HasPendingWork"/> and
+    /// <see cref="HasPendingPollWork"/> without their deadline and engine parts. The caller checked the peer is not disposed.
+    /// </summary>
+    private bool HasQueuedPollWork()
+    {
+        PeerCore core = _core;
+        if (Volatile.Read(ref _signals) != 0
+            || !core.CompletionRing.IsEmpty
+            || core.LocalCompletionsQueued != 0
+            || !core.ReceiveRing.IsEmpty
+            || !core.PendedStreams.IsEmpty
+            || !_pongs.IsEmpty
+            || !_streamPings.IsEmpty
+            || _transitionCount != 0
+            || _queuedWithHandler != 0
+            || _hasHeld
+            || _hasHeldForeign
+            || _front is { IsEmpty: false })
+        {
+            return true;
+        }
+
+        ReadOnlySpan<ReceiveMailbox> boxes = core.Mailboxes;
+        for (int i = 0; i < boxes.Length; i++)
+        {
+            if (boxes[i].HasDirty)
             {
                 return true;
             }
-
-            ReadOnlySpan<ReceiveMailbox> boxes = core.Mailboxes;
-            for (int i = 0; i < boxes.Length; i++)
-            {
-                if (boxes[i].HasDirty)
-                {
-                    return true;
-                }
-            }
-
-            return _nextDeadlineMicros <= _clock.NowMicros;
         }
+
+        return false;
     }
 
     /// <summary>

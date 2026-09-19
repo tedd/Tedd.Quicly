@@ -97,6 +97,11 @@ public sealed unsafe partial class QuiclyPeer
                 RaiseTransitions(holdClosed: false);
             }
 
+            if (_state == PeerState.Connected)
+            {
+                LowerFlushDeadlineForPassWork(now);
+            }
+
             UpdateNextDeadline(next);
             return dispatched;
         }

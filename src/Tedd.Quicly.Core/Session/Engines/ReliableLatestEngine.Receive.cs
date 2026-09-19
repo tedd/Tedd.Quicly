@@ -34,6 +34,12 @@ internal sealed unsafe partial class ReliableLatestEngine
     private long _maxStage;
 
     private bool _ackDatagramsRefused;
+
+    /// <summary>
+    /// The last pass that was due to send owed acks sent none (no carrier fits a batch): until one does, a Poll does not
+    /// bring the flush deadline forward for them (<see cref="LowerControlDeadline"/>). Game thread.
+    /// </summary>
+    private bool _acksStuck;
     private TransportStreamId[] _txStreams = [];
     private int[] _txLocals = [];
 
@@ -812,6 +818,7 @@ internal sealed unsafe partial class ReliableLatestEngine
         _sweepSlot = 0;
         _nextAckMicros = 0;
         _ackDatagramsRefused = false;
+        _acksStuck = false;
     }
 
     // ------------------------------------------------------------------ acks the peer sent us (game thread)
@@ -947,6 +954,7 @@ internal sealed unsafe partial class ReliableLatestEngine
         int limit = datagrams ? Math.Min(_core.MaxDatagramPayload, AckFrameBytes) : AckFrameBytes;
         if (limit <= 8)
         {
+            _acksStuck = true;
             return;
         }
 
@@ -1008,6 +1016,48 @@ internal sealed unsafe partial class ReliableLatestEngine
             // nothing (no carrier, a datagram limit too small for any batch) would skip that window's acks silently, and
             // with AckDelay 0 it would also pin the flush deadline at the current time (LowerDeadline).
             _nextAckMicros = now + _ackDelayMicros;
+        }
+
+        _acksStuck = !transmitted && HasPendingAcks();
+    }
+
+    /// <summary>
+    /// Lowers <paramref name="deadline"/> to when the next pass has the control work the transport thread left since the
+    /// last one (game thread, the end of a Poll; a pass computes its deadline from what it saw): now for LatestAck,
+    /// LatestReject and stream notices to apply; for acks and rejects owed, the end of the <see cref="PeerOptions.AckDelay"/>
+    /// window, or now once it is over. Acks the last due pass could not send at all are left out: that pass published their
+    /// time, or none (<see cref="LowerDeadline"/>), and now would make a host that sleeps until the deadline spin on a Flush
+    /// that cannot send them.
+    /// </summary>
+    /// <param name="now">Clock micros.</param>
+    /// <param name="deadline">The flush deadline to lower.</param>
+    internal void LowerControlDeadline(long now, ref long deadline)
+    {
+        long due;
+        if (!_notices.IsEmpty)
+        {
+            due = now;
+        }
+        else if (!HasPendingAcks())
+        {
+            return;
+        }
+        else if (_nextAckMicros > now)
+        {
+            due = _nextAckMicros;
+        }
+        else if (_acksStuck)
+        {
+            return;
+        }
+        else
+        {
+            due = now;
+        }
+
+        if (due < deadline)
+        {
+            deadline = due;
         }
     }
 

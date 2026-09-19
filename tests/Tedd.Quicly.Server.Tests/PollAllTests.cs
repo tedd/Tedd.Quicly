@@ -253,6 +253,48 @@ public class PollAllTests
         Assert.Equal(payload, sink.Bytes);
     }
 
+    /// <summary>
+    /// A peer whose flush deadline is due is flushed by PollAll on its own. The table has a Bulk channel, so every peer's
+    /// flush gate is off and a FlushAll would flush all three: PollAll must not turn one due ack into a flush of every peer.
+    /// </summary>
+    [Fact]
+    public async Task PollAll_Flushes_Only_The_Peers_Whose_Flush_Deadline_Is_Due()
+    {
+        ChannelTable table = ChannelTable.Create()
+            .Add(2, "state", ChannelMode.UnreliableUnordered)
+            .Add(5, "world", ChannelMode.Bulk, o => o.Priority = 0)
+            .Add(6, "latest", ChannelMode.ReliableLatest)
+            .Build();
+        await using ServerFixture f = new(o => o.Channels = table);
+        int received = 0;
+        f.Server.PeerAdmitted += peer => peer.RegisterHandler(6, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
+        QuiclyPeer[] clients = [f.Connect(table: table), f.Connect(table: table), f.Connect(table: table)];
+        Assert.True(f.RunUntil(() => clients.All(c => c.State == PeerState.Connected)), "not admitted");
+        QuiclyPeer[] peers = clients.Select(f.ServerPeerOf).ToArray();
+        f.Run(4_000_000, step: 10_000);
+        Assert.True(f.RunUntil(() => peers.All(p =>
+        {
+            long untilPing = p.NextPollDeadlineMicros - f.Clock.NowMicros;
+            return untilPing > 100_000 && !IsMarked(f.Server, p.Index) && !p.HasPendingWork && p.NextFlushDeadlineMicros == long.MaxValue;
+        }), 3_000_000, step: 10_000), "the peers never settled");
+
+        SendResult sent = clients[1].SendCopy(new SendHeader(6, 42), [1, 2, 3], SendOptions.Tracked);
+        clients[1].Flush();
+        f.Network.Advance(1_000);
+        long flushed = f.Server.PeersFlushed;
+        f.Server.PollAll();
+        Assert.Equal(1, received);
+        Assert.Equal(flushed + 1, f.Server.PeersFlushed);
+        Assert.False(peers[1].HasPendingWork, "the ack was not flushed");
+
+        for (int i = 0; i < 3; i++)
+        {
+            f.Step(1_000);
+        }
+
+        Assert.Equal(DeliveryStatus.Delivered, clients[1].GetDeliveryStatus(sent.Token));
+    }
+
     /// <summary>Serves one in-memory object for any request, and authorises every request.</summary>
     private sealed class ArrayProvider(byte[] bytes) : IBulkProvider, IBulkAuthorizer
     {

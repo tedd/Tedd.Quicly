@@ -450,31 +450,17 @@ public unsafe class SlabAllocatorTests
         for (int i = 0; i < 1_000; i++)
             RentWriteReturn(allocator);
 
-        // Measured in windows like the other zero-allocation tests: a one-off runtime event on this thread (tier-up or
-        // OSR compilation landing inside a window, observed on .NET 11 previews) does not repeat, while a steady-state
-        // allocation shows up in every window.
-        const int windows = 5;
-        long[] deltas = new long[windows];
-        int allocating = 0;
-        for (int window = 0; window < windows; window++)
+        WindowedAllocation.AssertNone(() =>
         {
-            long before = GC.GetAllocatedBytesForCurrentThread();
             for (int i = 0; i < 20_000; i++)
                 RentWriteReturn(allocator);
-            deltas[window] = GC.GetAllocatedBytesForCurrentThread() - before;
-            if (deltas[window] != 0)
-                allocating++;
-        }
-
-        Assert.True(allocating <= 1, $"Rent/return allocated in {allocating} of {windows} windows: {string.Join(", ", deltas)} bytes per 20000 calls.");
+        });
 
         // Statistics snapshots are allocation-free too (asserting inside the loop would allocate in xunit).
         long rentedSum = 0;
         long capacitySum = 0;
-        allocating = 0;
-        for (int window = 0; window < windows; window++)
+        int windows = WindowedAllocation.AssertNone(() =>
         {
-            long before = GC.GetAllocatedBytesForCurrentThread();
             for (int i = 0; i < 2_000; i++)
             {
                 SlabStatistics stats = allocator.GetStatistics();
@@ -482,15 +468,11 @@ public unsafe class SlabAllocatorTests
                 SizeClassStatistics one = allocator.GetClassStatistics(1);
                 capacitySum += one.Capacity;
             }
+        });
 
-            deltas[window] = GC.GetAllocatedBytesForCurrentThread() - before;
-            if (deltas[window] != 0)
-                allocating++;
-        }
-
-        Assert.True(allocating <= 1, $"Statistics allocated in {allocating} of {windows} windows: {string.Join(", ", deltas)} bytes per 2000 calls.");
         Assert.Equal(0, rentedSum);
-        Assert.Equal(40_000, capacitySum);
+        // Class 1 holds 4 blocks.
+        Assert.Equal(windows * 2_000 * 4, capacitySum);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]

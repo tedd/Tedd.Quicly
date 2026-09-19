@@ -1043,33 +1043,27 @@ internal static class Handlers
         (QuiclyPeer _, in ReceiveHeader header, ReadOnlySpan<byte> payload) => into.Add((header, payload.ToArray()));
 }
 
-/// <summary>Zero-allocation assertion over windows of calls (the pattern of the other zero-allocation tests).</summary>
+/// <summary>Zero-allocation assertion over windows of calls (<see cref="WindowedAllocation"/>, after a warm-up).</summary>
 internal static class AllocationAssert
 {
-    public static void NoAllocations(Action body, int warmup = 1_000, int iterations = 2_000, int windows = 5)
+    /// <summary>
+    /// Calls <paramref name="body"/> <paramref name="warmup"/> times, then measures windows of <paramref name="iterations"/>
+    /// calls with <see cref="WindowedAllocation.AssertNone"/>.
+    /// </summary>
+    /// <returns>The number of windows run.</returns>
+    public static int NoAllocations(Action body, int warmup = 1_000, int iterations = 2_000)
     {
         for (int i = 0; i < warmup; i++)
         {
             body();
         }
 
-        long[] deltas = new long[windows];
-        int allocating = 0;
-        for (int window = 0; window < windows; window++)
+        return WindowedAllocation.AssertNone(() =>
         {
-            long before = GC.GetAllocatedBytesForCurrentThread();
             for (int i = 0; i < iterations; i++)
             {
                 body();
             }
-
-            deltas[window] = GC.GetAllocatedBytesForCurrentThread() - before;
-            if (deltas[window] != 0)
-            {
-                allocating++;
-            }
-        }
-
-        Assert.True(allocating <= 1, $"Allocated in {allocating} of {windows} windows: {string.Join(", ", deltas)} bytes per {iterations} calls.");
+        });
     }
 }

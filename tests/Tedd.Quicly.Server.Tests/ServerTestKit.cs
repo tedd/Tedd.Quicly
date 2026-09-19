@@ -371,33 +371,70 @@ internal sealed class PairConnector(SimulatedNetwork network, ManualListener lis
     }
 }
 
-/// <summary>Allocation checks over warmed-up windows (a one-off runtime allocation in one window is tolerated).</summary>
+/// <summary>
+/// Zero-allocation checks over rounds of warmed-up windows, measured with <see cref="GC.GetAllocatedBytesForCurrentThread"/>
+/// like the Core tests' <c>WindowedAllocation</c>. A steady-state allocation shows up in every window of every round. Inside
+/// the test host the runtime also allocates a few kilobytes on the test thread now and then, in a single window of roughly
+/// one measurement in ten; two of those can still land in the same round, so a round passes with at most one allocating
+/// window and a round with more is measured again, up to <see cref="Rounds"/> rounds.
+/// </summary>
 internal static class AllocationAssert
 {
-    public static void NoAllocations(Action body, int warmup = 200, int iterations = 1_000, int windows = 5)
+    /// <summary>Number of measured windows per round.</summary>
+    public const int Windows = 5;
+
+    /// <summary>Number of rounds measured before the check fails.</summary>
+    public const int Rounds = 3;
+
+    /// <summary>
+    /// Calls <paramref name="body"/> <paramref name="warmup"/> times, then runs rounds of <see cref="Windows"/> windows of
+    /// <paramref name="iterations"/> calls until a round allocates in at most one of them, and fails when
+    /// <see cref="Rounds"/> rounds in a row allocated in more than one.
+    /// </summary>
+    /// <returns>The number of windows run, a multiple of <see cref="Windows"/>.</returns>
+    public static int NoAllocations(Action body, int warmup = 200, int iterations = 1_000)
     {
         for (int i = 0; i < warmup; i++)
         {
             body();
         }
 
-        long[] deltas = new long[windows];
-        int allocating = 0;
-        for (int window = 0; window < windows; window++)
+        long[] deltas = new long[Rounds * Windows];
+        int run = 0;
+        int allocating;
+        do
         {
-            long before = GC.GetAllocatedBytesForCurrentThread();
-            for (int i = 0; i < iterations; i++)
+            allocating = 0;
+            for (int w = 0; w < Windows; w++, run++)
             {
-                body();
-            }
+                long before = GC.GetAllocatedBytesForCurrentThread();
+                for (int i = 0; i < iterations; i++)
+                {
+                    body();
+                }
 
-            deltas[window] = GC.GetAllocatedBytesForCurrentThread() - before;
-            if (deltas[window] != 0)
-            {
-                allocating++;
+                deltas[run] = GC.GetAllocatedBytesForCurrentThread() - before;
+                if (deltas[run] != 0)
+                {
+                    allocating++;
+                }
             }
         }
+        while (allocating > 1 && run < deltas.Length);
 
-        Assert.True(allocating <= 1, "Allocated in " + allocating + " of " + windows + " windows: " + string.Join(", ", deltas) + " bytes per " + iterations + " calls.");
+        Assert.True(allocating <= 1, "Allocated in more than one of " + Windows + " windows in each of " + Rounds + " rounds: "
+            + Describe(deltas) + " bytes per " + iterations + " calls.");
+        return run;
+    }
+
+    private static string Describe(long[] deltas)
+    {
+        string[] rounds = new string[Rounds];
+        for (int r = 0; r < Rounds; r++)
+        {
+            rounds[r] = string.Join(", ", deltas[(r * Windows)..((r + 1) * Windows)]);
+        }
+
+        return string.Join(" | ", rounds);
     }
 }

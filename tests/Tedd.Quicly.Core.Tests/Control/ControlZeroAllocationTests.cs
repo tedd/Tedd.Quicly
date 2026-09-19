@@ -13,43 +13,29 @@ public class ControlZeroAllocationTests
 {
     private const int Warmup = 1_000;
     private const int Iterations = 2_000;
-    private const int Windows = 5;
 
     private static readonly ControlCarrier[] Carriers = [ControlCarrier.Datagram, ControlCarrier.Stream];
 
     /// <summary>
-    /// Warms <paramref name="body"/> up, then measures <see cref="Windows"/> consecutive windows of
-    /// <see cref="Iterations"/> calls; at most one window may allocate. A one-off runtime event on this thread (tier-up
-    /// or OSR compilation landing inside a window) does not repeat, so it cannot fail the test on its own, while a
-    /// steady-state allocation, including an amortised one that recurs only every few thousand calls (a rarely
-    /// resized buffer), shows up in at least two windows.
+    /// Warms <paramref name="body"/> up, then measures windows of <see cref="Iterations"/> calls with
+    /// <see cref="WindowedAllocation.AssertNone"/>. A steady-state allocation, including an amortised one that recurs only
+    /// every few thousand calls (a rarely resized buffer), shows up in at least two windows of every round.
     /// </summary>
-    private static void AssertNoAllocations(Action body)
+    /// <returns>The number of windows run.</returns>
+    private static int AssertNoAllocations(Action body)
     {
         for (int i = 0; i < Warmup; i++)
         {
             body();
         }
 
-        long[] deltas = new long[Windows];
-        int allocatingWindows = 0;
-        for (int window = 0; window < Windows; window++)
+        return WindowedAllocation.AssertNone(() =>
         {
-            long before = GC.GetAllocatedBytesForCurrentThread();
             for (int i = 0; i < Iterations; i++)
             {
                 body();
             }
-
-            deltas[window] = GC.GetAllocatedBytesForCurrentThread() - before;
-            if (deltas[window] != 0)
-            {
-                allocatingWindows++;
-            }
-        }
-
-        Assert.True(allocatingWindows <= 1,
-            $"Allocated in {allocatingWindows} of {Windows} windows: {string.Join(", ", deltas)} bytes per {Iterations} calls.");
+        });
     }
 
     private static ReadOnlySpan<byte> ReadFrame(ReadOnlySpan<byte> frame, ControlCarrier carrier, out ControlType type)
@@ -162,9 +148,11 @@ public class ControlZeroAllocationTests
     [Fact]
     public void Session_Token_Mint_Validate_Inspect()
     {
+        // Every call consumes a token of its own, and the clock stands still, so the replay cache keeps them all: both are
+        // sized for the most windows the measurement can run.
+        const int tokenCount = Warmup + (WindowedAllocation.Rounds * WindowedAllocation.Windows * Iterations);
         VirtualClock clock = new(0);
-        using SessionTokenAuthority authority = new(Bytes(32, 7), clock);
-        const int tokenCount = Warmup + (Windows * Iterations);
+        using SessionTokenAuthority authority = new(Bytes(32, 7), clock, replayCacheCapacity: tokenCount);
         byte[] tokens = new byte[tokenCount * SessionTokenAuthority.TokenLength];
         for (int i = 0; i < tokenCount; i++)
         {
@@ -173,7 +161,7 @@ public class ControlZeroAllocationTests
 
         byte[] scratch = new byte[SessionTokenAuthority.TokenLength];
         int next = 0;
-        AssertNoAllocations(() =>
+        int windows = AssertNoAllocations(() =>
         {
             ReadOnlySpan<byte> token = tokens.AsSpan(next++ * SessionTokenAuthority.TokenLength, SessionTokenAuthority.TokenLength);
             if (authority.TryInspect(token, out _, out _) != SessionTokenStatus.Valid
@@ -185,6 +173,8 @@ public class ControlZeroAllocationTests
 
             authority.Mint(1, 2, 3, scratch);
         });
+
+        Assert.Equal(Warmup + (windows * Iterations), next);
     }
 
     [Fact]

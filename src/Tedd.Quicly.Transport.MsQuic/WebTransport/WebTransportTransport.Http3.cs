@@ -625,6 +625,9 @@ public sealed unsafe partial class WebTransportTransport
         ITransport? inner = _inner;
         lock (_gate)
         {
+            // Remembered before the close, because the close comes back as a LOCAL one: it is this end that tears the
+            // inner connection down. Without this the application is told it closed a session the peer ended.
+            _peerEndedSession = true;
             if (_state is StateClosing or StateClosed) return;
             _state = StateClosing;
         }

@@ -173,6 +173,40 @@ public sealed unsafe class WebTransportProtocolErrorTests : IDisposable
         Assert.Equal(0x10ul, closed.ErrorCode);
     }
 
+    /// <summary>
+    /// The peer can end the session without a capsule — by finishing the CONNECT stream (RFC 9114 §4.1) or by sending
+    /// GOAWAY. That is still the peer ending it, so the application must be told <see cref="TransportCloseReason.Peer"/>,
+    /// and it must not be handed the carrier's own HTTP/3 code: 0x100 is H3_NO_ERROR, which means nothing to an
+    /// application that only knows QUICLY application codes.
+    /// </summary>
+    [Fact]
+    public void A_peer_that_finishes_the_connect_stream_is_reported_as_a_peer_close()
+    {
+        StartConnected();
+        _peer.FinishStream(_peer.ConnectStream);
+
+        Assert.True(Pump(() => _clientSink.IsClosed), "the client's OnClosed after the CONNECT stream ended");
+        RecordedEvent closed = _clientSink.OfKind(RecordedEventKind.Closed)[0];
+        Assert.Equal(TransportCloseReason.Peer, closed.CloseReason);
+        Assert.Equal(0ul, closed.ErrorCode);
+    }
+
+    /// <summary>GOAWAY is the other way the peer ends a session without a capsule.</summary>
+    [Fact]
+    public void A_peer_that_sends_goaway_is_reported_as_a_peer_close()
+    {
+        StartConnected();
+        Span<byte> payload = stackalloc byte[8];
+        int written = Http3FrameWriter.WriteFrame(payload, (ulong)Http3FrameType.GoAway, [0x00]);
+        Assert.True(written > 0, "the GOAWAY frame did not fit");
+        _peer.SendMore(_peer.ControlStream, payload.Slice(0, written));
+
+        Assert.True(Pump(() => _clientSink.IsClosed), "the client's OnClosed after GOAWAY");
+        RecordedEvent closed = _clientSink.OfKind(RecordedEventKind.Closed)[0];
+        Assert.Equal(TransportCloseReason.Peer, closed.CloseReason);
+        Assert.Equal(0ul, closed.ErrorCode);
+    }
+
     [Fact]
     public void A_malformed_close_session_capsule_closes_the_connection()
     {

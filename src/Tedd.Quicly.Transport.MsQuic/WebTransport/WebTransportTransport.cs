@@ -91,6 +91,13 @@ public sealed unsafe partial class WebTransportTransport : ITransport, ITranspor
     /// <summary>The close code the peer sent in a CLOSE_WEBTRANSPORT_SESSION capsule, or -1.</summary>
     private long _peerCapsuleCode = -1;
 
+    /// <summary>
+    /// The peer ended the session — a CLOSE_WEBTRANSPORT_SESSION capsule, a finished CONNECT stream or GOAWAY. All
+    /// three make this end close the inner connection, so the close arrives as <see cref="TransportCloseReason.Local"/>
+    /// and only this says otherwise.
+    /// </summary>
+    private bool _peerEndedSession;
+
     private readonly NativeArray<byte> _controlBytes;
     private readonly NativeArray<TransportSegment> _controlSegments;
     private int _controlUsed;
@@ -286,12 +293,14 @@ public sealed unsafe partial class WebTransportTransport : ITransport, ITranspor
     {
         ITransportSink? sink;
         long capsuleCode;
+        bool peerEnded;
         lock (_gate)
         {
             if (_state == StateClosed) return;
             _state = StateClosed;
             sink = _sink;
             capsuleCode = _peerCapsuleCode;
+            peerEnded = _peerEndedSession;
         }
 
         FailPendingDatagrams();
@@ -307,7 +316,7 @@ public sealed unsafe partial class WebTransportTransport : ITransport, ITranspor
             return;
         }
 
-        if (reason == TransportCloseReason.Local && WebTransportErrorCode.TryFromHttp3(errorCode, out uint local))
+        if (reason == TransportCloseReason.Local && WebTransportErrorCode.TryFromHttp3(errorCode, out uint local) && !peerEnded)
         {
             sink.OnClosed(TransportCloseReason.Local, local, transportStatus);
             return;
@@ -317,6 +326,15 @@ public sealed unsafe partial class WebTransportTransport : ITransport, ITranspor
         if (capsuleCode >= 0)
         {
             sink.OnClosed(TransportCloseReason.Peer, (ulong)capsuleCode, transportStatus);
+            return;
+        }
+
+        // The peer finished the CONNECT stream or sent GOAWAY: it ended the session without naming a code. This end
+        // closed the inner connection in response, with H3_NO_ERROR, so the reason says Local and the code is an HTTP/3
+        // one -- neither of which is the application's business. It ended cleanly, at the peer's request.
+        if (peerEnded)
+        {
+            sink.OnClosed(TransportCloseReason.Peer, 0, transportStatus);
             return;
         }
 

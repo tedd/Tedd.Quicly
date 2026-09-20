@@ -98,6 +98,13 @@ internal sealed unsafe class RawHttp3Peer : ITransportSink, IDisposable
         Transport!.SendStream(id, RentSegment(buffer.Segment(0, bytes.Length)), 1, 7, TransportSendFlags.None);
     }
 
+    /// <summary>Ends a stream this peer opened or answered, with a FIN and no more bytes.</summary>
+    public void FinishStream(TransportStreamId id)
+    {
+        NativeBuffer buffer = Rent(1);
+        Transport!.SendStream(id, RentSegment(buffer.Segment(0, 0)), 1, 8, TransportSendFlags.Fin);
+    }
+
     /// <summary>Opens a bidirectional stream carrying exactly <paramref name="bytes"/>.</summary>
     public TransportStreamId OpenBidirectional(ReadOnlySpan<byte> bytes)
     {

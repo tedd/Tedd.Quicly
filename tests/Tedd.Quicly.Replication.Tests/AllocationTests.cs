@@ -5,21 +5,27 @@ namespace Tedd.Quicly.Replication.Tests;
 /// <summary>Steady-state hot paths must not allocate (ADR 0007/0008).</summary>
 public class AllocationTests
 {
-    private static void AssertNoAllocations(Action body, int iterations = 5000)
+    /// <summary>
+    /// Warms <paramref name="body"/> up and then measures it over the rounds of windows <see cref="WindowedAllocation"/>
+    /// describes, <paramref name="iterations"/> calls to a window.
+    /// </summary>
+    /// <returns>The number of windows run, for callers that count the calls made in them.</returns>
+    private static int AssertNoAllocations(Action body, int iterations = 5000)
     {
         for (int i = 0; i < 200; i++)
         {
             body();
         }
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < iterations; i++)
+        Action window = () =>
         {
-            body();
-        }
+            for (int i = 0; i < iterations; i++)
+            {
+                body();
+            }
+        };
 
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        return WindowedAllocation.AssertNone(window);
     }
 
     [Fact]

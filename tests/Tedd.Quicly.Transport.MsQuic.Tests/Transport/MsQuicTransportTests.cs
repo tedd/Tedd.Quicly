@@ -474,9 +474,10 @@ public unsafe class MsQuicTransportTests
         Assert.InRange(statistics.PathMtu, (ushort)1200, (ushort)1500);
         Assert.Equal(0UL, statistics.BytesInFlight);
         client.GetStatistics(out _);
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 100; i++) client.GetStatistics(out statistics);
-        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+        WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 100; i++) client.GetStatistics(out _);
+        });
         scope.Finish();
     }
 

@@ -65,13 +65,12 @@ public class Base64UrlCodecTests
             Base64UrlCodec.Encode(data, buffer);
         }
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 10_000; i++)
+        WindowedAllocation.AssertNone(() =>
         {
-            Base64UrlCodec.Encode(data, buffer);
-        }
-
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+            for (int i = 0; i < 10_000; i++)
+            {
+                Base64UrlCodec.Encode(data, buffer);
+            }
+        });
     }
 }

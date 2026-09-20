@@ -15,16 +15,26 @@ public class MsQuicAllocationCollection
 /// Zero GC allocation in steady state (after warm-up) on the datagram and stream send/receive paths: the sending thread
 /// allocates nothing (<see cref="GC.GetAllocatedBytesForCurrentThread"/>), the callback path allocates nothing on any MsQuic
 /// worker thread (<see cref="CallbackAllocationProbe"/>), and the whole process allocates less than
-/// <see cref="ProcessBudgetBytes"/> over 10 000 messages (runtime and test-runner background work included).
+/// <see cref="ProcessBudgetBytes"/> per <see cref="Round"/> messages (runtime and test-runner background work included).
 /// </summary>
+/// <remarks>
+/// The sending thread is measured over the rounds of windows <see cref="WindowedAllocation"/> describes, a window of
+/// <see cref="PerWindow"/> messages at a time, because the test host's runtime now and then allocates a few kilobytes on the
+/// test thread. A window drains its own messages before it ends, so a round that has to be measured again leaves no more
+/// work outstanding than a single window does, and the worker-thread probes and the process budget cover every round run.
+/// The probes stay a single measurement: they sample a different thread, which the test host's transient does not touch.
+/// </remarks>
 [Collection(MsQuicAllocationCollection.Name)]
 public unsafe class MsQuicTransportAllocationTests
 {
-    /// <summary>Process-wide allocation budget for 10 000 messages; documented in docs/benchmarks/msquic-transport.md.</summary>
+    /// <summary>Process-wide allocation budget for <see cref="Round"/> messages; documented in docs/benchmarks/msquic-transport.md.</summary>
     public const long ProcessBudgetBytes = 64 * 1024;
 
     private const int Warmup = 2_000;
-    private const int Measured = 10_000;
+    private const int PerWindow = 2_000;
+
+    /// <summary>Messages in one round of windows: the 10 000 the budget above is written for.</summary>
+    private const int Round = WindowedAllocation.Windows * PerWindow;
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(30);
 
     [Fact]
@@ -36,7 +46,8 @@ public unsafe class MsQuicTransportAllocationTests
         byte* payload = (byte*)NativeMemory.AllocZeroed(64);
         var segment = (TransportSegment*)NativeMemory.AllocZeroed((nuint)sizeof(TransportSegment));
         *segment = new TransportSegment(payload, 64);
-        long sender = -1, process = -1;
+        long process = -1;
+        int windows = 0, measured = 0;
         try
         {
             ConformancePair pair = harness.CreatePair(clientSink, serverSink);
@@ -50,20 +61,25 @@ public unsafe class MsQuicTransportAllocationTests
             clientSink.Probe.Arm();
             serverSink.Probe.Arm();
             process = GC.GetTotalAllocatedBytes(precise: true);
-            sender = GC.GetAllocatedBytesForCurrentThread();
-            SendDatagrams(client, segment, Warmup, Measured);
-            sender = GC.GetAllocatedBytesForCurrentThread() - sender;
-            bool finals = Spin.UntilAtLeast(ref clientSink.FinalStates, Warmup + Measured, Timeout);
-            bool received = Spin.UntilAtLeast(ref serverSink.DatagramsReceived, (Warmup + Measured) * 9 / 10, Timeout);
+            int sent = Warmup;
+            windows = WindowedAllocation.AssertNone(() =>
+            {
+                SendDatagrams(client, segment, sent, PerWindow);
+                sent += PerWindow;
+                if (!Spin.UntilAtLeast(ref clientSink.FinalStates, sent, Timeout))
+                    throw new InvalidOperationException($"final states {clientSink.FinalStates} of {sent}");
+            });
+            measured = windows * PerWindow;
+            Assert.Equal(Warmup + measured, clientSink.FinalStates);
+            bool received = Spin.UntilAtLeast(ref serverSink.DatagramsReceived, (Warmup + measured) * 9 / 10, Timeout);
             process = GC.GetTotalAllocatedBytes(precise: true) - process;
-            Assert.True(finals, $"final states {clientSink.FinalStates}");
+            long budget = (long)ProcessBudgetBytes * measured / Round;
             Assert.True(received, $"received {serverSink.DatagramsReceived}");
-            Assert.Equal(0, sender);
             Assert.Equal(0, clientSink.Probe.Allocated);
             Assert.Equal(0, serverSink.Probe.Allocated);
-            Assert.True(clientSink.Probe.Samples > Measured / 2, $"client samples {clientSink.Probe.Samples}");
-            Assert.True(serverSink.Probe.Samples > Measured / 2, $"server samples {serverSink.Probe.Samples}");
-            Assert.True(process < ProcessBudgetBytes, $"the process allocated {process} bytes over {Measured} datagrams (budget {ProcessBudgetBytes})");
+            Assert.True(clientSink.Probe.Samples > measured / 2, $"client samples {clientSink.Probe.Samples}");
+            Assert.True(serverSink.Probe.Samples > measured / 2, $"server samples {serverSink.Probe.Samples}");
+            Assert.True(process < budget, $"the process allocated {process} bytes over {measured} datagrams (budget {budget})");
         }
         finally
         {
@@ -72,7 +88,7 @@ public unsafe class MsQuicTransportAllocationTests
             NativeMemory.Free(payload);
         }
         Assert.Null(harness.CleanupError);
-        TestContext.Current.SendDiagnosticMessage($"datagrams: sender {sender} B, process {process} B over {Measured} messages");
+        TestContext.Current.SendDiagnosticMessage($"datagrams: process {process} B over {measured} messages in {windows} windows");
     }
 
     [Fact]
@@ -84,7 +100,8 @@ public unsafe class MsQuicTransportAllocationTests
         byte* payload = (byte*)NativeMemory.AllocZeroed(1024);
         var segment = (TransportSegment*)NativeMemory.AllocZeroed((nuint)sizeof(TransportSegment));
         *segment = new TransportSegment(payload, 1024);
-        long sender = -1, process = -1;
+        long process = -1;
+        int windows = 0, measured = 0;
         try
         {
             ConformancePair pair = harness.CreatePair(clientSink, serverSink);
@@ -101,21 +118,26 @@ public unsafe class MsQuicTransportAllocationTests
             clientSink.Probe.Arm();
             serverSink.Probe.Arm();
             process = GC.GetTotalAllocatedBytes(precise: true);
-            sender = GC.GetAllocatedBytesForCurrentThread();
-            SendStream(client, id, segment, Warmup, Measured);
-            sender = GC.GetAllocatedBytesForCurrentThread() - sender;
-            bool completions = Spin.UntilAtLeast(ref clientSink.SendCompletions, Warmup + Measured, Timeout);
-            bool bytes = Spin.UntilAtLeast(ref serverSink.StreamBytes, (Warmup + Measured) * 1024L, Timeout);
+            int sent = Warmup;
+            windows = WindowedAllocation.AssertNone(() =>
+            {
+                SendStream(client, id, segment, sent, PerWindow);
+                sent += PerWindow;
+                if (!Spin.UntilAtLeast(ref clientSink.SendCompletions, sent, Timeout))
+                    throw new InvalidOperationException($"completions {clientSink.SendCompletions} of {sent}");
+            });
+            measured = windows * PerWindow;
+            Assert.Equal(Warmup + measured, clientSink.SendCompletions);
+            bool bytes = Spin.UntilAtLeast(ref serverSink.StreamBytes, (Warmup + measured) * 1024L, Timeout);
             process = GC.GetTotalAllocatedBytes(precise: true) - process;
-            Assert.True(completions, $"completions {clientSink.SendCompletions}");
+            long budget = (long)ProcessBudgetBytes * measured / Round;
             Assert.True(bytes, $"bytes {serverSink.StreamBytes}");
             Assert.Equal(0, clientSink.CanceledCompletions);
-            Assert.Equal(0, sender);
             Assert.Equal(0, clientSink.Probe.Allocated);
             Assert.Equal(0, serverSink.Probe.Allocated);
-            Assert.True(clientSink.Probe.Samples > Measured / 2, $"client samples {clientSink.Probe.Samples}");
+            Assert.True(clientSink.Probe.Samples > measured / 2, $"client samples {clientSink.Probe.Samples}");
             Assert.True(serverSink.Probe.Samples > 0, $"server samples {serverSink.Probe.Samples}");
-            Assert.True(process < ProcessBudgetBytes, $"the process allocated {process} bytes over {Measured} stream sends (budget {ProcessBudgetBytes})");
+            Assert.True(process < budget, $"the process allocated {process} bytes over {measured} stream sends (budget {budget})");
         }
         finally
         {
@@ -124,7 +146,7 @@ public unsafe class MsQuicTransportAllocationTests
             NativeMemory.Free(payload);
         }
         Assert.Null(harness.CleanupError);
-        TestContext.Current.SendDiagnosticMessage($"streams: sender {sender} B, process {process} B over {Measured} messages");
+        TestContext.Current.SendDiagnosticMessage($"streams: process {process} B over {measured} messages in {windows} windows");
     }
 
     private static void SendDatagrams(ITransport transport, TransportSegment* segment, int first, int count)

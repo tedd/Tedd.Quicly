@@ -61,7 +61,10 @@ Every benchmark change is recorded in `docs/benchmarks/<area>.md` with hypothesi
 * `src/` projects are AOT-compatible (`IsAotCompatible=true`): no reflection, no dynamic code.
 * Hot path: no GC allocations, no LINQ, no exceptions for control flow, no per-operation delegates.
   Guard it with a test that asserts `GC.GetAllocatedBytesForCurrentThread()` does not change across a
-  warmed-up loop, measured with `WindowedAllocation.AssertNone` in the Core tests (`AllocationAssert.NoAllocations`
-  in the Server tests): the test host's runtime now and then allocates a few kilobytes on the test thread in one
-  window, which those helpers tolerate and a hand-rolled single measurement does not.
+  warmed-up loop, measured with `WindowedAllocation.AssertNone` (`AllocationAssert.NoAllocations` in the Server
+  tests): the test host's runtime now and then allocates a few kilobytes on the test thread in one window, which
+  those helpers tolerate and a hand-rolled single measurement does not. Test projects do not reference one
+  another, so each one that needs it carries its own copy of `WindowedAllocation`; keep the copies in step.
+  A check whose assertions count the work done takes the window count the helper returns, and one that measures
+  a one-time cost (rather than a steady-state loop) takes the smallest of several samples instead.
 * Public API gets XML docs.

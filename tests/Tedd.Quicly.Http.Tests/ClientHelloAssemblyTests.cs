@@ -199,15 +199,15 @@ public class ClientHelloAssemblyTests
         var scratch = new byte[ClientHelloParser.MaxClientHelloLength];
         for (int i = 0; i < 1000; i++)
             ClientHelloParser.TryAssemble(raw, scratch, out _, out _);
-        long before = GC.GetAllocatedBytesForCurrentThread();
         int total = 0;
-        for (int i = 0; i < 10_000; i++)
+        WindowedAllocation.AssertNone(() =>
         {
-            if (ClientHelloParser.TryAssemble(raw, scratch, out int length, out _) == ClientHelloAssembleStatus.Complete)
-                total += length;
-        }
-        long after = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 10_000; i++)
+            {
+                if (ClientHelloParser.TryAssemble(raw, scratch, out int length, out _) == ClientHelloAssembleStatus.Complete)
+                    total += length;
+            }
+        });
         Assert.True(total > 0);
-        Assert.Equal(0, after - before);
     }
 }

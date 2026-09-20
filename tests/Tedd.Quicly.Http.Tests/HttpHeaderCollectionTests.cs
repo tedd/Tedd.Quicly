@@ -102,16 +102,16 @@ public class HttpHeaderCollectionTests
         h.Add("Accept", "*/*");
         for (int i = 0; i < 1000; i++)
             h.TryGetValue("Accept", out _);
-        long before = GC.GetAllocatedBytesForCurrentThread();
         int found = 0;
-        for (int i = 0; i < 10_000; i++)
+        WindowedAllocation.AssertNone(() =>
         {
-            if (h.TryGetValue("accept", out _)) found++;
-            foreach (var x in h) found += x.Name.Length;
-        }
-        long after = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 10_000; i++)
+            {
+                if (h.TryGetValue("accept", out _)) found++;
+                foreach (var x in h) found += x.Name.Length;
+            }
+        });
         Assert.True(found > 0);
-        Assert.Equal(0, after - before);
     }
 }
 
@@ -149,20 +149,21 @@ public class ByteBufferWriterTests
     [Fact]
     public void Steady_state_header_serialisation_does_not_allocate()
     {
-        var w = new ByteBufferWriter(1024);
+        // The writer lives in a one-element array: a window delegate cannot capture the `ref` the writes take.
+        ByteBufferWriter[] box = [new ByteBufferWriter(1024)];
         try
         {
             for (int i = 0; i < 1000; i++)
-                Write(ref w);
-            long before = GC.GetAllocatedBytesForCurrentThread();
-            for (int i = 0; i < 10_000; i++)
-                Write(ref w);
-            long after = GC.GetAllocatedBytesForCurrentThread();
-            Assert.Equal(0, after - before);
+                Write(ref box[0]);
+            WindowedAllocation.AssertNone(() =>
+            {
+                for (int i = 0; i < 10_000; i++)
+                    Write(ref box[0]);
+            });
         }
         finally
         {
-            w.Dispose();
+            box[0].Dispose();
         }
 
         static void Write(ref ByteBufferWriter w)

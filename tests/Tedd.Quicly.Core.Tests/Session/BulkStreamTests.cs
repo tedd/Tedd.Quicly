@@ -134,7 +134,7 @@ public class BulkStreamTests
         Assert.Equal(4UL, provider.Requests[0].ObjectId);
         Assert.Equal(2UL, provider.Requests[0].ObjectVersion);
         Assert.Equal(payload, router.Sink<MemorySink>().Bytes);
-        Assert.Equal(BulkHashState.Verified, router.Sink<MemorySink>().Result!.Value.Hash);
+        Assert.Equal(BulkStatus.Completed, router.Sink<MemorySink>().Result!.Value.Status);
         await Task.CompletedTask;
     }
 
@@ -288,6 +288,45 @@ public class BulkStreamTests
         Assert.Equal((long)VarInt.MaxValue, router.Accepted[0].TotalLength);
         Assert.False(router.Accepted[0].IsWholeObject);
         Assert.Equal(0, h.Statistics().ReceiveBytesOutstanding);
+        Assert.Equal(PeerState.Connected, h.Server!.State);
+    }
+
+    [Fact]
+    public void A_Range_Whose_Bytes_Do_Not_Match_Its_Trailer_Fails_That_Range()
+    {
+        // The transport cannot corrupt a range — QUIC.s AEAD discards anything the wire damages — so the corrupt one is
+        // written by hand. What is under test is the receiver.s reaction: this range fails, and it says why.
+        byte[] payload = new byte[4096];
+        new Random(7).NextBytes(payload);
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
+        using ServerHarness h = new(link: new LinkOptions { DelayMicros = 1_000 }, table: BulkTables.Main, server: BulkKit.Receiver(router));
+        Assert.True(h.Admit(), "the raw client was not admitted");
+
+        BulkHeader header = new()
+        {
+            TransferId = 1,
+            ObjectId = 9,
+            ObjectVersion = 1,
+            TotalLength = (ulong)payload.Length,
+            Offset = 0,
+            Length = (ulong)payload.Length,
+            Flags = BulkFlags.ChecksumPresent,
+        };
+
+        // A trailer that does not describe the body.
+        byte[] stream = BulkKit.BulkStream(5, in header, payload, checksum: XxHash64.Hash(payload) ^ 1);
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(stream, out _, fin: true));
+        Assert.True(h.RunUntil(() => router.Sinks.Count > 0 && router.Sink<MemorySink>().IsFinished), "the range never finished");
+
+        BulkResult result = router.Sink<MemorySink>().Result!.Value;
+        Assert.Equal(BulkStatus.Failed, result.Status);
+        Assert.Equal(QuiclyErrorCode.BulkChecksumFailed, result.Code);
+
+        // The bytes were delivered before the trailer condemned them, which is why a sink writes at absolute offsets and a
+        // retry overwrites. And the range is never reported fully accepted, so its sender cannot complete underneath.
+        Assert.Equal(payload, router.Sink<MemorySink>().Bytes);
+        Assert.True(result.BytesTransferred < payload.Length, "a failed range must not be reported as fully accepted");
+        Assert.Equal(1, h.Statistics().BulkChecksumFailures);
         Assert.Equal(PeerState.Connected, h.Server!.State);
     }
 

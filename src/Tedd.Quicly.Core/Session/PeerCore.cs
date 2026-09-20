@@ -176,7 +176,31 @@ internal sealed unsafe class PeerCore : IDisposable
         BulkMaxBytesPerSecond = options.BulkMaxBytesPerSecond;
         BulkChunkBytes = options.BulkChunkBytes;
         BulkMaxChunk = options.BulkMaxChunk;
-        BulkRouter = options.BulkRouter;
+        BulkObjectsPerDirection = options.BulkObjectsPerDirection;
+        BulkObjectRangesInFlight = options.BulkObjectRangesInFlight > 0
+            ? Math.Min(options.BulkObjectRangesInFlight, options.BulkTransfersPerDirection)
+            : options.BulkTransfersPerDirection;
+        BulkObjectRangeBytes = options.BulkObjectRangeBytes;
+        BulkObjectProgressBytes = options.BulkObjectProgressBytes;
+        BulkObjectRangeRetries = options.BulkObjectRangeRetries;
+        BulkChecksum = options.BulkChecksum;
+
+        // The object driver is the engine's router when it is present: it turns the per-transfer view into a per-object one
+        // (PeerOptions.Validate refuses both at once).
+        BulkObjectIdleMicros = Math.Max(0, PeerOptions.ToMicros(options.BulkObjectIdleTimeout));
+        BulkObjectReceiver = options.BulkObjectRouter is { } objectRouter
+            ? new BulkObjectReceiver(
+                objectRouter,
+                Clock,
+
+                // An object delivers nothing without a transfer slot, so more object slots than slots would only reserve
+                // reorder shadows that can never be used.
+                Math.Min(options.BulkObjectsPerDirection, options.BulkTransfersPerDirection),
+                options.BulkTransfersPerDirection + 2,
+                options.BulkObjectProgressBytes,
+                NoteObjectCallbackFault)
+            : null;
+        BulkRouter = BulkObjectReceiver ?? options.BulkRouter;
         BulkAuthorizer = options.BulkAuthorizer;
         BulkProvider = options.BulkProvider;
         Packer = new DatagramPacker(this);
@@ -428,6 +452,34 @@ internal sealed unsafe class PeerCore : IDisposable
     public IBulkProvider? BulkProvider { get; }
 
     // ---- end of the wave C2c seam
+
+    /// <summary>The object-assembling router installed as <see cref="BulkRouter"/>, or null without <see cref="PeerOptions.BulkObjectRouter"/>.</summary>
+    internal BulkObjectReceiver? BulkObjectReceiver { get; }
+
+    /// <summary>Bulk objects per direction (<see cref="PeerOptions.BulkObjectsPerDirection"/>).</summary>
+    public int BulkObjectsPerDirection { get; }
+
+    /// <summary>Ranges of one object in flight, already clamped to <see cref="BulkTransfersPerDirection"/>.</summary>
+    public int BulkObjectRangesInFlight { get; }
+
+    /// <summary>Largest range one transfer of an object carries; 0 means the channel's own <c>MaxMessageSize</c>.</summary>
+    public int BulkObjectRangeBytes { get; }
+
+    /// <summary>Whether bulk transfers append a checksum trailer by default (<see cref="PeerOptions.BulkChecksum"/>).</summary>
+    public bool BulkChecksum { get; }
+
+    /// <summary>Ranges re-sent after a checksum failure before an object is given up on.</summary>
+    public int BulkObjectRangeRetries { get; }
+
+    /// <summary>Bytes between object progress reports (<see cref="PeerOptions.BulkObjectProgressBytes"/>).</summary>
+    public long BulkObjectProgressBytes { get; }
+
+    /// <summary>How long an assembling object may go quiet before it is given up on; 0 disables the sweep.</summary>
+    public long BulkObjectIdleMicros { get; }
+
+    /// <summary>Records what an application's bulk object progress callback threw, without taking the connection down.</summary>
+    /// <param name="exception">What the callback threw.</param>
+    private void NoteObjectCallbackFault(Exception exception) => Peer.NoteObjectFault(exception);
 
     /// <summary>The buffer pool (shared or private).</summary>
     public SlabAllocator Allocator => _allocator;

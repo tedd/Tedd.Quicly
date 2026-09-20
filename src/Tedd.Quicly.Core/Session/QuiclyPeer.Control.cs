@@ -641,6 +641,14 @@ public sealed unsafe partial class QuiclyPeer
                 }
 
                 next = SweepIdleStreams(now, next);
+
+                // An object is several transfers, and a sender that stops between two of them leaves no stream to reset:
+                // this is what keeps its peer from waiting for bytes that are never coming (QuiclyPeer.Bulk.cs).
+                if (_core.BulkObjectReceiver is { } objects)
+                {
+                    next = objects.SweepIdle(now, _core.BulkObjectIdleMicros, next);
+                }
+
                 if (_state == PeerState.Connected)
                 {
                     // Deadlines a Poll serves too (the request table's timeouts, docs/design/session-layer.md §7.8): the

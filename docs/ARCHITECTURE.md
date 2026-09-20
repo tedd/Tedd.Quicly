@@ -247,6 +247,32 @@ Channels are declared once in a `ChannelTable` (both sides must agree; the hands
 | `ReliableLatest` | intermediate versions may be discarded; the latest version is eventually delivered while the epoch lives | versioned DATAGRAMs + application acks + loss-driven/timed retries (large values: per-key stream that aborts the previous one) |
 | `Bulk` | large objects with progress / cancel / resume | one stream per transfer, chunked, low priority, bounded concurrency, SHA-256 identity |
 
+### 5.1 Bulk objects larger than one transfer
+
+A Bulk channel's `MaxMessageSize` bounds **one transfer** — the range one stream carries, at most 16 MiB — and not the
+object (PROTOCOL.md §8: `TotalLength` is a varint, so an object runs to 2^62 − 1 bytes). An object bigger than a transfer
+is therefore several of them, and the **object driver** is what turns that back into one thing for the application:
+
+* Send: `BeginBulkObjectSend(in BulkObjectDescriptor, IBulkSource, BulkObjectProgressCallback?)` (or the awaitable
+  `SendBulkObjectAsync`) splits `[Offset, Offset+Length)` into ascending ranges of `BulkObjectRangeBytes`, keeps
+  `BulkObjectRangesInFlight` of them going, repeats the object's identity and whole-object SHA-256 on each, and completes
+  once with the object's outcome. Ranges start on the game thread from `Poll`; the source is read at absolute object
+  offsets and never for bytes already sent, so a 10 GB object costs a few hundred bytes of driver state.
+* Receive: `PeerOptions.BulkObjectRouter` is asked **once per object**, not once per transfer, and returns one
+  `IBulkObjectSink` that is written at absolute object offsets and finished once. A range is refused unless it lies
+  inside the object and repeats no byte already taken, so reaching the declared length really does mean every byte
+  arrived.
+* Integrity: every range carries an xxHash64 trailer over its own bytes (PROTOCOL.md §3.3), checked by the engine when
+  the range ends. A range that fails is forgotten by the receiver and re-sent by the driver, up to
+  `BulkObjectRangeRetries`. There is no whole-object hash: the range is the unit of recovery, so it is the unit of
+  detection, and every range verifying over a range set that exactly tiles the object *is* the object verifying. What a
+  file is — a content address — is the application's, not the transport's. The check is a switch (`PeerOptions.BulkChecksum`),
+  because what it catches is bugs and bad hardware rather than the wire, which QUIC's mandatory AEAD already covers.
+* Termination: a sender abandons a transfer by resetting its stream, so a sender that stops *between* two ranges leaves
+  nothing to reset. `BulkObjectIdleTimeout` is what ends such an object on the receiver.
+
+Nothing here changes the wire: an object is exactly the transfers PROTOCOL.md §3.3 already describes.
+
 Ordering scope: session + direction + channel. Replacement scope: session + direction + channel + key.
 Channels are typed by the application (one channel per message kind); there is no message-type field.
 Keys can be retired (`RetireKey`) so per-key state is freed on both sides; sequence counters are per channel,

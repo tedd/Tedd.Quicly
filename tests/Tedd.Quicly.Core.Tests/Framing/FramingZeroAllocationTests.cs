@@ -132,7 +132,7 @@ public class FramingZeroAllocationTests
     [Fact]
     public void Bulk_And_Control_Streams()
     {
-        BulkHeader header = StreamFramingTests.SampleBulk(hash: true, chunked: true, length: 300);
+        BulkHeader header = StreamFramingTests.SampleBulk(checksum: true, chunked: true, length: 300);
         byte[] bulk = new StreamBuilder().Preamble(BulkChannel).Bulk(header).Chunk(0, Bytes.Fill(100)).Chunk(200, Bytes.Fill(100)).ToArray();
         byte[] control = new StreamBuilder().Preamble(0).Control(0x10, Bytes.Fill(30)).Control(0x01, Bytes.Fill(4)).ToArray();
         ChannelTable table = All;
@@ -163,7 +163,7 @@ public class FramingZeroAllocationTests
     {
         ChannelDefinition ch = Get(OrderedFull);
         byte[] buffer = new byte[128];
-        BulkHeader bulk = StreamFramingTests.SampleBulk(hash: true, chunked: false);
+        BulkHeader bulk = StreamFramingTests.SampleBulk(checksum: true, chunked: false);
         AllocationAssert.None(() =>
         {
             StreamMessageHeader h = new() { Length = 40, Key = 12345, RequestId = 3, RawLength = 90 };

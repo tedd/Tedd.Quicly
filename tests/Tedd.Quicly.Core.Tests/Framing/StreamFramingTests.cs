@@ -182,31 +182,36 @@ public class StreamFramingTests
         Assert.Equal(ParseStatus.NonMinimalVarint, StreamFraming.TryParseControlFrameHeader(Bytes.Hex("4005 10"), out _, out _, out _));
     }
 
-    internal static BulkHeader SampleBulk(bool hash, bool chunked, ulong length = 100)
+    internal static BulkHeader SampleBulk(bool checksum, bool chunked, ulong length = 100) => new()
     {
-        BulkHeader h = new()
-        {
-            TransferId = 7,
-            ObjectId = 1000,
-            ObjectVersion = 3,
-            TotalLength = 1_000_000,
-            Offset = 64,
-            Length = length,
-            Flags = (hash ? BulkFlags.HashPresent : 0) | (chunked ? BulkFlags.Chunked : 0),
-        };
-        Span<byte> digest = h.Hash;
-        for (int i = 0; i < digest.Length; i++)
-        {
-            digest[i] = (byte)(0xA0 + i);
-        }
+        TransferId = 7,
+        ObjectId = 1000,
+        ObjectVersion = 3,
+        TotalLength = 1_000_000,
+        Offset = 64,
+        Length = length,
+        Flags = (checksum ? BulkFlags.ChecksumPresent : 0) | (chunked ? BulkFlags.Chunked : 0),
+    };
 
-        return h;
+    [Fact]
+    public void Bulk_Checksum_Trailer_Vector()
+    {
+        // docs/protocol-vectors.md: the trailer is the range's xxHash64 as 8 little-endian bytes.
+        byte[] b = new byte[StreamFraming.BulkChecksumLength];
+        Assert.Equal(b.Length, StreamFraming.WriteBulkChecksum(b, XxHash64.Hash(new byte[100])));
+        Assert.Equal("2F502CC90311BB17", Bytes.ToHex(b));
+
+        Assert.Equal(ParseStatus.Ok, StreamFraming.ParseBulkChecksum(b, out ulong parsed, out int consumed));
+        Assert.Equal(b.Length, consumed);
+        Assert.Equal(0x17BB1103C92C502FUL, parsed);
+        Assert.Equal(ParseStatus.Truncated, StreamFraming.ParseBulkChecksum(b.AsSpan(0, 7), out _, out int none));
+        Assert.Equal(0, none);
     }
 
     [Fact]
     public void Bulk_Header_Vector()
     {
-        BulkHeader h = SampleBulk(hash: false, chunked: true);
+        BulkHeader h = SampleBulk(checksum: false, chunked: true);
         byte[] b = new byte[StreamFraming.GetBulkHeaderLength(h)];
         Assert.Equal(b.Length, StreamFraming.WriteBulkHeader(b, h));
         Assert.Equal("07 43E8 03 800F4240 4040 4064 02".Replace(" ", "", StringComparison.Ordinal), Bytes.ToHex(b));
@@ -232,11 +237,8 @@ public class StreamFramingTests
         Assert.Equal(h.Offset, p.Offset);
         Assert.Equal(h.Length, p.Length);
         Assert.Equal(h.Flags, p.Flags);
-        Assert.Equal(hash, p.HasHash);
+        Assert.Equal(hash, p.HasChecksum);
         Assert.Equal(chunked, p.IsChunked);
-        ReadOnlySpan<byte> expectedHash = h.Hash;
-        ReadOnlySpan<byte> actualHash = p.Hash;
-        Assert.Equal(hash ? Bytes.ToHex(expectedHash) : new string('0', 64), Bytes.ToHex(actualHash));
 
         for (int length = 0; length < n; length++)
         {
@@ -282,11 +284,11 @@ public class StreamFramingTests
         { "01 02 03 3C 00 00 00", 1000, ParseStatus.BadBulkRange },          // Length = 0
         { "01 02 03 3C 32 0B 00", 1000, ParseStatus.BadBulkRange },          // 50 + 11 > 60
         { "01 02 03 3C 32 0A 00", 1000, ParseStatus.Ok },                    // 50 + 10 = 60
-        { "01 02 03 3C 00 0A 04", 1000, ParseStatus.BadFlags },              // hash algorithm 1
-        { "01 02 03 3C 00 0A 0C", 1000, ParseStatus.BadFlags },              // hash algorithm 3
+        { "01 02 03 3C 00 0A 04", 1000, ParseStatus.BadFlags },              // reserved bit 2
+        { "01 02 03 3C 00 0A 0C", 1000, ParseStatus.BadFlags },              // reserved bits 2-3
         { "01 02 03 3C 00 0A 10", 1000, ParseStatus.BadFlags },              // reserved bit 4
         { "01 02 03 3C 00 0A 80", 1000, ParseStatus.BadFlags },
-        { "01 02 03 3C 00 0A 01", 1000, ParseStatus.Truncated },             // hash missing
+        { "01 02 03 3C 00 0A 01", 1000, ParseStatus.Ok },                    // ChecksumPresent: the trailer is after the body
         { "4001 02 03 3C 00 0A 00", 1000, ParseStatus.NonMinimalVarint },
         { "01 4002 03 3C 00 0A 00", 1000, ParseStatus.NonMinimalVarint },
         { "01 02 4003 3C 00 0A 00", 1000, ParseStatus.NonMinimalVarint },

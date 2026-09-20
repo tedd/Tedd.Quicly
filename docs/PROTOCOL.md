@@ -191,21 +191,39 @@ stream for the same key when a newer version is submitted. A malformed group str
 ```
 Preamble : ChannelId varint
 Header   : TransferId varint, ObjectId varint, ObjectVersion varint, TotalLength varint,
-           Offset varint, Length varint, Flags u8 (bit0 hash present, bit1 chunked, bits 2-3 hash algorithm: 0 = SHA-256),
-           Hash 32 bytes when bit0
+           Offset varint, Length varint, Flags u8 (bit0 checksum trailer present, bit1 chunked, bits 2-7 reserved = 0)
 Body     : raw bytes                                                  when bit1 = 0
            repeat: ChunkLength varint, RawLength varint, bytes        when bit1 = 1 (each chunk independently LZ4-decodable; both lengths ≤ BulkMaxChunk, default 1 MiB)
+Trailer  : Checksum u64 LE                                            when bit0 — xxHash64 (seed 0) of this transfer's *decoded* range
 FIN
 ```
 
 Validation before any state is created: `Offset + Length ≤ TotalLength`, all three ≤ 2^62−1, `Length > 0`,
 `TransferId` unique per (peer, direction), and — for a peer-initiated bulk stream — the application's
 receive router MUST accept the descriptor (default: reject). `TotalLength`, `Offset` and `Length` are
-untrusted: buffers grow as bytes arrive, never at the declared size. The hash covers the **whole object**
-(identity = `ObjectId` + `ObjectVersion`), is computed once per object version by the sender, and is verified
-by the receiver when the last byte of the object has arrived across all transfers. TLS already protects the
-wire; the hash exists for cross-transfer identity and cache integrity. Resume = a new transfer for the
+untrusted: buffers grow as bytes arrive, never at the declared size. Resume = a new transfer for the
 remaining `[Offset, Offset+Length)` range with the same `ObjectId`/`ObjectVersion`.
+
+The **checksum trailer** covers exactly the bytes one transfer carries, decoded (before chunking and after
+decompression), and follows the last body byte so that neither end has to know the digest before it has seen
+the bytes: the sender hashes each piece as it reads it, the receiver as it writes it, and nothing is read
+twice or buffered. A receiver whose digest does not match MUST fail **that transfer** with
+`BulkChecksumFailed` (§6), MUST NOT report the range as fully accepted in `BulkProgress`, and SHOULD send
+`BulkCancel` carrying that code so the sender can send the range again; the connection and the object
+survive. The range is the unit of recovery (`BulkRequest` already asks for one), so it is also the unit of
+detection: an object of a thousand transfers is verified by verifying each of them, and a bad byte costs one
+range rather than the object.
+
+This is **not** a wire-integrity check. TLS 1.3 is mandatory in QUIC (RFC 9001) and its AEAD tag already
+discards and retransmits anything the wire corrupts. What the trailer covers is the path AEAD cannot see: the
+endpoints themselves — framing and reassembly bugs, a wrong offset, an LZ4 decode that succeeds but is wrong,
+memory corruption before encrypt or after decrypt, a partial object that rotted on disk between two epochs.
+It is therefore a defence against bugs and hardware rather than against attackers, which is why the digest is
+xxHash64 rather than a cryptographic hash — the peer supplies both the bytes and the digest, so collision
+resistance would buy nothing, and 8 bytes at better than 10 GB/s costs far less than the alternative. Bit 0 is
+per transfer, so a sender that omits it and a receiver that wants it still interoperate: a receiver checks
+whatever arrives. Object *identity* is not a transport concern and has no field here; an application that
+needs a content address carries one in its own manifest.
 
 ### 3.4 Control stream (channel 0)
 
@@ -476,6 +494,7 @@ Application error codes (QUIC CONNECTION_CLOSE / RESET_STREAM / STOP_SENDING and
 | 0x07 | InternalError | implementation fault |
 | 0x10 | BulkCanceled | transfer cancelled by either side |
 | 0x11 | BulkRejected | bulk request not authorised / invalid range |
+| 0x12 | BulkChecksumFailed | a transfer's bytes did not match its checksum trailer (§3.3); that range fails, the connection and the object survive |
 
 Rules: a malformed frame on the control stream or a persistent ordered stream → connection close
 `ProtocolViolation`; a malformed group or bulk stream → RESET_STREAM/STOP_SENDING with the code, the
@@ -554,10 +573,11 @@ Byte-exact examples are in [protocol-vectors.md](protocol-vectors.md).
   Payload` — the §3.1 framing with the §2.1 `Sequence` field inserted after `Length`. `Sequence` MUST equal
   `GroupId`; a second message on the stream is malformed.
 * **§3.3 bulk.** `MaxMessageSize` of a Bulk channel bounds `Length` of one transfer (the range one stream carries),
-  not `TotalLength`. `Flags` bits 4–7 MUST be 0 and the hash-algorithm bits 2–3 MUST be 0 (SHA-256; the others are
-  rejected, whether or not bit 0 is set). An unchunked body is exactly `Length` bytes. In a chunked body
-  `ChunkLength ≥ 1`; `RawLength = 0` means the chunk is stored uncompressed, otherwise `ChunkLength < RawLength`;
-  the decoded sizes of all chunks sum to exactly `Length`. Bytes after the body are malformed. The session cap
+  not `TotalLength`. `Flags` bits 2–7 are reserved and MUST be 0. An unchunked body is exactly `Length` bytes. In a
+  chunked body `ChunkLength ≥ 1`; `RawLength = 0` means the chunk is stored uncompressed, otherwise
+  `ChunkLength < RawLength`; the decoded sizes of all chunks sum to exactly `Length`. The checksum trailer, when bit 0 is
+  set, is the 8 bytes immediately after the last body byte; a stream that ends before them is truncated, and bytes after
+  the body (or after the trailer) are malformed. The session cap
   `HelloAck.maxMessageSize` bounds message frames only (datagram messages, ordered and group stream frames); it does
   not apply to Bulk transfers, whose `Length` is bounded by the Bulk channel's own `MaxMessageSize` alone.
 * **§3.3 transfer ids.** A receiver enforces the uniqueness of `TransferId` per (peer, direction) over every transfer it

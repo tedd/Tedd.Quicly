@@ -168,10 +168,10 @@ public class StreamFrameParserTests
         Assert.Equal(F(ParseStatus.Truncated), StreamDriver.Run(StreamRole.Control, All, Array.Empty<byte>())[^1]);
     }
 
-    private static byte[] BulkStream(bool chunked, bool hash, params (int Raw, byte[] Bytes)[] chunks)
+    private static byte[] BulkStream(bool chunked, bool checksum, params (int Raw, byte[] Bytes)[] chunks)
     {
         ulong length = chunked ? (ulong)chunks.Sum(c => c.Raw == 0 ? c.Bytes.Length : c.Raw) : (ulong)chunks[0].Bytes.Length;
-        BulkHeader header = StreamFramingTests.SampleBulk(hash, chunked, length);
+        BulkHeader header = StreamFramingTests.SampleBulk(checksum, chunked, length);
         StreamBuilder b = new StreamBuilder().Preamble(BulkChannel).Bulk(header);
         foreach ((int raw, byte[] bytes) in chunks)
         {
@@ -185,25 +185,36 @@ public class StreamFrameParserTests
             }
         }
 
+        if (checksum)
+        {
+            // The parser only locates the trailer; what it holds is the engine.s business, so any value will do here.
+            b.BulkChecksum(TestChecksum);
+        }
+
         return b.ToArray();
     }
 
-    private static string B(bool hash, bool chunked, ulong length)
+    /// <summary>The trailer value the parser fixtures use.</summary>
+    private const ulong TestChecksum = 0x0123456789ABCDEF;
+
+    private static string C() => $"C {TestChecksum:X16}";
+
+    private static string B(bool checksum, bool chunked, ulong length)
     {
-        BulkHeader h = StreamFramingTests.SampleBulk(hash, chunked, length);
-        ReadOnlySpan<byte> digest = h.Hash;
-        return $"B t=7 o=1000 v=3 total=1000000 off=64 len={length} flags={h.Flags} hash={(hash ? Convert.ToHexString(digest) : "-")}";
+        BulkHeader h = StreamFramingTests.SampleBulk(checksum, chunked, length);
+        return $"B t=7 o=1000 v=3 total=1000000 off=64 len={length} flags={h.Flags}";
     }
 
     [Fact]
     public void Bulk_Unchunked_Body_Is_One_Message()
     {
-        byte[] stream = BulkStream(chunked: false, hash: true, (0, P100));
+        byte[] stream = BulkStream(chunked: false, checksum: true, (0, P100));
         Assert.Equal(new[]
         {
             P(BulkChannel, 0, StreamRole.Bulk),
             B(true, false, 100),
             S(100), E(P100),
+            C(),
             F(ParseStatus.Ok),
         }, StreamDriver.Run(StreamRole.Bulk, All, stream));
 
@@ -215,7 +226,7 @@ public class StreamFrameParserTests
     [Fact]
     public void Bulk_Chunked_Body_Is_One_Message_Per_Chunk()
     {
-        byte[] stream = BulkStream(chunked: true, hash: false, (0, P5), (300, P100), (0, P1));
+        byte[] stream = BulkStream(chunked: true, checksum: false, (0, P5), (300, P100), (0, P1));
         Assert.Equal(new[]
         {
             P(BulkChannel, 0, StreamRole.Bulk),
@@ -247,7 +258,7 @@ public class StreamFrameParserTests
     [MemberData(nameof(BulkChunkErrors))]
     public void Bulk_Chunk_Validation(string chunkHex, string expected)
     {
-        BulkHeader header = StreamFramingTests.SampleBulk(hash: false, chunked: true, length: 60);
+        BulkHeader header = StreamFramingTests.SampleBulk(checksum: false, chunked: true, length: 60);
         byte[] stream = new StreamBuilder().Preamble(BulkChannel).Bulk(header).Raw(Bytes.Hex(chunkHex)).ToArray();
         List<string> log = StreamDriver.Run(StreamRole.Unknown, All, stream, bulkMaxChunk: 64);
         Assert.Equal($"X {expected}", log[^1]);
@@ -445,8 +456,8 @@ public class StreamFrameParserTests
             .ToArray(),
         "latest" => LatestStream(123456, 123456),
         "latestlz4" => LatestStream(uint.MaxValue, uint.MaxValue, compressed: true),
-        "bulk" => BulkStream(chunked: false, hash: true, (0, Bytes.Fill(200))),
-        "bulkchunked" => BulkStream(chunked: true, hash: true, (0, P5), (1000, P100), (0, P1), (70, Bytes.Fill(69))),
+        "bulk" => BulkStream(chunked: false, checksum: true, (0, Bytes.Fill(200))),
+        "bulkchunked" => BulkStream(chunked: true, checksum: true, (0, P5), (1000, P100), (0, P1), (70, Bytes.Fill(69))),
         "control" => ControlStream(),
         _ => new StreamBuilder() // 32-byte message headers back to back
             .Preamble(OrderedFull)
@@ -603,13 +614,13 @@ public class StreamFrameParserTests
         Assert.Equal(ParseStatus.Ok, FinishAfterPayloadOf(empty, 1));
 
         // Chunked bulk body: complete after the last chunk only.
-        BulkHeader header = StreamFramingTests.SampleBulk(hash: false, chunked: true, length: 200);
+        BulkHeader header = StreamFramingTests.SampleBulk(checksum: false, chunked: true, length: 200);
         byte[] chunked = new StreamBuilder().Preamble(BulkChannel).Bulk(header).Chunk(0, Bytes.Fill(100)).Chunk(0, Bytes.Fill(100)).ToArray();
         Assert.Equal(ParseStatus.Truncated, FinishAfterPayloadOf(chunked, 1));
         Assert.Equal(ParseStatus.Ok, FinishAfterPayloadOf(chunked, 2));
 
         // Unchunked bulk body.
-        BulkHeader whole = StreamFramingTests.SampleBulk(hash: false, chunked: false, length: 100);
+        BulkHeader whole = StreamFramingTests.SampleBulk(checksum: false, chunked: false, length: 100);
         byte[] unchunked = new StreamBuilder().Preamble(BulkChannel).Bulk(whole).Raw(Bytes.Fill(100)).ToArray();
         Assert.Equal(ParseStatus.Ok, FinishAfterPayloadOf(unchunked, 1));
     }

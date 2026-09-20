@@ -316,6 +316,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.MalformedDatagrams = Volatile.Read(ref c.MalformedDatagrams);
         statistics.DroppedBeforeAdmission = Volatile.Read(ref c.DroppedBeforeAdmission);
         statistics.StreamsReset = Volatile.Read(ref c.StreamsReset);
+        statistics.BulkChecksumFailures = Volatile.Read(ref c.BulkChecksumFailures);
         statistics.PingsSent = c.PingsSent;
         statistics.PongsReceived = Volatile.Read(ref c.PongsReceived);
         statistics.PongsSent = Volatile.Read(ref c.PongsSent) + c.StreamPongsSent;

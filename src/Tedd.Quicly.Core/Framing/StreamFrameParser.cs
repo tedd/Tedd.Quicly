@@ -43,6 +43,12 @@ public enum StreamEvent : byte
     /// <summary>A bulk header was parsed and validated: <see cref="StreamFrameParser.Bulk"/>.</summary>
     BulkHeader,
 
+    /// <summary>
+    /// A bulk transfer's checksum trailer was parsed: <see cref="StreamFrameParser.BulkChecksum"/>. It follows the last
+    /// body byte, so the range's bytes have all been handed out by the time this arrives.
+    /// </summary>
+    BulkChecksum,
+
     /// <summary>The stream is malformed: <see cref="StreamFrameParser.Error"/>. Sticky until reset.</summary>
     Error,
 }
@@ -72,6 +78,7 @@ public struct StreamFrameParser
     private const StreamEvent Continue = (StreamEvent)0xFF;
 
     private BulkHeader _bulk;
+    private ulong _bulkChecksum;
     private StreamMessageHeader _message;
     private ulong _groupId;
     private ulong _bulkDecoded;
@@ -96,7 +103,7 @@ public struct StreamFrameParser
         Header,
         BulkIdentity,
         BulkRange,
-        BulkHash,
+        BulkChecksum,
         BodyStart,
         Payload,
         MessageEnd,
@@ -121,6 +128,9 @@ public struct StreamFrameParser
 
     /// <summary>The bulk header (after <see cref="StreamEvent.BulkHeader"/>).</summary>
     public readonly BulkHeader Bulk => _bulk;
+
+    /// <summary>The bulk transfer's checksum trailer (after <see cref="StreamEvent.BulkChecksum"/>).</summary>
+    public readonly ulong BulkChecksum => _bulkChecksum;
 
     /// <summary>Payload bytes of the current message not yet handed out.</summary>
     public readonly int RemainingPayload => _remaining;
@@ -422,7 +432,7 @@ public struct StreamFrameParser
             case State.BulkRange:
                 return StreamFraming.ParseBulkRange(source, _limit, ref _bulk, out consumed);
             default:
-                return StreamFraming.ParseBulkHash(source, ref _bulk, out consumed);
+                return StreamFraming.ParseBulkChecksum(source, out _bulkChecksum, out consumed);
         }
     }
 
@@ -460,17 +470,13 @@ public struct StreamFrameParser
                 return Continue;
 
             case State.BulkRange:
-                if (_bulk.HasHash)
-                {
-                    _state = State.BulkHash;
-                    return Continue;
-                }
-
-                goto default;
-
-            default:
                 _state = _bulk.IsChunked ? State.Header : State.BodyStart;
                 return StreamEvent.BulkHeader;
+
+            default:
+                // The checksum trailer: the body is already complete, so this ends the stream.
+                _state = State.Done;
+                return StreamEvent.BulkChecksum;
         }
     }
 
@@ -603,7 +609,10 @@ public struct StreamFrameParser
     {
         if (_role == StreamRole.Bulk)
         {
-            return _bulk.IsChunked && _bulkDecoded < _bulk.Length ? State.Header : State.Done;
+            // More chunks to come, else the checksum trailer if one was promised, else the stream is over.
+            return _bulk.IsChunked && _bulkDecoded < _bulk.Length ? State.Header
+                : _bulk.HasChecksum ? State.BulkChecksum
+                : State.Done;
         }
 
         return _latest ? State.Done : State.Header;

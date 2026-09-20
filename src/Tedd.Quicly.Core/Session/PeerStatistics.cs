@@ -73,6 +73,13 @@ public struct PeerStatistics
     /// <summary>Peer streams reset by this end (unsupported channel, malformed, before admission).</summary>
     public long StreamsReset;
 
+    /// <summary>
+    /// Bulk ranges whose bytes did not match the checksum trailer their sender appended (PROTOCOL.md §3.3). Not wire
+    /// corruption — QUIC.s AEAD discards anything the wire damaged — so anything above zero means a bug, a bad memory
+    /// module, or a source that changed underneath a transfer. Worth alerting on.
+    /// </summary>
+    public long BulkChecksumFailures;
+
     /// <summary>Pings sent.</summary>
     public long PingsSent;
 

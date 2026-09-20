@@ -93,7 +93,7 @@ public static class XxHash64
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static ulong Round(ulong acc, ulong input)
+    internal static ulong Round(ulong acc, ulong input)
     {
         acc += input * Prime2;
         acc = BitOperations.RotateLeft(acc, 31);

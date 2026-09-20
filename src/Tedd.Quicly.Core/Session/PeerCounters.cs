@@ -30,6 +30,13 @@ internal sealed class PeerCounters
     /// <summary>Peer streams reset by this end.</summary>
     public long StreamsReset;
 
+    /// <summary>
+    /// Bulk ranges whose bytes did not match the checksum trailer their sender appended (PROTOCOL.md §3.3). Not wire
+    /// corruption — QUIC's AEAD has already discarded anything the wire damaged — so a non-zero value here means a bug,
+    /// a bad memory module, or a source that changed underneath a transfer, and is worth alerting on.
+    /// </summary>
+    public long BulkChecksumFailures;
+
     /// <summary>Pongs received (datagram and stream).</summary>
     public long PongsReceived;
 

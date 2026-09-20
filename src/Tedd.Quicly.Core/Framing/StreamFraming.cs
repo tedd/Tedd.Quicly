@@ -30,25 +30,22 @@ public struct StreamMessageHeader
     public readonly bool Compressed => RawLength > 0;
 }
 
-/// <summary>Flags of a bulk stream header (PROTOCOL.md §3.3). Bits 2–3 (hash algorithm) are always 0 = SHA-256.</summary>
+/// <summary>Flags of a bulk stream header (PROTOCOL.md §3.3). Bits 2–7 are reserved and MUST be 0.</summary>
 [Flags]
 public enum BulkFlags : byte
 {
     /// <summary>No flag.</summary>
     None = 0,
 
-    /// <summary>A 32-byte SHA-256 of the whole object follows the flags.</summary>
-    HashPresent = 0x01,
+    /// <summary>
+    /// An 8-byte xxHash64 of this transfer's decoded range follows the body, before FIN. It is a trailer rather than a
+    /// header field so that neither end has to know the digest before it has seen the bytes: the sender hashes each
+    /// piece as it reads it and the receiver as it writes it, so nothing is read twice and nothing is buffered.
+    /// </summary>
+    ChecksumPresent = 0x01,
 
     /// <summary>The body is a sequence of <c>(ChunkLength, RawLength, bytes)</c> chunks.</summary>
     Chunked = 0x02,
-}
-
-/// <summary>The 32-byte object hash of a bulk header.</summary>
-[InlineArray(StreamFraming.BulkHashLength)]
-public struct BulkHash
-{
-    private byte _element0;
 }
 
 /// <summary>Header of a bulk stream (PROTOCOL.md §3.3).</summary>
@@ -75,11 +72,8 @@ public struct BulkHeader
     /// <summary>Flags.</summary>
     public BulkFlags Flags;
 
-    /// <summary>SHA-256 of the whole object when <see cref="BulkFlags.HashPresent"/>.</summary>
-    public BulkHash Hash;
-
-    /// <summary>Whether <see cref="Hash"/> is present.</summary>
-    public readonly bool HasHash => (Flags & BulkFlags.HashPresent) != 0;
+    /// <summary>Whether an xxHash64 trailer follows the body.</summary>
+    public readonly bool HasChecksum => (Flags & BulkFlags.ChecksumPresent) != 0;
 
     /// <summary>Whether the body is chunked.</summary>
     public readonly bool IsChunked => (Flags & BulkFlags.Chunked) != 0;
@@ -102,8 +96,8 @@ public static class StreamFraming
     /// <summary>Default <c>BulkMaxChunk</c>: the largest chunk length and chunk raw length.</summary>
     public const int DefaultBulkMaxChunk = 1 << 20;
 
-    /// <summary>Size of the bulk object hash.</summary>
-    public const int BulkHashLength = 32;
+    /// <summary>Size of a bulk range's checksum trailer: one xxHash64, little-endian.</summary>
+    public const int BulkChecksumLength = 8;
 
     /// <summary>Largest message frame header (Length + Key + RequestId + RawLength, 8 bytes each).</summary>
     public const int MaxFrameHeaderLength = 32;
@@ -328,8 +322,22 @@ public static class StreamFraming
     /// <param name="header">The header.</param>
     public static int GetBulkHeaderLength(in BulkHeader header) =>
         VarInt.GetLength(header.TransferId) + VarInt.GetLength(header.ObjectId) + VarInt.GetLength(header.ObjectVersion)
-        + VarInt.GetLength(header.TotalLength) + VarInt.GetLength(header.Offset) + VarInt.GetLength(header.Length)
-        + 1 + (header.HasHash ? BulkHashLength : 0);
+        + VarInt.GetLength(header.TotalLength) + VarInt.GetLength(header.Offset) + VarInt.GetLength(header.Length) + 1;
+
+    /// <summary>Writes a bulk range's checksum trailer.</summary>
+    /// <param name="destination">Buffer of at least <see cref="BulkChecksumLength"/> bytes.</param>
+    /// <param name="checksum">xxHash64 of the transfer's decoded range.</param>
+    /// <returns>Bytes written.</returns>
+    public static int WriteBulkChecksum(Span<byte> destination, ulong checksum)
+    {
+        if (destination.Length < BulkChecksumLength)
+        {
+            ThrowDestinationTooSmall(BulkChecksumLength);
+        }
+
+        BinaryPrimitives.WriteUInt64LittleEndian(destination, checksum);
+        return BulkChecksumLength;
+    }
 
     /// <summary>Writes a bulk header (after the preamble).</summary>
     /// <param name="destination">Buffer of at least <see cref="GetBulkHeaderLength"/> bytes.</param>
@@ -344,7 +352,7 @@ public static class StreamFraming
         if (header.TotalLength > VarInt.MaxValue || header.Length == 0 || header.Offset > header.TotalLength
             || header.Length > header.TotalLength - header.Offset || ((byte)header.Flags & ~0x03) != 0)
         {
-            throw new ArgumentException("Bulk header range or flags are invalid (Length > 0, Offset + Length <= TotalLength <= 2^62-1, flags HashPresent|Chunked only).", nameof(header));
+            throw new ArgumentException("Bulk header range or flags are invalid (Length > 0, Offset + Length <= TotalLength <= 2^62-1, flags ChecksumPresent|Chunked only).", nameof(header));
         }
 
         int length = GetBulkHeaderLength(header);
@@ -360,19 +368,12 @@ public static class StreamFraming
         pos += VarInt.Write(destination.Slice(pos), header.Offset);
         pos += VarInt.Write(destination.Slice(pos), header.Length);
         destination[pos++] = (byte)header.Flags;
-        if (header.HasHash)
-        {
-            ((ReadOnlySpan<byte>)header.Hash).CopyTo(destination.Slice(pos));
-            pos += BulkHashLength;
-        }
-
         return pos;
     }
 
     /// <summary>
     /// Parses a bulk header from one contiguous span and validates it before any state is created: reserved flag bits
-    /// and the hash algorithm (bits 2–3 must be 0 = SHA-256), <c>Length &gt; 0</c>, <c>Offset + Length ≤ TotalLength</c>,
-    /// <c>Length ≤ maxLength</c>, 32 hash bytes when flagged.
+    /// (2–7 must be 0), <c>Length &gt; 0</c>, <c>Offset + Length ≤ TotalLength</c>, <c>Length ≤ maxLength</c>.
     /// </summary>
     /// <param name="source">Bytes starting after the preamble.</param>
     /// <param name="maxLength">Largest acceptable <c>Length</c> (the channel's effective MaxMessageSize).</param>
@@ -398,17 +399,7 @@ public static class StreamFraming
             return status;
         }
 
-        int c = 0;
-        if (header.HasHash)
-        {
-            status = ParseBulkHash(source.Slice(a + b), ref header, out c);
-            if (status != ParseStatus.Ok)
-            {
-                return status;
-            }
-        }
-
-        bytesConsumed = a + b + c;
+        bytesConsumed = a + b;
         return ParseStatus.Ok;
     }
 
@@ -605,17 +596,18 @@ public static class StreamFraming
         return ParseStatus.Ok;
     }
 
-    /// <summary>Bulk header stage 3 (32 bytes): the object hash.</summary>
-    internal static ParseStatus ParseBulkHash(ReadOnlySpan<byte> source, ref BulkHeader header, out int bytesConsumed)
+    /// <summary>Parses the checksum trailer that follows a bulk body (8 bytes, little-endian).</summary>
+    internal static ParseStatus ParseBulkChecksum(ReadOnlySpan<byte> source, out ulong checksum, out int bytesConsumed)
     {
-        if (source.Length < BulkHashLength)
+        if (source.Length < BulkChecksumLength)
         {
+            checksum = 0;
             bytesConsumed = 0;
             return ParseStatus.Truncated;
         }
 
-        source.Slice(0, BulkHashLength).CopyTo(header.Hash);
-        bytesConsumed = BulkHashLength;
+        checksum = BinaryPrimitives.ReadUInt64LittleEndian(source);
+        bytesConsumed = BulkChecksumLength;
         return ParseStatus.Ok;
     }
 

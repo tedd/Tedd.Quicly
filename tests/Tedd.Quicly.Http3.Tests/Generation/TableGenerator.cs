@@ -118,7 +118,13 @@ public class TableGenerator
         sb.Append("    /// <summary>The end-of-string symbol.</summary>\n");
         sb.Append("    public const int Eos = 256;\n\n");
         sb.Append("    /// <summary>Codes, left-aligned in 32 bits.</summary>\n");
-        sb.Append("    public static ReadOnlySpan<uint> Codes =>\n    [\n");
+        sb.Append("    public static ReadOnlySpan<uint> Codes => s_codes;\n\n");
+        sb.Append("    // Held in a static array rather than written inline as `ReadOnlySpan<uint> Codes => [...]`. For element\n");
+        sb.Append("    // types wider than a byte the compiler lowers that form to RuntimeHelpers.CreateSpan<T>, whose ldtoken of\n");
+        sb.Append("    // the data field allocates a 72-byte field handle on every call until the JIT folds the intrinsic away at\n");
+        sb.Append("    // tier 1 - so unoptimised and tier-0 code allocates once per Encode, on the QPACK hot path. Lengths below\n");
+        sb.Append("    // is a byte span, which lowers to a plain data-field address and never allocates, so it stays inline.\n");
+        sb.Append("    private static readonly uint[] s_codes =\n    [\n");
         for (int i = 0; i < codes.Length; i++)
         {
             if (i % 8 == 0) sb.Append("        ");
@@ -162,7 +168,12 @@ public class TableGenerator
         sb.Append("    /// <summary>Number of entries.</summary>\n");
         sb.Append("    public const int EntryCount = ").Append(entries.Count.ToString(CultureInfo.InvariantCulture)).Append(";\n\n");
         sb.Append("    /// <summary>Per entry: nameOffset, nameLength, valueOffset, valueLength (offsets into <see cref=\"Blob\"/>).</summary>\n");
-        sb.Append("    public static ReadOnlySpan<ushort> Layout =>\n    [\n");
+        sb.Append("    public static ReadOnlySpan<ushort> Layout => s_layout;\n\n");
+        sb.Append("    // Held in a static array for the reason given in HuffmanTable: a `ReadOnlySpan<ushort> => [...]` property\n");
+        sb.Append("    // lowers to RuntimeHelpers.CreateSpan<ushort>, whose ldtoken allocates 72 bytes per call until the JIT\n");
+        sb.Append("    // optimises it away, and every field line encoded or decoded reads this table at least once. Blob below is\n");
+        sb.Append("    // a byte span, which lowers to a data-field address and never allocates, so it stays inline.\n");
+        sb.Append("    private static readonly ushort[] s_layout =\n    [\n");
         for (int i = 0; i < entries.Count; i++)
         {
             sb.Append("        ");

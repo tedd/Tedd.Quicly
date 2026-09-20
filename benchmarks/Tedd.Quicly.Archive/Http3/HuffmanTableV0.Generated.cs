@@ -17,7 +17,14 @@ internal static class HuffmanTableV0
     public const int Eos = 256;
 
     /// <summary>Codes, left-aligned in 32 bits.</summary>
-    public static ReadOnlySpan<uint> Codes =>
+    public static ReadOnlySpan<uint> Codes => s_codes;
+
+    // Held in a static array rather than written inline as `ReadOnlySpan<uint> Codes => [...]`. For element
+    // types wider than a byte the compiler lowers that form to RuntimeHelpers.CreateSpan<T>, whose ldtoken of
+    // the data field allocates a 72-byte field handle on every call until the JIT folds the intrinsic away at
+    // tier 1 - so unoptimised and tier-0 code allocates once per Encode, on the QPACK hot path. Lengths below
+    // is a byte span, which lowers to a plain data-field address and never allocates, so it stays inline.
+    private static readonly uint[] s_codes =
     [
         0xFFC00000, 0xFFFFB000, 0xFFFFFE20, 0xFFFFFE30, 0xFFFFFE40, 0xFFFFFE50, 0xFFFFFE60, 0xFFFFFE70,
         0xFFFFFE80, 0xFFFFEA00, 0xFFFFFFF0, 0xFFFFFE90, 0xFFFFFEA0, 0xFFFFFFF4, 0xFFFFFEB0, 0xFFFFFEC0,

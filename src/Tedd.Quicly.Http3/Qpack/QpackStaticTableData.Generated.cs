@@ -14,7 +14,13 @@ internal static class QpackStaticTableData
     public const int EntryCount = 99;
 
     /// <summary>Per entry: nameOffset, nameLength, valueOffset, valueLength (offsets into <see cref="Blob"/>).</summary>
-    public static ReadOnlySpan<ushort> Layout =>
+    public static ReadOnlySpan<ushort> Layout => s_layout;
+
+    // Held in a static array for the reason given in HuffmanTable: a `ReadOnlySpan<ushort> => [...]` property
+    // lowers to RuntimeHelpers.CreateSpan<ushort>, whose ldtoken allocates 72 bytes per call until the JIT
+    // optimises it away, and every field line encoded or decoded reads this table at least once. Blob below is
+    // a byte span, which lowers to a data-field address and never allocates, so it stays inline.
+    private static readonly ushort[] s_layout =
     [
         0, 10, 10, 0, // 0: :authority
         10, 5, 15, 1, // 1: :path = /

@@ -27,8 +27,11 @@ namespace Tedd.Quicly.Core.Session;
 /// </remarks>
 internal sealed class BulkObjectReceiver : IBulkRouter
 {
-    /// <summary>Verified ranges of one object tracked at once before it counts as too fragmented.</summary>
-    private const int MaxRanges = 16;
+    /// <summary>
+    /// Verified runs of one object tracked at once, however few ranges the peer may have in flight. A peer that keeps a
+    /// handful of ranges going never needs this many; it is the floor below which the capacity is not worth deriving.
+    /// </summary>
+    private const int MinRanges = 16;
 
     private readonly IBulkObjectRouter _router;
     private readonly ObjectSlot[] _objects;
@@ -61,10 +64,14 @@ internal sealed class BulkObjectReceiver : IBulkRouter
         _clock = clock;
         _progressBytes = Math.Max(1, progressBytes);
         _onFault = onFault;
+        // Every range in flight can land out of order and leave a gap behind it, so the runs an honest peer can produce
+        // scale with the window it is allowed, not with a constant. Sizing this off the window is what keeps a legitimate
+        // wide sender from failing its own object with LimitExceeded.
+        int ranges = Math.Max(MinRanges, Math.Max(1, shims) + 8);
         _objects = new ObjectSlot[Math.Max(1, objects)];
         for (int i = 0; i < _objects.Length; i++)
         {
-            _objects[i] = new ObjectSlot();
+            _objects[i] = new ObjectSlot(ranges);
         }
 
         _shims = new RangeSink[Math.Max(1, shims)];
@@ -452,10 +459,11 @@ internal sealed class BulkObjectReceiver : IBulkRouter
     }
 
     /// <summary>One object being assembled (transport thread; preallocated and reused).</summary>
-    private sealed class ObjectSlot
+    /// <param name="ranges">Disjoint verified runs this object may hold before it counts as too fragmented.</param>
+    private sealed class ObjectSlot(int ranges)
     {
         /// <summary>The ranges that verified, merged; ascending ranges collapse to one entry.</summary>
-        public BulkRangeSet Covered { get; } = new(MaxRanges);
+        public BulkRangeSet Covered { get; } = new(ranges);
 
         public bool InUse { get; private set; }
 

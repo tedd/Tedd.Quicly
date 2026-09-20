@@ -167,4 +167,38 @@ public class BulkObjectRegressionTests
         h.Run(200_000);
         Assert.Equal(PeerState.Connected, h.Server!.State);
     }
+
+    /// <summary>Sixteen verified runs is the receiver's hard limit; a window of more ranges can exceed it legitimately.</summary>
+    [Fact]
+    public void Seventeen_Disjoint_Ranges_Of_One_Object_Do_Not_Fail_It()
+    {
+        byte[] payload = new byte[64 * 1024];
+        new Random(13).NextBytes(payload);
+        AcceptObjectRouter router = AcceptObjectRouter.Memory(payload.Length);
+        using ServerHarness h = new(
+            link: new LinkOptions { DelayMicros = 1_000 },
+            table: BulkTables.Main,
+            server: options =>
+            {
+                BulkKit.ObjectReceiver(router)(options);
+                options.BulkTransfersPerDirection = 64;
+            });
+        Assert.True(h.Admit(), "the raw client was not admitted");
+
+        // 1 KiB ranges, every other one, so nothing merges: 17 disjoint runs.
+        ulong id = 1;
+        for (int i = 0; i < 17; i++)
+        {
+            int expected = i + 1;
+            Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(Range(id++, payload, i * 2048, 1024), out _, fin: true));
+            Assert.True(
+                h.RunUntil(() => router.Sinks.Count > 0
+                    && (router.Sink<MemoryObjectSink>().Writes >= expected || router.Sink<MemoryObjectSink>().IsFinished)),
+                $"range {i} never arrived");
+        }
+
+        h.Run(500_000);
+        MemoryObjectSink sink = router.Sink<MemoryObjectSink>();
+        Assert.False(sink.IsFinished, $"the object failed after 17 disjoint runs: {sink.Result?.Status} / {sink.Result?.Code}");
+    }
 }

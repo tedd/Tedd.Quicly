@@ -423,23 +423,42 @@ channel with the same key). The Replication package's entity generations are the
 
 ## 5. HTTP/3 / WebTransport mapping (ALPN `h3`, opt-in)
 
-* Enabled only by `ServerOptions.EnableHttp3`; the listener uses a separate MsQuic configuration for the
-  `h3` ALPN (HTTP/3-sized stream limits) chosen from `NegotiatedAlpn` in the new-connection callback.
+Implemented by `Tedd.Quicly.Transport.MsQuic.WebTransport` (`WebTransportTransport`, `WebTransportConnector`,
+`WebTransportListener`): the carrier is an `ITransport` over an inner raw-QUIC `ITransport`, so everything above it is
+unchanged. A server is stood up with `WebTransportListener.CreateMsQuic` and a client with
+`WebTransportConnector.CreateMsQuic`; `WebTransportOptions` holds the path, the origin policy and the limits below.
+One listener serving both `quicly/1` and `h3` on the same UDP port (a separate MsQuic configuration chosen from
+`NegotiatedAlpn`), `ServerOptions.EnableHttp3` and `ServerOptions.Http3Static` are not built yet — see STATUS.md.
+
+* Both ends open the control stream (type `0x00`) with SETTINGS and the two QPACK streams (`0x02`, `0x03`), which
+  stay empty because the dynamic table is off. A first control frame that is not SETTINGS, a second SETTINGS, or a
+  request frame on the control stream closes the connection.
 * Server SETTINGS: `QPACK_MAX_TABLE_CAPACITY=0`, `QPACK_BLOCKED_STREAMS=0`, `MAX_FIELD_SECTION_SIZE=16384`,
   `ENABLE_CONNECT_PROTOCOL=1`, `H3_DATAGRAM (0x33)=1`, `ENABLE_WEBTRANSPORT (0x2b603742)=1`,
   `WT_MAX_SESSIONS (0xc671706a)=1`.
-* Limits: ≤ 16 concurrent request streams, capsules ≤ 32 KiB, request timeout 10 s, GOAWAY on shutdown,
-  unknown frame types ignored (RFC 9114), streams/datagrams for an unknown session id are reset/dropped
+* The session is usable only once the peer's SETTINGS have arrived *and* the Extended CONNECT is settled; a peer
+  whose SETTINGS do not enable WebTransport and Extended CONNECT is refused with `H3_SETTINGS_ERROR`. A peer without
+  `H3_DATAGRAM` leaves the session with streams only, which Core hears as the datagram capability going away.
+* Limits: ≤ 16 concurrent request streams, capsules ≤ 32 KiB, GOAWAY on shutdown, unknown frame types,
+  stream types and capsules ignored (RFC 9114 §9), streams/datagrams for an unknown session id are reset/dropped
   immediately (never buffered).
 * Session establishment: Extended CONNECT (`:method=CONNECT`, `:protocol=webtransport`, `:scheme=https`,
-  `:authority`, `:path` = `ServerOptions.WebTransportPath` (default `/quicly`), `origin` — required unless
-  `AllowMissingOrigin`) → `:status 200`. The CONNECT stream stays open for the session.
+  `:authority`, `:path` = `WebTransportOptions.Path` (default `/quicly`), `origin` — checked according to
+  `WebTransportOptions.OriginPolicy`) → `:status 200`. The CONNECT stream stays open for the session and its QUIC
+  stream id is the session id.
 * Datagrams: RFC 9297 — `quarterStreamId varint` (= CONNECT stream id / 4) prefix, then the QUICLY frame.
 * Unidirectional streams: `0x54 varint`, `sessionId varint`, then the QUICLY stream. Bidirectional streams:
   `0x41 varint`, `sessionId varint`.
-* Session close: `CLOSE_WEBTRANSPORT_SESSION` capsule (0x2843) on the CONNECT stream, or QUIC close.
-* Plain HTTP/3 GET on the same listener is answered by the HTTP handler only when `ServerOptions.Http3Static`
-  is configured (root-jailed, MIME allow-list, no listing, max file size).
+* Session close: `CLOSE_WEBTRANSPORT_SESSION` capsule (0x2843) on the CONNECT stream *and* a QUIC close whose code is
+  the application code mapped into the WebTransport range of the HTTP/3 error space
+  (`h3 = 0x52e4a40fa8db + n + floor(n / 0x1e)`, draft §4.3). Either signal alone tells the peer which §6 code
+  ended the session, so a capsule that never made it out is not a lost close reason. `RESET_STREAM` and
+  `STOP_SENDING` codes are mapped the same way.
+* Framing overhead is added without copying: the datagram prefix and the stream preamble each go out as one extra
+  gather segment in front of the caller's, so one Core send is one QUIC send. `MaxDatagramPayload` is reported to
+  Core minus the prefix.
+* Planned: plain HTTP/3 GET on the same listener answered by the HTTP handler when `ServerOptions.Http3Static` is
+  configured (root-jailed, MIME allow-list, no listing, max file size).
 
 ## 6. Errors
 

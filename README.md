@@ -17,12 +17,27 @@ QUICLY gives a game the transport primitives it actually needs — on one UDP po
 
 Design goals: zero allocations and no locks on the hot path, data-oriented (struct arrays, cache locality),
 explicit buffer ownership (zero-copy send from your own buffers, receive straight into memory you choose),
-a 1–6 byte application header, and a server that also speaks HTTP/3 + WebTransport and HTTP/1.1 so it can
-serve a web client and obtain its own certificates from any ACME CA (Let's Encrypt, ZeroSSL, Buypass,
-Google Trust Services, …).
+a 1–6 byte application header, an opt-in WebTransport-over-HTTP/3 carrier so a browser can speak the same
+protocol, and an HTTP/1.1 server that obtains its own certificates from any ACME CA (Let's Encrypt, ZeroSSL,
+Buypass, Google Trust Services, …).
 
 * [Architecture](docs/ARCHITECTURE.md) · [Wire protocol](docs/PROTOCOL.md) · [Decisions](docs/adr/) ·
   [Benchmarks](docs/benchmarks/) · [Development guide](docs/DEVELOPMENT.md)
+
+## Carriers
+
+The same QUICLY session runs over either carrier, so nothing above the transport changes:
+
+```csharp
+// Raw QUIC, ALPN quicly/1
+var listener = new MsQuicTransportListener(endPoint, certificate);
+
+// WebTransport over HTTP/3, ALPN h3 — what a browser can reach (docs/PROTOCOL.md §5)
+var listener = WebTransportListener.CreateMsQuic(endPoint, certificate,
+    options: new WebTransportOptions { Path = "/quicly" });
+```
+
+Both hand an `ITransport` to the accept callback and both pass the same transport conformance suite.
 
 ## Status
 

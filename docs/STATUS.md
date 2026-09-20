@@ -1,6 +1,6 @@
 # Implementation status
 
-Last updated 2026-09-19. Test counts are totals across both target frameworks (net11.0 + net10.0), measured on `main` after
+Last updated 2026-09-20. Test counts are totals across both target frameworks (net11.0 + net10.0), measured on `main` after
 the hot-path performance pass (docs/benchmarks/session.md, "Hot-path pass") and the engine pass-work fixes (Bulk work signal and
 level, owed ReliableLatest acks in the flush deadline, `PollAll` flushing only due peers; session-layer.md §4.7). Line coverage figures are from the module reviews (Microsoft.Testing.Extensions.CodeCoverage,
 cobertura; the Core rows were re-measured at the wave C2 merge) and were not re-measured after the hot-path pass. Every test
@@ -22,6 +22,7 @@ fixed names piled up in the Windows intermediate store past its 50-per-name limi
 | **Core total** | | **3 854** | | |
 | Http3 | HTTP/3 frames, QPACK (static + Huffman), HTTP datagrams, WebTransport framing and capsules | 504 | 100 % | [http3](benchmarks/http3.md) |
 | Transport.MsQuic | layout-validated MsQuic interop and wrappers; MsQuic-backed `ITransport`, connector, listener with reference-counted certificate hot swap | 722 (4 skipped here: one test needs machine-key rights, one runs off Windows only) | 98.4 % bindings, 93.5 % transport | [msquic-transport](benchmarks/msquic-transport.md) |
+| Transport.MsQuic · WebTransport | wave C4: the WebTransport-over-HTTP/3 carrier (ALPN `h3`) — an `ITransport` over an inner raw-QUIC `ITransport` that runs the HTTP/3 handshake (control stream, SETTINGS, QPACK streams), the Extended CONNECT exchange with path and origin checks, the RFC 9297 datagram prefix and the draft §4.2 stream preambles, capsules and close-code mapping, with the prefixes added as gather segments so nothing is copied; connector and listener wrapping any `ITransportConnector`/`ITransportListener`. The shared transport conformance suite runs against it (24 scenarios × clean and lossy links), plus wire-level checks against a hand-written HTTP/3 peer, the protocol-error paths, and real MsQuic loopback | 248 | 91.0 % | — |
 | Testing | deterministic simulated network and transport (with the ideal-send-buffer model MsQuic reports), recording sink, test certificates, in-process fake ACME CA, transport conformance suite (24 scenarios, run against the simulator and MsQuic) | 380 | 97.6 % | [simulation](benchmarks/simulation.md) |
 | Acme | RFC 8555 client for any CA, EAB, http-01 / dns-01 / tls-alpn-01, renewal (ARI aware) | 430 | ~98 % (Unix-only branches) | [acme](benchmarks/acme.md) |
 | Server | certificate provisioning (static, file, ACME) with consumer binding and grace-period disposal; admission with per-address limits and an auth-failure limiter; sessions with token resume, a grace-period replay guard and epoch bumps; dense peer table, peer sets and shared broadcast; work-signal driven `PollAll` that flushes only the peers whose flush deadline is due, and a `FlushAll` that skips peers whose Flush would do nothing; activation marks the peer's slot (a work bit taken before the peer was queued is no longer lost); graceful shutdown; optional HTTP side endpoint | 706 | 99.6 % | — |
@@ -40,5 +41,5 @@ fixed names piled up in the Windows intermediate store past its 50-per-name limi
 | Wave | Content |
 |---|---|
 | C5 | End-to-end tests over real MsQuic loopback with the session layer, samples, end-to-end benchmarks; plan and verified warnings in [design/wave-c5-plan.md](design/wave-c5-plan.md) |
-| C4 | WebTransport-over-HTTP/3 carrier (opt-in) |
+| C4b | The rest of PROTOCOL.md §5: one listener serving `quicly/1` and `h3` on the same UDP port (separate MsQuic configurations chosen from `NegotiatedAlpn`), `ServerOptions.EnableHttp3` wiring the carrier into `QuiclyServer`, and `ServerOptions.Http3Static` answering plain HTTP/3 GETs. The carrier itself is merged; until this lands a WebTransport server is stood up with `WebTransportListener` on its own port. |
 | later | Browser (WebAssembly) transport — deferred: optional, waits for .NET 11 browser tooling to mature |

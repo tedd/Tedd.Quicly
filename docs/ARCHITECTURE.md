@@ -49,7 +49,7 @@ Target frameworks: `net11.0` (primary) and `net10.0` for every library and test 
  ───────────────────────────────────────────────────────────────────────
  ITransport (Core)                datagrams + streams + capabilities + events
    ├─ MsQuicRawTransport          ALPN quicly/1 : QUIC streams & DATAGRAM frames directly
-   ├─ WebTransportH3Transport     ALPN h3       : HTTP/3 + Extended CONNECT + WT framing (opt-in)
+   ├─ WebTransportTransport       ALPN h3       : HTTP/3 + Extended CONNECT + WT framing (opt-in)
    ├─ BrowserWebTransport         JS WebTransport (optional, later)
    └─ SimulatedTransport          tests / benchmarks
  ───────────────────────────────────────────────────────────────────────
@@ -108,6 +108,25 @@ on abort/close) and it may arrive on the transport thread **before the call retu
 Callers therefore publish everything the completion needs (state = InFlight, token, lease) *before* the
 call and never touch the slot afterwards. `TransportStreamId` is a local slot index valid immediately; the
 QUIC stream id (`QuicStreamId`, needed by the WebTransport carrier) is valid after the start-complete event.
+
+### 2.2 The WebTransport carrier
+
+`WebTransportTransport` is both an `ITransport` (towards Core) and an `ITransportSink` (towards an inner raw-QUIC
+transport), so a WebTransport session is a transport like any other and Core cannot tell the two carriers apart.
+It mirrors the inner transport's stream slots, so a `TransportStreamId` means the same thing on both sides of the
+wrapper and the mapping costs nothing. The session's own streams — control, the two QPACK streams and the CONNECT
+stream — are held by the carrier and never shown to Core.
+
+The framing overhead is added without copying the caller's buffers: a datagram's RFC 9297 quarter-stream-id prefix
+and a stream's draft §4.2 preamble each go out as one extra gather segment in front of the caller's, taken from a
+pool that is returned when the send completes. One call of Core's is therefore always one send of the inner
+transport's, which is what keeps the status, the flags and the completion meaning exactly what the contract says.
+On the way in the preamble is consumed by itself and the rest of the indication is re-indicated, so the data path
+hands Core the inner transport's own segment array untouched. `MaxDatagramPayload` is reported minus the prefix.
+
+The same 24-scenario conformance suite (`TransportConformance`) runs against the carrier as against the raw carrier
+and the simulator, which is what makes them interchangeable.
+
 Group and bulk streams are started with the first send (`Start` flag) and closed with `Fin` on the last.
 
 Stream receive: a frame header may be split across the buffers of one receive event as well as across

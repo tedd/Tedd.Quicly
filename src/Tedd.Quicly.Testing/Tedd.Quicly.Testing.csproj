@@ -4,6 +4,8 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Tedd.Quicly.Testing.Tests" />
+    <!-- The WebTransport carrier's conformance harness lives in the MsQuic test project and drives the simulated network. -->
+    <InternalsVisibleTo Include="Tedd.Quicly.Transport.MsQuic.Tests" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Tedd.Quicly.Core\Tedd.Quicly.Core.csproj" />

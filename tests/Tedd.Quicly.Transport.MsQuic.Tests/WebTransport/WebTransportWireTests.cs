@@ -210,6 +210,38 @@ public sealed unsafe class WebTransportWireTests : IDisposable
         Assert.Equal(0, _clientSink.CountOf(RecordedEventKind.DatagramReceived));
     }
 
+    /// <summary>
+    /// The close capsule goes out as the content of a DATA frame. This is the check that says a browser would see it:
+    /// the Capsule Protocol is the message's content, and HTTP/3 carries content in DATA frames (RFC 9297 §3.2), so a
+    /// capsule written straight onto the CONNECT stream reaches a browser as an unknown frame type and is ignored
+    /// (RFC 9114 §9) — the session would appear to hang rather than close. Two QUICLY ends would agree either way,
+    /// which is exactly why this reads the bytes rather than the round trip.
+    /// </summary>
+    [Fact]
+    public void A_close_capsule_goes_out_inside_a_data_frame()
+    {
+        Start();
+        Assert.True(Pump(() => _clientSink.CountOf(RecordedEventKind.Connected) == 1), "the client's OnConnected");
+
+        int before = _peer.BytesOf(_peer.ConnectStream).Length;
+        _client!.Close(0x2A, "done"u8);
+        Assert.True(Pump(() => _peer.BytesOf(_peer.ConnectStream).Length > before), "the close capsule reached the peer");
+
+        byte[] all = _peer.BytesOf(_peer.ConnectStream);
+        ReadOnlySpan<byte> tail = all.AsSpan(before);
+
+        // The outer frame is what a browser's HTTP/3 layer sees.
+        Assert.True(Http3FrameReader.TryReadFrame(tail, out ulong outer, out ReadOnlySpan<byte> content, out _), "an outer HTTP/3 frame");
+        Assert.Equal((ulong)Http3FrameType.Data, outer);
+
+        // Its content is the capsule, carrying the application's code and reason.
+        Assert.True(CapsuleReader.TryRead(content, out ulong capsuleType, out ReadOnlySpan<byte> body, out _), "a capsule inside the DATA frame");
+        Assert.Equal((ulong)CapsuleType.CloseWebTransportSession, capsuleType);
+        Assert.True(CapsuleReader.TryParseCloseSession(body, out uint code, out ReadOnlySpan<byte> reason), "a CLOSE_WEBTRANSPORT_SESSION body");
+        Assert.Equal(0x2Au, code);
+        Assert.Equal("done"u8.ToArray(), reason.ToArray());
+    }
+
     public void Dispose()
     {
         _client?.Dispose();

@@ -72,12 +72,28 @@ internal sealed unsafe class RawHttp3Peer : ITransportSink, IDisposable
     }
 
     /// <summary>Sends a capsule on the CONNECT stream, which is where the session's own signalling lives.</summary>
+    /// <summary>
+    /// Sends one capsule on the CONNECT stream the way a browser does: as the content of a DATA frame, since the
+    /// Capsule Protocol is the message's content and HTTP/3 carries content in DATA frames (RFC 9297 §3.2).
+    /// </summary>
     public void SendCapsule(ulong type, ReadOnlySpan<byte> payload)
     {
-        int length = Http3FrameWriter.GetHeaderLength(type, (ulong)payload.Length) + payload.Length;
+        int capsule = Http3FrameWriter.GetHeaderLength(type, (ulong)payload.Length) + payload.Length;
+        int header = Http3FrameWriter.GetHeaderLength((ulong)Http3FrameType.Data, (ulong)capsule);
+        int length = header + capsule;
         NativeBuffer buffer = Rent(length);
-        Http3FrameWriter.WriteFrame(new Span<byte>(buffer.Pointer, length), type, payload);
+        var span = new Span<byte>(buffer.Pointer, length);
+        Http3FrameWriter.WriteHeader(span, (ulong)Http3FrameType.Data, (ulong)capsule);
+        Http3FrameWriter.WriteFrame(span.Slice(header), type, payload);
         Transport!.SendStream(ConnectStream, RentSegment(buffer.Segment(0, length)), 1, 4, TransportSendFlags.None);
+    }
+
+    /// <summary>Sends raw bytes on the CONNECT stream, with no DATA wrapping: what a non-conforming peer would do.</summary>
+    public void SendOnConnectStreamRaw(ReadOnlySpan<byte> bytes)
+    {
+        NativeBuffer buffer = Rent(bytes.Length);
+        bytes.CopyTo(new Span<byte>(buffer.Pointer, bytes.Length));
+        Transport!.SendStream(ConnectStream, RentSegment(buffer.Segment(0, bytes.Length)), 1, 4, TransportSendFlags.None);
     }
 
     /// <summary>Opens a unidirectional stream carrying exactly <paramref name="bytes"/>.</summary>
@@ -150,6 +166,12 @@ internal sealed unsafe class RawHttp3Peer : ITransportSink, IDisposable
         }
 
         transport.SendStream(id, RentSegment(buffer.Segment(0, length)), 1, 1, TransportSendFlags.Start);
+    }
+
+    /// <summary>Every byte this peer has received on <paramref name="id"/>, so a test can read the wire directly.</summary>
+    public byte[] BytesOf(TransportStreamId id)
+    {
+        lock (_gate) return _streamBytes.TryGetValue(id, out List<byte>? bytes) ? bytes.ToArray() : [];
     }
 
     public void OnPeerStreamStarted(TransportStreamId id, StreamKind kind)

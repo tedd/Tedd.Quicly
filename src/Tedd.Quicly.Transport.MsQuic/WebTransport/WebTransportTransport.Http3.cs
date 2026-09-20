@@ -394,8 +394,89 @@ public sealed unsafe partial class WebTransportTransport
             return _isClient ? HandleConnectResponse(payload) : HandleConnectRequest(id, payload);
         }
 
-        // After the header section the stream carries capsules (RFC 9297 §3.2), which share the frame shape.
-        return HandleCapsule(type, payload);
+        // After the header section the message's content is the Capsule Protocol (RFC 9297 §3.2), and in HTTP/3 a
+        // message's content is the bytes of its DATA frames — "the data stream of a given HTTP request consists of all
+        // bytes sent in DATA frames" (RFC 9297 §3.5). Capsules are read out of DATA, not off the stream: a browser
+        // writes them that way, and a bare capsule would reach it as an unknown frame type and be ignored (RFC 9114 §9).
+        if (type == (ulong)Http3FrameType.Data) return FeedCapsules(slot, payload);
+
+        switch ((Http3FrameType)type)
+        {
+            case Http3FrameType.Headers:
+                // Trailers after the content; nothing here needs them.
+                return true;
+
+            case Http3FrameType.Settings:
+            case Http3FrameType.GoAway:
+            case Http3FrameType.CancelPush:
+            case Http3FrameType.MaxPushId:
+                CloseWithHttp3Error(Http3ErrorCode.FrameUnexpected, "A control frame arrived on the CONNECT stream.");
+                return false;
+
+            default:
+                // Unknown and grease frame types are ignored (RFC 9114 §9).
+                return true;
+        }
+    }
+
+    /// <summary>
+    /// Runs the capsule reader over the content of one DATA frame. One frame may carry several capsules and one capsule
+    /// may span several frames, so the reader holds its own position across calls.
+    /// </summary>
+    private bool FeedCapsules(StreamSlot slot, ReadOnlySpan<byte> bytes)
+    {
+        while (!bytes.IsEmpty)
+        {
+            Http3FrameReadStatus status = slot.Capsules.Read(bytes, out int consumed, out ReadOnlySpan<byte> payload);
+            bytes = bytes.Slice(consumed);
+            switch (status)
+            {
+                case Http3FrameReadStatus.NeedMoreData:
+                    return true;
+
+                case Http3FrameReadStatus.Frame:
+                    if (!HandleCapsule(slot.Capsules.Type, payload)) return false;
+                    break;
+
+                case Http3FrameReadStatus.PayloadFragment:
+                    if (!AccumulateCapsule(slot, payload)) return false;
+                    break;
+
+                case Http3FrameReadStatus.PayloadEnd:
+                    if (!AccumulateCapsule(slot, payload)) return false;
+                    if (!HandleCapsule(slot.Capsules.Type, slot.CapsuleAccumulator.AsSpan(0, slot.CapsuleAccumulatorLength))) return false;
+                    slot.CapsuleAccumulatorLength = 0;
+                    break;
+
+                default:
+                    CloseWithHttp3Error(Http3ErrorCode.DatagramError, "A capsule exceeded the carrier's limit.");
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>Collects the payload of a capsule that spanned more than one DATA frame.</summary>
+    private bool AccumulateCapsule(StreamSlot slot, ReadOnlySpan<byte> payload)
+    {
+        int needed = slot.CapsuleAccumulatorLength + payload.Length;
+        if (needed > _options.MaxCapsuleLength)
+        {
+            CloseWithHttp3Error(Http3ErrorCode.ExcessiveLoad, "A capsule payload exceeded the carrier's limit.");
+            return false;
+        }
+
+        if (slot.CapsuleAccumulator is null || slot.CapsuleAccumulator.Length < needed)
+        {
+            var grown = new byte[Math.Max(needed, 256)];
+            slot.CapsuleAccumulator.AsSpan(0, slot.CapsuleAccumulatorLength).CopyTo(grown);
+            slot.CapsuleAccumulator = grown;
+        }
+
+        payload.CopyTo(slot.CapsuleAccumulator.AsSpan(slot.CapsuleAccumulatorLength));
+        slot.CapsuleAccumulatorLength = needed;
+        return true;
     }
 
     private Http3HeaderCollection Headers()
@@ -561,15 +642,24 @@ public sealed unsafe partial class WebTransportTransport
         if (inner is null || !connect.IsValid) return;
 
         ReadOnlySpan<byte> trimmed = reason.Length > CapsuleWriter.MaxCloseReasonLength ? reason.Slice(0, CapsuleWriter.MaxCloseReasonLength) : reason;
-        int length = CapsuleWriter.GetLength((ulong)CapsuleType.CloseWebTransportSession, (ulong)(sizeof(uint) + trimmed.Length));
-        if (length < 0 || length > ControlArenaSize) return;
+        int capsule = CapsuleWriter.GetLength((ulong)CapsuleType.CloseWebTransportSession, (ulong)(sizeof(uint) + trimmed.Length));
+        if (capsule < 0) return;
+
+        // The capsule is the message's content, so it goes inside a DATA frame (RFC 9297 §3.2). A browser reads the
+        // CONNECT stream as HTTP/3 frames and would skip a bare capsule as an unknown type.
+        int header = Http3FrameWriter.GetHeaderLength((ulong)Http3FrameType.Data, (ulong)capsule);
+        if (header < 0) return;
+        int length = header + capsule;
+        if (length > ControlArenaSize) return;
 
         try
         {
             Span<byte> buffer = ReserveControl(SegCapsule, length, out TransportSegment* segment);
-            int written = CapsuleWriter.WriteCloseSession(buffer, ToApplicationCode(errorCode), trimmed);
+            int head = Http3FrameWriter.WriteHeader(buffer, (ulong)Http3FrameType.Data, (ulong)capsule);
+            if (head < 0) return;
+            int written = CapsuleWriter.WriteCloseSession(buffer.Slice(head), ToApplicationCode(errorCode), trimmed);
             if (written < 0) return;
-            segment->Length = (uint)written;
+            segment->Length = (uint)(head + written);
             inner.SendStream(connect, segment, 1, 0, TransportSendFlags.Fin);
         }
         catch (InvalidOperationException)

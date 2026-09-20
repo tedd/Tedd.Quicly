@@ -86,6 +86,16 @@ public sealed unsafe partial class WebTransportTransport
         /// <summary>Frame parser of a control or CONNECT stream.</summary>
         public Http3FrameReader Reader;
 
+        /// <summary>
+        /// Capsule parser of the CONNECT stream, run over the content of its DATA frames (RFC 9297 §3.2). Capsules are
+        /// the message's content, so one DATA frame may carry several and one capsule may span several.
+        /// </summary>
+        public Http3FrameReader Capsules;
+
+        /// <summary>Payload of a capsule that spanned more than one DATA frame.</summary>
+        public byte[]? CapsuleAccumulator;
+        public int CapsuleAccumulatorLength;
+
         /// <summary>Payload of a frame that arrived in fragments.</summary>
         public byte[]? Accumulator;
         public int AccumulatorLength;
@@ -157,6 +167,7 @@ public sealed unsafe partial class WebTransportTransport
             slot.Kind = kind;
             slot.Local = local;
             if (role is StreamRole.PeerControl or StreamRole.Connect) slot.Reader = new Http3FrameReader((ulong)MaxFrameLengthFor(role));
+            if (role == StreamRole.Connect) slot.Capsules = new Http3FrameReader((ulong)_options.MaxCapsuleLength);
             return slot;
         }
     }
@@ -584,6 +595,7 @@ public sealed unsafe partial class WebTransportTransport
             slot.Deferred = defer;
             slot.DeferredFin = defer && consumedHere == copied && fin;
             if (role is StreamRole.PeerControl or StreamRole.Connect) slot.Reader = new Http3FrameReader((ulong)MaxFrameLengthFor(role));
+            if (role == StreamRole.Connect) slot.Capsules = new Http3FrameReader((ulong)_options.MaxCapsuleLength);
         }
 
         // Stop the inner transport indicating this stream; ReleaseDeferredStreams resumes it once the session exists.

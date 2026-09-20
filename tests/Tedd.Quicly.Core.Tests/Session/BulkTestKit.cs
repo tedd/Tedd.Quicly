@@ -712,6 +712,9 @@ internal sealed class MemoryObjectSink(long length) : IBulkObjectSink
 
     public BulkObjectResult? Result { get; private set; }
 
+    /// <summary>Times Finish was called; its contract is exactly once per accepted object.</summary>
+    public int Finishes { get; private set; }
+
     public bool IsFinished => Result is not null;
 
     public void Write(long objectOffset, ReadOnlySpan<byte> data)
@@ -721,7 +724,11 @@ internal sealed class MemoryObjectSink(long length) : IBulkObjectSink
         Writes++;
     }
 
-    public void Finish(in BulkObjectResult result) => Result = result;
+    public void Finish(in BulkObjectResult result)
+    {
+        Result = result;
+        Finishes++;
+    }
 }
 
 /// <summary>

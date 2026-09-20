@@ -262,4 +262,42 @@ public class BulkObjectRegressionTests
 
         Assert.Single(router.Accepted);
     }
+
+    /// <summary>
+    /// A peer disposed mid-object still finishes it exactly once, and Disconnected.
+    /// </summary>
+    /// <remarks>
+    /// This pins the contract, not the race behind it: the defect it accompanies is that the object used to be finished
+    /// from the dispose hook, while the transport thread may still have been writing into the receive records the object
+    /// is assembled from. The simulated transport runs on the game thread, so it cannot schedule that interleaving —
+    /// this test passes either way and is here to catch a regression in what the application is told, not to prove the
+    /// ordering.
+    /// </remarks>
+    [Fact]
+    public void Disposing_A_Peer_Mid_Object_Finishes_It_Once()
+    {
+        byte[] payload = new byte[4096];
+        new Random(29).NextBytes(payload);
+        AcceptObjectRouter router = AcceptObjectRouter.Memory(payload.Length);
+        using ServerHarness h = new(
+            link: new LinkOptions { DelayMicros = 1_000 },
+            table: BulkTables.Main,
+            server: BulkKit.ObjectReceiver(router));
+        Assert.True(h.Admit(), "the raw client was not admitted");
+
+        // A range that opens and writes but never ends, so its receive record stays accepted and the object stays live.
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(Range(1, payload, 0, 2048), out _, fin: false));
+        Assert.True(
+            h.RunUntil(() => router.Sinks.Count > 0 && router.Sink<MemoryObjectSink>().BytesWritten > 0),
+            "the range never arrived");
+
+        MemoryObjectSink sink = router.Sink<MemoryObjectSink>();
+        Assert.False(sink.IsFinished, "the object finished before the peer was disposed");
+
+        h.DisposeServer();
+        h.Run(200_000);
+
+        Assert.Equal(1, sink.Finishes);
+        Assert.Equal(BulkStatus.Disconnected, sink.Result!.Value.Status);
+    }
 }

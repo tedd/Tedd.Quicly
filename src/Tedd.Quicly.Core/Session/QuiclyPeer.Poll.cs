@@ -631,7 +631,10 @@ public sealed unsafe partial class QuiclyPeer
             engines[i].OnDisposing();
         }
 
-        AbortBulkObjects(BulkStatus.Disconnected);
+        // Only the objects this end is sending. The receiving ones are assembled from records the transport thread may
+        // still be writing into, which is the very reason the engines' OnDisposing leaves those records alone; they are
+        // ended in FreeResources, once the transport has reported its close and BulkEngine.Dispose has finished them.
+        AbortSendingBulkObjects(BulkStatus.Disconnected);
         _core.Completions.CompleteAll(Tedd.Quicly.Core.Threading.DeliveryStatus.Disconnected);
     }
 

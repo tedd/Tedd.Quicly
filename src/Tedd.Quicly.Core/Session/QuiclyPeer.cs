@@ -532,7 +532,12 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         }
 
         ReleaseForeignSends();
+
+        // Disposing the core finishes the half-received transfers (BulkEngine.DisposeReceive), which is the first moment
+        // the objects assembled from them can be ended without racing the transport thread: it has reported its close and
+        // no Poll or Flush is running. Objects whose ranges all ended are already finished by then; this releases the rest.
         _core.Dispose();
+        AbortReceivingBulkObjects(BulkStatus.Disconnected);
         _controlPool.Dispose();
         _queues.Dispose();
         _pongs.Dispose();

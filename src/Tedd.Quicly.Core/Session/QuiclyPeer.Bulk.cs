@@ -133,13 +133,38 @@ public sealed partial class QuiclyPeer
         }
     }
 
-    /// <summary>Ends every bulk object still in flight in either direction (game thread, peer teardown).</summary>
+    /// <summary>
+    /// Ends every bulk object still in flight in either direction (game thread, on the <em>close</em> path only, once
+    /// <see cref="ChannelEngine.OnPeerClosed"/> has finished the receive records the objects are assembled from).
+    /// </summary>
     /// <param name="status">Why the objects are ending.</param>
     private void AbortBulkObjects(BulkStatus status)
     {
-        _bulkObjects?.AbortAll(status);
-        _core.BulkObjectReceiver?.AbortAll(status);
+        AbortSendingBulkObjects(status);
+        AbortReceivingBulkObjects(status);
     }
+
+    /// <summary>
+    /// Ends the bulk objects this end is <em>sending</em> (game thread). Their state is the game thread's alone, so this
+    /// is safe on the dispose path, where the transport is still live.
+    /// </summary>
+    /// <param name="status">Why the objects are ending.</param>
+    private void AbortSendingBulkObjects(BulkStatus status) => _bulkObjects?.AbortAll(status);
+
+    /// <summary>
+    /// Ends the bulk objects this end is <em>receiving</em> (game thread).
+    /// </summary>
+    /// <remarks>
+    /// This must not run while the transport may still be writing into a receive record: an object is assembled from those
+    /// records, so finishing one out from under the transport thread calls <see cref="IBulkObjectSink.Finish"/> while
+    /// <see cref="IBulkObjectSink.Write"/> may still be running, and breaks Finish's "exactly once, last" promise. It is
+    /// why <see cref="ChannelEngine.OnDisposing"/> deliberately leaves the receive records alone. So this runs at exactly
+    /// two points: on the close path, after <see cref="ChannelEngine.OnPeerClosed"/> has finished those records, and on
+    /// the dispose path in <c>FreeResources</c>, after the transport has reported its close and <c>BulkEngine.Dispose</c>
+    /// has finished them.
+    /// </remarks>
+    /// <param name="status">Why the objects are ending.</param>
+    private void AbortReceivingBulkObjects(BulkStatus status) => _core.BulkObjectReceiver?.AbortAll(status);
 
     /// <summary>
     /// Records what an application's bulk object progress callback threw: counted as

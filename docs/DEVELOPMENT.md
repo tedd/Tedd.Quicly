@@ -58,8 +58,9 @@ Every benchmark change is recorded in `docs/benchmarks/<area>.md` with hypothesi
 ## Releasing
 
 Pushing to the `deploy` branch runs `.github/workflows/nuget.yml`: it packs every `src/` project, which builds the
-solution, and pushes the packages and their symbol packages to nuget.org; a failed build stops the publish. Ordinary
-builds and pull requests are covered by `.github/workflows/ci.yml`; nothing is published from them.
+solution, and pushes the packages and their symbol packages to nuget.org; a failed build stops the publish. The same
+push runs `.github/workflows/pages.yml`, so the project site and the packages on nuget.org always describe the same
+version. Ordinary builds and pull requests are covered by `.github/workflows/ci.yml`; nothing is published from them.
 
 **Nothing is tested on the way to nuget.org.** The publish workflow used to carry a report-only test job that ran the
 whole suite on a Windows runner — it gated nothing, it hung often enough that it needed a 40-minute cap, and Windows
@@ -71,6 +72,12 @@ you have not run the suites on.
 CI itself is kept cheap on purpose: it skips pushes that only touch docs, the site or markdown; a newer push cancels the
 run it superseded; it tests one target framework rather than both; and every job has an explicit `timeout-minutes`,
 because without one a hung run bills GitHub's six-hour default.
+
+It also runs only the fast, deterministic suites — Http3, Testing and Acme, about 25 seconds together. Core,
+Transport.MsQuic, EndToEnd, Client, Server, Http and Replication bind sockets, build certificates and drive real
+MsQuic; they are the slow ones and the flaky-under-sharing ones, and they run locally, per project, before a push.
+The build step still compiles every project and every test project on both target frameworks, so an API break or a
+bad merge fails CI whatever the test selection is.
 
 * **Version.** `Directory.Build.props` holds the base version, `Major.Minor.Patch`. Every package is published as
   `Major.Minor.(Patch + workflow run number)`, so each push to `deploy` gets a higher version than the last and a

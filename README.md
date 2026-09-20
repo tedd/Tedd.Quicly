@@ -66,6 +66,19 @@ already covers the wire — so it is a switch: `PeerOptions.BulkChecksum`, overr
 Under construction; see [docs/STATUS.md](docs/STATUS.md) for what is merged, what is in progress and the test and coverage numbers. Targets `net11.0` (primary) and `net10.0`. Windows 11 / Server 2022+ (Schannel QUIC),
 Linux with `libmsquic`, macOS with `libmsquic`. Browser (WebAssembly) client support is optional and experimental.
 
+## Tests and releases
+
+The test suite runs **locally, one project at a time**, before anything is pushed — that is the gate, not CI.
+A full-solution run shares ports, the machine certificate store and HttpListener prefixes between assemblies and
+fails a rotating handful of real-network tests for that reason alone, so the per-project run is also the only one
+worth reading. CI on `main` is a safety net: it builds everything on both target frameworks and runs the fast,
+deterministic suites, leaving the slow socket-, certificate- and MsQuic-bound ones to the machine that can run
+them properly.
+
+Releases are cut from the **`deploy`** branch: pushing to it publishes the packages to nuget.org and the project
+site, so the two always describe the same version. `main` never publishes. See
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
 ## Layout
 
 ```

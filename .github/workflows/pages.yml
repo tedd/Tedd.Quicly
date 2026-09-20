@@ -1,8 +1,10 @@
 name: Deploy GitHub Pages
 
+# The site ships with a release, not with every push to main: `deploy` is the branch that publishes
+# (docs/DEVELOPMENT.md), so the page and the package on nuget.org describe the same version.
 on:
   push:
-    branches: [main]
+    branches: [deploy]
     paths:
       - site/**
       - .github/workflows/pages.yml

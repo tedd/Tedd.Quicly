@@ -1,12 +1,19 @@
 name: CI
 
+# What runs here is a safety net, not the gate. The gate is the local per-project run before a push
+# (docs/DEVELOPMENT.md): a full-solution run shares ports, the machine certificate store and HttpListener
+# prefixes between assemblies and fails a rotating handful of real-network tests for that reason alone, so
+# the suites worth trusting are the ones run one project at a time — which is a thing to do on a developer's
+# machine, not on a billed runner.
+#
 # Cost control (GitHub bills Windows minutes at twice the Linux rate):
 #   * docs, the site and markdown never affect the build, so they do not start one;
 #   * a newer push cancels the run it superseded instead of paying for both;
-#   * one target framework, not both — net10.0 catches essentially every real regression,
-#     and both frameworks are still run locally before anything is released;
+#   * one target framework — net10.0 catches essentially every real regression, and both are run locally;
+#   * only the fast, deterministic, no-network suites. Core (~95 s), Transport.MsQuic, EndToEnd, Client,
+#     Server, Http and Replication bind sockets, build certificates and drive real MsQuic; they are the
+#     slow and flaky ones, and they run locally before a push;
 #   * an explicit timeout, because a hung run would otherwise bill GitHub's 6-hour default.
-# The real gate is the local per-project run (docs/DEVELOPMENT.md); this is the safety net.
 on:
   push:
     branches: [ main ]
@@ -21,6 +28,7 @@ on:
       - docs/**
       - site/**
       - LICENSE
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -29,7 +37,7 @@ concurrency:
 jobs:
   build-test:
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v5
@@ -40,12 +48,15 @@ jobs:
             11.0.x
           dotnet-quality: preview
 
+      # The build is most of the value: it compiles every project and every test project on both target
+      # frameworks, so an API break or a bad merge fails here whatever the test selection is.
       - name: Build
         run: dotnet build Tedd.Quicly.slnx -c Release
 
-      # One framework. A per-project loop rather than the whole solution at once, because a
-      # solution-wide run shares ports, the machine certificate store and HttpListener prefixes
-      # between assemblies and fails a rotating handful of real-network tests for that reason
-      # alone (see the memory of full-solution flakiness in docs/DEVELOPMENT.md).
-      - name: Test
-        run: dotnet test Tedd.Quicly.slnx -c Release --no-build -f net10.0
+      # About 25 seconds of tests. Never pass --artifacts-path to Http3.Tests: two of its tests find the
+      # repository root by walking up for Tedd.Quicly.slnx and a redirected path fails them.
+      - name: Test (fast suites)
+        run: |
+          dotnet test tests/Tedd.Quicly.Http3.Tests/Tedd.Quicly.Http3.Tests.csproj -c Release --no-build -f net10.0
+          dotnet test tests/Tedd.Quicly.Testing.Tests/Tedd.Quicly.Testing.Tests.csproj -c Release --no-build -f net10.0
+          dotnet test tests/Tedd.Quicly.Acme.Tests/Tedd.Quicly.Acme.Tests.csproj -c Release --no-build -f net10.0

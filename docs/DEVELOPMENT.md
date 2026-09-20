@@ -57,9 +57,12 @@ Every benchmark change is recorded in `docs/benchmarks/<area>.md` with hypothesi
 
 ## Releasing
 
-Pushing to the `deploy` branch runs `.github/workflows/nuget.yml`: it builds and tests the solution and, if that
-passes, packs every `src/` project and pushes the packages and their symbol packages to nuget.org. Ordinary
-builds and pull requests are covered by `.github/workflows/ci.yml`; nothing is published from them.
+Pushing to the `deploy` branch runs `.github/workflows/nuget.yml`: it packs every `src/` project, which builds the
+solution, and pushes the packages and their symbol packages to nuget.org; a failed build stops the publish. The
+tests run in a separate job that reports but does not gate the publish, because the suite does not finish reliably
+on the GitHub runner yet (a `Core.Tests` run hangs and a few tests fail there): look at that job before you trust a
+release. Ordinary builds and pull requests are covered by `.github/workflows/ci.yml`; nothing is published from
+them.
 
 * **Version.** `Directory.Build.props` holds the base version, `Major.Minor.Patch`. Every package is published as
   `Major.Minor.(Patch + workflow run number)`, so each push to `deploy` gets a higher version than the last and a

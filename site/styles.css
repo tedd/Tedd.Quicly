@@ -124,6 +124,66 @@ h1 em { color: transparent; font-style: normal; -webkit-text-stroke: 1.35px #8ea
 .code-caption { display: grid; grid-template-columns: repeat(3,1fr); gap: 1px; padding: 1px; color: #78a8a6; background: #263d47; font: 700 .52rem var(--display); letter-spacing: .1em; text-align: center; }
 .code-caption span { padding: .9rem; background: #09131c; }
 
+.motivation { background: var(--canvas); }
+.motivation-note { position: relative; max-width: 1180px; margin: 0 auto 3.5rem; padding: clamp(2rem,4vw,3.4rem); color: #dcebe9; background: radial-gradient(circle at 82% 20%,rgba(34,181,167,.15),transparent 30%),var(--night-soft); border: 1px solid #2e4a53; box-shadow: 0 30px 80px rgba(34,70,70,.16); }
+.motivation-note::before { position: absolute; top: 0; left: clamp(2rem,4vw,3.4rem); width: 56px; height: 3px; background: #65d2c6; content: ""; }
+.motivation-note blockquote { margin: 0; }
+.motivation-note blockquote p { max-width: 64ch; margin: 0; font: 500 clamp(1.05rem,1.7vw,1.46rem)/1.58 var(--display); letter-spacing: -.015em; }
+.motivation-note a { color: #65d2c6; border-bottom: 1px solid rgba(101,210,198,.42); }
+.motivation-note a:hover, .motivation-note a:focus-visible { border-bottom-color: #65d2c6; }
+.motivation-note figcaption { display: flex; align-items: center; gap: .7rem; margin-top: 1.7rem; color: #85a2a4; font-size: .76rem; }
+.motivation-note figcaption::before { width: 24px; height: 1px; background: #4a6a70; content: ""; }
+.motivation-note figcaption strong { color: #eaf5f3; font: 600 .82rem var(--display); }
+
+.bench-highlights { display: grid; grid-template-columns: repeat(3,1fr); gap: 1px; max-width: 1180px; margin: 0 auto 3.5rem; background: var(--line); border: 1px solid var(--line); }
+.bench-highlights p { min-height: 118px; display: flex; flex-direction: column; justify-content: center; gap: .35rem; margin: 0; padding: 1.4rem clamp(1.1rem,2.2vw,1.9rem); background: #fff; }
+.bench-highlights strong { color: var(--aqua); font: 600 1.55rem var(--display); letter-spacing: -.02em; }
+.bench-highlights span { color: var(--muted); font-size: .78rem; }
+
+.chart { max-width: 1180px; margin: 0 auto 2rem; padding: clamp(1.5rem,3vw,2.4rem); background: var(--panel); border: 1px solid var(--line); box-shadow: 0 18px 50px rgba(34,70,70,.06); }
+.chart > figcaption { margin-bottom: 2rem; }
+.chart > figcaption h3 { margin: 0 0 .35rem; font: 600 1.24rem var(--display); letter-spacing: -.02em; }
+.chart > figcaption p { margin: 0; color: var(--muted); font-size: .8rem; }
+.bar-chart { display: grid; gap: 1.7rem; margin: 0; padding: 0; list-style: none; }
+.bar-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: .6rem; margin: 0 0 .6rem; color: #465e65; font: 600 .79rem var(--display); }
+.bar-title b { padding: .16rem .45rem; color: var(--aqua-dark); background: var(--aqua-light); border: 1px solid #b6e0da; font: 700 .62rem var(--display); letter-spacing: .04em; }
+.bar-title b.worse { color: #8a5a15; background: #fbf1df; border-color: #e8d2ab; }
+.bar, .chart-scale { display: grid; grid-template-columns: 74px minmax(0,1fr) 108px; gap: .9rem; align-items: center; }
+.bar + .bar { margin-top: .4rem; }
+.bar-series { color: #7f9598; font: 700 .56rem var(--display); letter-spacing: .12em; }
+.bar-track { position: relative; height: 26px; background: #fbfdfc; border: 1px solid var(--line); }
+.bar-track::before { position: absolute; inset: 0; background: repeating-linear-gradient(to right,rgba(148,175,172,.34) 0 1px,transparent 1px 25%); content: ""; }
+.bar-track i { position: relative; z-index: 1; display: block; min-width: 2px; height: 100%; background: #a8bcbd; }
+.bar.quicly .bar-track i { background: var(--aqua); }
+.bar-value { display: flex; flex-direction: column; align-items: flex-end; font: 600 .82rem var(--display); font-variant-numeric: tabular-nums; }
+.bar-value em { color: #8b9ea1; font: 500 .62rem var(--body); font-variant-numeric: tabular-nums; }
+.bar.quicly .bar-value { color: var(--aqua-dark); }
+.chart-scale { margin: 1.1rem 0 0; }
+.chart-scale .ticks { display: flex; justify-content: space-between; color: #93a6a8; font: 600 .58rem var(--display); letter-spacing: .06em; }
+.chart-scale .ticks i { font-style: normal; }
+.chart-foot { margin: 1.5rem 0 0; padding-top: 1.1rem; color: var(--muted); border-top: 1px solid var(--line); font-size: .76rem; }
+
+.bench-caveats { max-width: 1180px; margin: 2rem auto 0; padding: clamp(1.6rem,3vw,2.4rem); background: var(--soft); border: 1px solid var(--line); }
+.bench-caveats h3 { margin: 0 0 1.35rem; font: 600 1rem var(--display); }
+.bench-caveats ul { display: grid; gap: .85rem; margin: 0; padding: 0; list-style: none; }
+.bench-caveats li { position: relative; padding-left: 1.5rem; color: var(--muted); font-size: .84rem; }
+.bench-caveats li::before { position: absolute; top: .72em; left: 0; width: 9px; height: 1px; background: var(--aqua); content: ""; }
+.bench-caveats strong { color: var(--ink); font-weight: 600; }
+.bench-caveats > p { margin: 1.6rem 0 0; padding-top: 1.2rem; color: #7c8f93; border-top: 1px solid var(--line); font-size: .74rem; }
+.bench-caveats code { padding: .1rem .3rem; background: #fff; border: 1px solid var(--line); font-size: .92em; }
+
+@media (max-width: 800px) {
+  .bench-highlights { grid-template-columns: 1fr; }
+  .bar, .chart-scale { grid-template-columns: 64px minmax(0,1fr) 92px; gap: .65rem; }
+}
+@media (max-width: 580px) {
+  .bar, .chart-scale { grid-template-columns: 54px minmax(0,1fr) 76px; gap: .45rem; }
+  .bar-series { font-size: .48rem; letter-spacing: .08em; }
+  .bar-value { font-size: .72rem; }
+  .bar-value em { font-size: .55rem; }
+  .chart-scale .ticks { font-size: .5rem; letter-spacing: 0; }
+}
+
 .status { background: #fff; }
 .status-card { max-width: 1350px; display: grid; grid-template-columns: 1.15fr .85fr; gap: clamp(3rem,7vw,8rem); margin: 0 auto; padding: clamp(2.4rem,5vw,5rem); background: linear-gradient(135deg,#edf8f5,#fff); border: 1px solid var(--line); box-shadow: 0 30px 80px rgba(34,70,70,.1); }
 .status-copy > p:not(.eyebrow) { max-width: 700px; margin: 1.7rem 0 0; color: var(--muted); }

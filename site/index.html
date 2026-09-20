@@ -21,6 +21,7 @@
     <nav aria-label="Primary navigation">
       <a href="#modes">Delivery modes</a>
       <a href="#architecture">Architecture</a>
+      <a href="#benchmarks">Benchmarks</a>
       <a href="#status">Status</a>
       <a href="https://github.com/tedd/Tedd.QUICLY">Source</a>
       <a class="nav-cta" href="#configure">Configure channels</a>
@@ -112,6 +113,132 @@
     .<span class="code-call">Add</span>(<span class="code-number">4</span>, <span class="code-string">"world"</span>,  <span class="code-type">ChannelMode</span>.Bulk)
     .<span class="code-call">Build</span>();</code></pre>
         <div class="code-caption"><span>CANONICAL TABLE HASH</span><span>PEER COMPATIBILITY CHECK</span><span>FAIL-FAST VALIDATION</span></div>
+      </div>
+    </section>
+
+    <section class="motivation section-shell" id="benchmarks">
+      <div class="section-intro reveal">
+        <div><p class="eyebrow">Motivation</p><h2>Why this library<br>exists.</h2></div>
+        <p>QUICLY began as a replacement for a stack that had served well for years. The goal was a standardised, encrypted protocol that still speaks the game loop's language.</p>
+      </div>
+
+      <figure class="motivation-note reveal">
+        <blockquote>
+          <p>For years I have been using the <a href="https://github.com/lidgren/lidgren-network-gen3">lidgren-network-gen3</a> library, which I truly love. A great piece of software. But partially due to less updates lately, and partially that I wanted a standardized protocol with encryption, I developed a new version under QUIC with aim for HTTP/3 and WebAssembly standards. With benchmarks on my game engine, Tedd.Quicly shows promising results.</p>
+        </blockquote>
+        <figcaption><strong>Tedd Hansen</strong><span>Author, Tedd.QUICLY</span></figcaption>
+      </figure>
+
+      <div class="bench-highlights reveal">
+        <p><strong>12.8× – 122×</strong><span>More payload delivered per second across four workloads</span></p>
+        <p><strong>≈ 99.9%</strong><span>Fewer managed bytes allocated per delivered MiB</span></p>
+        <p><strong>TLS 1.3</strong><span>Encrypted throughout, while Lidgren ran unencrypted</span></p>
+      </div>
+
+      <figure class="chart reveal">
+        <figcaption>
+          <h3>Delivered payload</h3>
+          <p>MiB per second — higher is better</p>
+        </figcaption>
+        <ul class="bar-chart">
+          <li>
+            <p class="bar-title">32 KiB unordered chunk batches <b>16.8×</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:2.95%"></i></span><span class="bar-value">7.09<em>6.62–7.17</em></span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:49.75%"></i></span><span class="bar-value">119.39<em>115.59–122.28</em></span></div>
+          </li>
+          <li>
+            <p class="bar-title">Equal 64 KiB ordered messages <b>27.7×</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:3.32%"></i></span><span class="bar-value">7.97<em>7.51–8.65</em></span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:91.93%"></i></span><span class="bar-value">220.63<em>215.98–224.29</em></span></div>
+          </li>
+          <li>
+            <p class="bar-title">File slices, 1,374 B → 64 KiB <b>122.0×</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:0.75%"></i></span><span class="bar-value">1.80<em>1.06–1.81</em></span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:91.63%"></i></span><span class="bar-value">219.92<em>219.05–221.76</em></span></div>
+          </li>
+          <li>
+            <p class="bar-title">Complete 20 MiB objects, bulk mode <b>12.8×</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:3.84%"></i></span><span class="bar-value">9.21<em>8.46–9.69</em></span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:49.30%"></i></span><span class="bar-value">118.32<em>115.73–136.61</em></span></div>
+          </li>
+        </ul>
+        <p class="chart-scale"><span></span><span class="ticks"><i>0</i><i>60</i><i>120</i><i>180</i><i>240</i></span><span></span></p>
+        <p class="chart-foot">Median of three fresh-process runs, with the observed min–max beneath each value. Loopback, one sender and one receiver in one process.</p>
+      </figure>
+
+      <figure class="chart reveal">
+        <figcaption>
+          <h3>Managed allocation</h3>
+          <p>.NET bytes allocated per delivered MiB — lower is better</p>
+        </figcaption>
+        <ul class="bar-chart">
+          <li>
+            <p class="bar-title">32 KiB unordered chunk batches <b>−99.60%</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:87.95%"></i></span><span class="bar-value">3,518,177</span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:0.355%"></i></span><span class="bar-value">14,185</span></div>
+          </li>
+          <li>
+            <p class="bar-title">Equal 64 KiB ordered messages <b>−99.88%</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:76.27%"></i></span><span class="bar-value">3,050,849</span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:0.093%"></i></span><span class="bar-value">3,723</span></div>
+          </li>
+          <li>
+            <p class="bar-title">File slices, 1,374 B → 64 KiB <b>−99.86%</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:71.39%"></i></span><span class="bar-value">2,855,585</span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:0.097%"></i></span><span class="bar-value">3,872</span></div>
+          </li>
+          <li>
+            <p class="bar-title">Complete 20 MiB objects, bulk mode <b>−99.86%</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:78.14%"></i></span><span class="bar-value">3,125,505</span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:0.106%"></i></span><span class="bar-value">4,244</span></div>
+          </li>
+        </ul>
+        <p class="chart-scale"><span></span><span class="ticks"><i>0</i><i>1 MB</i><i>2 MB</i><i>3 MB</i><i>4 MB</i></span><span></span></p>
+        <p class="chart-foot">Not native allocation, retained memory, peak memory, or proof of end-to-end zero-copy transfers.</p>
+      </figure>
+
+      <figure class="chart reveal">
+        <figcaption>
+          <h3>CPU cost</h3>
+          <p>Milliseconds of process CPU per delivered MiB, both endpoints — lower is better</p>
+        </figcaption>
+        <ul class="bar-chart">
+          <li>
+            <p class="bar-title">32 KiB unordered chunk batches <b class="worse">+16%</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:45.63%"></i></span><span class="bar-value">7.30<em>6.08–13.91</em></span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:53.00%"></i></span><span class="bar-value">8.48<em>8.19–9.12</em></span></div>
+          </li>
+          <li>
+            <p class="bar-title">Equal 64 KiB ordered messages <b class="worse">+8%</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:46.63%"></i></span><span class="bar-value">7.46<em>6.10–7.54</em></span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:50.13%"></i></span><span class="bar-value">8.02<em>7.92–8.05</em></span></div>
+          </li>
+          <li>
+            <p class="bar-title">File slices, 1,374 B → 64 KiB <b>−49%</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:96.31%"></i></span><span class="bar-value">15.41<em>12.29–21.54</em></span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:49.56%"></i></span><span class="bar-value">7.93<em>7.81–7.98</em></span></div>
+          </li>
+          <li>
+            <p class="bar-title">Complete 20 MiB objects, bulk mode <b class="worse">+75%</b></p>
+            <div class="bar lidgren"><span class="bar-series">Lidgren</span><span class="bar-track"><i style="width:39.06%"></i></span><span class="bar-value">6.25<em>4.43–7.03</em></span></div>
+            <div class="bar quicly"><span class="bar-series">QUICLY</span><span class="bar-track"><i style="width:68.19%"></i></span><span class="bar-value">10.91<em>9.69–10.97</em></span></div>
+          </li>
+        </ul>
+        <p class="chart-scale"><span></span><span class="ticks"><i>0</i><i>4</i><i>8</i><i>12</i><i>16</i></span><span></span></p>
+        <p class="chart-foot">QUICLY spends more CPU per second while delivering far more data per second. No profile here separates encryption cost from packet processing, copies or scheduling.</p>
+      </figure>
+
+      <div class="bench-caveats reveal">
+        <h3>How to read these numbers</h3>
+        <ul>
+          <li><strong>Transport only.</strong> These measure payload moved between two endpoints. Not frame rate, world generation or rendering.</li>
+          <li><strong>Loopback, one machine.</strong> AMD Ryzen 9 5950X, Windows 11 Pro, .NET 11 preview, IPv4 loopback, one sender and one receiver in a single process. Not the internet, not packet loss, not many clients.</li>
+          <li><strong>Three runs per case.</strong> Medians of three fresh-process runs. Three samples is not a narrow confidence interval, particularly for CPU.</li>
+          <li><strong>Not a like-for-like security comparison.</strong> Lidgren ran unencrypted; QUICLY ran TLS 1.3 throughout.</li>
+          <li><strong>The 122× file case is not pure QUIC.</strong> It also uses larger slices and drops a temporary allocation and copy. The equal-size ordered-message row isolates the transport difference.</li>
+          <li><strong>Optional bulk checksums are close to free.</strong> Disabling the range checksum moved 20 MiB object throughput from 118.32 to 119.49 MiB/s, inside run-to-run variation.</li>
+        </ul>
+        <p>Measured 20 September 2026 against QUICLY <code>7b2688c</code>, on a game engine using both libraries in turn. Full method, raw samples and reproduction notes live with the benchmark harness.</p>
       </div>
     </section>
 

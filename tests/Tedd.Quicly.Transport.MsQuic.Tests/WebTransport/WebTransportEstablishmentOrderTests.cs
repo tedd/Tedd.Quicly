@@ -179,6 +179,30 @@ public sealed unsafe class WebTransportEstablishmentOrderTests : IDisposable
         Assert.Equal(0, _clientSink.CountOf(RecordedEventKind.DatagramReceived));
     }
 
+    /// <summary>
+    /// The carrier's native arenas are freed once the inner connection has reported its close, and not before: the
+    /// inner transport's Dispose only asks the connection to close and returns, so MsQuic may still be sending from the
+    /// preamble bytes, the control arena and the datagram arena. Deferring the free must not lose it.
+    /// </summary>
+    [Fact]
+    public void Native_memory_is_released_after_the_inner_connection_closes()
+    {
+        Start();
+        Assert.True(Pump(() => _clientSink.CountOf(RecordedEventKind.Connected) == 1), "the client's OnConnected");
+
+        var carrier = (WebTransportTransport)_client!;
+        Assert.False(carrier.NativeMemoryReleased, "the arenas were freed while the session was live");
+
+        carrier.Dispose();
+
+        // The inner transport's Dispose only asks the connection to close, so the free cannot have happened yet.
+        Assert.False(carrier.NativeMemoryReleased, "the arenas were freed before the inner connection reported its close");
+
+        Assert.True(
+            Pump(() => carrier.NativeMemoryReleased),
+            "the carrier never released its native memory after the inner connection closed");
+    }
+
     public void Dispose()
     {
         _client?.Dispose();

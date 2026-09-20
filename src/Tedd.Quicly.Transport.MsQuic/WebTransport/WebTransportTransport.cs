@@ -98,6 +98,15 @@ public sealed unsafe partial class WebTransportTransport : ITransport, ITranspor
     /// </summary>
     private bool _peerEndedSession;
 
+    /// <summary>The inner connection reported its close, so no callback and no send of its can touch this any more.</summary>
+    private int _innerClosedSeen;
+
+    /// <summary>The native arenas have been freed, exactly once.</summary>
+    private int _nativeFreed;
+
+    /// <summary>Whether the carrier's native arenas have been released (tests: the deferred free must not be lost).</summary>
+    internal bool NativeMemoryReleased => Volatile.Read(ref _nativeFreed) != 0;
+
     private readonly NativeArray<byte> _controlBytes;
     private readonly NativeArray<TransportSegment> _controlSegments;
     private int _controlUsed;
@@ -225,11 +234,34 @@ public sealed unsafe partial class WebTransportTransport : ITransport, ITranspor
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        _inner?.Dispose();
+
+        ITransport? inner = _inner;
+        inner?.Dispose();
         lock (_gate)
         {
             _state = StateClosed;
         }
+
+        // Without an inner connection nothing can be holding the buffers and no close will ever be reported.
+        if (inner is null) Volatile.Write(ref _innerClosedSeen, 1);
+        TryFreeNative();
+    }
+
+    /// <summary>
+    /// Frees the carrier's native memory once nothing can be using it: this end has been disposed and the inner
+    /// connection has reported its close. Whichever happens last does the freeing, exactly once.
+    /// </summary>
+    /// <remarks>
+    /// It cannot be done in <see cref="Dispose"/>. The inner transport's own Dispose only asks the connection to close
+    /// and returns; the handles go later, when MsQuic raises SHUTDOWN_COMPLETE. Until then MsQuic may still be sending
+    /// from these buffers — the preamble bytes, the control arena, the datagram arena are all handed to it by pointer —
+    /// and may still raise callbacks into this carrier. <see cref="ITransportSink.OnClosed"/> is the point where that
+    /// stops: "no further callbacks follow", and before it "every accepted send has completed".
+    /// </remarks>
+    private void TryFreeNative()
+    {
+        if (Volatile.Read(ref _disposed) == 0 || Volatile.Read(ref _innerClosedSeen) == 0) return;
+        if (Interlocked.Exchange(ref _nativeFreed, 1) != 0) return;
 
         DisposeStreams();
         DisposeDatagrams();
@@ -290,6 +322,21 @@ public sealed unsafe partial class WebTransportTransport : ITransport, ITranspor
 
     /// <inheritdoc/>
     void ITransportSink.OnClosed(TransportCloseReason reason, ulong errorCode, int transportStatus)
+    {
+        try
+        {
+            ReportClosed(reason, errorCode, transportStatus);
+        }
+        finally
+        {
+            // Outside ReportClosed's own early returns, and outside its state guard: a Dispose that ran first already
+            // set the state to Closed, and this is still the moment the inner connection stops touching the arenas.
+            Volatile.Write(ref _innerClosedSeen, 1);
+            TryFreeNative();
+        }
+    }
+
+    private void ReportClosed(TransportCloseReason reason, ulong errorCode, int transportStatus)
     {
         ITransportSink? sink;
         long capsuleCode;

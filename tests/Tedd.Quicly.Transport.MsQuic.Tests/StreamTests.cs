@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Text;
 using Tedd.Quicly.Transport.MsQuic.Interop;
+using Tedd.Quicly.Transport.MsQuic.Tests.Transport;
 
 namespace Tedd.Quicly.Transport.MsQuic.Tests;
 
@@ -545,15 +546,13 @@ public class StreamTests
         public void ShutdownComplete(MsQuicStream stream, in MsQuicStreamShutdownInfo info) => ShutdownCompleted = true;
     }
 
-    private static long SendMeasured(MsQuicStream stream, NativeBuffers buffers, int first, int count)
+    private static void Send(MsQuicStream stream, NativeBuffers buffers, int first, int count)
     {
-        long before = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < count; i++)
         {
             int status = buffers.SendOn(stream, first + i == 0 ? QUIC_SEND_FLAGS.START : QUIC_SEND_FLAGS.NONE, first + i + 1);
             if (MsQuicStatus.Failed(status)) throw new MsQuicException(status, "StreamSend");
         }
-        return GC.GetAllocatedBytesForCurrentThread() - before;
     }
 
     [Fact]
@@ -574,20 +573,30 @@ public class StreamTests
         using NativeBuffers buf = NativeBuffers.Single(block);
 
         const int warmup = 200;
-        const int measured = 2000;
-        SendMeasured(stream!, buf, 0, warmup);
+        const int perWindow = 2000;
+        Send(stream!, buf, 0, warmup);
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref clientProbe.SendCompletes) == warmup, TestTimeouts.Default));
         Assert.NotNull(serverProbe);
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref serverProbe.ReceivedBytes) == warmup * 1024L, TestTimeouts.Default));
 
         clientProbe.Probe.Arm();
         serverProbe.Probe.Arm();
-        long senderAllocated = SendMeasured(stream!, buf, warmup, measured);
+        // The sending thread is measured over rounds of windows (see WindowedAllocation); a window waits for its own sends
+        // to complete, so a repeated round leaves no more outstanding than one window does. The probes sample the worker
+        // threads, which the test host's transient does not touch, so they stay one measurement over every round run.
+        int sent = warmup;
+        int windows = WindowedAllocation.AssertNone(() =>
+        {
+            Send(stream!, buf, sent, perWindow);
+            sent += perWindow;
+            if (!Spin.UntilAtLeast(ref clientProbe.SendCompletes, sent, TestTimeouts.Default))
+                throw new InvalidOperationException($"send completes {clientProbe.SendCompletes} of {sent}");
+        });
+        int measured = windows * perWindow;
 
-        Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref clientProbe.SendCompletes) == warmup + measured, TestTimeouts.Default));
+        Assert.Equal(warmup + measured, Volatile.Read(ref clientProbe.SendCompletes));
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref serverProbe.ReceivedBytes) == (warmup + measured) * 1024L, TestTimeouts.Default));
 
-        Assert.Equal(0, senderAllocated);
         Assert.Equal(0, clientProbe.Probe.Allocated);
         Assert.Equal(0, serverProbe.Probe.Allocated);
         Assert.True(clientProbe.Probe.Samples > measured / 2, $"client samples {clientProbe.Probe.Samples}");

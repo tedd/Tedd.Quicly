@@ -5,19 +5,22 @@ namespace Tedd.Quicly.Http3.Tests;
 
 /// <summary>
 /// Every hot path must not allocate on the GC heap in steady state (ADR 0007). Each test warms the path up
-/// (type initialisers, tiering) and then measures <see cref="GC.GetAllocatedBytesForCurrentThread"/> around a loop.
+/// (type initialisers, tiering) and then measures <see cref="GC.GetAllocatedBytesForCurrentThread"/> around a loop,
+/// over the rounds of windows <see cref="WindowedAllocation"/> describes.
 /// </summary>
 public class ZeroAllocationTests
 {
     private const int Iterations = 2_000;
 
-    private static void AssertNoAllocations(Action body)
+    /// <returns>The number of windows run, each of <see cref="Iterations"/> calls of <paramref name="body"/>.</returns>
+    private static int AssertNoAllocations(Action body)
     {
         for (int i = 0; i < 50; i++) body();
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < Iterations; i++) body();
-        long after = GC.GetAllocatedBytesForCurrentThread();
-        Assert.Equal(0, after - before);
+        Action window = () =>
+        {
+            for (int i = 0; i < Iterations; i++) body();
+        };
+        return WindowedAllocation.AssertNone(window);
     }
 
     [Fact]

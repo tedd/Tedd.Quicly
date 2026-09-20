@@ -401,13 +401,15 @@ public unsafe class DatagramTests
         for (int i = 0; i < 40_000; i++)
             SendAndAdvance(network, ta, tb, payload);
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 10_000; i++)
-            SendAndAdvance(network, ta, tb, payload);
-        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
-        Assert.Equal(0, allocated);
-        Assert.Equal(50_000, a.Sent);
-        Assert.True(b.Received > 45_000);
+        int windows = WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 10_000; i++)
+                SendAndAdvance(network, ta, tb, payload);
+        });
+
+        int sent = 40_000 + (windows * 10_000);
+        Assert.Equal(sent, a.Sent);
+        Assert.True(b.Received > sent * 0.9, $"received {b.Received} of {sent}");
     }
 
     [Fact]
@@ -422,11 +424,13 @@ public unsafe class DatagramTests
         for (int i = 0; i < 5_000; i++)
             SendAndAdvance(network, ta, tb, payload);
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 20_000; i++)
-            SendAndAdvance(network, ta, tb, payload);
-        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
-        Assert.Equal(25_000, a.Sent);
+        int windows = WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 20_000; i++)
+                SendAndAdvance(network, ta, tb, payload);
+        });
+
+        Assert.Equal(5_000 + (windows * 20_000), a.Sent);
         Assert.Equal(0, a.Lost);
         Assert.InRange(b.Received - a.Acknowledged, 0, 20); // acknowledgements still in flight
     }

@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using Tedd.Quicly.Transport.MsQuic.Interop;
+using Tedd.Quicly.Transport.MsQuic.Tests.Transport;
 
 namespace Tedd.Quicly.Transport.MsQuic.Tests;
 
@@ -175,15 +176,13 @@ public class DatagramTests
         }
     }
 
-    private static long SendMeasured(MsQuicConnection client, NativeBuffers buffers, int first, int count)
+    private static void Send(MsQuicConnection client, NativeBuffers buffers, int first, int count)
     {
-        long before = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < count; i++)
         {
             int status = buffers.SendDatagramOn(client, QUIC_SEND_FLAGS.NONE, first + i + 1);
             if (MsQuicStatus.Failed(status)) throw new MsQuicException(status, "DatagramSend");
         }
-        return GC.GetAllocatedBytesForCurrentThread() - before;
     }
 
     [Fact]
@@ -202,18 +201,28 @@ public class DatagramTests
         using NativeBuffers buffers = NativeBuffers.Single(block);
 
         const int warmup = 200;
-        const int measured = 2000;
-        SendMeasured(client, buffers, 0, warmup);
+        const int perWindow = 2000;
+        Send(client, buffers, 0, warmup);
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref clientProbe.FinalStates) == warmup, TestTimeouts.Default));
 
         clientProbe.Probe.Arm();
         serverProbe.Probe.Arm();
-        long senderAllocated = SendMeasured(client, buffers, warmup, measured);
+        // The sending thread is measured over rounds of windows (see WindowedAllocation); a window waits for its own sends
+        // to reach a final state, so a repeated round leaves no more outstanding than one window does. The probes sample the
+        // worker threads, which the test host's transient does not touch, so they stay one measurement over every round run.
+        int sent = warmup;
+        int windows = WindowedAllocation.AssertNone(() =>
+        {
+            Send(client, buffers, sent, perWindow);
+            sent += perWindow;
+            if (!Spin.UntilAtLeast(ref clientProbe.FinalStates, sent, TestTimeouts.Default))
+                throw new InvalidOperationException($"final states {clientProbe.FinalStates} of {sent}");
+        });
+        int measured = windows * perWindow;
 
-        Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref clientProbe.FinalStates) == warmup + measured, TestTimeouts.Default), $"final {clientProbe.FinalStates}");
+        Assert.Equal(warmup + measured, Volatile.Read(ref clientProbe.FinalStates));
         Assert.True(await TestTimeouts.WaitUntilAsync(() => Volatile.Read(ref serverProbe.Received) >= (warmup + measured) * 9 / 10, TestTimeouts.Default), $"received {serverProbe.Received}");
 
-        Assert.Equal(0, senderAllocated);
         Assert.Equal(0, clientProbe.Probe.Allocated);
         Assert.Equal(0, serverProbe.Probe.Allocated);
         Assert.True(clientProbe.Probe.Samples > measured / 2, $"client samples {clientProbe.Probe.Samples}");

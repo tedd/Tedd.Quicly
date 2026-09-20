@@ -173,14 +173,14 @@ public class HttpParserTests
         for (int i = 0; i < 2000; i++)
             Run(request, ref parsed);
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
         int total = 0;
-        for (int i = 0; i < 10_000; i++)
-            total += Run(request, ref parsed);
-        long after = GC.GetAllocatedBytesForCurrentThread();
+        WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 10_000; i++)
+                total += Run(request, ref parsed);
+        });
 
         Assert.True(total > 0);
-        Assert.Equal(0, after - before);
     }
 }
 

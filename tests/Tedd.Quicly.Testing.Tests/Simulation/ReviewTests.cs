@@ -98,12 +98,15 @@ public unsafe class ReviewTests
         for (int i = 0; i < 20_000; i++)
             OneMessage(network, ta, payload);
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 5_000; i++)
-            OneMessage(network, ta, payload);
-        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
-        Assert.Equal(0, allocated);
-        Assert.True(b.Bytes > 9_000 * 3000L);
+        int windows = WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 5_000; i++)
+                OneMessage(network, ta, payload);
+        });
+
+        // Streams are opened as often as the stream limit allows, so the bytes through are a fraction of the messages tried.
+        long tried = 20_000 + (windows * 5_000L);
+        Assert.True(b.Bytes > tried * 3000L * 9 / 25, $"received {b.Bytes} bytes of {tried} messages tried");
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]

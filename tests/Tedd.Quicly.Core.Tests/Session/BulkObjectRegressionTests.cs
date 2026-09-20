@@ -231,4 +231,35 @@ public class BulkObjectRegressionTests
         Assert.Equal(QuiclyErrorCode.BulkChecksumFailed, transfer.Result.Code);
         Assert.Equal(BulkStatus.Failed, transfer.Result.Status);
     }
+
+    /// <summary>A range of an object the receiver already gave up on starts a second object under the same identity.</summary>
+    [Fact]
+    public void A_Range_After_An_Object_Was_Given_Up_On_Does_Not_Start_A_Second_Object()
+    {
+        byte[] payload = new byte[4096];
+        new Random(9).NextBytes(payload);
+        AcceptObjectRouter router = AcceptObjectRouter.Memory(payload.Length);
+        using ServerHarness h = new(
+            link: new LinkOptions { DelayMicros = 1_000 },
+            table: BulkTables.Main,
+            server: options =>
+            {
+                BulkKit.ObjectReceiver(router)(options);
+                options.BulkObjectIdleTimeout = TimeSpan.FromSeconds(1);
+            });
+        Assert.True(h.Admit(), "the raw client was not admitted");
+
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(Range(1, payload, 0, 2048), out _, fin: true));
+        Assert.True(h.RunUntil(() => router.Sinks.Count > 0), "the object never began");
+        Assert.True(
+            h.RunUntil(() => router.Sink<MemoryObjectSink>().IsFinished, maxMicros: 30_000_000),
+            "the stranded object was never given up on");
+        Assert.Equal(QuiclyErrorCode.Timeout, router.Sink<MemoryObjectSink>().Result!.Value.Code);
+
+        // The rest of the object turns up after the sweep gave up on it.
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(Range(2, payload, 2048, 2048), out _, fin: true));
+        h.Run(2_000_000);
+
+        Assert.Single(router.Accepted);
+    }
 }

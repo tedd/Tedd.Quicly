@@ -33,6 +33,13 @@ internal sealed class BulkObjectReceiver : IBulkRouter
     /// </summary>
     private const int MinRanges = 16;
 
+    /// <summary>
+    /// How quiet an ended object's identity has to go before it may begin again. It only has to outlast the ranges of the
+    /// attempt that just ended — streams the peer had already opened, or opens before it hears the object is over — which
+    /// is a round trip's worth of skew, not a timeout's.
+    /// </summary>
+    private const long TombstoneQuietMicros = 2_000_000;
+
     private readonly IBulkObjectRouter _router;
     private readonly ObjectSlot[] _objects;
     private readonly RangeSink[] _shims;
@@ -50,6 +57,18 @@ internal sealed class BulkObjectReceiver : IBulkRouter
 
     /// <summary>Objects being assembled; read without the lock so an idle peer's timer pass never takes it.</summary>
     private int _live;
+
+    /// <summary>
+    /// Identities of objects that have ended, so a range still arriving for one is refused rather than taken as the start
+    /// of a new object. A slot is released the moment its object ends, so without this the identity is simply forgotten
+    /// and the next stray range looks like a first range.
+    /// </summary>
+    private readonly bool[] _deadSet;
+    private readonly ushort[] _deadChannel;
+    private readonly ulong[] _deadId;
+    private readonly ulong[] _deadVersion;
+    private readonly long[] _deadSeen;
+    private int _deadNext;
 
     /// <param name="router">The application's object router.</param>
     /// <param name="clock">The peer's clock, for the idle sweep.</param>
@@ -79,6 +98,13 @@ internal sealed class BulkObjectReceiver : IBulkRouter
         {
             _shims[i] = new RangeSink(this);
         }
+
+        int dead = Math.Max(8, _objects.Length * 4);
+        _deadSet = new bool[dead];
+        _deadChannel = new ushort[dead];
+        _deadId = new ulong[dead];
+        _deadVersion = new ulong[dead];
+        _deadSeen = new long[dead];
     }
 
     /// <summary>Objects being assembled right now (tests).</summary>
@@ -104,6 +130,14 @@ internal sealed class BulkObjectReceiver : IBulkRouter
             // The object already ended — it failed, or the idle sweep gave up on it — and its slot is only still here
             // because another range was writing. Taking this one would hand the application a second object under an
             // identity it has already been told about.
+            return BulkReceiveDecision.Reject(QuiclyErrorCode.BulkRejected);
+        }
+
+        if (slot is null && IsDead(in info, _clock.NowMicros))
+        {
+            // The object ended — completed, failed, or given up on by the idle sweep — and its slot has already gone back.
+            // This range is the tail of that attempt, so beginning an object for it would hand the application a second
+            // sink under an identity it has already had a Finish for.
             return BulkReceiveDecision.Reject(QuiclyErrorCode.BulkRejected);
         }
 
@@ -373,6 +407,7 @@ internal sealed class BulkObjectReceiver : IBulkRouter
         }
 
         slot.Finished = true;
+        NoteDead(slot, _clock.NowMicros);
         IBulkObjectSink? sink = slot.Sink;
         BulkObjectResult result = new(status, slot.BytesDone, slot.Length, code, slot.Ranges, slot.Retries);
         if (slot.Live == 0)
@@ -403,6 +438,56 @@ internal sealed class BulkObjectReceiver : IBulkRouter
         {
             _onFault(exception);
         }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="info"/> names an object that already ended and has not gone quiet since (under the
+    /// lifecycle lock). A hit refreshes the identity, so a long tail of strays keeps it refused for as long as it lasts
+    /// and a genuine second attempt is only held off until they stop.
+    /// </summary>
+    private bool IsDead(in BulkTransferInfo info, long now)
+    {
+        for (int i = 0; i < _deadSet.Length; i++)
+        {
+            if (!_deadSet[i] || _deadChannel[i] != info.Channel || _deadId[i] != info.ObjectId || _deadVersion[i] != info.ObjectVersion)
+            {
+                continue;
+            }
+
+            if (now - _deadSeen[i] > TombstoneQuietMicros)
+            {
+                // Nothing has arrived under this identity in long enough that it cannot be the old attempt's tail.
+                _deadSet[i] = false;
+                return false;
+            }
+
+            _deadSeen[i] = now;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>Remembers an ended object's identity (under the lifecycle lock).</summary>
+    private void NoteDead(ObjectSlot slot, long now)
+    {
+        for (int i = 0; i < _deadSet.Length; i++)
+        {
+            if (_deadSet[i] && _deadChannel[i] == slot.Channel && _deadId[i] == slot.ObjectId && _deadVersion[i] == slot.ObjectVersion)
+            {
+                _deadSeen[i] = now;
+                return;
+            }
+        }
+
+        // The oldest entry goes: an identity that has been quiet longest is the one least likely to still have ranges out.
+        int at = _deadNext;
+        _deadNext = at + 1 == _deadSet.Length ? 0 : at + 1;
+        _deadSet[at] = true;
+        _deadChannel[at] = slot.Channel;
+        _deadId[at] = slot.ObjectId;
+        _deadVersion[at] = slot.ObjectVersion;
+        _deadSeen[at] = now;
     }
 
     /// <summary>Whether another range of <paramref name="slot"/> is already bringing part of <c>[start, end)</c>.</summary>

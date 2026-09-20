@@ -10,8 +10,10 @@ folder and `docs/benchmarks/end-to-end.md`, and may fix library defects it expos
 
 ## Starting point
 
-- `samples/Tedd.Quicly.Samples.Server` and `.Client` are six-line placeholders. Both target `net11.0`; the server sample
-  references Server and Transport.MsQuic, the client sample Client and Transport.MsQuic.
+- `samples/Tedd.Quicly.Samples.Server` and `.Client` now run a real bulk-object file transfer over MsQuic loopback
+  (self-signed dev certificate, one Bulk channel, an IBulkObjectRouter writing to disk). Both target `net11.0`; the
+  server sample references Server and Transport.MsQuic, the client sample Client and Transport.MsQuic. C5 still owns
+  the wider sample surface — the six modes, movement traffic beside a transfer, reconnect.
 - `tests/Tedd.Quicly.EndToEnd.Tests` already references every `src` project. Today it covers certificates and TLS only
   (hot swap, certificate paths, client validation, restart, tls-alpn-01 provisioning, a smoke test) plus reusable
   infrastructure for a real MsQuic server and client. Session-layer tests go in a new `Session/` folder and reuse

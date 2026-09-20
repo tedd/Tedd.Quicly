@@ -4,9 +4,14 @@ namespace Tedd.Quicly.Core.Session;
 
 /// <summary>
 /// Describes the object range one bulk transfer carries (<see cref="QuiclyPeer.BeginBulkSendAsync"/>, PROTOCOL.md §3.3).
-/// The object's identity is <see cref="ObjectId"/> + <see cref="ObjectVersion"/>; <see cref="Sha256"/>, when present,
-/// covers the <em>whole</em> object, not this range.
+/// The object's identity is <see cref="ObjectId"/> + <see cref="ObjectVersion"/>.
 /// </summary>
+/// <remarks>
+/// There is no object-level hash here. The transport's integrity check is the per-transfer checksum trailer
+/// (<see cref="Checksum"/>), which is what makes a corrupt range detectable at <em>its</em> end rather than the object's
+/// and re-requestable on its own. What a file <em>is</em> — a content address, a manifest entry — is the application's,
+/// not the transport's.
+/// </remarks>
 /// <param name="Channel">The Bulk channel.</param>
 /// <param name="ObjectId">Object identity.</param>
 /// <param name="ObjectVersion">Object version (identity is id + version).</param>
@@ -32,16 +37,26 @@ public readonly record struct BulkDescriptor(
     bool Resumable = false)
 {
     /// <summary>
-    /// SHA-256 of the <b>whole</b> object (32 bytes) or empty. Computed once per object version by the sender and
-    /// verified by the receiver when the last byte of the object has arrived; see <see cref="BulkHashState"/> for how a
-    /// transfer that carries only part of the object is handled.
+    /// Append an xxHash64 of this transfer's range after its body, so the receiver can tell that the bytes it assembled
+    /// are the bytes that were read (PROTOCOL.md §3.3). <see langword="null"/> (the default) follows
+    /// <see cref="PeerOptions.BulkChecksum"/>; set it to override that for one transfer.
     /// </summary>
-    public ReadOnlyMemory<byte> Sha256 { get; init; }
+    /// <remarks>
+    /// <para>QUIC's AEAD already covers the wire and cannot be turned off, so this is not a wire check. It is an
+    /// end-to-end one, over the path from <see cref="IBulkSource.Read"/> to <see cref="IBulkSink.Write"/>: a framing or
+    /// reassembly bug, an LZ4 decode that succeeds but is wrong, memory corruption before encrypt or after decrypt, a
+    /// partial object that rotted on disk between two epochs. Everything it catches is somebody's bug or somebody's
+    /// hardware — which is exactly why it is a switch and not a rule.</para>
+    /// <para>xxHash64 rather than a cryptographic hash, because the peer supplies both the bytes and the digest: this can
+    /// only ever catch accident, so paying for collision resistance against an adversary would buy nothing. It runs at
+    /// better than 10 GB/s, roughly an order of magnitude faster than SHA-256, and costs 8 wire bytes per transfer.</para>
+    /// </remarks>
+    public bool? Checksum { get; init; }
 
     /// <summary>Bytes this transfer carries: <see cref="Length"/>, or the rest of the object when it is 0.</summary>
     public long EffectiveLength => Length > 0 ? Length : TotalLength - Offset;
 
-    /// <summary>Whether the transfer's range is the whole object, which is what lets the receiver verify <see cref="Sha256"/>.</summary>
+    /// <summary>Whether the transfer's range is the whole object.</summary>
     public bool IsWholeObject => Offset == 0 && EffectiveLength == TotalLength;
 }
 
@@ -67,34 +82,14 @@ public enum BulkStatus : byte
     Disconnected = 5,
 }
 
-/// <summary>
-/// What became of the sender's whole-object SHA-256 (PROTOCOL.md §3.3: the hash covers the whole object and is verified
-/// when its last byte has arrived).
-/// </summary>
-public enum BulkHashState : byte
-{
-    /// <summary>The sender sent no hash.</summary>
-    None = 0,
-
-    /// <summary>The transfer carried the whole object and its bytes hashed to the value the sender sent.</summary>
-    Verified = 1,
-
-    /// <summary>The transfer carried the whole object and the hash did not match: the transfer ends <see cref="BulkStatus.Failed"/>.</summary>
-    Mismatch = 2,
-
-    /// <summary>
-    /// The transfer carried only part of the object (a resumed range), so this end saw neither the first nor every byte
-    /// and cannot verify a whole-object hash. The hash is handed to the application, which verifies the assembled object.
-    /// </summary>
-    DeferredToApplication = 3,
-}
-
 /// <summary>Outcome of a bulk transfer.</summary>
 /// <param name="Status">How it ended.</param>
 /// <param name="BytesTransferred">Bytes of the range that were transferred (accepted on the send side, written on the receive side).</param>
-/// <param name="Hash">What became of the whole-object hash.</param>
-/// <param name="Code">The QUIC application error code involved, or <see cref="QuiclyErrorCode.NoError"/>.</param>
-public readonly record struct BulkResult(BulkStatus Status, long BytesTransferred, BulkHashState Hash, QuiclyErrorCode Code);
+/// <param name="Code">
+/// The QUIC application error code involved, or <see cref="QuiclyErrorCode.NoError"/>. A range whose bytes did not match
+/// its checksum trailer ends <see cref="BulkStatus.Failed"/> with <see cref="QuiclyErrorCode.BulkChecksumFailed"/>.
+/// </param>
+public readonly record struct BulkResult(BulkStatus Status, long BytesTransferred, QuiclyErrorCode Code);
 
 /// <summary>Lets <see cref="BulkTransfer.Cancel"/> reach the engine that owns the transfer (any thread).</summary>
 internal interface IBulkCancelSink
@@ -264,8 +259,8 @@ public readonly struct BulkTransferInfo
     /// <summary>Bytes this transfer carries (already checked against the channel's <c>MaxMessageSize</c>).</summary>
     public long Length { get; init; }
 
-    /// <summary>Whether the sender supplied a whole-object SHA-256.</summary>
-    public bool HasHash { get; init; }
+    /// <summary>Whether the sender will append a checksum trailer, so a corrupt range fails instead of being assembled.</summary>
+    public bool HasChecksum { get; init; }
 
     /// <summary>Whether the body is chunked (each chunk independently LZ4-decodable).</summary>
     public bool Chunked { get; init; }

@@ -13,7 +13,7 @@ namespace Tedd.Quicly.Core.Session.Engines;
 
 /// <summary>
 /// The receive half of the Bulk engine (PROTOCOL.md §3.3; docs/design/session-layer.md §7.7): the direct-mode receive
-/// router, the progressive write into the application's <see cref="IBulkSink"/>, the whole-object hash and the
+/// router, the progressive write into the application's <see cref="IBulkSink"/>, the per-range checksum and the
 /// <c>BulkProgress</c> this end owes.
 /// </summary>
 /// <remarks>
@@ -31,15 +31,12 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// <see cref="QuiclyErrorCode.LimitExceeded"/> (the transfer fails, the connection survives); a chunk that merely finds
 /// the budget exhausted is <see cref="StreamConsume.Pend"/>ed and resumed from <see cref="QuiclyPeer.Poll"/>. This end
 /// never sends a chunk larger than <see cref="PeerOptions.BulkChunkBytes"/> (default 64 KiB, one pooled block).</para>
-/// <para><b>Hashing a resumed range.</b> The hash of PROTOCOL.md §3.3 covers the <em>whole</em> object, so it can only be
-/// checked by an end that saw every byte of it in order. A transfer whose range is the whole object
-/// (<c>Offset == 0 &amp;&amp; Length == TotalLength</c>) is hashed as it arrives and verified at its last byte:
-/// <see cref="BulkHashState.Verified"/>, or <see cref="BulkHashState.Mismatch"/> and
-/// <see cref="BulkStatus.Failed"/>. A transfer that carries only part of the object — every resumed range — is
-/// <b>not</b> hashed by the engine at all: it reports <see cref="BulkHashState.DeferredToApplication"/> and hands the
-/// sender's hash to the application, which is the only party holding the assembled object and can verify it once the last
-/// range has landed. Resume is a new transfer for the remaining range with the same object identity, so the hash value
-/// itself is repeated on every range's header and stays comparable.</para>
+/// <para><b>Checking a range.</b> The checksum trailer of PROTOCOL.md §3.3 covers exactly the bytes one transfer
+/// carries, so every range is checkable on its own — whole object or resumed fragment, in order or not. A range whose
+/// bytes do not match ends <see cref="BulkStatus.Failed"/> with <see cref="QuiclyErrorCode.BulkChecksumFailed"/>, and a
+/// <c>BulkCancel</c> carrying that code tells its sender, whose object driver sends the range again. The progress this
+/// end reports deliberately stops one byte short of the range until the trailer verifies, so the sender cannot complete
+/// the transfer underneath that cancel.</para>
 /// </remarks>
 internal sealed unsafe partial class BulkEngine
 {
@@ -47,8 +44,7 @@ internal sealed unsafe partial class BulkEngine
     private const byte RecvInUse = 1;
     private const byte RecvAccepted = 2;
     private const byte RecvChunked = 4;
-    private const byte RecvHasHash = 8;
-    private const byte RecvHashing = 16;
+    private const byte RecvChecksum = 8;
     private const byte RecvStaging = 32;
     private const byte RecvFinished = 64;
 
@@ -69,8 +65,7 @@ internal sealed unsafe partial class BulkEngine
     /// <see cref="BulkStatus.Failed"/>.
     /// </summary>
     private int[] _recvCancelCode = [];
-    private IncrementalHash?[] _hashers = [];
-    private byte[] _recvHashes = [];
+    private XxHash64Builder[] _recvChecksums = [];
     private int[] _openStreams = [];
     private SpscRing<int> _retired = null!;
     private SpscRing<int> _recycle = null!;
@@ -94,8 +89,7 @@ internal sealed unsafe partial class BulkEngine
         _recv = new NativeArray<BulkRecv>(transfers);
         _sinks = new IBulkSink?[transfers];
         _recvCancelCode = new int[transfers];
-        _hashers = new IncrementalHash?[transfers];
-        _recvHashes = new byte[transfers * StreamFraming.BulkHashLength];
+        _recvChecksums = new XxHash64Builder[transfers];
         _openStreams = new int[Math.Max(channelCount, 1)];
         _retired = new SpscRing<int>(transfers + 8);
         _recycle = new SpscRing<int>(transfers + 8);
@@ -170,6 +164,7 @@ internal sealed unsafe partial class BulkEngine
         return message.Phase switch
         {
             StreamMessagePhase.BulkHeader => OnBulkHeader(record, ref recv, ref message),
+            StreamMessagePhase.BulkChecksum => OnBulkChecksum(record, ref recv, ref message),
             StreamMessagePhase.Start => OnBodyStart(ref recv, ref message),
             StreamMessagePhase.Chunk => OnBodyChunk(record, ref recv, ref message),
             StreamMessagePhase.End => OnBodyEnd(record, ref recv, ref message),
@@ -209,7 +204,7 @@ internal sealed unsafe partial class BulkEngine
             TotalLength = (long)header.TotalLength,
             Offset = (long)header.Offset,
             Length = (long)header.Length,
-            HasHash = header.HasHash,
+            HasChecksum = header.HasChecksum,
             Chunked = header.IsChunked,
             PeerIndex = _core.Peer.Index,
         };
@@ -237,17 +232,11 @@ internal sealed unsafe partial class BulkEngine
         }
 
         _sinks[record] = decision.Sink;
-        if (header.HasHash)
+        if (header.HasChecksum)
         {
-            recv.Flags |= RecvHasHash;
-            ((ReadOnlySpan<byte>)header.Hash).CopyTo(_recvHashes.AsSpan(record * StreamFraming.BulkHashLength));
-            if (info.IsWholeObject)
-            {
-                // Only a transfer that carries the whole object can be verified here; a resumed range is the application's.
-                IncrementalHash hash = _hashers[record] ??= IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                hash.GetHashAndReset();
-                recv.Flags |= RecvHashing;
-            }
+            // Every range is checkable, whole object or not: the trailer covers exactly the bytes this transfer carries.
+            recv.Flags |= RecvChecksum;
+            _recvChecksums[record].Reset();
         }
 
         // LastReportMicros has one owner, the game thread (ADR 0008 invariant 4), so the window is not started here: the
@@ -352,7 +341,41 @@ internal sealed unsafe partial class BulkEngine
         return StreamConsume.Continue;
     }
 
-    /// <summary>Writes decoded object bytes to the application's target, hashes them and completes the transfer at its last byte.</summary>
+    /// <summary>
+    /// The range's checksum trailer arrived (PROTOCOL.md §3.3), which is what completes a checksummed transfer: every
+    /// byte is in, and now this end knows whether they are the bytes that were read.
+    /// </summary>
+    /// <remarks>
+    /// A mismatch fails <em>this range</em> and nothing more. The range is the unit of recovery — the whole point of
+    /// checksumming per range rather than per object — so the peer is told with a <c>BulkCancel</c> carrying
+    /// <see cref="QuiclyErrorCode.BulkChecksumFailed"/> (receiver to sender, PROTOCOL.md §3.4) and its object driver
+    /// sends that range again. The bytes already written to the application are overwritten by the retry.
+    /// </remarks>
+    private StreamConsume OnBulkChecksum(int record, ref BulkRecv recv, ref StreamMessageContext message)
+    {
+        if ((recv.Flags & RecvAccepted) == 0 || (recv.Flags & RecvChecksum) == 0)
+        {
+            // The parser produces this only for a transfer whose header promised it; defence in depth.
+            return StreamConsume.ResetStream(QuiclyErrorCode.ProtocolViolation);
+        }
+
+        if (_recvChecksums[record].Digest() != message.BulkChecksum)
+        {
+            _core.RecvCounters(message.ChannelIndex).Dropped++;
+            _core.Counters.BulkChecksumFailures++;
+
+            // BytesAccepted stays short of the range, so the peer's transfer cannot complete on a final progress frame
+            // that races the cancel.
+            FinishReceive(record, ref recv, BulkStatus.Failed, QuiclyErrorCode.BulkChecksumFailed);
+            return StreamConsume.Continue;
+        }
+
+        Volatile.Write(ref recv.BytesAccepted, recv.Length);
+        FinishReceive(record, ref recv, BulkStatus.Completed, QuiclyErrorCode.NoError);
+        return StreamConsume.Continue;
+    }
+
+    /// <summary>Writes decoded object bytes to the application's target, checksums them and completes the transfer at its last byte.</summary>
     private StreamConsume Deliver(int record, ref BulkRecv recv, ReadOnlySpan<byte> data, ref StreamMessageContext message)
     {
         if (data.IsEmpty)
@@ -368,18 +391,22 @@ internal sealed unsafe partial class BulkEngine
         }
 
         _sinks[record]!.Write(recv.Offset + accepted, data);
-        if ((recv.Flags & RecvHashing) != 0)
+        bool checksummed = (recv.Flags & RecvChecksum) != 0;
+        if (checksummed)
         {
-            _hashers[record]!.AppendData(data);
+            _recvChecksums[record].Append(data);
         }
 
         accepted += data.Length;
-        Volatile.Write(ref recv.BytesAccepted, accepted);
+
+        // With a trailer coming, the range is not *accepted* until it verifies. Reporting the whole range now would
+        // complete the sender's transfer, and it would never learn that it has to send this range again.
+        Volatile.Write(ref recv.BytesAccepted, checksummed && accepted >= recv.Length ? recv.Length - 1 : accepted);
         ref ChannelRecvCounters counters = ref _core.RecvCounters(message.ChannelIndex);
         counters.Received++;
         counters.Bytes += data.Length;
         _core.NoteTransportWork();
-        if (accepted >= recv.Length)
+        if (accepted >= recv.Length && !checksummed)
         {
             FinishReceive(record, ref recv, BulkStatus.Completed, QuiclyErrorCode.NoError);
         }
@@ -400,40 +427,10 @@ internal sealed unsafe partial class BulkEngine
         }
 
         recv.Flags |= RecvFinished;
-        BulkHashState hash = BulkHashState.None;
-        if ((recv.Flags & RecvHasHash) != 0)
-        {
-            if ((recv.Flags & RecvHashing) == 0)
-            {
-                hash = BulkHashState.DeferredToApplication;
-            }
-            else if (status != BulkStatus.Completed)
-            {
-                _hashers[record]!.GetHashAndReset();
-            }
-            else
-            {
-                Span<byte> computed = stackalloc byte[StreamFraming.BulkHashLength];
-                _hashers[record]!.GetHashAndReset(computed);
-                ReadOnlySpan<byte> expected = _recvHashes.AsSpan(record * StreamFraming.BulkHashLength, StreamFraming.BulkHashLength);
-                if (computed.SequenceEqual(expected))
-                {
-                    hash = BulkHashState.Verified;
-                }
-                else
-                {
-                    hash = BulkHashState.Mismatch;
-                    status = BulkStatus.Failed;
-                    _core.RecvCounters(recv.ChannelIndex).Dropped++;
-                }
-            }
-        }
-
         recv.Status = (byte)status;
-        recv.Hash = (byte)hash;
         recv.Code = (uint)code;
         ReleaseStaging(ref recv);
-        _sinks[record]?.Finish(new BulkResult(status, recv.BytesAccepted, hash, code));
+        _sinks[record]?.Finish(new BulkResult(status, recv.BytesAccepted, code));
     }
 
     /// <inheritdoc/>
@@ -569,6 +566,14 @@ internal sealed unsafe partial class BulkEngine
             if (!SendProgress(recv.TransferId, recv.BytesAccepted))
             {
                 return;
+            }
+
+            if (recv.Code == (uint)QuiclyErrorCode.BulkChecksumFailed)
+            {
+                // Telling the peer is what lets its object driver send this range again. BulkCancel is receiver-to-sender
+                // (PROTOCOL.md §3.4), which is exactly this direction, and the progress above stopped short of the range
+                // so the peer's transfer has not completed underneath it.
+                SendBulkCancel(recv.TransferId, QuiclyErrorCode.BulkChecksumFailed);
             }
 
             _retiredPending = -1;
@@ -906,11 +911,6 @@ internal sealed unsafe partial class BulkEngine
             _recv.Dispose();
         }
 
-        foreach (IncrementalHash? hash in _hashers)
-        {
-            hash?.Dispose();
-        }
-
         _retired?.Dispose();
         _recycle?.Dispose();
     }
@@ -976,14 +976,11 @@ internal sealed unsafe partial class BulkEngine
         /// <summary>The channel id.</summary>
         [FieldOffset(108)] public ushort Channel;
 
-        /// <summary><see cref="RecvInUse"/>, <see cref="RecvAccepted"/>, <see cref="RecvChunked"/>, <see cref="RecvHasHash"/>, <see cref="RecvHashing"/>, <see cref="RecvStaging"/>, <see cref="RecvFinished"/>.</summary>
+        /// <summary><see cref="RecvInUse"/>, <see cref="RecvAccepted"/>, <see cref="RecvChunked"/>, <see cref="RecvChecksum"/>, <see cref="RecvStaging"/>, <see cref="RecvFinished"/>.</summary>
         [FieldOffset(110)] public byte Flags;
 
         /// <summary>The <see cref="BulkStatus"/> the transfer ended with.</summary>
         [FieldOffset(111)] public byte Status;
-
-        /// <summary>The <see cref="BulkHashState"/> the transfer ended with.</summary>
-        [FieldOffset(112)] public byte Hash;
 
         // ---- game thread from here (its own cache line)
 

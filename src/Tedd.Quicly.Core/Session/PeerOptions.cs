@@ -161,6 +161,92 @@ public sealed class PeerOptions
 
     // ---- end of the wave C2c region
 
+    // ---- region added by the bulk object driver (objects larger than one transfer)
+
+    /// <summary>
+    /// Where a bulk <em>object</em> the peer sends is assembled — one call per object rather than one per transfer, so an
+    /// application receiving a 10 GB file sees one sink and one completion (<see cref="IBulkObjectRouter"/>).
+    /// <see langword="null"/> (the default) leaves <see cref="BulkRouter"/> in charge, which is the raw per-transfer view.
+    /// Setting both is an error: the object driver <em>is</em> the router when it is present.
+    /// </summary>
+    public IBulkObjectRouter? BulkObjectRouter { get; set; }
+
+    /// <summary>Bulk objects this end may send, and assemble on receive, at once. Default 4.</summary>
+    public int BulkObjectsPerDirection { get; set; } = 4;
+
+    /// <summary>
+    /// Ranges of one object in flight at once. 0 (the default) follows <see cref="BulkTransfersPerDirection"/>, which is
+    /// also the ceiling: the engine's own slots are what a range has to fit into, and they are shared with the transfers
+    /// the peer asked for.
+    /// </summary>
+    public int BulkObjectRangesInFlight { get; set; }
+
+    /// <summary>
+    /// Largest range one transfer of an object carries, capped by the Bulk channel's own <c>MaxMessageSize</c>; 0 uses
+    /// that cap, which is the protocol's ceiling for one transfer (PROTOCOL.md §8). Default 1 MiB.
+    /// </summary>
+    /// <remarks>
+    /// The ceiling is not the good default it looks like. The range is the unit of <em>detection and recovery</em>: a
+    /// range that fails its checksum is re-read and sent again on its own, so the range size is how much work one bad
+    /// megabyte costs. A range also costs only one stream and about forty header bytes, so at 1 MiB the wire overhead is
+    /// four thousandths of a percent — there is nothing to buy back by making it 16 times larger, and a great deal to
+    /// lose when something has to be re-sent.
+    /// </remarks>
+    public int BulkObjectRangeBytes { get; set; } = 1024 * 1024;
+
+    /// <summary>
+    /// How many of an object's ranges may be sent again after failing their checksum before the object is given up on.
+    /// Default 3; 0 disables retrying.
+    /// </summary>
+    /// <remarks>
+    /// The bound is per object rather than per range, and deliberately small. A checksum failure is not packet loss —
+    /// QUIC has already retransmitted and its AEAD has already thrown out anything the wire corrupted — so it means a bug,
+    /// a bad memory module, or a source that is changing underneath the transfer. None of those get better with retries,
+    /// and a 10 GB object that hits three of them should fail loudly rather than grind.
+    /// </remarks>
+    public int BulkObjectRangeRetries { get; set; } = 3;
+
+    /// <summary>
+    /// Whether bulk transfers append a checksum trailer by default (PROTOCOL.md §3.3). Default <see langword="true"/>;
+    /// <see cref="BulkDescriptor.Checksum"/> and <see cref="BulkObjectDescriptor.Checksum"/> override it per transfer.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>This is not a wire integrity check and it is not optional in QUIC.</b> TLS 1.3 is mandatory there
+    /// (RFC 9001) and its AEAD tag already discards anything the wire corrupts, retransmitting it. What this catches is
+    /// what the AEAD structurally cannot: the path <em>inside</em> each endpoint, between the application handing bytes to
+    /// <see cref="IBulkSource"/> and getting them back from <see cref="IBulkSink"/>. Framing and reassembly bugs, a wrong
+    /// offset, memory corruption before encrypt or after decrypt, a partial object that rotted on disk across a resume.
+    /// </para>
+    /// <para>So it is defence in depth against bugs and hardware, and worth turning off if you would rather not pay for
+    /// it: about 8 wire bytes per transfer and one xxHash64 pass over the data, which runs at better than 10 GB/s — under
+    /// 1 % of a core at 1 Gbps, but real at 100. A peer that sends without checksums and one that requires them still
+    /// interoperate: the flag is per transfer, and a receiver checks whatever arrives.</para>
+    /// </remarks>
+    public bool BulkChecksum { get; set; } = true;
+
+    /// <summary>
+    /// Bytes between <see cref="BulkObjectProgressCallback"/> reports on both sides; the final state is always reported
+    /// through the object's completion or <see cref="IBulkObjectSink.Finish"/>. Default 1 MiB.
+    /// </summary>
+    public long BulkObjectProgressBytes { get; set; } = 1024 * 1024;
+
+    /// <summary>
+    /// How long an incomplete object being assembled may go with no range of its own running before it is given up on
+    /// (<see cref="BulkStatus.Failed"/>, <see cref="QuiclyErrorCode.Timeout"/>). Default 30 s, as
+    /// <see cref="StreamIdleTimeout"/>; <see cref="TimeSpan.Zero"/> disables it.
+    /// </summary>
+    /// <remarks>
+    /// This is what guarantees a receiving object ends. An object is several transfers, and the protocol has no frame
+    /// that says "the object is over" (PROTOCOL.md §3.4: a sender abandoning a transfer signals by resetting <em>its
+    /// stream</em>). A sender that stops between two ranges therefore leaves nothing to reset, and its peer would
+    /// otherwise wait for bytes that are never coming: a cancel that lands exactly on a range boundary, a sender whose
+    /// application abandoned the object, a sender that died. A cancel that lands anywhere else resets the range that was
+    /// running and reaches the receiver at once; this is the backstop for the rest.
+    /// </remarks>
+    public TimeSpan BulkObjectIdleTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    // ---- end of the bulk object driver region
+
     /// <summary>
     /// After Close is sent, how long the peer waits for the control stream to deliver it before closing the transport
     /// anyway. Default 1 s.
@@ -330,6 +416,23 @@ public sealed class PeerOptions
         CheckRange(BulkSendWindowBytes, 1, int.MaxValue, nameof(BulkSendWindowBytes));
         CheckRange(BulkChunkBytes, 1, Framing.StreamFraming.DefaultBulkMaxChunk, nameof(BulkChunkBytes));
         CheckRange(BulkMaxChunk, 1, Framing.StreamFraming.DefaultBulkMaxChunk, nameof(BulkMaxChunk));
+        CheckNonNegative(BulkObjectIdleTimeout, nameof(BulkObjectIdleTimeout));
+        CheckRange(BulkObjectsPerDirection, 1, 1024, nameof(BulkObjectsPerDirection));
+        CheckRange(BulkObjectRangesInFlight, 0, 1024, nameof(BulkObjectRangesInFlight));
+        CheckRange(BulkObjectRangeBytes, 0, ChannelDefinition.BulkMaxMessageSize, nameof(BulkObjectRangeBytes));
+        CheckRange(BulkObjectRangeRetries, 0, 1024, nameof(BulkObjectRangeRetries));
+        if (BulkObjectProgressBytes < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(BulkObjectProgressBytes), BulkObjectProgressBytes, "BulkObjectProgressBytes must be at least 1.");
+        }
+
+        if (BulkObjectRouter is not null && BulkRouter is not null)
+        {
+            // The object driver is installed *as* the engine's router, so there is no place for a second one; an
+            // application that wants the raw per-transfer view routes objects itself.
+            throw new ArgumentException("BulkObjectRouter and BulkRouter cannot both be set.", nameof(BulkObjectRouter));
+        }
+
         if (BulkChunkBytes > BulkMaxChunk)
         {
             throw new ArgumentException($"BulkChunkBytes ({BulkChunkBytes}) must not exceed BulkMaxChunk ({BulkMaxChunk}).", nameof(BulkChunkBytes));

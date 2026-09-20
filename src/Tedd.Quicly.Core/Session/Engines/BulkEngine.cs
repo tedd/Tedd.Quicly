@@ -62,7 +62,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     private const byte SendCounted = 4;
     private const byte SendFreed = 8;
     private const byte SendCompress = 16;
-    private const byte SendHasHash = 32;
+    private const byte SendChecksum = 32;
 
     /// <summary>The peer's <c>BulkProgress</c> claimed the whole range at least once (PROTOCOL.md §4.3's <c>Delivered</c>).</summary>
     private const byte SendPeerClaimedAll = 64;
@@ -88,7 +88,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     private NativeArray<byte>? _scratch;
     private IBulkSource?[] _sources = [];
     private BulkTransfer?[] _transfers = [];
-    private byte[] _sendHashes = [];
+    private XxHash64Builder[] _sendChecksums = [];
 
     /// <summary>The peer's request id of a transfer flagged <see cref="SendRequested"/> (game thread).</summary>
     private ulong[] _servedRequests = [];
@@ -255,7 +255,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         _records = new NativeArray<BulkSend>(transfers);
         _sources = new IBulkSource?[transfers];
         _transfers = new BulkTransfer?[transfers];
-        _sendHashes = new byte[transfers * StreamFraming.BulkHashLength];
+        _sendChecksums = new XxHash64Builder[transfers];
         _servedRequests = new ulong[transfers];
         for (int record = transfers - 1; record >= 0; record--)
         {
@@ -368,13 +368,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             throw new ArgumentOutOfRangeException(nameof(descriptor), $"A transfer carries at most {limit} bytes on channel {channel.Id} (asked for {length}).");
         }
 
-        ReadOnlySpan<byte> hash = descriptor.Sha256.Span;
-        if (hash.Length is not (0 or StreamFraming.BulkHashLength))
-        {
-            throw new ArgumentException($"A bulk object hash is {StreamFraming.BulkHashLength} bytes or empty.", nameof(descriptor));
-        }
-
-        BulkTransfer transfer = StartSend(local, dense, in descriptor, length, source, hash, requestId: null, out bool started);
+        BulkTransfer transfer = StartSend(local, dense, in descriptor, length, source, requestId: null, out bool started);
         if (!started)
         {
             // Not connected, or the peer-wide / per-channel limit is reached: the transfer is finished before it began and
@@ -397,11 +391,10 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     /// <param name="descriptor">The validated range.</param>
     /// <param name="length">Bytes the transfer carries.</param>
     /// <param name="source">Where its bytes come from.</param>
-    /// <param name="hash">The whole-object hash, or empty.</param>
     /// <param name="requestId">The peer's request id when the transfer answers a <c>BulkRequest</c>, else null.</param>
     /// <param name="started">Whether the transfer was registered.</param>
     private BulkTransfer StartSend(
-        int local, int dense, in BulkDescriptor descriptor, long length, IBulkSource source, ReadOnlySpan<byte> hash, ulong? requestId,
+        int local, int dense, in BulkDescriptor descriptor, long length, IBulkSource source, ulong? requestId,
         out bool started)
     {
         DrainNotices();
@@ -409,7 +402,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         if (_core.Peer.State != PeerState.Connected || _freeSend < 0 || _liveSends >= _core.BulkTransfersPerDirection)
         {
             BulkTransfer rejected = new(in descriptor, 0, length);
-            rejected.Finish(new BulkResult(BulkStatus.Rejected, 0, BulkHashState.None, QuiclyErrorCode.BulkRejected));
+            rejected.Finish(new BulkResult(BulkStatus.Rejected, 0, QuiclyErrorCode.BulkRejected));
             return rejected;
         }
 
@@ -435,10 +428,10 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             send.Flags |= SendCompress;
         }
 
-        if (!hash.IsEmpty)
+        if (descriptor.Checksum ?? _core.BulkChecksum)
         {
-            send.Flags |= SendHasHash;
-            hash.CopyTo(_sendHashes.AsSpan(record * StreamFraming.BulkHashLength));
+            send.Flags |= SendChecksum;
+            _sendChecksums[record].Reset();
         }
 
         if (requestId is { } id)
@@ -717,8 +710,13 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         int written = 0;
         if (opening)
         {
-            written = WriteHeader(record, block, in send, channel);
+            written = WriteHeader(block, in send, channel);
         }
+
+        // The piece may still be refused below, and its bytes are then read — and hashed — again next pass, so the
+        // checksum is snapshotted here and restored on every path that does not commit.
+        bool checksummed = (send.Flags & SendChecksum) != 0;
+        XxHash64Builder savedChecksum = checksummed ? _sendChecksums[record] : default;
 
         int encoded = EncodeBody(record, block.Slice(written), in send, body, out int decoded);
         if (encoded < 0)
@@ -732,10 +730,23 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         }
 
         written += encoded;
+        bool fin = send.BytesRead + decoded >= send.Length;
+        if (fin && checksummed)
+        {
+            // PROTOCOL.md §3.3: the range's xxHash64 follows its last body byte. MaxPrefixBytes leaves far more headroom
+            // than this now that the header carries no hash, so the trailer always fits the piece that closes the range.
+            written += StreamFraming.WriteBulkChecksum(block.Slice(written), _sendChecksums[record].Digest());
+        }
+
         if (opening && !TryOpenStream(record, ref send, channel))
         {
             _core.ReturnSend(in lease);
             _core.DiscardEntry(slot);
+            if (checksummed)
+            {
+                _sendChecksums[record] = savedChecksum;
+            }
+
             return false;
         }
 
@@ -745,7 +756,6 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         entry.Aux0 = MakeTag(record, send.Serial);
         entry.Aux1 = ((long)written << 32) | (uint)decoded;
         _core.StampAdmission(slot);
-        bool fin = send.BytesRead + decoded >= send.Length;
         TransportSendFlags flags = opening ? TransportSendFlags.Start : TransportSendFlags.None;
         if (fin)
         {
@@ -758,8 +768,14 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         TransportStatus status = _core.SubmitStream(send.Stream, entries.GetSegments(slot) + 1, 1, slot, flags);
         if (status != TransportStatus.Success)
         {
-            // No completion follows a refused call: the bytes were never read, so nothing has to be rewound.
+            // No completion follows a refused call: the bytes were never read, so nothing has to be rewound — except the
+            // checksum, which did take them and will take them again when the piece is retried.
             _core.DiscardEntry(slot);
+            if (checksummed)
+            {
+                _sendChecksums[record] = savedChecksum;
+            }
+
             if (opening)
             {
                 AbandonStream(ref send);
@@ -813,7 +829,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     }
 
     /// <summary>Writes the preamble and the PROTOCOL.md §3.3 header of a transfer's first piece.</summary>
-    private int WriteHeader(int record, Span<byte> destination, in BulkSend send, ChannelDefinition channel)
+    private static int WriteHeader(Span<byte> destination, in BulkSend send, ChannelDefinition channel)
     {
         int written = StreamFraming.WritePreamble(destination, channel.Id);
         BulkHeader header = new()
@@ -824,13 +840,9 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             TotalLength = (ulong)send.TotalLength,
             Offset = (ulong)send.Offset,
             Length = (ulong)send.Length,
-            Flags = ((send.Flags & SendHasHash) != 0 ? BulkFlags.HashPresent : BulkFlags.None)
+            Flags = ((send.Flags & SendChecksum) != 0 ? BulkFlags.ChecksumPresent : BulkFlags.None)
                 | ((send.Flags & SendCompress) != 0 ? BulkFlags.Chunked : BulkFlags.None),
         };
-        if ((send.Flags & SendHasHash) != 0)
-        {
-            _sendHashes.AsSpan(record * StreamFraming.BulkHashLength, StreamFraming.BulkHashLength).CopyTo(header.Hash);
-        }
 
         return written + StreamFraming.WriteBulkHeader(destination.Slice(written), in header);
     }
@@ -854,6 +866,11 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             }
 
             decoded = read;
+            if ((send.Flags & SendChecksum) != 0)
+            {
+                _sendChecksums[record].Append(destination.Slice(0, read));
+            }
+
             return read;
         }
 
@@ -869,6 +886,14 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
 
         decoded = taken;
         raw = raw.Slice(0, taken);
+
+        // The checksum covers the range's *decoded* bytes, so it takes the raw chunk before LZ4 sees it — which is also
+        // what lets the receiver check it against the bytes it hands the application rather than the bytes on the wire.
+        if ((send.Flags & SendChecksum) != 0)
+        {
+            _sendChecksums[record].Append(raw);
+        }
+
         int headerLength = StreamFraming.GetBulkChunkHeaderLength(taken, taken);
         int compressed = 0;
         if (taken >= 2)
@@ -1004,8 +1029,16 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
     /// out and waits for a <em>new</em> stream once the peer grants credit (docs/design/session-layer.md §7.7). The refusal
     /// notice and the canceled completions arrive in either order, and whichever is last lands here.
     /// </summary>
-    private static void RewindRefused(ref BulkSend send, ref BulkSendState state)
+    private void RewindRefused(int record, ref BulkSend send, ref BulkSendState state)
     {
+        // Nothing of this transfer reached the peer, so its checksum starts over with the bytes that are about to be read
+        // again. The rewind target is BytesCompleted, which is 0 here by construction: a transfer has one stream, and a
+        // refused start means none of its sends completed.
+        if ((send.Flags & SendChecksum) != 0)
+        {
+            _sendChecksums[record].Reset();
+        }
+
         send.BytesRead = send.BytesCompleted;
         send.WireOutstanding = 0;
         send.Phase = BulkPhase.Waiting;
@@ -1093,7 +1126,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         else if (send.Phase == BulkPhase.Refused && send.CarriersOutstanding == 0)
         {
             // The refusal notice came first and this was the last piece to come back canceled (the simulator's order).
-            RewindRefused(ref send, ref state);
+            RewindRefused(record, ref send, ref state);
         }
 
         // A piece canceled for any other reason means the stream is going away, but not yet *why*: a peer that stopped it
@@ -1211,7 +1244,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             ReleaseStreamSlot(ref send, ref _send[local]);
         }
 
-        _transfers[record]?.Finish(new BulkResult(status, send.BytesAcked, BulkHashState.None, code));
+        _transfers[record]?.Finish(new BulkResult(status, send.BytesAcked, code));
     }
 
     /// <summary>Gives back the channel's bulk-stream slot when a transfer stops holding a stream (at most once per open).</summary>
@@ -1357,7 +1390,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
             // A backstop, not an exit: the peer settles the lost connection (OnPeerClosed, so TerminateSend for every live
             // transfer) before it resets for the reconnect, so this Finish finds each transfer already finished and is a
             // no-op; the table itself is wiped wholesale below because nothing bound to the old transport survives.
-            _transfers[record]?.Finish(new BulkResult(BulkStatus.Disconnected, send.BytesAcked, BulkHashState.None, QuiclyErrorCode.NoError));
+            _transfers[record]?.Finish(new BulkResult(BulkStatus.Disconnected, send.BytesAcked, QuiclyErrorCode.NoError));
             uint serial = (send.Serial + 1) & PeerCore.EngineStreamSerialMask;
             send = default;
             send.Serial = serial;
@@ -1767,14 +1800,13 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         long length = descriptor.EffectiveLength;
         if (descriptor.Channel != channel.Id || descriptor.TotalLength < 0 || descriptor.TotalLength > (long)VarInt.MaxValue
             || descriptor.Offset < 0 || descriptor.Offset > descriptor.TotalLength || descriptor.Length < 0 || length <= 0
-            || length > descriptor.TotalLength - descriptor.Offset || length > _core.EffectiveMaxMessageSize(channel)
-            || descriptor.Sha256.Length is not (0 or StreamFraming.BulkHashLength))
+            || length > descriptor.TotalLength - descriptor.Offset || length > _core.EffectiveMaxMessageSize(channel))
         {
             SendBulkReject(notice.Id, QuiclyErrorCode.BulkRejected);
             return;
         }
 
-        StartSend(local, dense, in descriptor, length, source, descriptor.Sha256.Span, notice.Id, out bool started);
+        StartSend(local, dense, in descriptor, length, source, notice.Id, out bool started);
         if (!started)
         {
             SendBulkReject(notice.Id, QuiclyErrorCode.BulkRejected);
@@ -1885,7 +1917,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
                         if (send.CarriersOutstanding == 0)
                         {
                             // Every piece already came back canceled before the notice did (the order is the transport's).
-                            RewindRefused(ref send, ref state);
+                            RewindRefused(record, ref send, ref state);
                         }
                         else
                         {
@@ -2087,7 +2119,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
         /// <summary>Lifecycle of the transfer.</summary>
         [FieldOffset(120)] public BulkPhase Phase;
 
-        /// <summary><see cref="SendHeaderWritten"/>, <see cref="SendFinSent"/>, <see cref="SendCounted"/>, <see cref="SendFreed"/>, <see cref="SendCompress"/>, <see cref="SendHasHash"/>.</summary>
+        /// <summary><see cref="SendHeaderWritten"/>, <see cref="SendFinSent"/>, <see cref="SendCounted"/>, <see cref="SendFreed"/>, <see cref="SendCompress"/>, <see cref="SendChecksum"/>.</summary>
         [FieldOffset(121)] public byte Flags;
     }
 }

@@ -308,6 +308,12 @@ internal enum StreamMessagePhase : byte
     /// <see cref="StreamConsumeAction.Pend"/> un-reads the whole message.
     /// </summary>
     Whole = 4,
+
+    /// <summary>
+    /// A bulk transfer's checksum trailer was parsed: <see cref="StreamMessageContext.BulkChecksum"/>. It follows the
+    /// range's last body byte, so every byte has already been delivered by the time the engine can check it.
+    /// </summary>
+    BulkChecksum = 5,
 }
 
 /// <summary>One stream event for an engine (transport thread). Payload is never copied by the peer.</summary>
@@ -333,6 +339,9 @@ internal ref struct StreamMessageContext
 
     /// <summary>Bulk header (bulk streams).</summary>
     public BulkHeader Bulk;
+
+    /// <summary>The sender's range checksum for <see cref="StreamMessagePhase.BulkChecksum"/>.</summary>
+    public ulong BulkChecksum;
 
     /// <summary>Payload slice for <see cref="StreamMessagePhase.Chunk"/>.</summary>
     public ReadOnlySpan<byte> Chunk;

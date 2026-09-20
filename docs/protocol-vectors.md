@@ -111,5 +111,7 @@ Control frames (`Length = body + 1`, then `Type`): empty body, type 0xAA → `01
 16 383-byte body (the maximum) → `80004000 AA`.
 
 Bulk header (TransferId 7, ObjectId 1000, ObjectVersion 3, TotalLength 1 000 000, Offset 64, Length 100,
-flags = chunked, no hash) → `07 43E8 03 800F4240 4040 4064 02`. Bulk chunk header (ChunkLength 100, RawLength 0) →
-`4064 00`.
+flags = chunked, no checksum) → `07 43E8 03 800F4240 4040 4064 02`. Bulk chunk header (ChunkLength 100, RawLength 0) →
+`4064 00`. The checksum trailer, when flags bit 0 is set, is the range's xxHash64 as 8 little-endian bytes after
+the last body byte — an empty range cannot occur (`Length > 0`), and the digest of the 100 zero bytes above is
+`0x17BB1103C92C502F`, which is `2F502CC90311BB17` on the wire.

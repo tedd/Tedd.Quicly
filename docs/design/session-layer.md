@@ -1285,16 +1285,15 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   stream `LimitExceeded` (the transfer fails, the connection survives); a chunk that merely finds the budget exhausted is
   `Pend`ed and resumed from `Poll`. This end never sends a chunk larger than `BulkChunkBytes` (default 64 KiB, one pooled
   block), which is the counterpart of §7.2's receive-budget rule.
-* **Hashing, and precisely what a resumed range does.** The hash of PROTOCOL.md §3.3 covers the **whole object**, so only
-  an end that saw every byte of it, in order, can check it. A transfer whose range *is* the whole object
-  (`Offset == 0 && Length == TotalLength`) is hashed as it arrives and verified at its last byte: `Verified`, or
-  `Mismatch`, which ends the transfer `Failed` even though every byte arrived. A transfer that carries only **part** of the
-  object — every resumed range — is **not hashed by the engine at all**: it reports
-  `BulkHashState.DeferredToApplication` and hands the sender's hash to the application, which is the only party holding
-  the assembled object and can verify it once the last range has landed. Resume is a new transfer for the remaining range
-  with the same `ObjectId`/`ObjectVersion`, and the hash value is repeated on every range's header, so it stays comparable
-  across them. The sender's own transfer is unaffected by the verdict: it saw every byte accepted and completes normally,
-  because acting on a mismatch is the receiver's business.
+* **The checksum trailer, and what it means for a resumed range.** PROTOCOL.md §3.3 puts an xxHash64 of the transfer's
+  own decoded range after its body, so *every* range is checkable on its own — whole object, resumed fragment, in order
+  or not. It is a trailer rather than a header field precisely so neither end needs the digest before it has seen the
+  bytes: the sender hashes each piece as it reads it (snapshotting the builder, because a piece the transport refuses is
+  read and hashed again) and the receiver as it writes it. A mismatch ends that transfer `Failed` with
+  `BulkChecksumFailed`; the receiver deliberately stops its `BulkProgress` one byte short of the range until the trailer
+  verifies, so the sender cannot complete the transfer underneath the `BulkCancel` that tells it to send the range again.
+  Bytes are delivered before the trailer condemns them, which is why `IBulkSink.Write` is contractually a random-access
+  write: the retry overwrites the same offsets.
 * **Progress this end owes.** `BulkProgress` (0x05) is sent at most every 64 KiB or 100 ms per transfer, and on
   completion (PROTOCOL.md §2.3). The decision is the game thread's, in the engine's `Flush`: the carrier is chosen
   *before* the frame is encoded (the two framings differ), and the 64 KiB / 100 ms window advances **only when a frame
@@ -1380,7 +1379,7 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   and is still checked byte for byte, memory sources and sinks, accepting and denying routers, authorizers, a provider and
   hand-written bulk streams): `BulkDeliveryTests` (a byte-exact object whose progress completes the transfer; a 64 MiB
   object as four 16 MiB ranges over a bandwidth-capped link while 60 Hz movement datagrams keep flowing with bounded
-  latency; chunked compression shrinking the wire; the whole-object hash verified and a mismatch failing the transfer; a
+  latency; chunked compression shrinking the wire; each range verified against its checksum trailer and a mismatch failing that range; a
   partial range deferring the hash; the send window bounding outstanding bytes; both concurrency caps; a start the peer's
   stream limit refused going out on a new stream; an unrouted transfer and a peer with no router at all; a source that
   runs dry), `BulkStreamTests` (cancel from each side, an unauthorised request, a request with no authorizer, an
@@ -1389,7 +1388,7 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   declared object size that never becomes an allocation, a duplicate transfer id, the receive-side `MaxGroups` reset, a
   chunk this peer could never stage, and the session closing under a running transfer), `BulkZeroAllocationTests` (the
   raw and the chunked streaming paths, measured in the middle of one transfer), `BulkLimitTests` (what bounds a transfer and
-  what happens when a bound bites: a chunked object over a lossy, reordered, jittery link with its whole-object hash
+  what happens when a bound bites: a chunked object over a lossy, reordered, jittery link with its range checksums
   verified; a cancellation from each side racing that loss; the pass's send cap holding a pass back and setting the refill
   deadline; an exhausted send table and an exhausted send budget only *delaying* a transfer; a chunk pended because the
   receive budget is held by another transfer's half-arrived one, and a chunk whose decode block cannot be rented resetting
@@ -1419,6 +1418,43 @@ direction). Cold side arrays carry the managed references a transfer needs — i
   fragmentation and request/response code takes nothing out of a ring) either loops on the result or dequeues into a
   local it reads only after a `true` return, and none passes a field as the `out` argument. This is the next step if an
   instance is ever found.
+
+#### 7.7.1 Objects larger than one transfer (the object driver)
+
+The Bulk engine is a *transfer* engine, and PROTOCOL.md §8 is explicit that a Bulk channel's `MaxMessageSize` bounds one
+transfer and not the object it belongs to. An object of any size up to 2^62 − 1 bytes is therefore already expressible on
+the wire; what was missing was the party that issues its transfers, and the fact that nothing verified its hash once it
+took more than one. That is `BulkObjectSender`, `BulkObjectReceiver` and `BulkObjectHasher`, above the engine and behind
+`QuiclyPeer.BeginBulkObjectSend` / `PeerOptions.BulkObjectRouter`. No wire change: an object is exactly the transfers
+§3.3 already describes.
+
+* **Where the next range starts.** `BeginBulkSendAsync` registers a transfer in the engine's game-thread bookkeeping, so
+  ranges can only start on the game thread — but a range *completes* on the thread pool, where `BulkTransfer.Completion`
+  runs its continuations. The driver is therefore pumped from `Poll`, and the continuation does nothing but raise the
+  peer's work signal. `HasWork` is deliberately *not* derived from a flag that continuation sets: an object in flight
+  always has work, and deriving it from the pool would let a saturated pool strand an object rather than merely delay a
+  wake-up. This was a real failure, found only under a loaded full-suite run.
+* **Back-pressure is not failure.** The engine answers `BulkStatus.Rejected` synchronously when its per-direction slots
+  are full — they are shared with the ranges the peer asked for — so the driver stops issuing for that pass and tries the
+  same range again next time. No signal is raised for it (that would spin); the object stays in flight, which keeps the
+  peer marked. Only a range that actually started and then ended badly ends the object.
+* **Integrity per range, not per object.** The original design carried a whole-object SHA-256, and for a multi-range
+  object nobody verified it: the engine checks a hash only for a transfer that *is* the whole object and reports
+  `DeferredToApplication` for every partial range. Detecting a bad byte after 10 GB would have been the wrong answer
+  anyway — the unit of recovery is a range (`BulkRequest` asks for one), so the unit of detection has to be a range too.
+  Every range now carries an xxHash64 trailer over its own bytes. A range that fails is forgotten by the receiver and
+  re-sent by the driver; every range verifying, over a range set that exactly tiles the object, *is* the object verifying.
+  This deleted the reorder shadow the whole-object hash needed, and with it the coupling between range size and receive
+  memory. What a file *is* — a content address — is the application's concern, carried in its own manifest.
+* **What makes "complete" sound.** A range is refused unless it lies inside the object's range and shares no byte with
+  one already taken (`BulkRangeSet`), so a peer repeating a range cannot inflate the byte count into a false completion.
+  The set merges on insert, so ascending ranges collapse to one entry — a 10 GB object costs one, not ten thousand.
+* **What makes an object *end*.** A sender abandons a transfer by resetting its stream (§3.4), so a sender that stops
+  between two ranges has no stream to reset and its peer would wait for bytes that are never coming: a cancel landing
+  exactly on a range boundary, an abandoned object, a dead sender. `BulkObjectIdleTimeout` (default 30 s, as
+  `StreamIdleTimeout`) sweeps those from `RunTimers`, in the same shape as `SweepIdleStreams`. A cancel landing anywhere
+  else resets the range that was running and reaches the peer at once. Slot lifecycle is the one part of the receiver the
+  game thread touches, so it is the one part under a lock; the per-byte path never takes it.
 
 ### 7.8 Fragmentation and request/response (as built: wave C2d)
 
@@ -1622,7 +1658,7 @@ Waves:
 | C1 step 3 (done) | `ReliableOrdered` engine (persistent stream, carrier gathers, refused-start retry, progressive receive, back-pressure), `SendAsync`/`FlushAsync`/`ThreadSafeSend`, simulator flow control, benchmarks (§7.2, §7.3) | steps 1–2 |
 | C2a (done) | `ReliableLatestEngine` (§7.6): per-key values and versions, supersede, retransmission and budgets, large values on group streams, coalescing receive with cumulative acks, ack coalescing, epoch resync, key retirement | C1 |
 | C2b (done) | `GroupStreamEngine` (`ReliableUnordered`, §7.5): groups and carriers, refused starts, per-group failure, progressive receive | C1 |
-| C2c (done) | `BulkEngine` (§7.7): a stream per transfer at the lowest priority, the send window and rate cap, chunked compression, progress, cancel, resume, request authorisation, the whole-object hash | C1 |
+| C2c (done) | `BulkEngine` (§7.7): a stream per transfer at the lowest priority, the send window and rate cap, chunked compression, progress, cancel, resume, request authorisation, the per-range checksum trailer | C1 |
 | C2d (done) | fragmentation in the shared datagram engine and request/response in the ordered engine (§7.8): at most 8 fragments per message with a bounded reassembly table, correlated requests with a pooled value-task source and timeouts served by Poll and Flush | C1 |
 | C3 (done) | `MsQuicTransport` (ITransport over the MsQuic wrappers) + listener/connector; `QuiclyServer` / `QuiclyClient`; admission; reconnect | C1, msquic bindings |
 | C4 | WebTransport-over-HTTP/3 carrier (opt-in), HTTP/3 static responder | C3, Http3 |

@@ -779,6 +779,10 @@ public sealed unsafe partial class QuiclyPeer
                     case StreamEvent.MessageEnd:
                         context.Phase = StreamMessagePhase.End;
                         break;
+                    case StreamEvent.BulkChecksum:
+                        context.Phase = StreamMessagePhase.BulkChecksum;
+                        context.BulkChecksum = record.Parser.BulkChecksum;
+                        break;
                     default:
                         context.Phase = StreamMessagePhase.BulkHeader;
                         context.Bulk = record.Parser.Bulk;

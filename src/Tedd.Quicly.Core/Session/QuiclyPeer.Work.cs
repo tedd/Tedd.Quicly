@@ -103,7 +103,8 @@ public sealed unsafe partial class QuiclyPeer
             || _queuedWithHandler != 0
             || _hasHeld
             || _hasHeldForeign
-            || _front is { IsEmpty: false })
+            || _front is { IsEmpty: false }
+            || HasBulkObjectWork)
         {
             return true;
         }

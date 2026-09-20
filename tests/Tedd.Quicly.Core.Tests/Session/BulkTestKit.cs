@@ -92,6 +92,13 @@ internal static class BulkKit
         options.BulkRouter = router;
     };
 
+    /// <summary>Quiet options for a receiving peer that assembles every object into <paramref name="router"/>.</summary>
+    public static Action<PeerOptions> ObjectReceiver(IBulkObjectRouter router) => options =>
+    {
+        Quiet(options);
+        options.BulkObjectRouter = router;
+    };
+
     /// <summary>Quiet options for a peer that serves authorised range requests from <paramref name="provider"/>.</summary>
     public static Action<PeerOptions> Server(IBulkProvider provider, IBulkAuthorizer? authorizer = null) => options =>
     {
@@ -116,14 +123,30 @@ internal static class BulkKit
     /// <summary>The SHA-256 of <paramref name="bytes"/>, as a descriptor carries it.</summary>
     public static byte[] Hash(ReadOnlySpan<byte> bytes) => System.Security.Cryptography.SHA256.HashData(bytes);
 
-    /// <summary>A bulk stream's bytes written by hand (PROTOCOL.md §3.3): the preamble, the header, then the body.</summary>
-    public static byte[] BulkStream(ushort channel, in BulkHeader header, ReadOnlySpan<byte> body)
+    /// <summary>
+    /// A bulk stream's bytes written by hand (PROTOCOL.md §3.3): the preamble, the header, the body, and — when the
+    /// header's flags promise one — the checksum trailer.
+    /// </summary>
+    /// <param name="channel">The Bulk channel.</param>
+    /// <param name="header">The header; <see cref="BulkFlags.ChecksumPresent"/> decides whether a trailer follows.</param>
+    /// <param name="body">The body bytes.</param>
+    /// <param name="checksum">
+    /// The trailer to write, or null to write the one the body really hashes to. Passing a wrong value is how a test
+    /// gets a corrupt range past a transport that cannot corrupt one.
+    /// </param>
+    public static byte[] BulkStream(ushort channel, in BulkHeader header, ReadOnlySpan<byte> body, ulong? checksum = null)
     {
-        byte[] buffer = new byte[128 + body.Length];
+        byte[] buffer = new byte[128 + body.Length + StreamFraming.BulkChecksumLength];
         int position = StreamFraming.WritePreamble(buffer, channel);
         position += StreamFraming.WriteBulkHeader(buffer.AsSpan(position), in header);
         body.CopyTo(buffer.AsSpan(position));
-        return buffer.AsSpan(0, position + body.Length).ToArray();
+        position += body.Length;
+        if (header.HasChecksum)
+        {
+            position += StreamFraming.WriteBulkChecksum(buffer.AsSpan(position), checksum ?? XxHash64.Hash(body));
+        }
+
+        return buffer.AsSpan(0, position).ToArray();
     }
 
     /// <summary>A bulk stream whose header bytes are written by hand, so a hostile header can be built field by field.</summary>
@@ -622,9 +645,111 @@ internal sealed class MemoryProvider(byte[] bytes, bool compress = false, bool h
         long length = Math.Min(request.Length, bytes.Length - request.Offset);
         descriptor = new BulkDescriptor(request.Channel, request.ObjectId, request.ObjectVersion, bytes.Length, request.Offset, length, compress)
         {
-            Sha256 = hash ? BulkKit.Hash(bytes) : default,
+            Checksum = hash,
         };
         source = new MemorySource(bytes);
         return true;
     }
+}
+
+/// <summary>A router that accepts every object, handing each one the sink <paramref name="factory"/> makes.</summary>
+internal sealed class AcceptObjectRouter(Func<BulkObjectInfo, IBulkObjectSink> factory) : IBulkObjectRouter
+{
+    public List<BulkObjectInfo> Accepted { get; } = [];
+
+    public List<IBulkObjectSink> Sinks { get; } = [];
+
+    public List<BulkObjectProgress> Progress { get; } = [];
+
+    public List<(BulkRangeRequest Request, QuiclyErrorCode Code)> Rejections { get; } = [];
+
+    /// <summary>Accepts one object of <paramref name="length"/> bytes and keeps every byte of it.</summary>
+    public static AcceptObjectRouter Memory(long length) => new(_ => new MemoryObjectSink(length));
+
+    /// <summary>Accepts objects and verifies the pattern of <see cref="PatternSource"/> without storing them.</summary>
+    public static AcceptObjectRouter Pattern() => new(_ => new PatternObjectSink());
+
+    /// <summary>
+    /// Whether accepted objects get a progress callback. Off for the allocation windows: the callback appends to
+    /// <see cref="Progress"/>, and a growing <see cref="List{T}"/> is the test's allocation, not the driver's.
+    /// </summary>
+    public bool ReportProgress { get; init; } = true;
+
+    public BulkObjectReceiveDecision SelectTarget(in BulkObjectInfo info)
+    {
+        Accepted.Add(info);
+        IBulkObjectSink sink = factory(info);
+        Sinks.Add(sink);
+        return BulkObjectReceiveDecision.Accept(sink, 0, ReportProgress ? (in BulkObjectProgress p) => Progress.Add(p) : null);
+    }
+
+    public void OnRequestRejected(in BulkRangeRequest request, QuiclyErrorCode code) => Rejections.Add((request, code));
+
+    public T Sink<T>(int index = 0)
+        where T : class, IBulkObjectSink => (T)Sinks[index];
+}
+
+/// <summary>An object router that refuses everything (which is also what no router at all does).</summary>
+internal sealed class DenyObjectRouter(QuiclyErrorCode code = QuiclyErrorCode.BulkRejected) : IBulkObjectRouter
+{
+    public int Calls { get; private set; }
+
+    public BulkObjectReceiveDecision SelectTarget(in BulkObjectInfo info)
+    {
+        Calls++;
+        return BulkObjectReceiveDecision.Reject(code);
+    }
+}
+
+/// <summary>An object sink that keeps every byte, so a test can compare the object it assembled.</summary>
+internal sealed class MemoryObjectSink(long length) : IBulkObjectSink
+{
+    public byte[] Bytes { get; } = new byte[length];
+
+    public long BytesWritten { get; private set; }
+
+    public int Writes { get; private set; }
+
+    public BulkObjectResult? Result { get; private set; }
+
+    public bool IsFinished => Result is not null;
+
+    public void Write(long objectOffset, ReadOnlySpan<byte> data)
+    {
+        data.CopyTo(Bytes.AsSpan((int)objectOffset));
+        BytesWritten += data.Length;
+        Writes++;
+    }
+
+    public void Finish(in BulkObjectResult result) => Result = result;
+}
+
+/// <summary>
+/// An object sink that verifies every byte against <see cref="PatternSource.At"/> instead of storing it, so a multi-GiB
+/// object costs no memory and is still checked byte for byte at its true object offset.
+/// </summary>
+internal sealed class PatternObjectSink : IBulkObjectSink
+{
+    public long BytesWritten { get; private set; }
+
+    public long Mismatches { get; private set; }
+
+    public BulkObjectResult? Result { get; private set; }
+
+    public bool IsFinished => Result is not null;
+
+    public void Write(long objectOffset, ReadOnlySpan<byte> data)
+    {
+        for (int i = 0; i < data.Length; i++)
+        {
+            if (data[i] != PatternSource.At(objectOffset + i))
+            {
+                Mismatches++;
+            }
+        }
+
+        BytesWritten += data.Length;
+    }
+
+    public void Finish(in BulkObjectResult result) => Result = result;
 }

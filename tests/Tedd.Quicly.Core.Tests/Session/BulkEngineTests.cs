@@ -25,7 +25,7 @@ public class BulkEngineTests
         BulkTransfer transfer = new(new BulkDescriptor(5, 1, 1, 10), transferId: 1, length: 10);
 
         // Running is not a terminal state, so it is not an outcome and does not complete anything.
-        transfer.Finish(new BulkResult(BulkStatus.Running, 5, BulkHashState.None, QuiclyErrorCode.NoError));
+        transfer.Finish(new BulkResult(BulkStatus.Running, 5, QuiclyErrorCode.NoError));
         Assert.Equal(BulkStatus.Running, transfer.Status);
         Assert.False(transfer.Completion.IsCompleted);
 
@@ -33,16 +33,15 @@ public class BulkEngineTests
         Assert.Equal(4, transfer.BytesTransferred);
         Assert.Equal(0.4, transfer.Progress);
 
-        transfer.Finish(new BulkResult(BulkStatus.Completed, 10, BulkHashState.Verified, QuiclyErrorCode.NoError));
+        transfer.Finish(new BulkResult(BulkStatus.Completed, 10, QuiclyErrorCode.NoError));
         Assert.Equal(BulkStatus.Completed, transfer.Status);
         Assert.Equal(10, transfer.BytesTransferred);
-        Assert.Equal(BulkHashState.Verified, transfer.Result.Hash);
+        Assert.Equal(QuiclyErrorCode.NoError, transfer.Result.Code);
 
         // A second outcome — a close path arriving after the completion — leaves the first one exactly as it was.
-        transfer.Finish(new BulkResult(BulkStatus.Failed, 0, BulkHashState.Mismatch, QuiclyErrorCode.BulkCanceled));
+        transfer.Finish(new BulkResult(BulkStatus.Failed, 0, QuiclyErrorCode.BulkCanceled));
         Assert.Equal(BulkStatus.Completed, transfer.Status);
         Assert.Equal(10, transfer.BytesTransferred);
-        Assert.Equal(BulkHashState.Verified, transfer.Result.Hash);
         Assert.Equal(QuiclyErrorCode.NoError, transfer.Result.Code);
 
         // A transfer with no engine behind it still records the request, so a later Cancel is inert rather than a throw.
@@ -216,10 +215,6 @@ public class BulkEngineTests
         // PROTOCOL.md §8: the channel's MaxMessageSize bounds one transfer's Length (channel 7 carries 4 096 bytes).
         Assert.Throws<ArgumentOutOfRangeException>(() => h.Client.BeginBulkSendAsync(new BulkDescriptor(7, 1, 1, 5000), new EmptySource()));
         Assert.Equal(1, BulkKit.Stats(h.Client, 7).TooLarge);
-
-        // A hash is 32 bytes or nothing.
-        Assert.Throws<ArgumentException>(
-            () => h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, 10) { Sha256 = new byte[31] }, new EmptySource()));
 
         using CancellationTokenSource canceled = new();
         await canceled.CancelAsync();

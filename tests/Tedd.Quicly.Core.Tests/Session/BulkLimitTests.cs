@@ -65,10 +65,7 @@ public class BulkLimitTests
             client: BulkKit.Quiet,
             server: BulkKit.Receiver(router));
 
-        BulkDescriptor descriptor = new(5, 7, 3, payload.Length, 0, 0, Compress: true)
-        {
-            Sha256 = BulkKit.Hash(payload),
-        };
+        BulkDescriptor descriptor = new(5, 7, 3, payload.Length, 0, 0, Compress: true);
         BulkTransfer transfer = await h.Client.BeginBulkSendAsync(descriptor, new MemorySource(payload));
         Assert.True(h.RunUntil(() => transfer.IsFinished, 60_000_000), "the object never crossed the hostile link");
 
@@ -80,8 +77,10 @@ public class BulkLimitTests
         Assert.Equal(payload, sink.Bytes);
         Assert.Equal(BulkStatus.Completed, sink.Result!.Value.Status);
 
-        // The whole object arrived in order, so this end verified the sender's hash rather than deferring it.
-        Assert.Equal(BulkHashState.Verified, sink.Result!.Value.Hash);
+        // Every range carried a checksum trailer and every one matched, which is what Completed means here.
+        Assert.Equal(QuiclyErrorCode.NoError, sink.Result!.Value.Code);
+        h.Server!.GetStatistics(out PeerStatistics serverStats);
+        Assert.Equal(0, serverStats.BulkChecksumFailures);
         Assert.Equal(PeerState.Connected, h.Client.State);
         Assert.Equal(PeerState.Connected, h.Server!.State);
     }
@@ -138,15 +137,12 @@ public class BulkLimitTests
             client: BulkKit.Quiet,
             server: BulkKit.Receiver(router));
 
-        BulkDescriptor descriptor = new(5, 1, 1, payload.Length)
-        {
-            Sha256 = BulkKit.Hash(payload),
-        };
+        BulkDescriptor descriptor = new(5, 1, 1, payload.Length);
         BulkTransfer transfer = await h.Client.BeginBulkSendAsync(descriptor, new MemorySource(payload));
         Assert.True(
             h.RunUntil(() => router.Accepted.Count == 1 && router.Sink<MemorySink>().BytesWritten > 0, 30_000_000),
             "nothing arrived");
-        Assert.True(router.Accepted[0].HasHash && router.Accepted[0].IsWholeObject, "the receiver was not hashing the object");
+        Assert.True(router.Accepted[0].HasChecksum && router.Accepted[0].IsWholeObject, "the receiver was not checksumming the range");
 
         Assert.True(h.Server!.CancelBulk(5, router.Accepted[0].TransferId));
         Assert.True(h.RunUntil(() => transfer.IsFinished, 30_000_000), "the sender was never told");
@@ -156,8 +152,8 @@ public class BulkLimitTests
         Assert.True(h.RunUntil(() => sink.IsFinished, 30_000_000), "the receiver never finished");
         Assert.Equal(BulkStatus.Canceled, sink.Result!.Value.Status);
 
-        // Nothing to verify: a transfer that did not complete reports no verdict on the sender's hash.
-        Assert.Equal(BulkHashState.None, sink.Result!.Value.Hash);
+        // Cancelled before its trailer, so nothing was ever checked and nothing is claimed.
+        Assert.NotEqual(QuiclyErrorCode.BulkChecksumFailed, sink.Result!.Value.Code);
         Assert.Equal(PeerState.Connected, h.Client.State);
         Assert.Equal(PeerState.Connected, h.Server!.State);
     }

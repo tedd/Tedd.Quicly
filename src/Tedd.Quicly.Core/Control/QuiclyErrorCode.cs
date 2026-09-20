@@ -36,4 +36,10 @@ public enum QuiclyErrorCode : ulong
 
     /// <summary>A bulk request was not authorised or named an invalid range.</summary>
     BulkRejected = 0x11,
+
+    /// <summary>
+    /// A bulk transfer's bytes did not match the checksum trailer its sender appended (PROTOCOL.md §3.3). The range is
+    /// the unit of recovery, so this fails one transfer and the object driver re-requests exactly that range.
+    /// </summary>
+    BulkChecksumFailed = 0x12,
 }

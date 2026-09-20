@@ -8,7 +8,7 @@ namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Bulk delivery over the simulated transport (PROTOCOL.md §3.3, docs/design/session-layer.md §7.7): byte-exact objects,
-/// chunked compression, the whole-object hash, the send window, resume, and real-time traffic that keeps flowing while a
+/// chunked compression, the per-range checksum, the send window, resume, and real-time traffic that keeps flowing while a
 /// large object crosses a bandwidth-capped link.
 /// </summary>
 public class BulkDeliveryTests
@@ -41,7 +41,7 @@ public class BulkDeliveryTests
         Assert.Equal(payload, sink.Bytes);
         Assert.True(sink.IsFinished);
         Assert.Equal(BulkStatus.Completed, sink.Result!.Value.Status);
-        Assert.Equal(BulkHashState.None, sink.Result!.Value.Hash);
+        Assert.Equal(QuiclyErrorCode.NoError, sink.Result!.Value.Code);
 
         // The descriptor the router saw is the one the sender declared.
         BulkTransferInfo info = router.Accepted[0];
@@ -150,68 +150,48 @@ public class BulkDeliveryTests
     }
 
     [Fact]
-    public async Task The_Whole_Object_Hash_Is_Verified_And_A_Mismatch_Fails_The_Transfer()
+    public async Task Every_Range_Carries_A_Checksum_Trailer_That_Verifies()
     {
         byte[] payload = Payload(50_000);
-        AcceptRouter good = AcceptRouter.Memory(payload.Length);
-        using (SessionHarness h = new(link: new LinkOptions { DelayMicros = 1_000 }, table: BulkTables.Main,
-            client: BulkKit.Quiet, server: BulkKit.Receiver(good)))
-        {
-            BulkDescriptor descriptor = new(5, 1, 1, payload.Length) { Sha256 = BulkKit.Hash(payload) };
-            BulkTransfer transfer = await h.Client.BeginBulkSendAsync(descriptor, new MemorySource(payload));
-            Assert.True(h.RunUntil(() => transfer.IsFinished), "the transfer did not finish");
-            Assert.Equal(BulkStatus.Completed, transfer.Status);
-            Assert.Equal(BulkHashState.Verified, good.Sink<MemorySink>().Result!.Value.Hash);
-        }
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
+        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 1_000 }, table: BulkTables.Main,
+            client: BulkKit.Quiet, server: BulkKit.Receiver(router));
 
-        AcceptRouter bad = AcceptRouter.Memory(payload.Length);
-        using (SessionHarness h = new(link: new LinkOptions { DelayMicros = 1_000 }, table: BulkTables.Main,
-            client: BulkKit.Quiet, server: BulkKit.Receiver(bad)))
-        {
-            // The sender's hash does not describe the bytes it sends: the receiver detects it at the object's last byte.
-            byte[] wrong = BulkKit.Hash(payload);
-            wrong[0] ^= 0xFF;
-            BulkDescriptor descriptor = new(5, 1, 1, payload.Length) { Sha256 = wrong };
-            BulkTransfer transfer = await h.Client.BeginBulkSendAsync(descriptor, new MemorySource(payload));
-            Assert.True(h.RunUntil(() => bad.Sinks.Count > 0 && bad.Sink<MemorySink>().IsFinished), "the receiver did not finish the transfer");
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, payload.Length), new MemorySource(payload));
+        Assert.True(h.RunUntil(() => transfer.IsFinished), "the transfer did not finish");
 
-            BulkResult result = bad.Sink<MemorySink>().Result!.Value;
-            Assert.Equal(BulkHashState.Mismatch, result.Hash);
-            Assert.Equal(BulkStatus.Failed, result.Status);
+        Assert.Equal(BulkStatus.Completed, transfer.Status);
+        Assert.True(router.Accepted[0].HasChecksum, "the range carried no checksum");
+        Assert.Equal(payload, router.Sink<MemorySink>().Bytes);
+        Assert.Equal(BulkStatus.Completed, router.Sink<MemorySink>().Result!.Value.Status);
 
-            // Every byte still arrived: the hash is an integrity check over the object, not a framing rule. The sender saw
-            // every byte accepted, so its own transfer completes normally — acting on the mismatch is the receiver's.
-            Assert.Equal(payload, bad.Sink<MemorySink>().Bytes);
-            Assert.True(h.RunUntil(() => transfer.IsFinished), "the sender's transfer did not finish");
-            Assert.Equal(BulkStatus.Completed, transfer.Status);
-        }
+        h.Server!.GetStatistics(out PeerStatistics statistics);
+        Assert.Equal(0, statistics.BulkChecksumFailures);
     }
 
     [Fact]
-    public async Task A_Partial_Range_Hands_The_Object_Hash_To_The_Application()
+    public async Task A_Resumed_Range_Is_Verified_Like_Any_Other()
     {
         byte[] payload = Payload(40_000);
         AcceptRouter router = AcceptRouter.Memory(payload.Length);
         using SessionHarness h = new(link: new LinkOptions { DelayMicros = 1_000 }, table: BulkTables.Main,
             client: BulkKit.Quiet, server: BulkKit.Receiver(router));
 
-        // The second half only: this end never sees the first byte, so it cannot verify a whole-object hash.
-        BulkDescriptor descriptor = new(5, 3, 1, payload.Length, payload.Length / 2, payload.Length / 2)
-        {
-            Sha256 = BulkKit.Hash(payload),
-        };
+        // The second half only. Under a whole-object hash this end could verify nothing, because it never sees the first
+        // byte; a per-range checksum covers exactly what arrived, so a resumed range is as checkable as any other.
+        BulkDescriptor descriptor = new(5, 3, 1, payload.Length, payload.Length / 2, payload.Length / 2);
         BulkTransfer transfer = await h.Client.BeginBulkSendAsync(descriptor, new MemorySource(payload));
         Assert.True(h.RunUntil(() => transfer.IsFinished), "the transfer did not finish");
 
         Assert.Equal(BulkStatus.Completed, transfer.Status);
         MemorySink sink = router.Sink<MemorySink>();
-        Assert.Equal(BulkHashState.DeferredToApplication, sink.Result!.Value.Hash);
         Assert.Equal(BulkStatus.Completed, sink.Result!.Value.Status);
         Assert.Equal(payload.Length / 2, sink.FirstOffset);
         Assert.Equal(payload.AsSpan(payload.Length / 2).ToArray(), sink.Bytes.AsSpan(payload.Length / 2).ToArray());
         Assert.False(router.Accepted[0].IsWholeObject);
-        Assert.True(router.Accepted[0].HasHash);
+        Assert.True(router.Accepted[0].HasChecksum);
     }
+
 
     [Fact]
     public async Task The_Send_Window_Bounds_The_Bytes_One_Transfer_Keeps_Outstanding()

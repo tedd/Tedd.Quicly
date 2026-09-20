@@ -138,6 +138,14 @@ internal sealed class StreamBuilder
         return Raw(b);
     }
 
+    /// <summary>The checksum trailer that follows a bulk body when the header promised one (PROTOCOL.md §3.3).</summary>
+    public StreamBuilder BulkChecksum(ulong checksum)
+    {
+        byte[] b = new byte[StreamFraming.BulkChecksumLength];
+        StreamFraming.WriteBulkChecksum(b, checksum);
+        return Raw(b);
+    }
+
     public StreamBuilder Chunk(int rawLength, byte[] bytes)
     {
         Span<byte> b = stackalloc byte[16];
@@ -193,8 +201,10 @@ internal static class StreamDriver
                         break;
                     case StreamEvent.BulkHeader:
                         BulkHeader b = parser.Bulk;
-                        ReadOnlySpan<byte> hash = b.Hash;
-                        log.Add($"B t={b.TransferId} o={b.ObjectId} v={b.ObjectVersion} total={b.TotalLength} off={b.Offset} len={b.Length} flags={b.Flags} hash={(b.HasHash ? Convert.ToHexString(hash) : "-")}");
+                        log.Add($"B t={b.TransferId} o={b.ObjectId} v={b.ObjectVersion} total={b.TotalLength} off={b.Offset} len={b.Length} flags={b.Flags}");
+                        break;
+                    case StreamEvent.BulkChecksum:
+                        log.Add($"C {parser.BulkChecksum:X16}");
                         break;
                     case StreamEvent.Error:
                         log.Add($"X {parser.Error}");

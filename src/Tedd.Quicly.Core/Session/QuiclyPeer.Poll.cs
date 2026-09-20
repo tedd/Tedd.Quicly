@@ -71,6 +71,10 @@ public sealed unsafe partial class QuiclyPeer
             }
 
             ProcessSignals(now);
+
+            // A bulk object's next range starts here: BeginBulkSendAsync is the game thread's, while the range that just
+            // finished completed on the thread pool and only raised the work signal that brought the host back.
+            PumpBulkObjects();
             long next = RunTimers(now);
             RaiseTransitions(holdClosed: true);
             if (_disposed)
@@ -582,6 +586,8 @@ public sealed unsafe partial class QuiclyPeer
             engines[i].OnPeerClosed();
         }
 
+        // After the engines, so the ranges they just finished are folded into their objects rather than counted as lost.
+        AbortBulkObjects(BulkStatus.Disconnected);
         DrainCompletions();
         ReleaseForeignSends();
         ReleaseAllReceived();
@@ -625,6 +631,7 @@ public sealed unsafe partial class QuiclyPeer
             engines[i].OnDisposing();
         }
 
+        AbortBulkObjects(BulkStatus.Disconnected);
         _core.Completions.CompleteAll(Tedd.Quicly.Core.Threading.DeliveryStatus.Disconnected);
     }
 

@@ -143,8 +143,11 @@ public sealed unsafe partial class WebTransportTransport
             return;
         }
 
-        // A datagram for a session we do not have is dropped, never buffered (PROTOCOL.md §5).
-        if (!_sessionIdKnown || streamId != _sessionId)
+        // A datagram for a session we do not have is dropped, never buffered (PROTOCOL.md §5). A session whose id is
+        // known but which is not established yet is one we do not have: the id is read off the CONNECT request, well
+        // before the peer's SETTINGS have arrived, and Core has not been told the transport is connected. Unlike a
+        // stream there is nothing to hold a datagram in — they are droppable by definition — so it is dropped.
+        if (!_sessionIdKnown || streamId != _sessionId || !IsSessionEstablished)
         {
             Interlocked.Increment(ref _datagramsDroppedForSession);
             return;

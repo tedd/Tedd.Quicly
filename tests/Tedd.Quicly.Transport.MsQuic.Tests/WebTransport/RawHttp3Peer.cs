@@ -111,6 +111,15 @@ internal sealed unsafe class RawHttp3Peer : ITransportSink, IDisposable
     public void OnConnected(in TransportConnectedInfo info)
     {
         if (!SendSettings && ControlStreamOverride is null) return;
+        SendSettingsNow();
+    }
+
+    /// <summary>
+    /// Opens the control stream and sends SETTINGS, whatever <see cref="SendSettings"/> says. Lets a test hold SETTINGS
+    /// back and send them later, which is the window in which a peer may open streams optimistically.
+    /// </summary>
+    public void SendSettingsNow()
+    {
         ITransport transport = Transport!;
         if (transport.OpenStream(StreamKind.Unidirectional, 1, 32767, out TransportStreamId id) != TransportStatus.Success) return;
         ControlStream = id;

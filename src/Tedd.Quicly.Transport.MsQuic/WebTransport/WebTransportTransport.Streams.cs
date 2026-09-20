@@ -46,8 +46,21 @@ public sealed unsafe partial class WebTransportTransport
         public StreamKind Kind;
         public bool Local;
 
+        /// <summary>The stream's id, so a deferred stream can be resumed without a reverse lookup.</summary>
+        public TransportStreamId Id;
+
         /// <summary>Core has seen <see cref="ITransportSink.OnPeerStreamStarted"/> (or opened the stream itself).</summary>
         public bool Exposed;
+
+        /// <summary>
+        /// A peer data stream of this session that arrived before the session was established. Its preamble is stripped
+        /// and the rest is left unread on the inner transport until <see cref="ITransportSink.OnConnected"/> has been
+        /// raised, so nothing is buffered here and nothing reaches Core out of order.
+        /// </summary>
+        public bool Deferred;
+
+        /// <summary>The deferred stream's preamble carried the FIN, which has to be replayed when it is exposed.</summary>
+        public bool DeferredFin;
 
         /// <summary>Preamble sends whose completions the carrier still has to swallow (they are not Core's).</summary>
         public int PreambleSendsPending;
@@ -139,6 +152,7 @@ public sealed unsafe partial class WebTransportTransport
             }
 
             slot.Generation = id.Generation;
+            slot.Id = id;
             slot.Role = role;
             slot.Kind = kind;
             slot.Local = local;
@@ -151,6 +165,8 @@ public sealed unsafe partial class WebTransportTransport
     {
         slot.Role = StreamRole.Free;
         slot.Exposed = false;
+        slot.Deferred = false;
+        slot.DeferredFin = false;
         slot.PreambleSendsPending = 0;
         slot.PreambleQueued = false;
         slot.PreambleBytes = 0;
@@ -423,6 +439,10 @@ public sealed unsafe partial class WebTransportTransport
         ITransportSink? sink = _sink;
         if (sink is null) return ReceiveResult.Consumed(TotalLength(segments));
 
+        // A stream held back until the session exists: leave its bytes where they are rather than showing Core a stream
+        // it has not been told about. AdoptRole already pended it; this only catches an indication already in flight.
+        if (!slot.Exposed) return ReceiveResult.PendingAfter(0);
+
         ReceiveResult result = sink.OnStreamReceived(id, segments, absoluteOffset - (ulong)slot.PreambleBytes, fin);
         return result;
     }
@@ -531,6 +551,16 @@ public sealed unsafe partial class WebTransportTransport
             return AdoptRole(slot, id, StreamRole.Discard, signalLength + sessionLength, buffered, copied, fin, exposeAsData: false);
         }
 
+        // The id is known as soon as the CONNECT request is seen, which is before the peer's SETTINGS have arrived and
+        // the session has been established. A peer may open streams optimistically in that window, and they are this
+        // session's, so they are neither reset nor delivered: the preamble is taken and the rest is left unread on the
+        // inner transport until OnConnected has been raised. Nothing is buffered, and Core sees the stream in order.
+        if (!IsSessionEstablished)
+        {
+            return AdoptRole(
+                slot, id, StreamRole.Data, signalLength + sessionLength, buffered, copied, fin, exposeAsData: false, defer: true);
+        }
+
         return AdoptRole(slot, id, StreamRole.Data, signalLength + sessionLength, buffered, copied, fin, exposeAsData: true);
     }
 
@@ -538,7 +568,8 @@ public sealed unsafe partial class WebTransportTransport
     /// Settles a peer stream's role once its preamble is complete: only the preamble bytes of this indication are
     /// consumed, so the transport re-indicates the data with the stream already in its final state.
     /// </summary>
-    private ReceiveResult AdoptRole(StreamSlot slot, TransportStreamId id, StreamRole role, int preambleLength, int buffered, int copied, bool fin, bool exposeAsData)
+    private ReceiveResult AdoptRole(
+        StreamSlot slot, TransportStreamId id, StreamRole role, int preambleLength, int buffered, int copied, bool fin, bool exposeAsData, bool defer = false)
     {
         // How much of THIS indication the preamble took; earlier indications already paid for `buffered`.
         int consumedHere = preambleLength - buffered;
@@ -550,8 +581,13 @@ public sealed unsafe partial class WebTransportTransport
             slot.Role = role;
             slot.PreambleBytes = preambleLength;
             slot.Exposed = exposeAsData;
+            slot.Deferred = defer;
+            slot.DeferredFin = defer && consumedHere == copied && fin;
             if (role is StreamRole.PeerControl or StreamRole.Connect) slot.Reader = new Http3FrameReader((ulong)MaxFrameLengthFor(role));
         }
+
+        // Stop the inner transport indicating this stream; ReleaseDeferredStreams resumes it once the session exists.
+        if (defer) return ReceiveResult.PendingAfter(consumedHere);
 
         if (exposeAsData)
         {
@@ -567,6 +603,49 @@ public sealed unsafe partial class WebTransportTransport
         }
 
         return ReceiveResult.Consumed(consumedHere);
+    }
+
+    /// <summary>
+    /// Hands over the peer data streams that arrived before the session existed, in the order they were adopted, and
+    /// lets the inner transport indicate their bytes again. Called once, straight after
+    /// <see cref="ITransportSink.OnConnected"/>, so Core learns of these streams after the connection and never before.
+    /// </summary>
+    private void ReleaseDeferredStreams()
+    {
+        ITransportSink? sink = _sink;
+        ITransport? inner = _inner;
+        if (sink is null || inner is null) return;
+
+        StreamSlot?[] slots = _streamSlots;
+        for (int i = 0; i < slots.Length; i++)
+        {
+            StreamSlot? slot = Volatile.Read(ref slots[i]);
+            if (slot is null) continue;
+
+            TransportStreamId id;
+            StreamKind kind;
+            bool fin;
+            lock (_streamLock)
+            {
+                if (!slot.Deferred || slot.Role != StreamRole.Data) continue;
+                slot.Deferred = false;
+                slot.Exposed = true;
+                id = slot.Id;
+                kind = slot.Kind;
+                fin = slot.DeferredFin;
+                slot.DeferredFin = false;
+            }
+
+            sink.OnPeerStreamStarted(id, kind);
+            if (fin)
+            {
+                // The preamble indication carried the FIN, so there is nothing left to re-indicate.
+                sink.OnStreamReceived(id, default, 0, true);
+                continue;
+            }
+
+            inner.ResumeStreamReceive(id, 0);
+        }
     }
 
     /// <summary>Copies up to <paramref name="destination"/>.Length bytes from the front of the segment array.</summary>

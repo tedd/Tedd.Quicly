@@ -314,25 +314,31 @@ internal sealed class BulkObjectReceiver : IBulkRouter
             return false;
         }
 
-        long length = decision.ExpectedLength > 0 ? decision.ExpectedLength : info.TotalLength - info.Offset;
-        if (length <= 0 || info.Offset + length > info.TotalLength || info.Length > length)
+        // The object's extent is the object's, never the first-arriving range's. Ranges are carried on separate QUIC
+        // streams and nothing orders their headers, so anchoring on info.Offset would reject every range below whichever
+        // one won the race and call the object complete at that range's end — a truncated object reported Completed.
+        long offset = decision.ExpectedOffset;
+        long length = decision.ExpectedLength > 0 ? decision.ExpectedLength : info.TotalLength - offset;
+        if (offset < 0 || length <= 0 || offset > info.TotalLength || offset + length > info.TotalLength
+            || info.Offset < offset || info.Offset + info.Length > offset + length)
         {
-            // The application named a range that does not even contain the one that arrived; it has a sink out, so it gets
+            // The application named a window that does not contain the range that arrived; it has a sink out, so it gets
             // a Finish rather than silence.
-            BeginSlot(slot, in info, length, decision.Sink, decision.Progress);
+            BeginSlot(slot, in info, offset, length, decision.Sink, decision.Progress);
             FinishObject(slot, BulkStatus.Failed, QuiclyErrorCode.ProtocolViolation);
             slot.RejectCode = QuiclyErrorCode.ProtocolViolation;
             return false;
         }
 
-        BeginSlot(slot, in info, length, decision.Sink, decision.Progress);
+        BeginSlot(slot, in info, offset, length, decision.Sink, decision.Progress);
         return true;
     }
 
     /// <summary>Starts an object in <paramref name="slot"/> and counts it (under the lifecycle lock).</summary>
-    private void BeginSlot(ObjectSlot slot, in BulkTransferInfo info, long length, IBulkObjectSink sink, BulkObjectProgressCallback? progress)
+    private void BeginSlot(
+        ObjectSlot slot, in BulkTransferInfo info, long offset, long length, IBulkObjectSink sink, BulkObjectProgressCallback? progress)
     {
-        slot.Begin(in info, length, sink, progress);
+        slot.Begin(in info, offset, length, sink, progress);
         slot.LastActivity = _clock.NowMicros;
         Volatile.Write(ref _live, _live + 1);
     }
@@ -491,14 +497,14 @@ internal sealed class BulkObjectReceiver : IBulkRouter
         /// <summary>Clock micros of the last range this object took or finished; what <see cref="SweepIdle"/> measures.</summary>
         public long LastActivity { get; set; }
 
-        public void Begin(in BulkTransferInfo info, long length, IBulkObjectSink sink, BulkObjectProgressCallback? progress)
+        public void Begin(in BulkTransferInfo info, long offset, long length, IBulkObjectSink sink, BulkObjectProgressCallback? progress)
         {
             InUse = true;
             Finished = false;
             Channel = info.Channel;
             ObjectId = info.ObjectId;
             ObjectVersion = info.ObjectVersion;
-            Offset = info.Offset;
+            Offset = offset;
             Length = length;
             Sink = sink;
             Progress = progress;

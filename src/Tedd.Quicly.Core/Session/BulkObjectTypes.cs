@@ -194,7 +194,11 @@ public readonly struct BulkObjectInfo
     /// <summary>Declared size of the whole object (untrusted: nothing is allocated at this size).</summary>
     public long TotalLength { get; init; }
 
-    /// <summary>First object byte the peer's first range carried, which is where this object's assembly starts.</summary>
+    /// <summary>
+    /// First object byte of whichever range arrived first. Informational only: ranges travel on separate streams and
+    /// arrive in no order, so this is <em>not</em> where the object starts. The object's extent comes from
+    /// <see cref="BulkObjectReceiveDecision.Accept"/> / <see cref="BulkObjectReceiveDecision.AcceptRange"/>.
+    /// </summary>
     public long Offset { get; init; }
 
     /// <summary>Whether the sender is appending a checksum to each range, so corrupt ranges fail instead of assembling.</summary>
@@ -226,9 +230,10 @@ public interface IBulkObjectSink
 /// <summary>What the object router does with a bulk object the peer started sending.</summary>
 public readonly struct BulkObjectReceiveDecision
 {
-    private BulkObjectReceiveDecision(IBulkObjectSink? sink, long length, BulkObjectProgressCallback? progress, QuiclyErrorCode code)
+    private BulkObjectReceiveDecision(IBulkObjectSink? sink, long offset, long length, BulkObjectProgressCallback? progress, QuiclyErrorCode code)
     {
         Sink = sink;
+        ExpectedOffset = offset;
         ExpectedLength = length;
         Progress = progress;
         RejectCode = code;
@@ -237,7 +242,10 @@ public readonly struct BulkObjectReceiveDecision
     /// <summary>The application's target, or <see langword="null"/> when the object is refused.</summary>
     public IBulkObjectSink? Sink { get; }
 
-    /// <summary>Bytes the object's range holds, or 0 for "to the end of the object".</summary>
+    /// <summary>First object byte this end expects; 0 for a whole-object send.</summary>
+    public long ExpectedOffset { get; }
+
+    /// <summary>Bytes expected from <see cref="ExpectedOffset"/>, or 0 for "to the end of the object".</summary>
     public long ExpectedLength { get; }
 
     /// <summary>An optional progress callback, invoked on the transport thread.</summary>
@@ -249,12 +257,12 @@ public readonly struct BulkObjectReceiveDecision
     /// <summary>The RESET_STREAM / STOP_SENDING code of a refusal.</summary>
     public QuiclyErrorCode RejectCode { get; }
 
-    /// <summary>Accepts the object and writes its bytes to <paramref name="sink"/>.</summary>
+    /// <summary>Accepts the object from its start and writes its bytes to <paramref name="sink"/>.</summary>
     /// <param name="sink">The target.</param>
     /// <param name="expectedLength">
-    /// Bytes the object's range holds. 0 (the default) means "from <see cref="BulkObjectInfo.Offset"/> to the end of the
-    /// object", which is what a whole-object send carries; pass the length explicitly when this end asked for a sub-range
-    /// with <see cref="QuiclyPeer.RequestBulk"/>, so the driver knows when the object is complete.
+    /// Bytes expected from object offset 0. 0 (the default) means "the whole object", which is what a whole-object send
+    /// carries. Use <see cref="AcceptRange"/> when this end asked for a sub-range with
+    /// <see cref="QuiclyPeer.RequestBulk"/> and the object therefore does not start at 0.
     /// </param>
     /// <param name="progress">An optional progress callback (transport thread).</param>
     /// <exception cref="ArgumentNullException"><paramref name="sink"/> is null.</exception>
@@ -263,12 +271,37 @@ public readonly struct BulkObjectReceiveDecision
     {
         ArgumentNullException.ThrowIfNull(sink);
         ArgumentOutOfRangeException.ThrowIfNegative(expectedLength);
-        return new BulkObjectReceiveDecision(sink, expectedLength, progress, QuiclyErrorCode.NoError);
+        return new BulkObjectReceiveDecision(sink, 0, expectedLength, progress, QuiclyErrorCode.NoError);
+    }
+
+    /// <summary>
+    /// Accepts a known sub-range of the object — what this end asked for with <see cref="QuiclyPeer.RequestBulk"/> — and
+    /// writes its bytes to <paramref name="sink"/>.
+    /// </summary>
+    /// <remarks>
+    /// The window has to be named rather than inferred. Ranges of one object travel on separate QUIC streams and their
+    /// headers arrive in no particular order, so the first one through the door says nothing about where the object starts
+    /// or how long it is: a window taken from it would reject the ranges below it and call the object complete at the end
+    /// of whichever range happened to arrive first.
+    /// </remarks>
+    /// <param name="sink">The target.</param>
+    /// <param name="expectedOffset">First object byte this end expects.</param>
+    /// <param name="expectedLength">Bytes expected from <paramref name="expectedOffset"/>; 0 means "to the end of the object".</param>
+    /// <param name="progress">An optional progress callback (transport thread).</param>
+    /// <exception cref="ArgumentNullException"><paramref name="sink"/> is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="expectedOffset"/> or <paramref name="expectedLength"/> is negative.</exception>
+    public static BulkObjectReceiveDecision AcceptRange(
+        IBulkObjectSink sink, long expectedOffset, long expectedLength, BulkObjectProgressCallback? progress = null)
+    {
+        ArgumentNullException.ThrowIfNull(sink);
+        ArgumentOutOfRangeException.ThrowIfNegative(expectedOffset);
+        ArgumentOutOfRangeException.ThrowIfNegative(expectedLength);
+        return new BulkObjectReceiveDecision(sink, expectedOffset, expectedLength, progress, QuiclyErrorCode.NoError);
     }
 
     /// <summary>Refuses the object; the range's stream is reset with <paramref name="code"/>.</summary>
     /// <param name="code">The reset code.</param>
-    public static BulkObjectReceiveDecision Reject(QuiclyErrorCode code = QuiclyErrorCode.BulkRejected) => new(null, 0, null, code);
+    public static BulkObjectReceiveDecision Reject(QuiclyErrorCode code = QuiclyErrorCode.BulkRejected) => new(null, 0, 0, null, code);
 }
 
 /// <summary>

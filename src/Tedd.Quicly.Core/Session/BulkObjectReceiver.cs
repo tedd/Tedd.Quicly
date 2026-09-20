@@ -34,9 +34,10 @@ internal sealed class BulkObjectReceiver : IBulkRouter
     private const int MinRanges = 16;
 
     /// <summary>
-    /// How quiet an ended object's identity has to go before it may begin again. It only has to outlast the ranges of the
-    /// attempt that just ended — streams the peer had already opened, or opens before it hears the object is over — which
-    /// is a round trip's worth of skew, not a timeout's.
+    /// How long an ended object's identity is held before it may begin again. It only has to outlast the ranges of the
+    /// attempt that ended — streams the peer had already opened, or opens before it hears the object is over — which is a
+    /// round trip's worth of skew, not a timeout's. It is a fixed window from the end, so an object can always be sent
+    /// again under the same identity after it.
     /// </summary>
     private const long TombstoneQuietMicros = 2_000_000;
 
@@ -441,10 +442,14 @@ internal sealed class BulkObjectReceiver : IBulkRouter
     }
 
     /// <summary>
-    /// Whether <paramref name="info"/> names an object that already ended and has not gone quiet since (under the
-    /// lifecycle lock). A hit refreshes the identity, so a long tail of strays keeps it refused for as long as it lasts
-    /// and a genuine second attempt is only held off until they stop.
+    /// Whether <paramref name="info"/> names an object that ended too recently for this to be anything but its tail
+    /// (under the lifecycle lock).
     /// </summary>
+    /// <remarks>
+    /// The window runs from when the object ended and a hit does not extend it. Extending it on every stray would let a
+    /// sender that retries an object inside the window refresh the tombstone with its own attempts and keep that identity
+    /// dead for good.
+    /// </remarks>
     private bool IsDead(in BulkTransferInfo info, long now)
     {
         for (int i = 0; i < _deadSet.Length; i++)
@@ -456,12 +461,11 @@ internal sealed class BulkObjectReceiver : IBulkRouter
 
             if (now - _deadSeen[i] > TombstoneQuietMicros)
             {
-                // Nothing has arrived under this identity in long enough that it cannot be the old attempt's tail.
+                // Long enough since it ended that its ranges cannot still be turning up: this is a new attempt.
                 _deadSet[i] = false;
                 return false;
             }
 
-            _deadSeen[i] = now;
             return true;
         }
 

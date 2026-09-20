@@ -459,7 +459,9 @@ One listener serving both `quicly/1` and `h3` on the same UDP port (a separate M
   `H3_DATAGRAM` leaves the session with streams only, which Core hears as the datagram capability going away.
 * Limits: ≤ 16 concurrent request streams, capsules ≤ 32 KiB, GOAWAY on shutdown, unknown frame types,
   stream types and capsules ignored (RFC 9114 §9), streams/datagrams for an unknown session id are reset/dropped
-  immediately (never buffered).
+  immediately (never buffered). A session whose id is known but which is not established yet counts as unknown for
+  datagrams; its streams are held instead — the preamble is taken and the rest left unread on the transport until
+  `OnConnected` — because a peer may legitimately open one as soon as it has sent CONNECT.
 * Session establishment: Extended CONNECT (`:method=CONNECT`, `:protocol=webtransport`, `:scheme=https`,
   `:authority`, `:path` = `WebTransportOptions.Path` (default `/quicly`), `origin` — checked according to
   `WebTransportOptions.OriginPolicy`) → `:status 200`. The CONNECT stream stays open for the session and its QUIC
@@ -467,6 +469,10 @@ One listener serving both `quicly/1` and `h3` on the same UDP port (a separate M
 * Datagrams: RFC 9297 — `quarterStreamId varint` (= CONNECT stream id / 4) prefix, then the QUICLY frame.
 * Unidirectional streams: `0x54 varint`, `sessionId varint`, then the QUICLY stream. Bidirectional streams:
   `0x41 varint`, `sessionId varint`.
+* Capsules: after the header section the CONNECT stream carries the Capsule Protocol, which is the HTTP message's
+  *content* — so in HTTP/3 it is the payload of `DATA` frames (RFC 9297 §3.2, §3.5), never bare frames on the stream.
+  One `DATA` frame may carry several capsules and one capsule may span several. A control frame on the CONNECT stream
+  is `H3_FRAME_UNEXPECTED`; unknown frames and capsules are ignored (RFC 9114 §9).
 * Session close: `CLOSE_WEBTRANSPORT_SESSION` capsule (0x2843) on the CONNECT stream *and* a QUIC close whose code is
   the application code mapped into the WebTransport range of the HTTP/3 error space
   (`h3 = 0x52e4a40fa8db + n + floor(n / 0x1e)`, draft §4.3). Either signal alone tells the peer which §6 code

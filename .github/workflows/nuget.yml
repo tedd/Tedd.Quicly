@@ -1,8 +1,12 @@
 name: NuGet
 
 # Every push to `deploy` gives all packages the next automatic version and pushes them to
-# nuget.org. The publish job builds the solution as part of packing and does not wait for the
-# tests, which run in their own report-only job. See docs/DEVELOPMENT.md, "Releasing".
+# nuget.org. The publish job builds the solution as part of packing.
+#
+# There is deliberately no test job here. It used to run the whole suite on a Windows runner with a
+# 40-minute timeout while gating nothing, which bought no safety and cost up to 80 billable minutes
+# on every deploy. What reaches `deploy` has already been through CI on `main` and, before that, the
+# local per-project runs that are this project's real gate (docs/DEVELOPMENT.md).
 on:
   push:
     branches: [deploy]
@@ -11,35 +15,9 @@ permissions:
   contents: read
 
 jobs:
-  # Report only. The suite does not finish reliably on the GitHub runner yet (a Core.Tests run
-  # hangs, a few tests fail), so this job neither gates the publish nor may run without a limit.
-  test:
-    runs-on: windows-latest
-    continue-on-error: true
-    timeout-minutes: 40
-
-    steps:
-      - uses: actions/checkout@v5
-
-      # Keep the SDK in step with global.json. The net10.0 tests need the .NET 10 runtime.
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: |
-            10.0.x
-            11.0.100-preview.7.26381.103
-
-      - name: Restore
-        run: dotnet restore Tedd.Quicly.slnx
-
-      - name: Build
-        run: dotnet build Tedd.Quicly.slnx --no-restore --configuration Release
-
-      - name: Test
-        run: dotnet test Tedd.Quicly.slnx --no-build --configuration Release
-
   publish:
     runs-on: windows-latest
+    timeout-minutes: 30
     # One publish at a time; a newer push waits for the one in flight instead of cancelling it.
     concurrency:
       group: nuget-publish

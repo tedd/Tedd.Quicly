@@ -58,11 +58,19 @@ Every benchmark change is recorded in `docs/benchmarks/<area>.md` with hypothesi
 ## Releasing
 
 Pushing to the `deploy` branch runs `.github/workflows/nuget.yml`: it packs every `src/` project, which builds the
-solution, and pushes the packages and their symbol packages to nuget.org; a failed build stops the publish. The
-tests run in a separate job that reports but does not gate the publish, because the suite does not finish reliably
-on the GitHub runner yet (a `Core.Tests` run hangs and a few tests fail there): look at that job before you trust a
-release. Ordinary builds and pull requests are covered by `.github/workflows/ci.yml`; nothing is published from
-them.
+solution, and pushes the packages and their symbol packages to nuget.org; a failed build stops the publish. Ordinary
+builds and pull requests are covered by `.github/workflows/ci.yml`; nothing is published from them.
+
+**Nothing is tested on the way to nuget.org.** The publish workflow used to carry a report-only test job that ran the
+whole suite on a Windows runner — it gated nothing, it hung often enough that it needed a 40-minute cap, and Windows
+minutes bill at twice the Linux rate, so it cost up to 80 billable minutes per deploy for no safety at all. It is gone.
+What protects a release is, in order: the local per-project runs (the real gate — a full-solution run flakes on shared
+ports, the machine certificate store and HttpListener prefixes), then CI on `main`. Do not push to `deploy` from a tree
+you have not run the suites on.
+
+CI itself is kept cheap on purpose: it skips pushes that only touch docs, the site or markdown; a newer push cancels the
+run it superseded; it tests one target framework rather than both; and every job has an explicit `timeout-minutes`,
+because without one a hung run bills GitHub's six-hour default.
 
 * **Version.** `Directory.Build.props` holds the base version, `Major.Minor.Patch`. Every package is published as
   `Major.Minor.(Patch + workflow run number)`, so each push to `deploy` gets a higher version than the last and a

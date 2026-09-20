@@ -176,25 +176,191 @@ public class PollAllTests
             $"the value was dispatched {(f.Clock.NowMicros - arrived) / 1000} ms after it arrived (received {received.Count})");
         Assert.False(IsMarked(f.Server, peer.Index), "PollAll re-marked the peer for work only a Flush does");
 
-        // The ack it owes is pending work, but only a Flush sends it: further PollAll calls leave the peer alone.
+        // The ack it owes is work only a Flush does: pending, but PollAll does not poll the peer again for it. The Poll brought
+        // the peer's flush deadline forward to AckDelay (5 ms) later, so without a FlushAll from the host PollAll flushes
+        // the peer then — and not before.
         Assert.True(peer.HasPendingWork);
+        Assert.Equal(arrived + 5_000, peer.NextFlushDeadlineMicros);
         f.Server.GetStatistics(out ServerStatistics before);
-        for (int i = 0; i < 5; i++)
+        long flushed = f.Server.PeersFlushed;
+        for (int i = 0; i < 4; i++)
         {
+            f.Network.Advance(1_000);
             f.Server.PollAll();
         }
 
         f.Server.GetStatistics(out ServerStatistics after);
         Assert.Equal(before.PeersPolled, after.PeersPolled);
+        Assert.Equal(flushed, f.Server.PeersFlushed);
+        Assert.True(peer.HasPendingWork);
 
-        f.Server.FlushAll();
-        Assert.False(peer.HasPendingWork);
+        f.Network.Advance(1_000);
+        f.Server.PollAll();
+        Assert.Equal(flushed + 1, f.Server.PeersFlushed);
+        Assert.False(peer.HasPendingWork, "the ack the value is owed is still waiting for a flush");
+
         for (int i = 0; i < 3; i++)
         {
             f.Step(1_000); // the ack reaches the client, whose next pass completes the value
         }
 
         Assert.Equal(DeliveryStatus.Delivered, client.GetDeliveryStatus(sent.Token));
+    }
+
+    /// <summary>
+    /// A range request reaching an idle peer is work only the provider's next scheduler pass does: the peer's work signal
+    /// marks its slot, <see cref="QuiclyPeer.HasPendingWork"/> confirms it (so PollAll polls the peer instead of probing it
+    /// on every call until its next ping), and the Poll brings the peer's flush deadline forward, so a host that calls nothing
+    /// but PollAll still starts the transfer at once and delivers a small object.
+    /// </summary>
+    [Fact]
+    public async Task A_Bulk_Range_Request_Reaching_An_Idle_Peer_Is_Served_By_PollAll_Alone()
+    {
+        ChannelTable table = ChannelTable.Create()
+            .Add(2, "state", ChannelMode.UnreliableUnordered)
+            .Add(5, "world", ChannelMode.Bulk, o => o.Priority = 0)
+            .Build();
+        byte[] payload = new byte[2_000];
+        Random.Shared.NextBytes(payload);
+        ArrayProvider provider = new(payload);
+        await using ServerFixture f = new(o =>
+        {
+            o.Channels = table;
+            o.PeerOptions.BulkProvider = provider;
+            o.PeerOptions.BulkAuthorizer = provider;
+        });
+        ArraySink sink = new(payload.Length);
+        f.ConfigureClient = o => o.BulkRouter = new SingleRouter(sink);
+        QuiclyPeer client = f.Connect(table: table);
+        Assert.True(f.RunUntil(() => client.State == PeerState.Connected), "not admitted: " + client.State);
+        QuiclyPeer peer = f.ServerPeerOf(client);
+        f.Run(4_000_000, step: 10_000); // the fast-lock pings settle; from here the peer only has its 1 s pings
+        Assert.True(f.RunUntil(() =>
+        {
+            long untilPing = peer.NextPollDeadlineMicros - f.Clock.NowMicros;
+            return untilPing > 300_000 && untilPing < 700_000 && !IsMarked(f.Server, peer.Index) && !peer.HasPendingWork;
+        }, 3_000_000, step: 10_000), "the slot never settled");
+
+        client.RequestBulk(new BulkRangeRequest(5, 1, 1, 0, payload.Length));
+        client.Flush();
+        f.Network.Advance(1_000); // the request reaches the server peer; nothing on the server runs
+        Assert.True(peer.HasPendingWork, "the range request is not pending work");
+
+        long arrived = f.Clock.NowMicros;
+        f.Server.PollAll();
+        Assert.Equal(1, provider.Requests);
+        Assert.False(IsMarked(f.Server, peer.Index), "PollAll left the peer marked");
+
+        // No FlushAll at all: the host only polls.
+        while (sink.Result is null && f.Clock.NowMicros - arrived < 2_000_000)
+        {
+            f.Step(1_000);
+            f.Server.PollAll();
+        }
+
+        Assert.True(sink.Result is { Status: BulkStatus.Completed },
+            $"the transfer did not complete with PollAll alone ({(f.Clock.NowMicros - arrived) / 1000} ms, {sink.Written} bytes)");
+        Assert.True(f.Clock.NowMicros - arrived < 100_000, $"the transfer took {(f.Clock.NowMicros - arrived) / 1000} ms");
+        Assert.Equal(payload, sink.Bytes);
+    }
+
+    /// <summary>
+    /// A peer whose flush deadline is due is flushed by PollAll on its own. The table has a Bulk channel, so every peer's
+    /// flush gate is off and a FlushAll would flush all three: PollAll must not turn one due ack into a flush of every peer.
+    /// </summary>
+    [Fact]
+    public async Task PollAll_Flushes_Only_The_Peers_Whose_Flush_Deadline_Is_Due()
+    {
+        ChannelTable table = ChannelTable.Create()
+            .Add(2, "state", ChannelMode.UnreliableUnordered)
+            .Add(5, "world", ChannelMode.Bulk, o => o.Priority = 0)
+            .Add(6, "latest", ChannelMode.ReliableLatest)
+            .Build();
+        await using ServerFixture f = new(o => o.Channels = table);
+        int received = 0;
+        f.Server.PeerAdmitted += peer => peer.RegisterHandler(6, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
+        QuiclyPeer[] clients = [f.Connect(table: table), f.Connect(table: table), f.Connect(table: table)];
+        Assert.True(f.RunUntil(() => clients.All(c => c.State == PeerState.Connected)), "not admitted");
+        QuiclyPeer[] peers = clients.Select(f.ServerPeerOf).ToArray();
+        f.Run(4_000_000, step: 10_000);
+        Assert.True(f.RunUntil(() => peers.All(p =>
+        {
+            long untilPing = p.NextPollDeadlineMicros - f.Clock.NowMicros;
+            return untilPing > 100_000 && !IsMarked(f.Server, p.Index) && !p.HasPendingWork && p.NextFlushDeadlineMicros == long.MaxValue;
+        }), 3_000_000, step: 10_000), "the peers never settled");
+
+        SendResult sent = clients[1].SendCopy(new SendHeader(6, 42), [1, 2, 3], SendOptions.Tracked);
+        clients[1].Flush();
+        f.Network.Advance(1_000);
+        long flushed = f.Server.PeersFlushed;
+        f.Server.PollAll();
+        Assert.Equal(1, received);
+        Assert.Equal(flushed, f.Server.PeersFlushed); // the ack may wait AckDelay for the host's own flush
+
+        f.Network.Advance(5_000);
+        f.Server.PollAll();
+        Assert.Equal(flushed + 1, f.Server.PeersFlushed);
+        Assert.False(peers[1].HasPendingWork, "the ack was not flushed");
+
+        for (int i = 0; i < 3; i++)
+        {
+            f.Step(1_000);
+        }
+
+        Assert.Equal(DeliveryStatus.Delivered, clients[1].GetDeliveryStatus(sent.Token));
+    }
+
+    /// <summary>Serves one in-memory object for any request, and authorises every request.</summary>
+    private sealed class ArrayProvider(byte[] bytes) : IBulkProvider, IBulkAuthorizer
+    {
+        public int Requests;
+
+        public bool Authorize(in BulkRequestInfo request) => true;
+
+        public bool TryGetObject(in BulkRequestInfo request, out BulkDescriptor descriptor, out IBulkSource? source)
+        {
+            Requests++;
+            descriptor = new BulkDescriptor(request.Channel, request.ObjectId, request.ObjectVersion, bytes.Length);
+            source = new ArraySource(bytes);
+            return true;
+        }
+    }
+
+    private sealed class ArraySource(byte[] bytes) : IBulkSource
+    {
+        public int Read(long offset, Span<byte> destination)
+        {
+            if (offset >= bytes.Length)
+            {
+                return 0;
+            }
+
+            int take = (int)Math.Min(destination.Length, bytes.Length - offset);
+            bytes.AsSpan((int)offset, take).CopyTo(destination);
+            return take;
+        }
+    }
+
+    private sealed class ArraySink(int length) : IBulkSink
+    {
+        public byte[] Bytes { get; } = new byte[length];
+
+        public long Written;
+
+        public BulkResult? Result;
+
+        public void Write(long objectOffset, ReadOnlySpan<byte> data)
+        {
+            data.CopyTo(Bytes.AsSpan((int)objectOffset));
+            Written += data.Length;
+        }
+
+        public void Finish(in BulkResult result) => Result = result;
+    }
+
+    private sealed class SingleRouter(IBulkSink sink) : IBulkRouter
+    {
+        public BulkReceiveDecision SelectTarget(in BulkTransferInfo info) => BulkReceiveDecision.Accept(sink);
     }
 
     /// <summary>

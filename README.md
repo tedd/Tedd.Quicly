@@ -2,6 +2,8 @@
 
 Efficient game communication protocol and library for .NET, built directly on QUIC (MsQuic).
 
+Project site: [tedd.no/Tedd.QUICLY](https://tedd.no/Tedd.QUICLY/)
+
 QUICLY gives a game the transport primitives it actually needs — on one UDP port, with one API:
 
 | Need | Channel mode | Under the hood |

@@ -18,6 +18,9 @@ public sealed partial class QuiclyServer
     private long _peersDrained;
     private long _earliestFlushDeadline = long.MaxValue;
 
+    /// <summary>The tick the host last passed to <see cref="FlushAll"/>, which <see cref="FlushDue"/> passes on.</summary>
+    private uint _hostTick;
+
     /// <summary>
     /// Test seam: replaces the peers' <see cref="QuiclyPeer.Poll"/> inside PollAll, and with it the
     /// <see cref="QuiclyPeer.HasPendingWork"/> probe that decides whether a marked peer is polled at all (the override
@@ -41,11 +44,11 @@ public sealed partial class QuiclyServer
     public long NextPollDeadlineMicros => Math.Min(_earliestDeadline, _sessions.EarliestExpiry);
 
     /// <summary>
-    /// Clock micros of the earliest deadline only a <see cref="FlushAll"/> can serve: the peers' engine work (retries,
-    /// expiry, a send cap's refill time) and the <see cref="PeerOptions.AutoFlushInterval"/> schedule, or
-    /// <see cref="long.MaxValue"/>. <see cref="PollAll"/> brings its own flush forward to this time, so a host that only
-    /// calls PollAll needs it for nothing; a host that flushes on its own tick brings that flush forward instead of waiting
-    /// the tick out.
+    /// Clock micros of the earliest deadline only a flush can serve: the peers' engine work (retries, expiry, a send cap's
+    /// refill time, the acks a ReliableLatest value is owed, Bulk control; <see cref="QuiclyPeer.NextFlushDeadlineMicros"/>)
+    /// and the <see cref="PeerOptions.AutoFlushInterval"/> schedule, or <see cref="long.MaxValue"/>. <see cref="PollAll"/>
+    /// serves it itself — it flushes the peers whose deadline is due, not every peer — so a host that calls PollAll often
+    /// enough needs it for nothing; a host that sleeps between passes wakes for it.
     /// </summary>
     public long NextFlushDeadlineMicros =>
         _autoFlushMicros > 0 ? Math.Min(_earliestFlushDeadline, _nextAutoFlush) : _earliestFlushDeadline;
@@ -55,8 +58,8 @@ public sealed partial class QuiclyServer
     /// applies admission decisions, then polls each peer whose <see cref="PeerOptions.WorkSignal"/> reported work (and whose
     /// <see cref="QuiclyPeer.HasPendingWork"/> confirms it) or whose next poll deadline (ping, timeout, linger) is due.
     /// Raises <see cref="PeerAdmitted"/>, <see cref="PeerClosed"/>, <see cref="SessionEnded"/> and the events other threads
-    /// queued (<see cref="AdmissionFailed"/>, <see cref="CertificateConsumerFailed"/>), releases closed peers, and flushes
-    /// when the <see cref="PeerOptions.AutoFlushInterval"/> or a peer's engine deadline
+    /// queued (<see cref="AdmissionFailed"/>, <see cref="CertificateConsumerFailed"/>), releases closed peers, flushes every
+    /// peer when the <see cref="PeerOptions.AutoFlushInterval"/> is due and otherwise the peers whose engine deadline
     /// (<see cref="QuiclyPeer.NextFlushDeadlineMicros"/>) is due. Idle peers are skipped; allocation-free in steady state.
     /// Exceptions from <see cref="PeerClosed"/> and <see cref="SessionEnded"/> handlers propagate (the remaining peers keep
     /// their work, and the remaining <see cref="SessionEnded"/> events stay queued, for the next call); a
@@ -116,17 +119,16 @@ public sealed partial class QuiclyServer
                 PruneShared();
             }
 
-            // Poll never runs a scheduler pass, so engine work waits for a flush: the earliest engine deadline of the peers
-            // brings this flush forward (docs/design/session-layer.md §4.7).
-            bool autoFlush = _autoFlushMicros > 0 && now >= _nextAutoFlush;
-            if (autoFlush || now >= _earliestFlushDeadline)
+            // Poll never runs a scheduler pass, so engine work waits for a flush: the auto-flush schedule flushes every peer, and
+            // otherwise the peers whose engine deadline is due are flushed, not all of them (docs/design/session-layer.md §4.7).
+            if (_autoFlushMicros > 0 && now >= _nextAutoFlush)
             {
-                if (autoFlush)
-                {
-                    _nextAutoFlush = now + _autoFlushMicros;
-                }
-
+                _nextAutoFlush = now + _autoFlushMicros;
                 FlushAll();
+            }
+            else if (now >= _earliestFlushDeadline)
+            {
+                FlushDue(now);
             }
 
             RaiseQueuedEvents();
@@ -141,7 +143,8 @@ public sealed partial class QuiclyServer
     /// <summary>
     /// Flushes every peer (game thread): transmits what was sent since the last flush and runs each peer's time-driven work
     /// (<see cref="QuiclyPeer.Flush"/>). Call it once per tick after the game logic sent its updates; <see cref="PollAll"/>
-    /// also calls it when a peer's engine deadline (<see cref="NextFlushDeadlineMicros"/>) is due. Peers the application
+    /// also calls it on the <see cref="PeerOptions.AutoFlushInterval"/> schedule (a peer's own engine deadline makes PollAll
+    /// flush that peer alone, with the tick last passed here). Peers the application
     /// disposed itself are skipped, and so are peers for which a Flush would do nothing: nothing sent since their last flush
     /// (from any thread), nothing left queued, no completion, waiter or poll to follow up, no deadline due. A send made
     /// before the call is transmitted by it; a send from another thread that races the call is transmitted by this call or
@@ -152,6 +155,11 @@ public sealed partial class QuiclyServer
     public void FlushAll(uint tick = 0)
     {
         ThrowIfDisposed();
+        if (!_inPollAll)
+        {
+            _hostTick = tick;
+        }
+
         if (Volatile.Read(ref _activationCount) != 0)
         {
             ActivatePending();
@@ -232,6 +240,92 @@ public sealed partial class QuiclyServer
         {
             // A peer activated (or flushed) while the scan ran lowered the field again; keep the lower of the two.
             _earliestFlushDeadline = Math.Min(_earliestFlushDeadline, scanned ? earliestFlush : previous);
+        }
+    }
+
+    /// <summary>
+    /// Flushes the peers whose engine deadline (<see cref="QuiclyPeer.NextFlushDeadlineMicros"/>) is due (game thread,
+    /// <see cref="PollAll"/>): work only a scheduler pass serves — a retry, expiry, a send cap's refill, the acks a
+    /// ReliableLatest value is owed, Bulk control — reaches the wire without a flush of every other peer. The scan reads the
+    /// dense array of flush deadlines only; each flushed peer runs with the tick the host last passed to <see cref="FlushAll"/>.
+    /// </summary>
+    private void FlushDue(long now)
+    {
+        long earliest = long.MaxValue;
+        long[] deadlines = _flushDeadlines;
+        int count = _highWater;
+        int slot = 0;
+
+        // As in PollDue: deadlines set while the scan runs lower _earliestFlushDeadline again, and the scan's own minimum is
+        // merged in at the end; a continuation that throws leaves it no later than before.
+        long previous = _earliestFlushDeadline;
+        _earliestFlushDeadline = long.MaxValue;
+        bool scanned = false;
+        try
+        {
+            if (Vector.IsHardwareAccelerated && count >= Vector<long>.Count)
+            {
+                Vector<long> nowVector = new(now);
+                Vector<long> minimum = new(long.MaxValue);
+                int last = count - Vector<long>.Count;
+                for (; slot <= last; slot += Vector<long>.Count)
+                {
+                    Vector<long> block = new(deadlines, slot);
+                    if (Vector.LessThanOrEqualAny(block, nowVector))
+                    {
+                        for (int k = slot; k < slot + Vector<long>.Count; k++)
+                        {
+                            if (deadlines[k] <= now)
+                            {
+                                FlushSlot(k);
+                            }
+                        }
+
+                        block = new Vector<long>(deadlines, slot);
+                    }
+
+                    minimum = Vector.Min(minimum, block);
+                }
+
+                for (int k = 0; k < Vector<long>.Count; k++)
+                {
+                    earliest = Math.Min(earliest, minimum[k]);
+                }
+            }
+
+            for (; slot < count; slot++)
+            {
+                if (deadlines[slot] <= now)
+                {
+                    FlushSlot(slot);
+                }
+
+                earliest = Math.Min(earliest, deadlines[slot]);
+            }
+
+            scanned = true;
+        }
+        finally
+        {
+            _earliestFlushDeadline = Math.Min(_earliestFlushDeadline, scanned ? earliest : previous);
+        }
+    }
+
+    /// <summary>Flushes one peer for <see cref="FlushDue"/> and records its new deadlines.</summary>
+    private void FlushSlot(int slot)
+    {
+        QuiclyPeer? peer = _slots[slot].Peer;
+        if (peer is null || peer.IsDisposed)
+        {
+            _flushDeadlines[slot] = long.MaxValue; // nothing to flush; PollAll releases the slot
+            return;
+        }
+
+        _peersFlushed++;
+        peer.Flush(_hostTick);
+        if (ReferenceEquals(_slots[slot].Peer, peer))
+        {
+            UpdateDeadlines(slot, peer); // not when a completion continuation released the slot
         }
     }
 
@@ -456,19 +550,20 @@ public sealed partial class QuiclyServer
         }
 
         UpdateDeadlines(slot, peer);
-        if (peer.HasPendingPollWork && peer.NextDeadlineMicros > now)
+        if (peer.HasPendingPollWork && peer.NextPollDeadlineMicros > now)
         {
             // Work this Poll did not consume (a message of a channel without a handler, a stream held back): the peer raises
             // no second signal for it, so the level is what keeps the slot marked. Engine work only a Flush consumes (the
-            // ReliableLatest acks the peer owes) is left out: polling again cannot serve it, the next FlushAll does, and this
-            // Poll re-armed the peer's edge for anything published after it.
+            // ReliableLatest acks the peer owes, Bulk control) is left out: polling again cannot serve it, the Poll brought the
+            // peer's flush deadline forward to it (UpdateDeadlines above, then this PollAll's or the next one's FlushAll), and
+            // the Poll re-armed the peer's edge for anything published after it.
             MarkWork(slot);
         }
 
         return dispatched;
     }
 
-    /// <summary>Records <paramref name="peer"/>'s poll deadline for the scan and merges its flush deadline (game thread).</summary>
+    /// <summary>Records <paramref name="peer"/>'s poll and flush deadlines for the scans and merges them into the earliest ones (game thread).</summary>
     private void UpdateDeadlines(int slot, QuiclyPeer peer)
     {
         long deadline = peer.NextPollDeadlineMicros;
@@ -479,6 +574,7 @@ public sealed partial class QuiclyServer
         }
 
         long flush = peer.NextFlushDeadlineMicros;
+        _flushDeadlines[slot] = flush;
         if (flush < _earliestFlushDeadline)
         {
             _earliestFlushDeadline = flush;

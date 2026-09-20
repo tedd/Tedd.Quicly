@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10262c">
+  <meta name="description" content="Tedd.QUICLY is a game communication protocol and .NET library built directly on QUIC and MsQuic.">
+  <title>Tedd.QUICLY — Game communication over QUIC</title>
+  <script>document.documentElement.classList.add('js')</script>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="Tedd.QUICLY home">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span>TEDD<span class="brand-slash">/</span>QUICLY</span>
+    </a>
+    <nav aria-label="Primary navigation">
+      <a href="#modes">Delivery modes</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#status">Status</a>
+      <a href="https://github.com/tedd/Tedd.QUICLY">Source</a>
+      <a class="nav-cta" href="#configure">Configure channels</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="grid-field" aria-hidden="true"></div>
+      <div class="hero-copy">
+        <p class="eyebrow"><span></span> Game communication for .NET</p>
+        <h1>One port.<br><em>Six delivery semantics.</em></h1>
+        <p class="lede">A game-focused protocol and library built directly on QUIC. Match each message to the transport behavior it needs without maintaining separate networking stacks.</p>
+        <div class="actions">
+          <a class="button primary" href="#modes">Explore the modes <span aria-hidden="true">↓</span></a>
+          <a class="button secondary" href="https://github.com/tedd/Tedd.QUICLY">Inspect the source <span aria-hidden="true">↗</span></a>
+        </div>
+        <p class="development-note"><span></span><strong>Development status:</strong> under construction</p>
+      </div>
+
+      <div class="transport-panel" aria-label="QUICLY transport model">
+        <div class="panel-bar"><span></span><span></span><span></span><b>transport.map</b></div>
+        <div class="endpoint endpoint-client"><small>GAME CLIENT</small><strong>QuiclyPeer</strong></div>
+        <div class="packet-lanes" aria-hidden="true">
+          <div class="lane datagram"><i></i><span>DATAGRAM</span></div>
+          <div class="lane stream"><i></i><span>STREAM</span></div>
+          <div class="lane latest"><i></i><span>LATEST + ACK</span></div>
+          <div class="lane bulk"><i></i><span>BULK</span></div>
+        </div>
+        <div class="endpoint endpoint-server"><small>GAME SERVER</small><strong>QuiclyServer</strong></div>
+        <div class="transport-footer"><span>QUIC / TLS 1.3</span><span>ONE UDP PORT</span></div>
+      </div>
+    </section>
+
+    <section class="proof-strip" aria-label="Protocol summary">
+      <p><strong>6 modes</strong><span>Lossy, reliable and bulk delivery</span></p>
+      <p><strong>1–6 byte header</strong><span>Compact application framing</span></p>
+      <p><strong>1 UDP port</strong><span>Datagrams and streams together</span></p>
+      <p><strong>.NET 10 + 11</strong><span>Windows, Linux and macOS targets</span></p>
+    </section>
+
+    <section class="section-shell" id="modes">
+      <div class="section-intro reveal">
+        <div><p class="eyebrow">Delivery vocabulary</p><h2>Use the right guarantee<br>for every message.</h2></div>
+        <p>Positions should not queue behind stale positions. Chat must arrive in order. Large world data needs progress and resume. QUICLY expresses each case as a channel mode.</p>
+      </div>
+
+      <div class="mode-grid">
+        <article class="mode-card featured reveal"><span class="mode-number">01</span><p class="mode-wire">QUIC DATAGRAM</p><h3>Unreliable Sequenced</h3><p>Deliver only messages newer than the last accepted sequence. Intended for positions, aim and rapidly changing state.</p></article>
+        <article class="mode-card reveal"><span class="mode-number">02</span><p class="mode-wire">QUIC DATAGRAM</p><h3>Unreliable Unordered</h3><p>Send independent lossy events without ordering overhead: bullets, effects and disposable signals.</p></article>
+        <article class="mode-card reveal"><span class="mode-number">03</span><p class="mode-wire">PERSISTENT STREAM</p><h3>Reliable Ordered</h3><p>Preserve every message in sequence for RPC, chat, inventory and matchmaking.</p></article>
+        <article class="mode-card reveal"><span class="mode-number">04</span><p class="mode-wire">GROUP STREAMS</p><h3>Reliable Unordered</h3><p>Deliver every message while independent flush groups avoid application-level head-of-line blocking.</p></article>
+        <article class="mode-card reveal"><span class="mode-number">05</span><p class="mode-wire">DATAGRAM + RETRY</p><h3>Reliable Latest</h3><p>Keep the newest value per key and retry until that version arrives. Obsolete versions disappear from the queue.</p></article>
+        <article class="mode-card reveal"><span class="mode-number">06</span><p class="mode-wire">DEDICATED STREAM</p><h3>Bulk</h3><p>Move world data, assets and snapshots with chunking, progress, cancellation and resume.</p></article>
+      </div>
+    </section>
+
+    <section class="dark-section section-shell" id="architecture">
+      <div class="architecture-copy reveal">
+        <p class="eyebrow">Hot-path architecture</p>
+        <h2>Built around the game loop.</h2>
+        <p>The session layer is designed for explicit ownership, predictable polling and caller-controlled memory. MsQuic supplies encrypted transport; QUICLY supplies game-oriented semantics.</p>
+        <ul class="check-list">
+          <li><strong>Data-oriented state</strong> with struct arrays and cache-local tables</li>
+          <li><strong>Explicit buffer ownership</strong> for send and receive paths</li>
+          <li><strong>Poll and drain control</strong> at the cadence of the host loop</li>
+          <li><strong>Deterministic simulation</strong> for protocol and failure testing</li>
+        </ul>
+      </div>
+
+      <div class="stack-diagram reveal" aria-label="QUICLY architecture stack">
+        <div class="stack-layer application"><span>01</span><div><small>APPLICATION</small><strong>Game systems</strong></div><b>state · events · RPC · assets</b></div>
+        <div class="stack-layer protocol"><span>02</span><div><small>TEDD.QUICLY</small><strong>Channels + session</strong></div><b>framing · scheduling · retries</b></div>
+        <div class="stack-layer host"><span>03</span><div><small>HOST SERVICES</small><strong>Server + HTTP</strong></div><b>admission · ACME · HTTP/3</b></div>
+        <div class="stack-layer transport"><span>04</span><div><small>TRANSPORT</small><strong>MsQuic</strong></div><b>QUIC · TLS 1.3 · UDP</b></div>
+      </div>
+    </section>
+
+    <section class="configure section-shell" id="configure">
+      <div class="section-intro reveal">
+        <div><p class="eyebrow">Declarative channels</p><h2>Describe intent once.<br>Validate at startup.</h2></div>
+        <p>Both peers use the same immutable channel table. IDs, names, modes and options are validated before a session starts.</p>
+      </div>
+      <div class="code-window reveal" aria-label="Channel configuration example">
+        <div class="window-bar"><span></span><span></span><span></span><b>Channels.cs</b><button type="button" data-copy="var channels = ChannelTable.Create()&#10;    .Add(2, &quot;state&quot;, ChannelMode.UnreliableSequenced)&#10;    .Add(3, &quot;events&quot;, ChannelMode.ReliableUnordered)&#10;    .Add(4, &quot;world&quot;, ChannelMode.Bulk)&#10;    .Build();">Copy</button></div>
+        <pre><code><span class="code-keyword">var</span> channels = <span class="code-type">ChannelTable</span>.<span class="code-call">Create</span>()
+    .<span class="code-call">Add</span>(<span class="code-number">2</span>, <span class="code-string">"state"</span>,  <span class="code-type">ChannelMode</span>.UnreliableSequenced)
+    .<span class="code-call">Add</span>(<span class="code-number">3</span>, <span class="code-string">"events"</span>, <span class="code-type">ChannelMode</span>.ReliableUnordered)
+    .<span class="code-call">Add</span>(<span class="code-number">4</span>, <span class="code-string">"world"</span>,  <span class="code-type">ChannelMode</span>.Bulk)
+    .<span class="code-call">Build</span>();</code></pre>
+        <div class="code-caption"><span>CANONICAL TABLE HASH</span><span>PEER COMPATIBILITY CHECK</span><span>FAIL-FAST VALIDATION</span></div>
+      </div>
+    </section>
+
+    <section class="status section-shell" id="status">
+      <div class="status-card reveal">
+        <div class="status-copy">
+          <p class="eyebrow">Project status</p>
+          <h2>Core systems are merged.<br>The public API is still evolving.</h2>
+          <p>Core, transport, HTTP/3, testing, ACME, server, client, HTTP and replication modules are present. Real-MsQuic session end-to-end work, the WebTransport carrier and broader browser support remain on the roadmap.</p>
+          <div class="actions">
+            <a class="button primary" href="https://github.com/tedd/Tedd.QUICLY/blob/main/docs/STATUS.md">Read implementation status <span aria-hidden="true">↗</span></a>
+            <a class="button secondary" href="https://github.com/tedd/Tedd.QUICLY">Browse the repository</a>
+          </div>
+        </div>
+        <div class="status-list" aria-label="Current implementation status">
+          <p><span>MERGED</span><strong>Core + channel engines</strong></p>
+          <p><span>MERGED</span><strong>MsQuic transport</strong></p>
+          <p><span>MERGED</span><strong>Client + server hosts</strong></p>
+          <p><span>MERGED</span><strong>HTTP, HTTP/3 + ACME</strong></p>
+          <p class="pending"><span>NEXT</span><strong>Real-session end-to-end suite</strong></p>
+          <p class="pending"><span>LATER</span><strong>WebTransport + browser transport</strong></p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a class="brand" href="#top"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span>TEDD/QUICLY</span></a>
+    <p>Game communication over QUIC for .NET.</p>
+    <div><a href="#status">Status</a><a href="https://github.com/tedd/Tedd.QUICLY">Source</a><a href="https://github.com/tedd/Tedd.QUICLY/blob/main/LICENSE">LGPL-2.1</a></div>
+  </footer>
+</body>
+</html>

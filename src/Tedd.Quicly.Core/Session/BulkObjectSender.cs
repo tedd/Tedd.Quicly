@@ -181,7 +181,14 @@ internal sealed class BulkObjectSender
             // range can carry them. (A range that never started is answered Rejected synchronously and never gets here.)
             if (terminal == BulkStatus.Running)
             {
-                terminal = result.Status;
+                // A range out of retries is the object failing its integrity check, not the application cancelling it.
+                // The peer answers a trailer that did not verify by cancelling that range (PROTOCOL.md §3.4), so the
+                // range ends Canceled, and reporting that as the object's outcome would tell an application it had
+                // cancelled a transfer it never touched -- and contradict BulkObjectResult, which documents this case
+                // as Failed with BulkChecksumFailed.
+                terminal = !cancelling && result.Code == QuiclyErrorCode.BulkChecksumFailed
+                    ? BulkStatus.Failed
+                    : result.Status;
                 code = result.Code;
 
                 // Whatever the peer did accept still counts, so a cancelled object's byte count is not an understatement.

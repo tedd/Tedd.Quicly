@@ -201,4 +201,34 @@ public class BulkObjectRegressionTests
         MemoryObjectSink sink = router.Sink<MemoryObjectSink>();
         Assert.False(sink.IsFinished, $"the object failed after 17 disjoint runs: {sink.Result?.Status} / {sink.Result?.Code}");
     }
+
+    /// <summary>An object given up on after its range checksums kept failing must end Failed, as BulkObjectResult documents.</summary>
+    [Fact]
+    public void An_Object_Out_Of_Checksum_Retries_Ends_Failed()
+    {
+        byte[] payload = new byte[4096];
+        new Random(17).NextBytes(payload);
+        using ClientHarness h = new(
+            link: new LinkOptions { DelayMicros = 1_000, PeerUnidiStreams = 8 },
+            table: BulkTables.Main,
+            client: options =>
+            {
+                BulkKit.Quiet(options);
+                options.BulkObjectRangeRetries = 0;
+            });
+        Assert.True(h.Accept(), "the client was not accepted");
+
+        BulkObjectTransfer transfer = h.Client.BeginBulkObjectSend(new BulkObjectDescriptor(5, 3, 1, payload.Length), new MemorySource(payload));
+        Assert.True(h.RunUntil(() => h.Sink.CountOf(RecordedEventKind.PeerStreamStarted) > 1), "the range's stream never opened");
+        h.Run(20_000);
+
+        // The receiving end's answer to a range whose trailer did not verify (PROTOCOL.md §3.4).
+        byte[] frame = new byte[32];
+        Assert.True(ControlCodec.TryWrite(frame, new BulkCancel(1, QuiclyErrorCode.BulkChecksumFailed), out int written));
+        h.SendToClient(frame.AsSpan(0, written));
+
+        Assert.True(h.RunUntil(() => transfer.IsFinished), "the object never finished");
+        Assert.Equal(QuiclyErrorCode.BulkChecksumFailed, transfer.Result.Code);
+        Assert.Equal(BulkStatus.Failed, transfer.Result.Status);
+    }
 }

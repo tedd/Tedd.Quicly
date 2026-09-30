@@ -150,7 +150,13 @@ public unsafe class MsQuicTransportTests
     [Fact]
     public void Stream_table_is_bounded_and_slots_are_reused_with_a_new_generation()
     {
-        using var scope = new Scope(o => o.MaxStreams = 4);
+        // A table of four, and a peer that is granted no streams: all four slots are this end's own.
+        using var scope = new Scope(o =>
+        {
+            o.MaxStreams = 4;
+            o.ClientPeerBidiStreamCount = 0;
+            o.ClientPeerUnidiStreamCount = 0;
+        });
         (MsQuicTransport client, _, _, _) = Connect(scope);
         var ids = new TransportStreamId[4];
         for (int i = 0; i < ids.Length; i++) Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Bidirectional, (ulong)i, 32767, out ids[i]));
@@ -214,8 +220,10 @@ public unsafe class MsQuicTransportTests
     }
 
     [Fact]
-    public void Peer_streams_beyond_the_stream_table_are_refused_and_counted()
+    public void Peer_streams_the_transport_granted_always_find_a_slot()
     {
+        // MaxStreams is 4 and the server grants its client sixteen streams in each direction: the table is sized for the
+        // grants, not for the option, because a peer stream that finds no slot can only be dropped below the session.
         var diagnostics = new ConcurrentQueue<string>();
         using var scope = new Scope();
         MsQuicTransportOptions serverOptions = scope.Harness.ServerOptions();
@@ -227,33 +235,41 @@ public unsafe class MsQuicTransportTests
         Assert.True(WaitFor(cs, RecordedEventKind.Connected));
         Assert.True(Spin.Until(() => !accepted.IsEmpty, Timeout));
         (MsQuicTransport server, RecordingSink ss) = accepted.ToArray()[0];
+        int granted = serverOptions.ServerPeerBidiStreamCount + serverOptions.ServerPeerUnidiStreamCount;
+        Assert.Equal(32, granted);
+        Assert.Equal(MsQuicTransportOptions.StreamTableFor(granted), server.MaxStreams);
         NativeBlock block = scope.Block(10);
         TransportSegment* segment = scope.Segments(1);
         *segment = new TransportSegment(block.Pointer, 10);
-        // Five concurrently open peer streams (no FIN) against a table of four.
-        for (int i = 0; i < 5; i++)
+
+        // Sixteen concurrently open peer streams (no FIN) against an option of four.
+        for (int i = 0; i < 16; i++)
         {
             Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Unidirectional, (ulong)i, 32767, out TransportStreamId id));
             Assert.Equal(TransportStatus.Success, client.SendStream(id, segment, 1, (ulong)i, TransportSendFlags.Start));
         }
-        Assert.True(Spin.Until(() => server.RefusedPeerStreamCount == 1, Timeout), $"refused {server.RefusedPeerStreamCount}");
-        Assert.Equal(4, ss.CountOf(RecordedEventKind.PeerStreamStarted));
-        Assert.Equal(4, server.OpenStreamCount);
-        // The refusal is counted just before the diagnostic is logged on the worker thread: wait for the message.
-        Assert.True(Spin.Until(() => diagnostics.Any(m => m.Contains("stream table is full", StringComparison.Ordinal)), Timeout));
 
-        // The server had been told in advance: it let the client open more streams than its table has room for.
-        Assert.Single(diagnostics, m => m.Contains("raise MaxStreams", StringComparison.Ordinal));
+        Assert.True(Spin.Until(() => ss.CountOf(RecordedEventKind.PeerStreamStarted) == 16, Timeout), $"peer streams {ss.CountOf(RecordedEventKind.PeerStreamStarted)}");
+        Assert.Equal(16, server.OpenStreamCount);
+        Assert.Equal(0, server.RefusedPeerStreamCount);
+
+        // The quarter that is the server's own is still there with every granted unidirectional stream open.
+        Assert.Equal(TransportStatus.Success, server.OpenStream(StreamKind.Unidirectional, 99, 32767, out TransportStreamId own));
+        server.CloseStream(own);
+
+        // The server was told once that its table is larger than its options said.
+        Assert.Single(diagnostics, m => m.Contains("the table was raised", StringComparison.Ordinal));
         scope.Finish();
     }
 
     [Fact]
-    public void A_stream_table_too_small_for_what_the_peer_may_open_is_reported_once()
+    public void A_stream_table_too_small_for_what_the_peer_may_open_is_raised_and_reported_once()
     {
         var diagnostics = new ConcurrentQueue<string>();
         using var scope = new Scope();
         MsQuicTransportOptions clientOptions = scope.Harness.ClientOptions();
         clientOptions.MaxStreams = 8; // room for six peer streams next to the local ones
+        clientOptions.ClientPeerBidiStreamCount = 0;
         clientOptions.ClientPeerUnidiStreamCount = 64;
         clientOptions.Diagnostic = (_, message, _) => diagnostics.Enqueue(message);
         var accepted = new ConcurrentQueue<(MsQuicTransport Transport, RecordingSink Sink)>();
@@ -261,24 +277,33 @@ public unsafe class MsQuicTransportTests
         (MsQuicTransport client, RecordingSink cs) = Dial(scope, scope.Harness.CreateConnector(clientOptions), listener.LocalEndPoint);
         Assert.True(WaitFor(cs, RecordedEventKind.Connected));
 
-        // The grant is in the transport parameters, so it is reported from the start: the session sizes itself for it.
+        // The grant is in the transport parameters, so it is reported from the start — the session sizes itself for it —
+        // and the table has room for it from the start: 64 peer streams next to a quarter for the local ones.
         Assert.Equal(64, client.Capabilities.PeerUnidirectionalStreams);
-        Assert.Single(diagnostics, m => m.Contains("raise MaxStreams", StringComparison.Ordinal));
-        Assert.Contains("64 streams", diagnostics.Single(m => m.Contains("raise MaxStreams", StringComparison.Ordinal)), StringComparison.Ordinal);
+        Assert.Equal(85, client.MaxStreams);
+        Assert.Equal(64, MsQuicTransportOptions.PeerStreamRoom(client.MaxStreams));
+        Assert.Single(diagnostics, m => m.Contains("the table was raised", StringComparison.Ordinal));
+        Assert.Contains("64 streams", diagnostics.Single(m => m.Contains("the table was raised", StringComparison.Ordinal)), StringComparison.Ordinal);
 
-        // A later request of the session is covered by the same warning; it is not repeated.
+        // A later request of the session raises it again; the note is not repeated.
         client.UpdatePeerStreamLimits(0, 100);
-        Assert.Single(diagnostics, m => m.Contains("raise MaxStreams", StringComparison.Ordinal));
+        Assert.Equal(MsQuicTransportOptions.StreamTableFor(100), client.MaxStreams);
+        Assert.Single(diagnostics, m => m.Contains("the table was raised", StringComparison.Ordinal));
+
+        // Credit is never taken back, so a lower request leaves the table as it is.
+        client.UpdatePeerStreamLimits(0, 10);
+        Assert.Equal(MsQuicTransportOptions.StreamTableFor(100), client.MaxStreams);
         scope.Finish();
     }
 
     [Fact]
-    public void A_stream_table_with_room_for_the_peers_streams_is_not_reported()
+    public void A_stream_table_with_room_for_the_peers_streams_is_left_alone()
     {
         var diagnostics = new ConcurrentQueue<string>();
         using var scope = new Scope();
         MsQuicTransportOptions clientOptions = scope.Harness.ClientOptions();
         clientOptions.MaxStreams = 64; // room for forty-eight
+        clientOptions.ClientPeerBidiStreamCount = 0;
         clientOptions.ClientPeerUnidiStreamCount = 16;
         clientOptions.Diagnostic = (_, message, _) => diagnostics.Enqueue(message);
         var accepted = new ConcurrentQueue<(MsQuicTransport Transport, RecordingSink Sink)>();
@@ -287,11 +312,35 @@ public unsafe class MsQuicTransportTests
         Assert.True(WaitFor(cs, RecordedEventKind.Connected));
         Assert.Equal(16, client.Capabilities.PeerUnidirectionalStreams);
         client.UpdatePeerStreamLimits(0, 48);
-        Assert.DoesNotContain(diagnostics, m => m.Contains("raise MaxStreams", StringComparison.Ordinal));
+        Assert.Equal(64, client.MaxStreams);
+        Assert.DoesNotContain(diagnostics, m => m.Contains("the table was raised", StringComparison.Ordinal));
 
-        // Asking for more than the table can hold is reported when it is asked for.
+        // Asking for more than the table can hold next to the local streams raises it when it is asked for.
         client.UpdatePeerStreamLimits(0, 49);
-        Assert.Single(diagnostics, m => m.Contains("raise MaxStreams", StringComparison.Ordinal));
+        Assert.Equal(65, client.MaxStreams);
+        Assert.Single(diagnostics, m => m.Contains("the table was raised", StringComparison.Ordinal));
+        scope.Finish();
+    }
+
+    [Fact]
+    public void Local_streams_cannot_take_the_slots_of_the_streams_the_peer_was_granted()
+    {
+        // Twelve slots, eight of them granted to the peer: this end may have four streams of its own, however few the
+        // peer has open.
+        using var scope = new Scope(o =>
+        {
+            o.MaxStreams = 12;
+            o.ClientPeerBidiStreamCount = 0;
+            o.ClientPeerUnidiStreamCount = 8;
+        });
+        (MsQuicTransport client, _, _, _) = Connect(scope);
+        Assert.Equal(12, client.MaxStreams);
+        var ids = new TransportStreamId[4];
+        for (int i = 0; i < ids.Length; i++) Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Bidirectional, (ulong)i, 32767, out ids[i]));
+        Assert.Equal(TransportStatus.OutOfMemory, client.OpenStream(StreamKind.Bidirectional, 9, 32767, out _));
+        client.CloseStream(ids[1]);
+        Assert.True(Spin.Until(() => client.OpenStreamCount == 3, Timeout), $"open streams {client.OpenStreamCount}");
+        Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Unidirectional, 5, 32767, out _));
         scope.Finish();
     }
 

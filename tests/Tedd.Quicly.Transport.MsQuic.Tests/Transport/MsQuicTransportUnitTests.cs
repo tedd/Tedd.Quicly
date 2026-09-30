@@ -204,6 +204,21 @@ public unsafe class MsQuicTransportUnitTests
         Assert.Equal(768, MsQuicTransportOptions.PeerStreamRoom(1024));
         Assert.Equal(3, MsQuicTransportOptions.PeerStreamRoom(4));
         Assert.Equal(0, MsQuicTransportOptions.PeerStreamRoom(1));
+
+        // The smallest table with room for a number of peer streams: the inverse, exactly.
+        Assert.Equal(1, MsQuicTransportOptions.StreamTableFor(0));
+        Assert.Equal(2, MsQuicTransportOptions.StreamTableFor(1));
+        Assert.Equal(4, MsQuicTransportOptions.StreamTableFor(3));
+        Assert.Equal(10, MsQuicTransportOptions.StreamTableFor(8));
+        Assert.Equal(85, MsQuicTransportOptions.StreamTableFor(64));
+        Assert.Equal(1365, MsQuicTransportOptions.StreamTableFor(1024));
+        Assert.Equal(5461, MsQuicTransportOptions.StreamTableFor(4096));
+        for (int peer = 0; peer <= 5_000; peer++)
+        {
+            int table = MsQuicTransportOptions.StreamTableFor(peer);
+            Assert.True(MsQuicTransportOptions.PeerStreamRoom(table) >= peer, $"{peer} peer streams do not fit a table of {table}");
+            Assert.True(table == 1 || MsQuicTransportOptions.PeerStreamRoom(table - 1) < peer, $"a table of {table - 1} already has room for {peer} peer streams");
+        }
         Assert.Throws<ArgumentException>(() => new MsQuicTransportOptions { ServerCertificateValidation = ServerCertificateValidationMode.PinnedSpki }.Validate(client: true));
         Assert.Throws<ArgumentException>(() => new MsQuicTransportOptions { ServerCertificateValidation = ServerCertificateValidationMode.PinnedSpki, PinnedSpkiSha256 = [new byte[31]] }.Validate(client: true));
         Assert.Throws<ArgumentException>(() => new MsQuicTransportOptions { ServerCertificateValidation = ServerCertificateValidationMode.Callback }.Validate(client: true));

@@ -193,6 +193,50 @@ public class ReviewStackstartraceEngineTests
     }
 }
 
+/// <summary>The bulk engine under the combined refusal (GUARD).</summary>
+public class ReviewStackstartraceBulkTests
+{
+    /// <summary>
+    /// GUARD: a bulk transfer whose stream start loses the race in either combined shape waits for credit (it does not
+    /// retry on every pass), then completes byte-exact on a new stream; the abandoned stream's notices change nothing.
+    /// </summary>
+    [Theory]
+    [InlineData(CombinedShape.StartedOnly)]
+    [InlineData(CombinedShape.StartedAndShutdown)]
+    public async Task Bulk_Treats_A_Combined_Refusal_As_Final(CombinedShape shape)
+    {
+        byte[] payload = new byte[60_000];
+        new Random(5).NextBytes(payload);
+        AcceptRouter router = AcceptRouter.Memory(payload.Length);
+        CombinedRefusalConnector? connector = null;
+        using SessionHarness h = new(
+            link: new LinkOptions { DelayMicros = 1_000 },
+            table: BulkTables.Main,
+            client: BulkKit.Quiet,
+            server: BulkKit.Receiver(router),
+            connector: inner => connector = new CombinedRefusalConnector(inner));
+
+        CombinedRefusalTransport transport = connector!.Transport!;
+        transport.Shape = shape;
+        transport.RefuseStarts = 1;
+        BulkTransfer transfer = await h.Client.BeginBulkSendAsync(new BulkDescriptor(5, 1, 1, payload.Length), new MemorySource(payload));
+        h.Run(50_000);
+
+        // Refused once and parked: no further start while no credit arrives.
+        Assert.Equal(1, transport.Refused);
+        Assert.Equal(1, transport.StartsSent);
+        Assert.Equal(BulkStatus.Running, transfer.Status);
+        Assert.Equal(0, transfer.BytesTransferred);
+
+        transport.GrantCredit();
+        Assert.True(h.RunUntil(() => transfer.IsFinished, 30_000_000), "the transfer did not go out after credit returned");
+        Assert.Equal(BulkStatus.Completed, transfer.Status);
+        Assert.Equal(payload, router.Sink<MemorySink>().Bytes);
+        Assert.Equal(2, transport.StartsSent);
+        Assert.Equal(0, DatagramKit.Statistics(h.Client).CallbackFaults);
+    }
+}
+
 /// <summary>Which callbacks a combined refusal delivers before the call returns StreamLimitReached.</summary>
 public enum CombinedShape
 {

@@ -115,9 +115,12 @@ internal sealed unsafe class PeerCore : IDisposable
     private readonly NativeArray<long> _stamps;
     private readonly bool _atomicSendBudget;
     // Game thread: one bit per send-entry slot whose expiry deadline waits for its first scheduler pass (StampExpiry,
-    // ResolveExpiry), and the highest word that may hold one (-1 = none, the only thing a pass reads when nothing waits).
+    // ResolveExpiry), and the range of words that may hold one: the highest (-1 = none, the only thing a pass reads when
+    // nothing waits) and the lowest. Both ends, because the entry table hands out the slot freed last: after a burst has
+    // completed, a lone send sits at the top of the range the burst used, and a scan from word 0 would walk all of it.
     private readonly NativeArray<ulong> _expiryPending;
     private int _expiryWordHigh = -1;
+    private int _expiryWordLow = int.MaxValue;
     private long _passMicros;
     private long _stamp;
     private int _localHead;
@@ -265,6 +268,12 @@ internal sealed unsafe class PeerCore : IDisposable
     internal bool HasPendingExpiry => _expiryWordHigh >= 0;
 
     /// <summary>
+    /// How many words of the pending bitmap the next <see cref="ResolveExpiry"/> reads (game thread; tests): the range
+    /// between the lowest and the highest slot stamped since the last pass, 0 when nothing waits.
+    /// </summary>
+    internal int PendingExpiryWords => _expiryWordHigh < 0 ? 0 : _expiryWordHigh - _expiryWordLow + 1;
+
+    /// <summary>
     /// Gives an admitted entry a relative expiry (game thread, after the engine's commit point). The expiry clock starts at
     /// the first scheduler pass after admission (PROTOCOL.md §4.5): the deadline is stored as
     /// <see cref="UnresolvedDeadline"/> + <paramref name="expiryMicros"/> and the slot is marked, and
@@ -294,6 +303,11 @@ internal sealed unsafe class PeerCore : IDisposable
         {
             _expiryWordHigh = word;
         }
+
+        if (word < _expiryWordLow)
+        {
+            _expiryWordLow = word;
+        }
     }
 
     /// <summary>
@@ -301,7 +315,8 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <see cref="StampExpiry"/> since the previous pass gets its absolute deadline, <paramref name="nowMicros"/> plus its
     /// relative expiry. It runs before any engine looks at a deadline and covers entries no engine visits in this pass
     /// (behind a blocked head, in a stream that is still starting, in a group that is not sealed), so their clocks start
-    /// here too. One compare when nothing is pending.
+    /// here too. One compare when nothing is pending; otherwise it reads the bitmap words between the lowest and the
+    /// highest slot stamped since the last pass, so a single message costs one word wherever its slot lies.
     /// </summary>
     /// <remarks>
     /// A marked slot whose entry was freed before the pass (a cancel) is harmless: a free slot's deadline is rewritten at
@@ -317,10 +332,12 @@ internal sealed unsafe class PeerCore : IDisposable
             return;
         }
 
+        int low = _expiryWordLow;
         _expiryWordHigh = -1;
+        _expiryWordLow = int.MaxValue;
         ulong* words = _expiryPending.Pointer;
         long* deadlines = Entries.Deadlines.Pointer;
-        for (int word = 0; word <= high; word++)
+        for (int word = low; word <= high; word++)
         {
             ulong bits = words[word];
             if (bits == 0)
@@ -1798,6 +1815,7 @@ internal sealed unsafe class PeerCore : IDisposable
         // Every entry is gone, so no deadline waits for a pass (a stale bit would be harmless; this keeps the state exact).
         _expiryPending.Clear();
         _expiryWordHigh = -1;
+        _expiryWordLow = int.MaxValue;
         while (CompletionRing.TryDequeue(out _))
         {
         }

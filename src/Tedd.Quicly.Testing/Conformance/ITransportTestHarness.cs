@@ -11,6 +11,15 @@ namespace Tedd.Quicly.Testing.Conformance;
 /// Scenarios call transport APIs from the thread that calls <see cref="Pump"/> (the "game thread"). Sink callbacks run
 /// inside <see cref="Pump"/> for a simulated transport and on the transport's own threads for a real one, so the scenarios
 /// only use thread-safe sinks and never assume that a callback has or has not happened when an API call returns.
+/// <para>
+/// Two scenarios call <see cref="ITransport.ResumeStreamReceive"/> from a second thread, because the timing of that call
+/// against the receive callback is what they test (<c>ResumeRacingTheReceiveCallbackIsApplied</c>,
+/// <c>HeldStreamIsIndicatedAgainAfterEveryResume</c>). In both the pumping thread waits for that call inside its
+/// <see cref="Pump"/> condition before it goes on, so a harness on virtual time does not advance its clock while a resume
+/// is owed: the scenario takes the same virtual time in every run, and its timeout cannot run out merely because the
+/// second thread had to wait for a core. A harness must therefore evaluate the condition outside any lock its transports
+/// take in <see cref="ITransport.ResumeStreamReceive"/>.
+/// </para>
 /// </remarks>
 public interface ITransportTestHarness : IDisposable
 {

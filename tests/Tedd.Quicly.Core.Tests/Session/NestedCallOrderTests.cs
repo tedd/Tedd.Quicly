@@ -156,9 +156,10 @@ public class NestedCallOrderTests
     [Fact]
     public void A_Channel_That_Queues_Behind_Its_Backlog_Is_Served_Before_The_Ring_Whatever_MaxItems_Is()
     {
-        // The message that goes behind a queued one waits for the next Poll. It cannot starve there: a Poll dispatches the
-        // queues of channels with a handler before it takes anything from the ring, and it takes nothing from the ring
-        // while maxItems is used up. So with a Poll(1) host every call delivers the channel's oldest message.
+        // The message that goes behind a queued one waits for the next Poll. It cannot starve there: a Poll dispatches a
+        // channel's queue before any ring message of that channel (Route puts a ring message behind it), and it takes
+        // nothing from the ring while maxItems is used up. So with a Poll(1) host every call delivers the channel's oldest
+        // message.
         using SessionHarness h = Harness();
         QuiclyPeer server = h.Server!;
         List<int> got = [];

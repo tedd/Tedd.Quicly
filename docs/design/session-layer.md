@@ -140,8 +140,8 @@ options, authToken)` (client) and `QuiclyPeer.CreateServerPeer(transport, in inf
 **Hand-offs** (ADR 0008). Transport → game thread: a signal word (`Interlocked.Or` / `Exchange`) with the bits Connected, Hello,
 HelloAck, PeerClose, TransportClosed, CloseRequest, TableRequest, TableInfo — the data of a bit is written before it is set
 (Hello/HelloAck/Close bodies are copied to arrays: handshake and close only); SPSC rings `CompletionRing` (`CompletionEntry`,
-capacity 2 × send table: two per entry), `ReceiveRing` (`ReceiveEntry`, 64 B each), `PendedStreams` (capacity = the peer's
-unidirectional allowance + 2), pong samples (16) and stream-ping requests (8) — every ring's elements live in a `NativeArray`
+capacity 2 × send table: two per entry), `ReceiveRing` (`ReceiveEntry`, 64 B each), `PendedStreams` (`PendedStream`: the id and the block the stream waits for, 12 B;
+capacity = the peer's unidirectional allowance + 2, growing up to 8× for entries of streams reset while held), pong samples (16) and stream-ping requests (8) — every ring's elements live in a `NativeArray`
 (ADR 0008 invariants 5 and 12) and the peer disposes them with its other native tables; per-key mailboxes; `PeerCore.RequestClose(code)` (first request wins), executed by
 the game thread in Poll/Flush. Game → transport thread: `PeerCore.IsAdmitted` (volatile), the control stream id (volatile word) and
 `PeerCore.SessionMaxMessageSize` (server: its option; client: set by the transport thread from an accepted HelloAck before it
@@ -249,8 +249,9 @@ is back in `Filling` and still owned by the caller.
     reset `UnsupportedChannel`; malformed ⇒ reset `ProtocolViolation`; otherwise `engine.OnStreamOpened(id, channel, groupId)` →
     `Accept(cookie)` / `Reject(code)` (reset) / `CloseConnection(code)`.
   * Events ⇒ `engine.OnStreamMessage(ref StreamMessageContext)` (`Start`, `Chunk`, `End`, `BulkHeader`) → `Continue`, `Pend` (the
-    parser is restored from a `StreamFrameParser.Mark` taken before the event, a whole copy on bulk streams; the call returns `PendingAfter(bytes before the event)`, the stream id goes to
-    `PendedStreams` and Poll calls `ResumeStreamReceive(id, 0)`), `ResetStream(code)` or `CloseConnection(code)`.
+    parser is restored from a `StreamFrameParser.Mark` taken before the event, a whole copy on bulk streams; the call returns `PendingAfter(bytes before the event)`, the stream id and the block of the
+    message it waits with go to `PendedStreams` and Poll calls `ResumeStreamReceive(id, 0)`; a ring that cannot take it
+    after growing means a peer that resets held streams, and the connection closes `LimitExceeded`), `ResetStream(code)` or `CloseConnection(code)`.
     The context (`Chunk`, `Header`, `Bulk` and the `Cookie` ref) is valid only during the call (the peer declares it `scoped`);
     copy what you keep. An engine that sets `ChannelEngine.AcceptsWholeMessages` (the ordered and group engines) gets a message
     whose payload lies wholly in the current segment as **one** `Whole` event instead of `Start`, `Chunk`, `End`
@@ -317,7 +318,9 @@ is back in `Filling` and still owned by the caller.
    long as a hold lasts, while the transport thread keeps acknowledging those values to the sender.
    Compressed messages are decoded with `Lz4Block.DecompressExact` into a second lease (decoded-bytes budget; a failure drops and
    counts `DecodeFailures`). The lease is released after the handler unless `Retain` was called; handler exceptions propagate.
-5. `ResumePendedStreams()` (streams the ring or the budget held back: all of them, within the ring's free room), then
+5. `ResumePendedStreams()` (streams the ring or the budget held back, oldest first: as many as the ring has free slots and
+   the budget has room for their blocks — the oldest always, so one that cannot go on rotates to the back — plus the entries
+   beyond what the live streams account for, which are of streams reset while held), then
    `ResumeCreditPended()` (streams a channel's receive credit held back: only when something changed, and only as many as
    the channel has credit for — "Reliable class" below).
 6. Closed: engines' `OnPeerClosed`, requests still in the `ThreadSafeSend` front dropped (leases returned), every receive lease
@@ -444,14 +447,15 @@ allocated in native memory in chunks that double from 64.
     the end of `DispatchReceived`): a handler that throws on the last message of its backlog leaves the dispatch loop
     before the limit is lifted, and nothing else would come back to it.
     `Drained` — a `Drain` left the channel's queue empty (`SettleCreditAfterDrain`): the ring's capacity in messages and
-    `B/2` lease bytes as a threshold (a message is started while less than that waits, and always on an empty channel). A
+    `B/2/Qr` lease bytes as a threshold (a message is started while less than that waits, and always on an empty channel). A
     pass start demotes a `Drained` channel that still has messages queued which no take emptied during the whole pass
     before (`DemoteUndrainedChannels`, `ReceiveQueues.LeftUndrained`; one compare while no channel is in that state). A
     narrower limit takes nothing back: the channel keeps what it accepted and accepts nothing more until the application
-    has taken it down to the new limit — which is the reason for `B/2`: what a drained channel holds at the moment the
-    application stops coming for it stays, and the other half of the budget is what the channels that are read then have
-    (two channels abandoned that way can still hold all of it). A host that drains once per frame never meets the share,
-    and meets the half only with more than `B/2` of one channel's messages between two drains.
+    has taken it down to the new limit — which is the reason for `B/2/Qr`: what the drained channels hold at the moment the
+    application stops coming for them stays, at most `B/2` between them (plus a message each), and the other half of the
+    budget is what the channels that are read then have. (The first version gave each drained channel `B/2`, and two
+    channels abandoned that way held all of it: third review round, SC-1.) A host that drains once per frame never meets
+    the share, and meets its drained limit only with more than `B/2/Qr` of one channel's messages between two drains.
   * **Resuming.** A stream held back for credit is *not* retried by every Poll (that would resume and re-pend every stream of
     an unread channel each frame). The transport thread lists it (`NotePended`, an SPSC ring sized for every stream the peer
     may open); the game thread collects the list into its own (`Resume`: the end of `Drain`, every Poll, `RegisterHandler`)
@@ -496,23 +500,41 @@ allocated in native memory in chunks that double from 64.
     and datagrams are not affected. The same is true one level down for bytes: what a held stream has not delivered stays
     in the transport and counts against its flow-control windows — 2 MiB per unidirectional stream and 16 MiB per
     connection with the MsQuic transport's defaults — so unread channels that hold the connection's window between them
-    (eight unread ordered channels; one unread group channel with 16 MiB in held groups, measured on loopback as 524 groups
-    of 32 000 bytes) stop every stream of the connection until the application reads. And the sender's own send table and
-    send budget are shared by its channels: what it keeps sending into a channel nobody reads uses them up unless it sets
-    `ChannelOptions.QueueLimitBytes` there.
+    (eight unread ordered channels; held groups of a receiver that grants more streams than its table's sum, measured on
+    loopback as 514 groups of 32 KiB at a client granting 1 024) stop every stream of the connection until the application
+    reads. The MsQuic client therefore grants nothing before admission and its table's sum after it, as the server does
+    (`ClientPeerUnidiStreamCount` = 0): held groups are then at most Σ max(`MaxGroups`, 1) streams of at most
+    `GroupMaxBytes` and a message each. With a larger grant a late receiver can also wedge: a message it began to receive
+    holds its lease (the whole budget, for one above 64 KiB in the compact pool) while its tail needs window only the other
+    held streams can free, and they wait for budget, until `StreamIdleTimeout` gives the message up (third review round,
+    GR3-1; a release-notes known limit). And the sender's own send table and send budget are shared by its channels: what
+    it keeps sending into a channel nobody reads uses them up — every send of the sender then answers `OutOfBuffers` —
+    unless it sets `ChannelOptions.QueueLimitBytes` there.
   * **Order of a channel that has messages queued.** `Route` dispatches a ring message to its handler only when the
     channel has nothing queued; otherwise the message goes behind the queue, and the next Poll dispatches the queue first.
-    `DispatchQueued` runs before the ring loop, so the case needs a handler of the running Poll to have put older messages
-    of the channel there: by calling `Drain` for another channel, or by registering the handler over a backlog. Both
-    reordered a ReliableOrdered channel before (each review met it; the code is older than the credit).
+    The guarantee is that a channel's queue is always dispatched before any ring message of the *same* channel — not that
+    the ring is left alone while a handled queue is not empty: `DispatchQueued` makes one pass over the channel indices, so
+    a handler of a later index that drains another channel can refill the queue of an earlier handled channel, and the ring
+    loop then runs with `QueuedHandled > 0`; `Route` puts that channel's ring messages behind its queue, and nothing is lost
+    (at worst the pool fills and the ring is held until the next Poll). The case needs a handler of the running Poll to
+    have put older messages of the channel there: by calling `Drain` for another channel, or by registering the handler
+    over a backlog. Both reordered a ReliableOrdered channel before (each review met it; the code is older than the credit).
   * **Drain and compressed messages.** `Drain` decodes into a second lease the caller cannot release before the call
     returns, so a batch can need more decode buffers than the budget has, and `TryDecode` drops what it cannot decode: one
     call with a span of sixteen lost 34 of 40 queued messages of a reliable channel (the accounting review's finding B). On
     a reliable channel that compresses (`_decodeWaits`) Drain therefore rents the decode buffer *before* it takes the
-    message (`TryPeek`, `TryRentForDecode`); without one the message stays in the queue, the held slot, or — taken from the
-    ring — goes to the held slot, and the call returns what it has. A message that can never be decoded (no block of its
-    raw size within the budget) is still dropped and counted, as is one over the decode rate; the dispatch to a handler,
-    which needs one buffer at a time, is unchanged.
+    message (`TryPeek`, `TryRentForDecode`) and checks the decode rate (`TokenBucket.Available`); without either the
+    message stays where it is and the channel is *stalled* for the rest of the call: what the call meets of that channel
+    in the held slot or the ring goes behind it into its queue (a reliable channel without a handler always has a node),
+    so the channel's order holds (third review round, S2: the call used to go on to the ring and hand out a newer message
+    that needed no buffer). The decode buffer comes from `PeerCore.TryRentDecode`, which may take the budget past its
+    limit by that one buffer whenever what is outstanding does not exceed it yet, and falls back to a larger size class
+    within the budget: the budget and the class can both be full of the very compressed messages that wait, and a Drain
+    held to them waited for good (S1: two Drained LZ4 channels after a hitch, every Drain 0 for ever). The same rental serves
+    the dispatch to a handler, which no longer loses a burst's compressed messages to a full budget (S3). A message that can
+    never be decoded (its decoded block is larger than the whole budget, or its raw size above the decode rate's burst) is
+    still dropped and counted; `TryDecode` rents before it charges the rate, so such a drop costs the messages behind it
+    nothing. Over the rate, a handler's message is dropped (holding it would close the ring to every channel).
 * **`QueuedHandled`.** The number of queued messages whose channel has a handler — what the next Poll dispatches from the queues
   and what the work probe reads — is kept by `ReceiveQueues` itself (`SetHandled` from `RegisterHandler`/`UnregisterHandler`,
   adjusted in `TryAppend`/`Take`), not by the peer, so that every way an entry leaves the queues keeps it exact: a count that
@@ -548,7 +570,8 @@ allocated in native memory in chunks that double from 64.
 * `uni` = Σ max(MaxGroups, 1) over stream-capable channels, capped at 4 096 (`PeerCore.PeerUnidirectionalStreamLimit`).
   It is what the session *asks* the transport for. What the peer can actually have open is `PeerCore.PeerStreamCapacity`: that
   number, or the transport's own initial grant when it is more (`TransportCapabilities.PeerUnidirectionalStreams` — an MsQuic
-  client announces 1 024 in its transport parameters by default, and QUIC never takes granted credit back, so the later
+  client announces `ClientPeerUnidiStreamCount` in its transport parameters — 0 by default since the third review round,
+  1 024 before — and QUIC never takes granted credit back, so the later
   `UpdatePeerStreamLimits(0, uni)` does not lower it). Everything the session keeps per peer stream — the `PendedStreams` ring,
   the group engine's receive records — is sized from `PeerStreamCapacity`. It is set in `OnConnected`
   (`PeerCore.SetTransportPeerStreams`), on the transport thread: no stream of a connection exists before its `OnConnected`, so

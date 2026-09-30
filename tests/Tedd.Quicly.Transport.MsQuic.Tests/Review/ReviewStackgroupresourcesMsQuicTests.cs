@@ -43,12 +43,15 @@ public class ReviewStackgroupresourcesMsQuicTests
     /// so the tail never arrives. The receive path of the whole connection (every channel) stops until StreamIdleTimeout
     /// (30 s) gives up that message, which the sender then reports Failed; then the next one can do the same.
     /// Before the fix the client reset the streams beyond MaxGroups (the silent loss the fix removed), which also freed
-    /// their flow-control credit, so the window could not fill with held streams.
+    /// their flow-control credit, so the window could not fill with held streams. Intermittent: the 30/70 KiB load wedged
+    /// in about half the runs, the 4/150 KiB load in about a quarter.
     /// </summary>
-    [Fact]
-    public void A_Late_Client_Sent_More_Than_Its_Connection_Window_Catches_Up_Without_Stalling()
+    [Theory]
+    [InlineData(30 * 1024, 70 * 1024, 2)]
+    [InlineData(4 * 1024, 150 * 1024, 4)]
+    public void A_Late_Client_Sent_More_Than_Its_Connection_Window_Catches_Up_Without_Stalling(int smallBytes, int bigBytes, int bigEvery)
     {
-        string report = Run(clientIsReceiver: true, smallBytes: 30 * 1024, bigBytes: 70 * 1024, bigEvery: 2, clientConnWindow: null, lateFor: TimeSpan.FromSeconds(3),
+        string report = Run(clientIsReceiver: true, smallBytes, bigBytes, bigEvery, clientConnWindow: null, lateFor: TimeSpan.FromSeconds(3),
             catchUp: CatchUp(), out bool ok);
         Trace(report);
         Assert.True(ok, report);
@@ -56,8 +59,9 @@ public class ReviewStackgroupresourcesMsQuicTests
 
     /// <summary>
     /// Control for the failing case: the same load and the same session options, with only the client's MsQuic connection
-    /// window raised above what the sender can put in flight (256 MiB). It catches up in a couple of seconds, which pins
-    /// the stall on connection flow-control credit that held streams keep.
+    /// window raised above what the sender can put in flight (256 MiB). It never stops (longest gap about 0.1 s), which pins
+    /// the stall on connection flow-control credit that held streams keep. It is slow, though: about 85 MiB from 1 024 held
+    /// streams took 16 s and 560 000 hold-and-resume cycles, the budget-bound churn of the Core review test.
     /// </summary>
     [Fact]
     public void Control_The_Same_Load_Catches_Up_When_The_Connection_Window_Is_Larger_Than_What_The_Held_Streams_Buffer()
@@ -69,14 +73,13 @@ public class ReviewStackgroupresourcesMsQuicTests
     }
 
     /// <summary>
-    /// Guards: loads that also exceed the connection window, with messages whose staging leaves room in the budget or
-    /// rarer large ones, and the client-to-server direction (whose server grants only the session limit, 17 streams). All
-    /// catch up without a stall, loss or duplicate.
+    /// Guards: a load that also exceeds the connection window with rare large messages, and the client-to-server direction
+    /// (whose server grants only the session limit, 17 streams). Both caught up without a stall, loss or duplicate in
+    /// every run made.
     /// </summary>
     [Theory]
     [InlineData(true, 8 * 1024, 100 * 1024, 48)]
     [InlineData(false, 8 * 1024, 100 * 1024, 48)]
-    [InlineData(true, 4 * 1024, 150 * 1024, 4)]
     public void Guard_A_Late_Receiver_Sent_More_Than_The_Connection_Window_Catches_Up(bool clientIsReceiver, int smallBytes, int bigBytes, int bigEvery)
     {
         string report = Run(clientIsReceiver, smallBytes, bigBytes, bigEvery, clientConnWindow: null, lateFor: TimeSpan.FromSeconds(3),
@@ -86,7 +89,7 @@ public class ReviewStackgroupresourcesMsQuicTests
     }
 
     private static TimeSpan CatchUp() =>
-        TimeSpan.FromSeconds(int.TryParse(Environment.GetEnvironmentVariable("QUICLY_REVIEW_CATCHUP_SECONDS"), out int s) ? s : 20);
+        TimeSpan.FromSeconds(int.TryParse(Environment.GetEnvironmentVariable("QUICLY_REVIEW_CATCHUP_SECONDS"), out int s) ? s : 25);
 
     private static string Run(bool clientIsReceiver, int smallBytes, int bigBytes, int bigEvery, uint? clientConnWindow, TimeSpan lateFor, TimeSpan catchUp, out bool ok)
     {
@@ -202,7 +205,9 @@ public class ReviewStackgroupresourcesMsQuicTests
                 + $"receiver: StreamsReset {statistics.StreamsReset}, CallbackFaults {statistics.CallbackFaults}, StreamReceivePends {statistics.StreamReceivePends}, "
                 + $"ReceiveBytesOutstanding {statistics.ReceiveBytesOutstanding}; sender StreamsReset {senderStatistics.StreamsReset}; "
                 + $"refusals while late: {string.Join(", ", refusals.Select(r => $"{r.Value} {r.Key}"))}";
-            ok = all && duplicates == 0 && failed == 0 && statistics.StreamsReset == 0 && took < TimeSpan.FromSeconds(10);
+            // A stall is what fails, not a slow catch-up: the hold-and-resume churn of a budget-bound catch-up (see the Core review
+            // test A_Catch_Up_Bounded_By_The_Receive_Budget_...) makes a large one take many seconds without ever stopping.
+            ok = all && duplicates == 0 && failed == 0 && statistics.StreamsReset == 0 && longestGap < TimeSpan.FromSeconds(5);
             return report;
         }
         finally

@@ -865,6 +865,60 @@ public class ReviewCreditAccountingTests
         Assert.Equal(0, DatagramKit.Statistics(client).StreamsReset);
     }
 
+    /// <summary>
+    /// The variant the test above lost when its group message shrank to 12 000 bytes (third review round, SC-4): a message
+    /// above the byte share of a channel nobody reads (40 000 bytes, a 64 KiB block) can only be started on a channel the
+    /// application drains, so the channel is drained once first. The message is still arriving when the connection is lost;
+    /// the reconnect starts with exact counts, and the resumed connection carries a message of the same size.
+    /// </summary>
+    [Fact]
+    public void A_Reconnect_With_A_Message_Above_The_Unread_Share_Staged_Starts_With_Exact_Counts()
+    {
+        using SessionHarness h = new(connect: false, table: Table, link: new LinkOptions { BandwidthBitsPerSecond = 1_000_000 },
+            server: GroupKit.Prompt, client: o =>
+            {
+                GroupKit.Prompt(o);
+                o.ReceiveRingCapacity = Ring;
+            });
+        h.Admission.Handler = static (in HelloInfo hello, QuiclyPeer _) =>
+            AdmissionResult.Accept(ResumeToken, 4242, epoch: hello.SessionToken.IsEmpty ? 1u : 2u);
+        Assert.True(h.RunUntilConnected());
+        QuiclyPeer client = h.Client;
+        QuiclyPeer oldServer = h.Server!;
+        ReceiveCredit credit = client.Core.Credit;
+        Assert.True(40_000 > credit.ByteLimit, "the message must be above the share of a channel nobody reads");
+
+        Assert.Empty(DrainAll(client, Groups));
+        Assert.Equal(CreditState.Drained, State(client, Groups));
+        Assert.Equal(SendStatus.Admitted, oldServer.SendCopy(new SendHeader(Groups), Payload(7, 40_000)).Status);
+        Assert.True(h.RunUntil(() => Waiting(client, Groups) == 1, 2_000_000, step: 200), "the group message did not start");
+        Assert.Equal(0, Channel(client, Groups).Received);
+        Assert.True(WaitingBytes(client, Groups) >= 40_000);
+
+        oldServer.Core.Transport!.Close((ulong)QuiclyErrorCode.NoError, default);
+        for (int step = 0; step < 2_000 && !client.CanReconnect; step++)
+        {
+            h.Network.Advance(1_000);
+        }
+
+        Assert.True(client.CanReconnect);
+        client.Reconnect(h.Connector, h.Listener.LocalEndPoint, "test", default);
+        Assert.Equal(0, Waiting(client, Groups));
+        Assert.Equal(0, WaitingBytes(client, Groups));
+        Assert.Equal(0, Queued(client, Groups));
+        Assert.Equal(0, credit.ParkedStreams);
+        Assert.Equal(0, DatagramKit.Statistics(client).ReceiveBytesOutstanding);
+        Assert.True(h.RunUntil(() => client.State == PeerState.Connected && h.Server is not null
+            && !ReferenceEquals(h.Server, oldServer) && h.Server.State == PeerState.Connected));
+        oldServer.Dispose();
+
+        // The resumed connection: a message of the same size arrives once the application drains the channel.
+        Assert.Equal(SendStatus.Admitted, h.Server!.SendCopy(new SendHeader(Groups), Payload(8, 40_000)).Status);
+        Assert.Equal([8], DrainUntil(h, client, Groups, 1));
+        Assert.Equal(0, Waiting(client, Groups));
+        Assert.Equal(0, DatagramKit.Statistics(client).StreamsReset);
+    }
+
     // ================================================================== scripted runs
 
     [Flags]

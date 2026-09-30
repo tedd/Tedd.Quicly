@@ -38,6 +38,15 @@ the end that receives is the end to upgrade.
   `MaxGroups` is now a sender's bound only. A receiver accepts every group the connection's stream limit admits,
   and its per-stream receive state is sized for that limit, including the 1 024 streams an MsQuic client grants
   in its handshake. PROTOCOL.md §7, "`MaxGroups` is a sender's bound".
+* **A sender retried its stream opens on every pass while the peer held its streams, on a busy machine.** Over MsQuic, a
+  send that starts a stream is two calls. When the peer's stream limit refused the start between them, the send failed
+  with `InvalidState` — for a stream the application had just been told was refused. The engines take that for a failure
+  that no stream limit caused and do not wait for stream credit, so they opened, refused and abandoned a stream on every
+  pass (952 attempts in 500 ms in the test that measures it) for as long as the receiver kept its streams. The transport
+  now answers `StreamLimitReached`, which every engine handles by parking on credit. It needed a thread preempted in a
+  window of microseconds: about 1 run in 100 of the conformance scenario with 24 busy loops on its cores. The
+  `ITransport.SendStream` contract now says that a synchronous `StreamLimitReached` is final even when the refusal
+  callbacks for the stream have arrived.
 * **`ReliableLatest`: a large value whose stream the peer's stream limit refused was counted as sent.** A value
   that travels on a stream is now counted when its stream has started, a refused start goes out again as the
   value's first transmission, and values that wait for a stream no longer hold up the small values behind them.

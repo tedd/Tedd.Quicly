@@ -57,3 +57,10 @@ stops in the middle of a message (`StreamIdleTimeouts`). A receiver built before
 receive ring — and more than `MaxGroups` streams of the channel were open at it. If `StreamsReset` rises on a
 receiver while its peer's `ReliableUnordered` messages go missing, update the receiving end; the sender's
 version does not matter.
+
+One level below, an MsQuic transport refuses a peer stream for which its stream table has no slot, and the
+session never sees that stream: `MsQuicTransport.RefusedPeerStreamCount` counts them, and the transport warns
+through `MsQuicTransportOptions.Diagnostic` as soon as the peer is allowed more streams than the table has room
+for ("raise MaxStreams"). A receiver that falls behind holds its peer's streams open, so a table that is too
+small is reached exactly then. The default table (2 048 slots) has room for the default client grant of 1 024
+and for any channel table whose stream limit is at most 1 536; raise `MaxStreams` for a larger one.

@@ -586,22 +586,28 @@ the stream later — when its receive ring has room, its byte budget allows, or 
 receiver that is behind therefore sees more than `MaxGroups` streams of a channel open although the sender kept
 the limit. It MUST NOT reset them: the sender has already completed those messages `Delivered`, has released
 their payloads and cannot send them again, so a reset there is a silent loss on a reliable channel. What bounds
-the streams is the connection's unidirectional stream limit (Σ max(`MaxGroups`, 1) over the stream-capable
-channels, at most 4 096), which the transport enforces and which returns a slot only when the receiver has
-closed a stream; the receiver keeps one receive record per slot, whatever channel uses it. A sender that ignores
-`MaxGroups` gains nothing but the slots of its own other channels.
+the streams is what the transport admits: the unidirectional stream limit the session asks for after admission
+(Σ max(`MaxGroups`, 1) over the stream-capable channels, at most 4 096), or the transport's own initial grant
+when that is larger — a QUIC stack announces one in its transport parameters and never takes it back, and an
+MsQuic client grants its server 1 024 that way by default. A slot returns only when the receiver has closed a
+stream, and the receiver keeps one receive record for every stream it can be sent, whatever channel uses it. A
+sender that ignores `MaxGroups` gains nothing but the slots of its own other channels. The transport's own
+stream table must have room for what it admits as well (MsQuic: `MaxStreams`): a stream it has to refuse for
+want of a slot never reaches the session and is lost in the same way.
 
 This is a receiver-side rule, so it takes effect when the *receiving* end runs it, whatever the sender runs. A
 receiver built before it reset the excess streams, and still loses groups when it falls behind, however new its
 peer is; it counts them in `StreamsReset`. The reset remains the rule for large
-ReliableLatest values and Bulk transfers, where a reset is not silent: the value is never acknowledged and is
-transmitted again, and the transfer ends with a status.
+ReliableLatest values and Bulk transfers. There it is not silent, and a sender that keeps the limit does not
+reach it through a late receiver: a value is `Delivered` only when the receiver acknowledged it and a transfer
+ends with a status, and neither receive path holds a stream open while the host is late with its `Poll`.
 
 One consequence is not solved by it: the stream limit is shared by all channels of a connection. A
 ReliableUnordered channel whose receiver never reads it while its sender keeps sending ends up holding every
 slot, and from then on a group, a large value or a transfer that needs a *new* stream waits — on any channel —
-until that channel is read. Streams that are already open (every ReliableOrdered channel that has sent
-anything) and all datagram channels are not affected.
+until that channel is read (a large value waits for stream credit like a group does; its thirty-second version
+budget still ends it, with `Failed`, if the wait lasts that long). Streams that are already open (every
+ReliableOrdered channel that has sent anything) and all datagram channels are not affected.
 
 Decompression runs on the game thread inside `Poll` (never on a transport thread); compressed messages are
 staged compressed in a pooled lease. Every limit is configurable per channel or per peer, and every violation

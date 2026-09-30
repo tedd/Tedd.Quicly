@@ -26,14 +26,25 @@
   belief that both ends free a stream's slot at the same event. They do not: a stream is over for its sender
   when its data and FIN are acknowledged, and the receiver holds it open until it has read it, so a receiver
   that was behind reset streams of a sender that had kept the limit — after the sender had completed their
-  messages `Delivered`. The stream limit is enforced by the transport, which returns a slot only when the
-  receiver has closed a stream; it is Σ max(`MaxGroups`, 1) over the stream channels and at most 4 096, and the
-  engine keeps one 64-byte receive record per slot (0.6 KiB for a table with one group channel and one ordered
-  channel, 256 KiB per peer at the cap). A peer that opens every one of them on a single channel holds exactly
-  as many half-received messages — ring reservations and staging leases, the latter inside the receive byte
-  budget — as it could before by using each channel's share, and the stream idle rule still resets the ones it
-  leaves unfinished; the records are per connection, so it takes none from another channel. What it does take
-  is the stream slots of its own other channels.
+  messages `Delivered`. The bound is what the transport admits, and a slot returns only when the receiver has
+  closed a stream: the limit the session asks for after admission (Σ max(`MaxGroups`, 1) over the stream
+  channels, at most 4 096), or the transport's own initial grant when that is more
+  (`TransportCapabilities.PeerUnidirectionalStreams`; an MsQuic client grants 1 024 in its transport parameters
+  by default, and QUIC never takes granted credit back). The session keeps its per-stream receive state for the
+  larger of the two (`PeerCore.PeerStreamCapacity`): one 64-byte record of the group engine and 8 bytes of the
+  pended-stream ring per stream. **Both numbers are this end's own configuration — its channel table and its
+  transport options — so a peer cannot make the state larger than the host chose.** On a server peer the grant is
+  0 and the state is the table's sum: 0.6 KiB of records for one group channel and one ordered channel. On a
+  client peer at the default grant it is 64 KiB of records and a 16 KiB ring; at the most the option allows
+  (65 535) it would be 4 MiB and 1 MiB, and the transport's stream table (`MaxStreams`, default 2 048, a quarter
+  of it kept for local streams) has to be raised before that many streams are admitted at all. A peer that
+  opens every stream it may on a single channel holds one half-received message per stream — a ring reservation
+  and a staging lease, the lease inside the receive byte budget. That is more than the per-channel cap allowed
+  it on that one channel, and the same total it could always hold across the group and ordered channels; the
+  shares of ReliableLatest and Bulk channels, whose receive paths reserve no ring slot, are now usable for it
+  too. The stream idle rule still resets the streams it leaves unfinished, the records are per connection, so
+  it takes none from another peer or another channel, and what it does take is the stream slots of its own
+  other channels.
 * **Retransmission cannot be weaponised**: ReliableLatest has per-version and per-peer retry budgets;
   acks are coalesced per key (the highest accepted version); Pong is rate-limited; control message rate is capped.
 * **Sequence numbers give the peer nothing it did not have** (PROTOCOL §8 "sequence clock"). Only the

@@ -61,9 +61,11 @@ receive ring — and more than `MaxGroups` streams of the channel were open at i
 receiver while its peer's `ReliableUnordered` messages go missing, update the receiving end; the sender's
 version does not matter.
 
-One level below, an MsQuic transport refuses a peer stream for which its stream table has no slot, and the
-session never sees that stream: `MsQuicTransport.RefusedPeerStreamCount` counts them, and the transport warns
-through `MsQuicTransportOptions.Diagnostic` as soon as the peer is allowed more streams than the table has room
-for ("raise MaxStreams"). A receiver that falls behind holds its peer's streams open, so a table that is too
-small is reached exactly then. The default table (2 048 slots) has room for the default client grant of 1 024
-and for any channel table whose stream limit is at most 1 536; raise `MaxStreams` for a larger one.
+One level below, a transport that had no table slot for a stream its peer was allowed to open could only refuse
+the stream, and the session would never see it. The MsQuic transport does not get there: its stream table is
+sized from the streams it grants — the role's initial grant and whatever the session asks for after admission —
+next to a quarter for this end's own streams, whatever `MsQuicTransportOptions.MaxStreams` says (the option is
+the size the table has when that is enough; `MsQuicTransportOptions.Diagnostic` says once when it was raised,
+and `MsQuicTransport.RefusedPeerStreamCount` stays 0). What the option still limits is this end's own streams:
+`OpenStream` answers `OutOfMemory` once they hold everything the table has beyond the peer's grants. The
+WebTransport carrier's mirror of that table follows the slots in use and has no size of its own to get wrong.

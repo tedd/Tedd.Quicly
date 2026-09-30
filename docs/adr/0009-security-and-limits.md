@@ -36,8 +36,11 @@
   transport options — so a peer cannot make the state larger than the host chose.** On a server peer the grant is
   0 and the state is the table's sum: 0.6 KiB of records for one group channel and one ordered channel. On a
   client peer at the default grant it is 64 KiB of records and a 16 KiB ring; at the most the option allows
-  (65 535) it would be 4 MiB and 1 MiB, and the transport's stream table (`MaxStreams`, default 2 048, a quarter
-  of it kept for local streams) has to be raised before that many streams are admitted at all. A peer that
+  (65 535) it would be 4 MiB and 1 MiB. The transport's stream table follows the same two numbers: it is
+  `MaxStreams` slots (default 2 048) or as many as the grants need next to a quarter for this end's own streams,
+  so a stream the peer was allowed to open always finds a slot, and the local streams cannot take the slots of
+  the granted ones; slots are created as streams use them, and the WebTransport carrier's mirror of the table
+  grows the same way (slot records on first use, preamble storage in chunks of 256 slots). A peer that
   opens every stream it may on a single channel holds one half-received message per stream — a ring reservation
   and a staging lease, the lease inside the receive byte budget. That is more than the per-channel cap allowed
   it on that one channel, and the same total it could always hold across the group and ordered channels; the

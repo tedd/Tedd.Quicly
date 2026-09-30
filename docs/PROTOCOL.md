@@ -614,15 +614,19 @@ when that is larger — a QUIC stack announces one in its transport parameters a
 MsQuic client grants its server 1 024 that way by default. A slot returns only when the receiver has closed a
 stream, and the receiver keeps one receive record for every stream it can be sent, whatever channel uses it. A
 sender that ignores `MaxGroups` gains nothing but the slots of its own other channels. The transport's own
-stream table must have room for what it admits as well (MsQuic: `MaxStreams`): a stream it has to refuse for
-want of a slot never reaches the session and is lost in the same way.
+stream table must have room for what it admits as well: a stream it had to refuse for want of a slot would
+never reach the session and would be lost in the same way. The MsQuic transport therefore sizes its table from
+the streams it grants, whatever `MaxStreams` says, and keeps a quarter of it for this end's own streams.
 
 This is a receiver-side rule, so it takes effect when the *receiving* end runs it, whatever the sender runs. A
 receiver built before it reset the excess streams, and still loses groups when it falls behind, however new its
 peer is; it counts them in `StreamsReset`. The reset remains the rule for large
 ReliableLatest values and Bulk transfers. There it is not silent, and a sender that keeps the limit does not
-reach it through a late receiver: a value is `Delivered` only when the receiver acknowledged it and a transfer
-ends with a status, and neither receive path holds a stream open while the host is late with its `Poll`.
+reach it through a late receiver: a value is `Delivered` only when the receiver acknowledged it, and its receive
+path holds no stream open while the host is late with its `Poll`; a Bulk stream can be held (a chunk waits when
+the receive budget is used up), but the sender's transfer slot is given back only by the receiver's final
+`BulkProgress`, which its game thread sends, so the sender does not open the next stream past the limit before
+the receiver has let the last one go.
 
 One consequence is not solved by it: the stream limit is shared by all channels of a connection. A
 ReliableUnordered channel whose receiver never reads it while its sender keeps sending ends up holding every

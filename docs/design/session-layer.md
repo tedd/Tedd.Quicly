@@ -1305,12 +1305,21 @@ state of the peer's group streams. Every per-key array grows with the slots in u
   start (`StreamLimitReached`) releases the stream with `CloseStream` and the value waits until `StreamCreditGeneration`
   changes; a newer version aborts the older stream of the same key. MsQuic and the simulator refuse a start only *after* the
   send that carried it was accepted (`OnStreamStarted(StreamLimitReached)`, then the canceled completion, then the shutdown), so
-  that transmission has been counted like one that left. The transport thread hands the refusal to the game thread as a
-  notice, which takes it back — the value's attempt and the channel's `Sent` — and blocks the channel on the credit generation
-  read before the stream was opened; the canceled completion re-queues the value, and the refused stream's own shutdown gives
-  its per-channel slot back without unblocking the channel. Without the notice every pass opened a stream, had it refused and
-  spent one of the version's sixteen transmissions: a value ended `Failed` a few milliseconds into a stretch in which the
-  connection had no stream slot free, which is exactly what a receiver that is late with its Poll produces.
+  a stream transmission is **counted when its start is known**, not when the send is accepted: the transport thread hands
+  the start's outcome to the game thread as a notice (`StreamStarted`, `StreamRefused`; they and the shutdowns have a ring of
+  their own, sized for every stream the engine can have recorded, so a burst of acks cannot cost one). On `StreamStarted` the
+  version's attempt, the channel's `Sent`/`BytesSent` (and `Retries`), the aggregate retry budget and the value's in-flight
+  state are counted; on `StreamRefused` nothing is, and the channel's large values wait on the credit generation read before
+  the stream was opened. A refused start therefore costs none of the version's sixteen transmissions (a value used to end
+  `Failed` a few milliseconds into a stretch in which the connection had no stream slot free, which is exactly what a receiver
+  that is late with its Poll produces), `Sent` never goes down, and a value that waits for a stream is reported as queued. The
+  canceled completion puts the value back: at the **head of the fresh queue** when nothing of it has left the host, so that
+  its next transmission is its first — the retry budget does not gate it and `Retries` does not count it — and in the retry
+  queue otherwise. The refused stream's own shutdown gives its per-channel slot back without unblocking the channel.
+* **A value that waits for a stream holds nothing else back.** The scheduler's pass over a channel's queue (fresh or retry)
+  passes over a large value that cannot have a stream now — no stream credit, `MaxGroups` streams of the channel open, no
+  counted slot — and goes on with the values behind it: they fit a datagram and need no stream. Only the pass's budget, the
+  retry budget, the datagram limit and entry exhaustion end the pass.
 * **The channel's stream cap binds the sender too.** Both peers read the same channel table, so opening more than
   `MaxGroups` streams on a channel would make the *receiver* reset a live stream of ours (PROTOCOL.md §7) — silent loss of a
   value we believe is on its way. The engine therefore counts its own open streams per channel and holds a large value back

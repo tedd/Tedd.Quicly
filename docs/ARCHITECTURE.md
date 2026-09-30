@@ -404,7 +404,7 @@ public sealed class QuiclyClient
 | Setting | Default | Why |
 |---|---|---|
 | `PeerBidiStreamCount` | 1 before admission | the control stream only |
-| `PeerUnidiStreamCount` | server: 0 before admission. Client: 1 024 from the first packet (`MsQuicTransportOptions.ClientPeerUnidiStreamCount`; QUIC never takes it back). After admission both ask for channels + Σ MaxGroups + bulk concurrency (≤ 4 096) | per-channel streams and flush groups; the session keeps receive state for the larger of the two numbers (`PeerCore.PeerStreamCapacity`), and the transport's stream table (`MaxStreams`, 2 048) has to have room for it |
+| `PeerUnidiStreamCount` | server: 0 before admission. Client: 1 024 from the first packet (`MsQuicTransportOptions.ClientPeerUnidiStreamCount`; QUIC never takes it back). After admission both ask for Σ max(`MaxGroups`, 1) over the stream-capable channels (≤ 4 096) | per-channel streams and flush groups; the session keeps receive state for the larger of the two numbers (`PeerCore.PeerStreamCapacity`), and the transport's stream table is `MaxStreams` slots (2 048) or as many as those grants need next to a quarter for the local streams |
 | `StreamRecvWindowUnidiDefault` | 2 MiB | one Bulk stream per RTT must not be capped at 64 KiB |
 | `ConnFlowControlWindow` | 16 MiB | bulk throughput |
 | `IdleTimeoutMs` | 30 000 | dead-client detection when nothing is in flight |

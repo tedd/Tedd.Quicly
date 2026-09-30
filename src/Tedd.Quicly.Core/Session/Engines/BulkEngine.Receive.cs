@@ -75,6 +75,12 @@ internal sealed unsafe partial class BulkEngine
     private int _maxStage;
     private int _resetReceive;
 
+    /// <summary>
+    /// Receive records per transfer this end accepts at once (<see cref="PeerOptions.BulkTransfersPerDirection"/>): the live
+    /// ones, and the ones that ended and wait for the game thread to report them (<see cref="InitializeReceive"/>).
+    /// </summary>
+    internal const int ReceiveRecordsPerTransfer = 4;
+
     /// <summary>Peer bulk streams accepted on a channel right now (transport thread's count; tests).</summary>
     /// <param name="channelIndex">Dense index of a channel of this engine.</param>
     /// <returns>The number of accepted peer streams.</returns>
@@ -86,14 +92,22 @@ internal sealed unsafe partial class BulkEngine
     private void InitializeReceive(PeerCore core, int channelCount, int transfers)
     {
         _idealSendBuffer = new long[transfers];
-        _recv = new NativeArray<BulkRecv>(transfers);
-        _sinks = new IBulkSink?[transfers];
-        _recvCancelCode = new int[transfers];
-        _recvChecksums = new XxHash64Builder[transfers];
+
+        // More records than transfers may be live: a transfer that ended keeps its record until the game thread has sent its
+        // final progress, and a sender whose transfer was canceled gets its slot back from the stream's close alone — on
+        // this end's transport thread, whether or not its game thread is polling. So a sender that keeps the limit can
+        // start transfers while earlier ones still wait to be reported; the live limit is _recvLive. Past
+        // ReceiveRecordsPerTransfer - 1 transfers per slot ended during one hitch of this end's host, the next is refused
+        // (LimitExceeded) until the host polls again.
+        int records = transfers * ReceiveRecordsPerTransfer;
+        _recv = new NativeArray<BulkRecv>(records);
+        _sinks = new IBulkSink?[records];
+        _recvCancelCode = new int[records];
+        _recvChecksums = new XxHash64Builder[records];
         _openStreams = new int[Math.Max(channelCount, 1)];
-        _retired = new SpscRing<int>(transfers + 8);
-        _recycle = new SpscRing<int>(transfers + 8);
-        for (int record = transfers - 1; record >= 0; record--)
+        _retired = new SpscRing<int>(records + 8);
+        _recycle = new SpscRing<int>(records + 8);
+        for (int record = records - 1; record >= 0; record--)
         {
             ref BulkRecv recv = ref _recv[record];
             recv = default;

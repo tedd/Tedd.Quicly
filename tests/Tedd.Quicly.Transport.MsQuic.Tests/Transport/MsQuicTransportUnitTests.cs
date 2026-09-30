@@ -125,7 +125,10 @@ public unsafe class MsQuicTransportUnitTests
         Assert.Equal(ServerCertificateValidationMode.SystemRoots, options.ServerCertificateValidation);
         Assert.Equal(MsQuicServerCredentialMode.Auto, options.ServerCredentialMode);
         Assert.Equal(MsQuicKeyStorage.User, options.ServerKeyStorage);
-        Assert.Equal(1024, options.MaxStreams);
+        Assert.Equal(2048, options.MaxStreams);
+
+        // The table has room for everything a default client lets its server open, next to the local streams.
+        Assert.True(options.ClientPeerUnidiStreamCount <= MsQuicTransportOptions.PeerStreamRoom(options.MaxStreams));
 
         MsQuicSettings server = options.CreateServerSettings();
         Assert.Equal((ushort)1, server.PeerBidiStreamCount);
@@ -195,6 +198,12 @@ public unsafe class MsQuicTransportUnitTests
         Assert.Throws<ArgumentException>(() => new MsQuicTransportOptions { Alpns = [new string('x', 256)] }.Validate(client: true));
         Assert.Throws<ArgumentOutOfRangeException>(() => new MsQuicTransportOptions { MaxStreams = 0 }.Validate(client: false));
         Assert.Throws<ArgumentOutOfRangeException>(() => new MsQuicTransportOptions { MaxStreams = (1 << 20) + 1 }.Validate(client: false));
+
+        // A quarter of the table, at least one slot, stays free for the local streams.
+        Assert.Equal(1536, MsQuicTransportOptions.PeerStreamRoom(2048));
+        Assert.Equal(768, MsQuicTransportOptions.PeerStreamRoom(1024));
+        Assert.Equal(3, MsQuicTransportOptions.PeerStreamRoom(4));
+        Assert.Equal(0, MsQuicTransportOptions.PeerStreamRoom(1));
         Assert.Throws<ArgumentException>(() => new MsQuicTransportOptions { ServerCertificateValidation = ServerCertificateValidationMode.PinnedSpki }.Validate(client: true));
         Assert.Throws<ArgumentException>(() => new MsQuicTransportOptions { ServerCertificateValidation = ServerCertificateValidationMode.PinnedSpki, PinnedSpkiSha256 = [new byte[31]] }.Validate(client: true));
         Assert.Throws<ArgumentException>(() => new MsQuicTransportOptions { ServerCertificateValidation = ServerCertificateValidationMode.Callback }.Validate(client: true));

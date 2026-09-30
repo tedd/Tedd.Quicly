@@ -177,6 +177,7 @@ public sealed unsafe partial class WebTransportTransport : ITransport, ITranspor
             if (inner is null) return default;
             TransportCapabilities caps = inner.Capabilities;
             caps.MaxDatagramPayload = ReducedDatagramPayload(caps.MaxDatagramPayload);
+            caps.PeerUnidirectionalStreams = SessionPeerUnidiStreams(caps.PeerUnidirectionalStreams);
             return caps;
         }
     }

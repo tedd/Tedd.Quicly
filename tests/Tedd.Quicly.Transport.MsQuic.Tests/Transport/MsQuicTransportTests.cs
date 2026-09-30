@@ -114,9 +114,13 @@ public unsafe class MsQuicTransportTests
         Assert.NotNull(client.RemoteEndPoint);
         Assert.Equal(server.Connection.LocalEndPoint!.Port, client.RemoteEndPoint!.Port);
         Assert.True(client.CancelOnBlockedSupported);
-        Assert.Equal(1024, client.MaxStreams);
+        Assert.Equal(2048, client.MaxStreams);
         Assert.True(Spin.Until(() => client.Capabilities.Datagrams && server.Capabilities.Datagrams, Timeout));
         TransportCapabilities capabilities = client.Capabilities;
+
+        // What each end lets its peer open before anyone asks: the role's initial grant, as the harness configured it.
+        Assert.Equal(scope.Harness.ClientOptions().CreateClientSettings().PeerUnidiStreamCount ?? 0, capabilities.PeerUnidirectionalStreams);
+        Assert.Equal(scope.Harness.ServerOptions().CreateServerSettings().PeerUnidiStreamCount ?? 0, server.Capabilities.PeerUnidirectionalStreams);
         Assert.True(capabilities.StreamPriority && capabilities.IdealSendBufferSize && capabilities.CancelOnBlocked && capabilities.DatagramSendState);
         Assert.False(capabilities.AppOwnedReceiveBuffers);
         Assert.InRange(capabilities.MaxDatagramPayload, 1100, 1500);
@@ -237,6 +241,57 @@ public unsafe class MsQuicTransportTests
         Assert.Equal(4, server.OpenStreamCount);
         // The refusal is counted just before the diagnostic is logged on the worker thread: wait for the message.
         Assert.True(Spin.Until(() => diagnostics.Any(m => m.Contains("stream table is full", StringComparison.Ordinal)), Timeout));
+
+        // The server had been told in advance: it let the client open more streams than its table has room for.
+        Assert.Single(diagnostics, m => m.Contains("raise MaxStreams", StringComparison.Ordinal));
+        scope.Finish();
+    }
+
+    [Fact]
+    public void A_stream_table_too_small_for_what_the_peer_may_open_is_reported_once()
+    {
+        var diagnostics = new ConcurrentQueue<string>();
+        using var scope = new Scope();
+        MsQuicTransportOptions clientOptions = scope.Harness.ClientOptions();
+        clientOptions.MaxStreams = 8; // room for six peer streams next to the local ones
+        clientOptions.ClientPeerUnidiStreamCount = 64;
+        clientOptions.Diagnostic = (_, message, _) => diagnostics.Enqueue(message);
+        var accepted = new ConcurrentQueue<(MsQuicTransport Transport, RecordingSink Sink)>();
+        MsQuicTransportListener listener = Listen(scope, accepted);
+        (MsQuicTransport client, RecordingSink cs) = Dial(scope, scope.Harness.CreateConnector(clientOptions), listener.LocalEndPoint);
+        Assert.True(WaitFor(cs, RecordedEventKind.Connected));
+
+        // The grant is in the transport parameters, so it is reported from the start: the session sizes itself for it.
+        Assert.Equal(64, client.Capabilities.PeerUnidirectionalStreams);
+        Assert.Single(diagnostics, m => m.Contains("raise MaxStreams", StringComparison.Ordinal));
+        Assert.Contains("64 streams", diagnostics.Single(m => m.Contains("raise MaxStreams", StringComparison.Ordinal)), StringComparison.Ordinal);
+
+        // A later request of the session is covered by the same warning; it is not repeated.
+        client.UpdatePeerStreamLimits(0, 100);
+        Assert.Single(diagnostics, m => m.Contains("raise MaxStreams", StringComparison.Ordinal));
+        scope.Finish();
+    }
+
+    [Fact]
+    public void A_stream_table_with_room_for_the_peers_streams_is_not_reported()
+    {
+        var diagnostics = new ConcurrentQueue<string>();
+        using var scope = new Scope();
+        MsQuicTransportOptions clientOptions = scope.Harness.ClientOptions();
+        clientOptions.MaxStreams = 64; // room for forty-eight
+        clientOptions.ClientPeerUnidiStreamCount = 16;
+        clientOptions.Diagnostic = (_, message, _) => diagnostics.Enqueue(message);
+        var accepted = new ConcurrentQueue<(MsQuicTransport Transport, RecordingSink Sink)>();
+        MsQuicTransportListener listener = Listen(scope, accepted);
+        (MsQuicTransport client, RecordingSink cs) = Dial(scope, scope.Harness.CreateConnector(clientOptions), listener.LocalEndPoint);
+        Assert.True(WaitFor(cs, RecordedEventKind.Connected));
+        Assert.Equal(16, client.Capabilities.PeerUnidirectionalStreams);
+        client.UpdatePeerStreamLimits(0, 48);
+        Assert.DoesNotContain(diagnostics, m => m.Contains("raise MaxStreams", StringComparison.Ordinal));
+
+        // Asking for more than the table can hold is reported when it is asked for.
+        client.UpdatePeerStreamLimits(0, 49);
+        Assert.Single(diagnostics, m => m.Contains("raise MaxStreams", StringComparison.Ordinal));
         scope.Finish();
     }
 

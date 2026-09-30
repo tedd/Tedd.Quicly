@@ -687,6 +687,7 @@ public sealed unsafe partial class WebTransportTransport
 
         info.Capabilities.MaxDatagramPayload = ReducedDatagramPayload(info.Capabilities.MaxDatagramPayload);
         info.Capabilities.Datagrams = info.Capabilities.Datagrams && PeerSupportsDatagrams();
+        info.Capabilities.PeerUnidirectionalStreams = SessionPeerUnidiStreams(info.Capabilities.PeerUnidirectionalStreams);
         sink?.OnConnected(in info);
 
         // Streams the peer opened optimistically, before this point, are Core's only now that it has been connected.

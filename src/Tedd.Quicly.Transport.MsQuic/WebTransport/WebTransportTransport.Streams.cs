@@ -393,6 +393,12 @@ public sealed unsafe partial class WebTransportTransport
         inner?.UpdatePeerStreamLimits(AddOverhead(bidirectional, _isClient ? 0 : 1), AddOverhead(unidirectional, Http3UniStreamCount));
     }
 
+    /// <summary>
+    /// What the inner connection's initial unidirectional grant leaves for the session: three of those streams are HTTP/3's
+    /// own (control and the two QPACK streams) and never reach Core.
+    /// </summary>
+    private static int SessionPeerUnidiStreams(int inner) => Math.Max(0, inner - Http3UniStreamCount);
+
     private static ushort AddOverhead(ushort value, int overhead)
     {
         int raised = value + overhead;

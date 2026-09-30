@@ -391,6 +391,10 @@ public sealed unsafe partial class SimulatedTransport : ITransport
             StreamPriority = true,
             CancelOnBlocked = true,
             IdealSendBufferSize = o.IdealSendBufferReporting,
+
+            // The link's initial grant: what the peer may open before anyone calls UpdatePeerStreamLimits, which can raise
+            // it and never lower it.
+            PeerUnidirectionalStreams = o.PeerUnidiStreams,
         };
     }
 

@@ -28,6 +28,7 @@ public sealed class MsQuicTransportConnector : ITransportConnector, IDisposable
     private readonly MsQuicRegistration _registration;
     private readonly bool _ownsRegistration;
     private readonly MsQuicConfiguration _configuration;
+    private readonly int _initialPeerUnidiStreams;
     private readonly ServerCertificatePolicy _policy;
     private readonly Action<MsQuicTransport> _onHandlesClosed;
     private int _liveTransports;
@@ -52,7 +53,9 @@ public sealed class MsQuicTransportConnector : ITransportConnector, IDisposable
         _registration = registration ?? new MsQuicRegistration(_options.AppName, _options.ExecutionProfile);
         try
         {
-            _configuration = MsQuicConfiguration.CreateClient(_registration, _options.Alpns, _policy.WrapperValidation, _options.CreateClientSettings());
+            MsQuicSettings settings = _options.CreateClientSettings();
+            _initialPeerUnidiStreams = settings.PeerUnidiStreamCount ?? 0;
+            _configuration = MsQuicConfiguration.CreateClient(_registration, _options.Alpns, _policy.WrapperValidation, settings);
         }
         catch
         {
@@ -108,7 +111,7 @@ public sealed class MsQuicTransportConnector : ITransportConnector, IDisposable
         }
         var connection = new MsQuicConnection(_registration);
         string? validatedName = string.IsNullOrEmpty(serverName) ? (address is null ? target : null) : serverName;
-        var transport = new MsQuicTransport(connection, sink, _options, _policy, validatedName);
+        var transport = new MsQuicTransport(connection, sink, _options, _policy, validatedName, _initialPeerUnidiStreams);
         transport.HandlesClosedCallback = _onHandlesClosed;
         Interlocked.Increment(ref _liveTransports);
         if (_policy.Mode == ServerCertificateValidationMode.DangerousAcceptAnyServerCertificate)

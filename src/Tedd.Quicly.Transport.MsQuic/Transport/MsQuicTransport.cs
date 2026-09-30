@@ -124,8 +124,13 @@ public sealed unsafe partial class MsQuicTransport : ITransport, IMsQuicConnecti
     private TransportConnectedInfo _connectedInfo;
     private MsQuicTransportListener.ConfigurationEntry? _configurationLease;
 
-    internal MsQuicTransport(MsQuicConnection connection, ITransportSink? sink, MsQuicTransportOptions options, ServerCertificatePolicy? certificatePolicy, string? serverName)
+    /// <summary>Unidirectional streams the connection's settings grant the peer before <see cref="UpdatePeerStreamLimits"/> (<see cref="TransportCapabilities.PeerUnidirectionalStreams"/>).</summary>
+    private readonly int _initialPeerUnidiStreams;
+    private int _streamTableWarned;
+
+    internal MsQuicTransport(MsQuicConnection connection, ITransportSink? sink, MsQuicTransportOptions options, ServerCertificatePolicy? certificatePolicy, string? serverName, int initialPeerUnidiStreams = 0)
     {
+        _initialPeerUnidiStreams = initialPeerUnidiStreams;
         ThrowIfSegmentLayoutUnsupported();
         _connection = connection;
         _sink = sink;
@@ -136,6 +141,7 @@ public sealed unsafe partial class MsQuicTransport : ITransport, IMsQuicConnecti
         _supportedSendFlags = connection.Api.SupportedSendFlags;
         _cancelOnBlockedSupported = (_supportedSendFlags & QUIC_SEND_FLAGS.CANCEL_ON_BLOCKED) != 0;
         InitializeStreams(options.MaxStreams);
+        WarnIfStreamTableIsSmall(initialPeerUnidiStreams);
         connection.Events = this;
     }
 
@@ -211,6 +217,10 @@ public sealed unsafe partial class MsQuicTransport : ITransport, IMsQuicConnecti
                 AppOwnedReceiveBuffers = false,
                 IdealSendBufferSize = true,
                 CancelOnBlocked = _cancelOnBlockedSupported,
+
+                // What the connection's own settings let the peer open from the first packet on. It is in the transport
+                // parameters, so nothing the session asks for later takes it back.
+                PeerUnidirectionalStreams = _initialPeerUnidiStreams,
             };
         }
     }
@@ -282,7 +292,24 @@ public sealed unsafe partial class MsQuicTransport : ITransport, IMsQuicConnecti
     {
         int state = Volatile.Read(ref _state);
         if (state is StateClosing or StateClosed || _connection.IsClosed) return;
+        WarnIfStreamTableIsSmall(bidirectional + Math.Max(unidirectional, _initialPeerUnidiStreams));
         _connection.UpdatePeerStreamLimits(bidirectional, unidirectional);
+    }
+
+    /// <summary>
+    /// Says once, through the diagnostic sink, when the peer is allowed more streams than the stream table has room for next
+    /// to the local ones (<see cref="MsQuicTransportOptions.PeerStreamRoom"/>). MsQuic admits a stream the peer has credit
+    /// for; without a table slot the transport can only refuse it (<see cref="RefusedPeerStreamCount"/>), and what it
+    /// carried is lost without the session ever seeing it. A receiver that falls behind holds its peer's streams open, so
+    /// a table that is too small is reached exactly then.
+    /// </summary>
+    /// <param name="peerStreams">Streams the peer may have open at once.</param>
+    private void WarnIfStreamTableIsSmall(int peerStreams)
+    {
+        int room = MsQuicTransportOptions.PeerStreamRoom(_maxStreams);
+        if (peerStreams <= room || Interlocked.Exchange(ref _streamTableWarned, 1) != 0) return;
+        Diagnose(TransportDiagnosticLevel.Warning,
+            $"The peer may have {peerStreams} streams open, but the stream table (MsQuicTransportOptions.MaxStreams = {_maxStreams}) has room for {room} next to the local streams. Peer streams beyond the table are refused and their data is lost: raise MaxStreams.", null);
     }
 
     /// <summary>

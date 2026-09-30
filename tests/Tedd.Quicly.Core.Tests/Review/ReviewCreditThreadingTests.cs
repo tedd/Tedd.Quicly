@@ -35,6 +35,9 @@ public class ReviewCreditThreadingTests
 {
     private const int Ring = 64;
 
+    /// <summary>Messages the two-thread model has to deliver before its run may end (and its final assertion asks for).</summary>
+    private const long EnoughMessages = 50_000;
+
     /// <summary>Messages a reliable channel without a handler may have waiting at <see cref="Ring"/> (two reliable channels).</summary>
     private const int Limit = 16;
 
@@ -697,7 +700,21 @@ public class ReviewCreditThreadingTests
         transportThread.Start();
         gameThread.Start();
         prober.Start();
-        string? stall = WatchForAStall(delivered, left, runMillis: 1_500, stallMillis: 3_000, () => Volatile.Read(ref transportDone) != 0, () => Volatile.Write(ref finishing, 1));
+        // The run lasts until the model has done what the final assertion asks of it (and at least 1.5 s), not for a fixed
+        // time: how much two threads get done in a second is up to the machine. A run of the whole test project on a busy
+        // machine once reached only 9 000 of the 10 000 messages and failed on that, although nothing was wrong.
+        string? stall = WatchForAStall(delivered, left, runMillis: 1_500, stallMillis: 10_000, () => Volatile.Read(ref transportDone) != 0, () => Volatile.Write(ref finishing, 1),
+            enough: () =>
+            {
+                long sum = 0;
+                for (int s = 0; s < delivered.Length; s++)
+                {
+                    sum += Volatile.Read(ref delivered[s]);
+                }
+
+                return sum >= EnoughMessages && Volatile.Read(ref untakes) > 0 && Volatile.Read(ref gone) > 0 && Volatile.Read(ref grown) > 0 && Volatile.Read(ref probes) > 0;
+            },
+            maxMillis: 120_000);
         if (stall is not null)
         {
             StringBuilder report = new(stall);
@@ -738,16 +755,17 @@ public class ReviewCreditThreadingTests
         }
 
         Assert.Equal(total, returned);
-        Assert.True(untakes > 0 && gone > 0 && grown > 0 && probes > 0 && total > 10_000,
+        Assert.True(untakes > 0 && gone > 0 && grown > 0 && probes > 0 && total >= EnoughMessages,
             $"the model did too little: {total} messages, {untakes} given up, {gone} streams ended while held back, the list grew {grown} times, {probes} probes");
     }
 
     /// <summary>
-    /// Watches per-stream progress: runs the open-ended phase for <paramref name="runMillis"/>, then asks the transport
+    /// Watches per-stream progress: runs the open-ended phase for <paramref name="runMillis"/> (and until
+    /// <paramref name="enough"/> says the model did its share of work, but no longer than <paramref name="maxMillis"/>), then asks the transport
     /// thread to finish and waits for it. Returns a description when a stream with messages left made no progress for
     /// <paramref name="stallMillis"/>.
     /// </summary>
-    private static string? WatchForAStall(long[] delivered, long[] left, int runMillis, int stallMillis, Func<bool> finished, Action finish)
+    private static string? WatchForAStall(long[] delivered, long[] left, int runMillis, int stallMillis, Func<bool> finished, Action finish, Func<bool>? enough = null, int maxMillis = int.MaxValue)
     {
         Stopwatch clock = Stopwatch.StartNew();
         long[] seen = new long[delivered.Length];
@@ -757,7 +775,7 @@ public class ReviewCreditThreadingTests
         {
             Thread.Sleep(20);
             long now = clock.ElapsedMilliseconds;
-            if (!asked && now >= runMillis)
+            if (!asked && ((now >= runMillis && (enough is null || enough())) || now >= maxMillis))
             {
                 finish();
                 asked = true;

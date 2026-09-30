@@ -6,11 +6,14 @@ namespace Tedd.Quicly.Testing.Tests.Review;
 /// Adversarial review of fix/msquic-held-stream-resume (8107fc3), threading lens: the new conformance scenario
 /// <c>HeldStreamIsIndicatedAgainAfterEveryResume</c> on the simulator. The scenario resumes the held stream from a second,
 /// real thread, while the simulated harness burns virtual time as fast as the pumping thread can spin
-/// (<see cref="SimulatedTransportHarness.Pump"/>: 250 virtual microseconds per step, no waiting). The two are coupled by
-/// nothing but the scheduler: every one of the 2 000 resumes costs whatever virtual time the pump gets through before the
-/// resuming thread has run, and the scenario's 30 virtual seconds are over in a fraction of a wall-clock second. The
+/// (<see cref="SimulatedTransportHarness.Pump"/>: 250 virtual microseconds per step, no waiting). Were the two coupled by
+/// nothing but the scheduler, every one of the 2 000 resumes would cost whatever virtual time the pump gets through before
+/// the resuming thread has run, and the scenario's 30 virtual seconds are over in a fraction of a wall-clock second. The
 /// simulator is otherwise deterministic (same seed, same run), and <see cref="ITransportTestHarness"/> says scenarios call
-/// the transport from the thread that calls Pump.
+/// the transport from the thread that calls Pump. The pumping thread now blocks while a resume is owed, and the two
+/// threads hand off through events rather than by polling: a polled hand-off costs a scheduler quantum or more whenever
+/// no core is free, which on four cores made this class take 47 s instead of 8 s, and the CI runner's test job ran into
+/// its 15-minute limit.
 /// </summary>
 [Collection(ReviewResumeThreadingSimulatorCollection.Name)]
 public class ReviewResumeThreadingSimulatorTests

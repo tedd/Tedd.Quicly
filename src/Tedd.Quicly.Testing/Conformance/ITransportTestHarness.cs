@@ -12,13 +12,19 @@ namespace Tedd.Quicly.Testing.Conformance;
 /// inside <see cref="Pump"/> for a simulated transport and on the transport's own threads for a real one, so the scenarios
 /// only use thread-safe sinks and never assume that a callback has or has not happened when an API call returns.
 /// <para>
-/// Two scenarios call <see cref="ITransport.ResumeStreamReceive"/> from a second thread, because the timing of that call
-/// against the receive callback is what they test (<c>ResumeRacingTheReceiveCallbackIsApplied</c>,
-/// <c>HeldStreamIsIndicatedAgainAfterEveryResume</c>). In both the pumping thread waits for that call inside its
-/// <see cref="Pump"/> condition before it goes on, so a harness on virtual time does not advance its clock while a resume
-/// is owed: the scenario takes the same virtual time in every run, and its timeout cannot run out merely because the
-/// second thread had to wait for a core. A harness must therefore evaluate the condition outside any lock its transports
-/// take in <see cref="ITransport.ResumeStreamReceive"/>.
+/// Three scenarios make a transport call from a second thread, because the timing of that call is what they test:
+/// <see cref="ITransport.ResumeStreamReceive"/> against the receive callback (<c>ResumeRacingTheReceiveCallbackIsApplied</c>,
+/// <c>HeldStreamIsIndicatedAgainAfterEveryResume</c>) and <see cref="ITransport.Close"/> against datagrams in flight
+/// (<c>DatagramsInFlightAtCloseReachAFinalStateBeforeOnClosed</c>). The second thread is woken by an event the callback or
+/// the sink sets, and while its call is owed the pumping thread blocks inside its <see cref="Pump"/> condition until that
+/// call has been made (with a real-time bound of 30 seconds, after which the scenario fails). A harness on virtual time
+/// therefore does not advance its clock while the call is owed: the scenario takes the same virtual time in every run, its
+/// timeout cannot run out merely because the second thread had to wait for a core, and because neither thread spins
+/// against the other a hand-off costs a thread wake-up even when every core is busy. A harness must therefore evaluate the
+/// condition outside any lock its transports take in <see cref="ITransport.ResumeStreamReceive"/> and
+/// <see cref="ITransport.Close"/>. One receive callback blocks too: the held-stream scenario's callback waits (busy for
+/// 20 microseconds, then blocked) until the resuming thread runs, so that its resume races the callback's return; that
+/// thread signals before it calls the transport, so the wait never depends on a lock the callback's thread holds.
 /// </para>
 /// </remarks>
 public interface ITransportTestHarness : IDisposable

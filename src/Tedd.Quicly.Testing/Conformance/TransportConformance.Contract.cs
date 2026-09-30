@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Testing.Simulation;
@@ -7,6 +8,12 @@ namespace Tedd.Quicly.Testing.Conformance;
 /// <summary>Contract scenarios for refused and released streams, refused connections and the ways a connection ends.</summary>
 public static unsafe partial class TransportConformance
 {
+    /// <summary>
+    /// Real time a scenario gives the second thread it starts to make the call it owes (see the remarks of
+    /// <see cref="ITransportTestHarness"/>): only a thread that is dead or stuck takes this long.
+    /// </summary>
+    private static readonly TimeSpan SecondThreadTimeout = TimeSpan.FromSeconds(30);
+
     // ------------------------------------------------------------------ refused and released streams
 
     /// <summary>
@@ -291,11 +298,15 @@ public static unsafe partial class TransportConformance
         NativeSegments segments = s.RentSegments(Count);
         for (int i = 0; i < Count; i++) segments.Set(i, data.Segment(i * Length, Length));
         ITransport client = s.Client;
+        var closeCalled = new ManualResetEvent(false);
+        int abandoned = 0;
         var closer = new Thread(() =>
         {
-            long deadline = Environment.TickCount64 + 30_000;
-            while (!watcher.SentSeen && Environment.TickCount64 < deadline) Thread.SpinWait(20);
+            // Blocked until the sink reports the first Sent, then straight to Close.
+            watcher.Sent.WaitOne(SecondThreadTimeout);
+            if (Volatile.Read(ref abandoned) != 0) return;
             client.Close(3, default);
+            closeCalled.Set();
         })
         {
             IsBackground = true,
@@ -303,12 +314,32 @@ public static unsafe partial class TransportConformance
         };
         closer.Start();
         var accepted = new List<ulong>();
-        for (int i = 0; i < Count; i++)
+        bool closeOverdue = false;
+        try
         {
-            if (s.Client.SendDatagram(segments.At(i), 1, (ulong)(i + 1), TransportSendFlags.None) == TransportStatus.Success) accepted.Add((ulong)(i + 1));
+            for (int i = 0; i < Count; i++)
+            {
+                if (s.Client.SendDatagram(segments.At(i), 1, (ulong)(i + 1), TransportSendFlags.None) == TransportStatus.Success) accepted.Add((ulong)(i + 1));
+            }
+
+            // Once a datagram was reported Sent the close is owed by the other thread, and the pumping thread blocks until
+            // it has been made (see ITransportTestHarness): a harness on virtual time must not run its clock out while that
+            // thread waits for a core.
+            s.Wait(() =>
+            {
+                if (watcher.SentSeen && !closeCalled.WaitOne(SecondThreadTimeout)) closeOverdue = true;
+                return closeOverdue || s.BothClosed;
+            }, "OnClosed on both ends");
+            s.Require(!closeOverdue, $"the closing thread did not call Close within {SecondThreadTimeout.TotalSeconds:F0} s of the first Sent report.");
         }
-        s.Wait(() => s.BothClosed, "OnClosed on both ends");
-        s.Require(closer.Join(TimeSpan.FromSeconds(30)), "the closing thread did not finish.");
+        finally
+        {
+            // On a failure, release the closer without a close (the session closes both ends itself).
+            Volatile.Write(ref abandoned, 1);
+            watcher.Sent.Set();
+        }
+
+        s.Require(closer.Join(SecondThreadTimeout), "the closing thread did not finish.");
         s.Settle(TimeSpan.FromMilliseconds(200));
         IReadOnlyList<RecordedEvent> events = s.ClientSink.Events;
         int closed = IndexOf(events, static e => e.Kind == RecordedEventKind.Closed);
@@ -328,14 +359,17 @@ public static unsafe partial class TransportConformance
         s.Require(missing.Count == 0, $"{missing.Count} of {accepted.Count} accepted datagrams did not report exactly one final state before OnClosed (contexts {string.Join(", ", missing)}).");
     }
 
-    /// <summary>Records that a datagram was handed to the network.</summary>
+    /// <summary>Records that a datagram was handed to the network, and signals it to a thread blocked on <see cref="Sent"/>.</summary>
     private sealed class SentWatcher : SinkBase
     {
+        public readonly ManualResetEvent Sent = new(false);
         public volatile bool SentSeen;
 
         public override void OnDatagramSendStateChanged(ulong context, DatagramSendState state)
         {
-            if (state == DatagramSendState.Sent) SentSeen = true;
+            if (state != DatagramSendState.Sent || SentSeen) return;
+            SentSeen = true;
+            Sent.Set();
         }
     }
 
@@ -363,7 +397,7 @@ public static unsafe partial class TransportConformance
             if (call != 1) return ReceiveResult.Consumed(total);
             var issued = new ManualResetEventSlim();
             var returned = new ManualResetEventSlim();
-            resumer = new Thread(() =>
+            var thread = new Thread(() =>
             {
                 issued.Set();
                 server.ResumeStreamReceive(id, 5);
@@ -373,7 +407,9 @@ public static unsafe partial class TransportConformance
                 IsBackground = true,
                 Name = "conformance-resumer",
             };
-            resumer.Start();
+            thread.Start();
+            // Published once started: the pumping thread joins it (on a real transport this callback runs on another thread).
+            Volatile.Write(ref resumer, thread);
             issued.Wait(TimeSpan.FromSeconds(5));
             // A real transport usually takes the resume while this callback still runs; a simulator (one lock) takes it once the
             // callback has returned. The contract allows both.
@@ -386,12 +422,16 @@ public static unsafe partial class TransportConformance
         segments.Set(0, data.Segment(0, 100));
         s.Require(s.Client.OpenStream(StreamKind.Unidirectional, 1, 32767, out TransportStreamId id) == TransportStatus.Success, "OpenStream failed.");
         s.Require(s.Client.SendStream(id, segments.At(0), 1, 1, TransportSendFlags.Start | TransportSendFlags.Fin) == TransportStatus.Success, "SendStream failed.");
-        // The resume comes from another thread; the pumping thread waits for that call before it goes on, so that a harness
-        // on virtual time does not run its clock out while the thread waits for a core (the callback has returned by the
-        // time this condition runs, so the call is not held up by it).
-        s.Wait(() => (Volatile.Read(ref resumer)?.Join(TimeSpan.FromSeconds(10)) ?? true) && s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 1,
-            "the rest of the stream after the racing resume");
-        s.Require(resumer is null || resumer.Join(TimeSpan.FromSeconds(10)), "the resuming thread did not finish.");
+        // The resume comes from another thread; the pumping thread blocks until that call has been made before it goes on,
+        // so that a harness on virtual time does not run its clock out while the thread waits for a core (the callback has
+        // returned by the time this condition runs, so the call is not held up by it).
+        bool resumeOverdue = false;
+        s.Wait(() =>
+        {
+            if (Volatile.Read(ref resumer) is Thread thread && !thread.Join(SecondThreadTimeout)) resumeOverdue = true;
+            return resumeOverdue || s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 1;
+        }, "the rest of the stream after the racing resume");
+        s.Require(!resumeOverdue, $"the resuming thread did not finish within {SecondThreadTimeout.TotalSeconds:F0} s.");
         ulong[] seen;
         lock (offsets) seen = [.. offsets];
         s.Require(seen.Length == 2 && seen[0] == 0 && seen[1] == 15, $"indication offsets were [{string.Join(", ", seen)}], expected [0, 15].");
@@ -423,13 +463,20 @@ public static unsafe partial class TransportConformance
         var taken = new MemoryStream();
         TransportStreamId announced = default;
         int phase = 1;
-        int signal = 0;
         int stop = 0;
         int holds = 0;
         int resumes = 0;
         int calls = 0;
         int errors = 0;
         int finHeld = 0;
+        int armed = 0;
+        int callbackBlocked = 0;
+        // The hand-offs between the callback, the resuming thread and the pumping thread. A wait on them blocks — none spins
+        // or yields against the thread it waits for for longer than that thread takes to wake — so a hand-off costs a thread
+        // wake-up even when every core is busy.
+        var announcedSignal = new AutoResetEvent(false);
+        var armedSignal = new AutoResetEvent(false);
+        var resumedSignal = new AutoResetEvent(false);
         s.ServerSink.ReceiveHandler = (id, segments, offset, fin) =>
         {
             int total = 0;
@@ -438,52 +485,60 @@ public static unsafe partial class TransportConformance
             {
                 calls++;
                 // Whatever the stream, the sink is never shown a byte twice and never skips one.
-                bool held = phase == 1 && holds < Holds;
                 if (offset != (ulong)taken.Length) errors++;
-                if (held)
+                if (phase == 1 && holds < Holds)
                 {
                     holds++;
                     announced = id;
-                    Volatile.Write(ref signal, 1);
-                    return ReceiveResult.PendingAfter(0);
+                    Volatile.Write(ref armed, 0);
                 }
-
-                foreach (TransportSegment segment in segments) taken.Write(segment.AsSpan());
-                if (phase == 2 && calls == 1)
+                else
                 {
-                    announced = id;
-                    return ReceiveResult.PendingAfter(total);
-                }
+                    foreach (TransportSegment segment in segments) taken.Write(segment.AsSpan());
+                    if (phase == 2 && calls == 1)
+                    {
+                        announced = id;
+                        return ReceiveResult.PendingAfter(total);
+                    }
 
-                if (phase == 3 && total == 0 && fin && finHeld == 0)
-                {
-                    finHeld = 1;
-                    announced = id;
-                    return ReceiveResult.PendingAfter(0);
-                }
+                    if (phase == 3 && total == 0 && fin && finHeld == 0)
+                    {
+                        finHeld = 1;
+                        announced = id;
+                        return ReceiveResult.PendingAfter(0);
+                    }
 
-                return ReceiveResult.Consumed(total);
+                    return ReceiveResult.Consumed(total);
+                }
             }
+
+            // Held. The resuming thread is released from inside this callback, and the callback returns once that thread
+            // runs: its resume, a varying moment later, races this return.
+            announcedSignal.Set();
+            AwaitArmed();
+            return ReceiveResult.PendingAfter(0);
         };
         var resumer = new Thread(() =>
         {
             var random = new Random(7);
-            while (Volatile.Read(ref stop) == 0)
+            while (true)
             {
-                if (Interlocked.Exchange(ref signal, 0) == 0)
-                {
-                    Thread.Yield();
-                    continue;
-                }
+                announcedSignal.WaitOne();
+                if (Volatile.Read(ref stop) != 0) return;
+                // Signalled only when the callback has gone to sleep for it: a set event is a system call, which would delay
+                // the resume past a callback that returns at once.
+                Interlocked.Exchange(ref armed, 1);
+                if (Volatile.Read(ref callbackBlocked) != 0) armedSignal.Set();
 
-                // A varying moment after the hold was announced: the callback that holds the stream may still be running,
-                // may be returning, or may have returned.
+                // A varying moment after the callback was told it may return: it may still be running, may be returning, or
+                // may have returned.
                 int spins = random.Next(0, 60);
                 for (int i = 0; i < spins; i++) Thread.SpinWait(1);
                 TransportStreamId id;
                 lock (gate) id = announced;
                 server.ResumeStreamReceive(id, 0);
                 Interlocked.Increment(ref resumes);
+                resumedSignal.Set();
             }
         })
         {
@@ -495,15 +550,40 @@ public static unsafe partial class TransportConformance
             lock (gate) return value;
         }
 
-        // The pumping thread goes on only when no resume is owed. The resume comes from another thread on purpose, and a
-        // harness on virtual time advances it between two evaluations of a Pump condition as fast as this thread can spin:
-        // without the wait, how much virtual time each resume costs would be the scheduler's choice — not the same run
-        // twice, and on a machine with no core to spare the scenario's timeout would run out over a stream that is not
-        // stalled. On a real transport the wait is a few microseconds and changes nothing.
+        // The callback that holds the stream waits for the resuming thread to run before it returns: busy for a few
+        // microseconds, which is about what that thread takes to wake on an idle machine, so that the return and the resume
+        // are close together; then blocked, which on a machine with no core to spare hands this core to that thread.
+        void AwaitArmed()
+        {
+            long hot = Stopwatch.GetTimestamp() + (Stopwatch.Frequency / 50_000);
+            while (Volatile.Read(ref armed) == 0 && Stopwatch.GetTimestamp() < hot) Thread.SpinWait(1);
+            if (Volatile.Read(ref armed) != 0) return;
+
+            // Announce the sleep before the last look at the flag; the resuming thread sets the flag before it looks at this
+            // announcement, so one of the two sees the other and the wake-up cannot be lost.
+            Interlocked.Exchange(ref callbackBlocked, 1);
+            while (Volatile.Read(ref armed) == 0 && Volatile.Read(ref stop) == 0 && armedSignal.WaitOne(SecondThreadTimeout))
+            {
+            }
+
+            Volatile.Write(ref callbackBlocked, 0);
+        }
+
+        // The pumping thread goes on only when no resume is owed, and blocks until it has been made. The resume comes from
+        // another thread on purpose, and a harness on virtual time advances its clock between two evaluations of a Pump
+        // condition as fast as this thread can run: without the wait, how much virtual time each resume costs would be the
+        // scheduler's choice — not the same run twice, and on a machine with no core to spare the scenario's timeout would
+        // run out over a stream that is not stalled. On a real transport the wait is a few microseconds and changes nothing.
+        bool resumeOverdue = false;
         bool Owed()
         {
-            SpinWait spin = default;
-            while (Volatile.Read(ref resumes) < Read(ref holds) && resumer.IsAlive) spin.SpinOnce();
+            while (Volatile.Read(ref resumes) < Read(ref holds))
+            {
+                if (resumedSignal.WaitOne(SecondThreadTimeout)) continue;
+                resumeOverdue = true;
+                return true;
+            }
+
             return false;
         }
         void Begin(int next)
@@ -532,6 +612,7 @@ public static unsafe partial class TransportConformance
             s.Require(s.Client.OpenStream(StreamKind.Unidirectional, 1, 32767, out TransportStreamId one) == TransportStatus.Success, "OpenStream failed.");
             s.Require(s.Client.SendStream(one, segments.At(0), 1, 1, TransportSendFlags.Start | TransportSendFlags.Fin) == TransportStatus.Success, "SendStream failed.");
             bool ended = s.Harness.Pump(() => Owed() || s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 1 || Read(ref errors) != 0, s.Harness.DefaultTimeout);
+            s.Require(!resumeOverdue, $"the resuming thread did not resume the held stream within {SecondThreadTimeout.TotalSeconds:F0} s (hold {Read(ref holds)}).");
             s.Require(ended, $"a stream that was held and resumed with zero bytes was indicated {Read(ref holds)} times and then never again.");
             s.Require(Read(ref errors) == 0, "an indication of the held stream did not start where the sink had stopped consuming.");
             s.Require(Read(ref holds) == Holds, $"the stream was held {Read(ref holds)} times, expected {Holds}.");
@@ -539,10 +620,13 @@ public static unsafe partial class TransportConformance
         }
         finally
         {
+            // Wakes the resuming thread so that it ends, and a callback waiting for it so that it returns.
             Volatile.Write(ref stop, 1);
+            announcedSignal.Set();
+            armedSignal.Set();
         }
 
-        s.Require(resumer.Join(TimeSpan.FromSeconds(10)), "the resuming thread did not finish.");
+        s.Require(resumer.Join(SecondThreadTimeout), "the resuming thread did not finish.");
 
         // 2. Consumed whole and held: nothing more until the resume, then the end of the stream, and no byte twice.
         Begin(2);

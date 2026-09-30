@@ -80,9 +80,34 @@ public class DrainCompressedTests
     [Fact]
     public void Drain_Drops_A_Compressed_Message_That_Can_Never_Be_Decoded_And_Goes_On()
     {
-        // A receive budget of 64 KiB: the 64 KiB block a payload of 60 000 bytes decodes into never fits next to the block
-        // the message arrived in. Waiting for it would stop the channel for good, so it is dropped and counted, as before,
-        // and the message behind it arrives.
+        // A receive budget of 32 KiB: the 64 KiB block a payload of 60 000 bytes decodes into is larger than the whole
+        // budget. (A decode buffer may take the budget past its limit, by itself, but not one larger than the budget.)
+        // Waiting for it would stop the channel for good, so it is dropped and counted, as before, and the message behind
+        // it arrives.
+        using SessionHarness h = new(table: OrderedTables.Main, client: GroupKit.Prompt, server: o =>
+        {
+            GroupKit.Prompt(o);
+            o.ReceiveBudgetBytes = 32 * 1024;
+        });
+        QuiclyPeer server = h.Server!;
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(0, 60_000)).Status);
+        h.Run(20_000);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(1, 2_000)).Status);
+        h.Run(50_000);
+        Assert.Equal(2, DatagramKit.ChannelStats(server, Packed).Received);
+
+        List<int> got = DrainAll(server, Packed, 16);
+        Assert.Equal([1], got);
+        Assert.Equal(1, DatagramKit.Statistics(server).DecodeFailures);
+        Assert.Equal(0, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void Drain_Decodes_A_Message_Whose_Buffer_Fits_Only_Past_What_The_Waiting_Messages_Hold()
+    {
+        // A receive budget of 64 KiB: the 64 KiB block a payload of 60 000 bytes decodes into does not fit next to the
+        // block the message arrived in. The decode buffer may take the budget past its limit by itself, so it is decoded,
+        // and the budget is back within its limit once the application released it.
         using SessionHarness h = new(table: OrderedTables.Main, client: GroupKit.Prompt, server: o =>
         {
             GroupKit.Prompt(o);
@@ -95,9 +120,14 @@ public class DrainCompressedTests
         h.Run(50_000);
         Assert.Equal(2, DatagramKit.ChannelStats(server, Packed).Received);
 
-        List<int> got = DrainAll(server, Packed, 16);
-        Assert.Equal([1], got);
-        Assert.Equal(1, DatagramKit.Statistics(server).DecodeFailures);
+        List<int> got = [];
+        h.RunUntil(() =>
+        {
+            got.AddRange(DrainAll(server, Packed, 16));
+            return got.Count == 2;
+        }, 1_000_000);
+        Assert.Equal([0, 1], got);
+        Assert.Equal(0, DatagramKit.Statistics(server).DecodeFailures);
         Assert.Equal(0, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
     }
 }

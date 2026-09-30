@@ -65,6 +65,9 @@ internal struct TokenBucket
         }
     }
 
+    /// <summary>The bucket size in whole tokens: a <see cref="TryTake"/> of more can never succeed.</summary>
+    public readonly long Burst => _capacity / Scale;
+
     /// <summary>Takes <paramref name="count"/> tokens if available.</summary>
     /// <param name="nowMicros">Current clock micros.</param>
     /// <param name="count">Tokens to take.</param>

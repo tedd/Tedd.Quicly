@@ -192,7 +192,7 @@ internal sealed unsafe class PeerCore : IDisposable
 
         // What a reliable channel nobody reads may have waiting is what the drain queues keep for it: the nodes the layout
         // reserves per reliable channel, and an equal share of a quarter of the receive budget, counted in the pool's
-        // blocks. One the application drains: the ring, and half the budget.
+        // blocks. One the application drains: the ring, and an equal share of half the budget.
         ReceiveQueueLayout queueLayout = ReceiveQueueLayout.Compute(_channels, options.ReceiveRingCapacity, options.ReceiveBudgetBytes);
         ReadOnlySpan<SizeClassDefinition> sizeClasses = _allocator.SizeClasses;
         Span<int> blockSizes = stackalloc int[sizeClasses.Length];
@@ -201,11 +201,12 @@ internal sealed unsafe class PeerCore : IDisposable
             blockSizes[i] = sizeClasses[i].BlockSize;
         }
 
+        int reliableChannels = CountReliableQueueChannels(_channels);
         Credit = new ReceiveCredit(
             _channels.Length,
             PeerStreamCapacity + 2,
             queueLayout.ReliableNodes,
-            ReceiveCredit.ByteLimitFor(options.ReceiveBudgetBytes, CountReliableQueueChannels(_channels)),
+            ReceiveCredit.ByteLimitFor(options.ReceiveBudgetBytes, reliableChannels),
             ReceiveRing.Capacity,
             (int)Math.Clamp(options.ReceiveBudgetBytes / 2, 1, int.MaxValue - 1),
             blockSizes);
@@ -1257,20 +1258,50 @@ internal sealed unsafe class PeerCore : IDisposable
     }
 
     /// <summary>
-    /// Whether <see cref="TryRentReceive"/> can succeed for <paramref name="length"/> bytes at all while the caller holds
-    /// <paramref name="held"/> bytes of the budget itself: the pool has a block that holds them, and that block fits in
-    /// what is left of the receive budget. When it cannot, waiting for a buffer is pointless.
+    /// Rents the buffer a compressed message is decoded into (game thread). Unlike <see cref="TryRentReceive"/> it may take
+    /// the receive budget past its limit, by this one buffer: it succeeds whenever what is outstanding does not exceed the
+    /// budget yet. The compressed messages that wait for the application are counted in the budget too, and they can be
+    /// what fills it — so a decode held to the budget could wait for buffers that only its own channel's messages can free,
+    /// for ever. A decode that finds the budget already over its limit (an earlier decoded payload the application still
+    /// holds) fails, so the budget is exceeded by at most one decode buffer at a time, and the transport thread takes
+    /// nothing new until it is back within it.
+    /// </summary>
+    /// <param name="length">Bytes needed (the message's raw length).</param>
+    /// <param name="lease">The lease, or empty.</param>
+    /// <returns><see langword="false"/> when the budget is over its limit already or the pool has no block.</returns>
+    public bool TryRentDecode(int length, out BufferLease lease)
+    {
+        if (Volatile.Read(ref _receiveBytes) > _receiveBudget || !_allocator.TryRent(length, out lease))
+        {
+            lease = BufferLease.Empty;
+            return false;
+        }
+
+        if (lease.Length > _receiveBudget)
+        {
+            // Larger than the whole budget: never, not even past it (CanEverRentDecode).
+            _allocator.Return(in lease);
+            lease = BufferLease.Empty;
+            return false;
+        }
+
+        Interlocked.Add(ref _receiveBytes, lease.Length);
+        return true;
+    }
+
+    /// <summary>
+    /// Whether <see cref="TryRentDecode"/> can succeed for <paramref name="length"/> bytes at all: the pool has a block that
+    /// holds them, and that block is not larger than the receive budget. When it cannot, waiting for a buffer is pointless.
     /// </summary>
     /// <param name="length">Bytes needed.</param>
-    /// <param name="held">Budget bytes the caller keeps until the rent succeeded (a compressed message's own block).</param>
-    public bool CanEverRentReceive(int length, int held)
+    public bool CanEverRentDecode(int length)
     {
         ReadOnlySpan<SizeClassDefinition> classes = _allocator.SizeClasses;
         for (int i = 0; i < classes.Length; i++)
         {
             if (classes[i].BlockSize >= length)
             {
-                return classes[i].BlockSize <= _receiveBudget - held;
+                return classes[i].BlockSize <= _receiveBudget;
             }
         }
 

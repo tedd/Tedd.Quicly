@@ -26,7 +26,14 @@ public class ReviewStackcreditTests
         .Add(Ordered, "stream", ChannelMode.ReliableOrdered)
         .Add(Groups, "group", ChannelMode.ReliableUnordered)
         .Add(Read, "read", ChannelMode.ReliableOrdered)
+        .Add(Packed, "packed", ChannelMode.ReliableOrdered, o =>
+        {
+            o.Compression = ChannelCompression.Lz4;
+            o.MinCompressSize = 1;
+        })
         .Build();
+
+    private const ushort Packed = 13;
 
     private static byte[] Payload(int index, int size = 4)
     {
@@ -161,5 +168,70 @@ public class ReviewStackcreditTests
             + $"datagrams and {read.Count} of 20 ReliableOrdered messages arrived in two seconds; {statistics.OutOfReceiveBuffers} messages were dropped "
             + $"for want of a receive buffer; in the 100 ms after that a stream was held back {statistics.StreamReceivePends - pends} more times and the "
             + $"host was signalled {signal.Calls - signals} more times (HasPendingWork {server.HasPendingWork}).");
+    }
+
+    /// <summary>
+    /// FINDING, the same half-per-channel with a reliable consequence (release notes "Fixed": "Every other channel keeps
+    /// working, nothing is lost"). Two channels the application drained and then abandoned pin all of the receive budget
+    /// but one 4 KiB block. A <em>handled</em> ReliableOrdered channel that compresses gets its next message in (its
+    /// compressed block fits), and its handler never sees it: the decode needs a second block of the raw size and there is
+    /// none, so the message is dropped (<c>DecodeFailures</c>) after the transport acknowledged it — the sender reports it
+    /// <c>Delivered</c>. The Known-limits entry for compressed handler messages describes the mechanism; what makes it reach
+    /// a channel that is read is that each abandoned channel keeps up to half the budget, and two of them keep all of it.
+    /// </summary>
+    [Fact]
+    public void Channels_The_Application_Stops_Draining_Do_Not_Make_A_Handled_Compressed_Channel_Lose_Messages()
+    {
+        using SessionHarness h = new(
+            table: Table,
+            client: o =>
+            {
+                GroupKit.Prompt(o);
+                OrderedKit.Roomy(o);
+            },
+            server: o =>
+            {
+                GroupKit.Prompt(o);
+                o.ReceiveRingCapacity = Ring;
+            });
+        QuiclyPeer server = h.Server!;
+        List<int> packed = [];
+        server.RegisterHandler(Packed, Collect(packed));
+
+        Assert.Equal(0, DrainAll(server, Ordered));
+        Assert.Equal(0, DrainAll(server, Groups));
+
+        // 32 messages of 4 000 bytes reach the Drained threshold of the ordered channel (half the budget, 4 KiB blocks);
+        // the group channel's sender stops one message short of it.
+        for (int i = 0; i < Ring; i++)
+        {
+            Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Ordered), Payload(i, 4_000)).Status);
+        }
+
+        PumpSenderOnly(h, h.Client, 40);
+        for (int i = 0; i < 31; i++)
+        {
+            Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Groups), Payload(i, 4_000)).Status);
+        }
+
+        PumpSenderOnly(h, h.Client, 40);
+        server.Poll();
+        server.Poll();
+        server.Poll();
+        Assert.Equal(CreditState.Unread, State(server, Ordered));
+        Assert.Equal(CreditState.Unread, State(server, Groups));
+        long pinned = DatagramKit.Statistics(server).ReceiveBytesOutstanding;
+
+        // A compressible 3 000-byte message on the handled channel: a small block to arrive in, a 4 KiB block to decode into.
+        byte[] message = new byte[3_000];
+        BinaryPrimitives.WriteInt32LittleEndian(message, 7);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), message).Status);
+        h.RunUntil(() => packed.Count == 1 || DatagramKit.Statistics(server).DecodeFailures > 0, 2_000_000);
+        h.Run(100_000);
+        PeerStatistics statistics = DatagramKit.Statistics(server);
+        Assert.True(packed.Count == 1 && statistics.DecodeFailures == 0,
+            $"two abandoned channels pin {pinned} of {h.ServerOptions.ReceiveBudgetBytes} receive-budget bytes; the handler of the compressed "
+            + $"ReliableOrdered channel got {packed.Count} of 1 message, {statistics.DecodeFailures} were dropped as DecodeFailures "
+            + $"(the channel's Received: {DatagramKit.ChannelStats(server, Packed).Received}).");
     }
 }

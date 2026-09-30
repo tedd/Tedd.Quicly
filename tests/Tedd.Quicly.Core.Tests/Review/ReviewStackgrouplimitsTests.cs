@@ -108,4 +108,85 @@ public class ReviewStackgrouplimitsTests
             + $"{GroupKit.OpenPeerGroups(server, Groups)} peer group stream(s) open and received {received.Count} messages "
             + $"({received.Count(x => x < 16)} of the 16 that filled the ring)");
     }
+
+    /// <summary>
+    /// The same overflow with a host that is never late: it polls once per frame and dispatches everything. Since the
+    /// catch-up change (G2L-7), a Poll resumes at most as many pended entries as the receive ring has free slots, entries of
+    /// dead streams included, so a peer that fills the ring each frame and resets more held streams per frame than the ring
+    /// holds makes the pended-stream ring grow by the difference every frame until it overflows. Before that change every
+    /// Poll emptied the pended-stream ring, so a host that polled every frame was not reachable this way.
+    /// </summary>
+    [Fact]
+    public void A_Host_That_Polls_Every_Frame_Still_Resumes_A_Live_Stream_Held_Behind_Churned_Streams()
+    {
+        using ServerHarness h = new(table: TestTables.Plumbing, server: o =>
+        {
+            GroupKit.Prompt(o);
+            o.ReceiveRingCapacity = 8;
+        });
+        List<int> received = [];
+        h.Server!.RegisterHandler(Groups, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) =>
+            received.Add(BinaryPrimitives.ReadInt32LittleEndian(payload)));
+        Assert.True(h.Admit());
+        QuiclyPeer server = h.Server!;
+
+        int pendedCapacity = server.Core.PendedStreams.Capacity;
+        int perRound = 5;
+        ulong group = 100;
+        int frames = 0;
+        long faults = 0;
+        int fillIndex = 0;
+        while (frames++ < 60)
+        {
+            // The frame: the peer fills the ring, then resets two rounds of five held streams (more than the 8 a Poll resumes, fewer than the ring holds); then the host polls once.
+            byte[][] fill = new byte[8][];
+            for (int i = 0; i < fill.Length; i++)
+            {
+                fill[i] = Payload(fillIndex++);
+            }
+
+            Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStream(Groups, group++, fill), out _, fin: true));
+            AdvanceNetworkOnly(h, 5_000);
+            for (int round = 0; round < 2; round++)
+            {
+                List<TransportStreamId> ids = [];
+                while (ids.Count < perRound && h.Raw.OpenUni(GroupKit.GroupStream(Groups, group++, Payload(1_000_000)), out TransportStreamId id) == TransportStatus.Success)
+                {
+                    ids.Add(id);
+                }
+
+                AdvanceNetworkOnly(h, 3_000);
+                foreach (TransportStreamId id in ids)
+                {
+                    h.Raw.Transport.AbortStream(id, 0x77, StreamAbortDirection.Send);
+                }
+
+                AdvanceNetworkOnly(h, 3_000);
+            }
+
+            if (server.Core.PendedStreams.Count == pendedCapacity)
+            {
+                // A live group, held back like the others; the host polls it at the next frame as ever (RunUntil below).
+                Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStream(Groups, group++, Payload(7_777)), out _, fin: true));
+                AdvanceNetworkOnly(h, 3_000);
+                break;
+            }
+
+            server.GetStatistics(out PeerStatistics statistics);
+            faults = statistics.CallbackFaults;
+            server.Poll();
+            server.Flush();
+        }
+
+        Assert.True(frames <= 60, $"precondition: the pended-stream ring never filled (it holds {server.Core.PendedStreams.Count} of {pendedCapacity}; CallbackFaults {faults})");
+
+        // The peer stops; the host goes on polling every frame.
+        bool done = h.RunUntil(() => received.Contains(7_777) || server.State != PeerState.Connected, 3_000_000);
+        server.GetStatistics(out PeerStatistics after);
+        Assert.True(done && (received.Contains(7_777) || server.CloseReason.Code == QuiclyErrorCode.LimitExceeded),
+            $"the live group's message never arrived and the connection is {server.State}, although the host polled every "
+            + $"frame ({frames} frames): pended ring of {pendedCapacity}, CallbackFaults {after.CallbackFaults}, "
+            + $"StreamReceivePends {after.StreamReceivePends}; the server still holds {GroupKit.OpenPeerGroups(server, Groups)} "
+            + $"peer group stream(s) open; {received.Count(x => x < fillIndex)} of the {fillIndex} fill messages arrived");
+    }
 }

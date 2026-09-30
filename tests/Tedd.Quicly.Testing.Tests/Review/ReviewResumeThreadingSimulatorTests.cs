@@ -12,6 +12,7 @@ namespace Tedd.Quicly.Testing.Tests.Review;
 /// simulator is otherwise deterministic (same seed, same run), and <see cref="ITransportTestHarness"/> says scenarios call
 /// the transport from the thread that calls Pump.
 /// </summary>
+[Collection(ReviewResumeThreadingSimulatorCollection.Name)]
 public class ReviewResumeThreadingSimulatorTests
 {
     private static long Run(out string? failure)
@@ -85,4 +86,11 @@ public class ReviewResumeThreadingSimulatorTests
             $"{failures.Count} of 6 runs failed on the simulator with {load.Length} busy threads on {Environment.ProcessorCount} cores, which loses nothing, because the virtual timeout ran out while the resuming thread waited for a core "
             + $"(virtual microseconds per run: {string.Join(", ", virtualMicros)}): {string.Join(" | ", failures.Take(3))}");
     }
+}
+
+/// <summary>Runs alone: the load test saturates every core, which must not disturb the tests of other classes.</summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public class ReviewResumeThreadingSimulatorCollection
+{
+    public const string Name = "review-resume-threading-simulator";
 }

@@ -63,6 +63,59 @@ public class DatagramZeroAllocationTests
     }
 
     [Fact]
+    public void Sequenced_Receive_Across_The_16_Bit_Wrap_Does_Not_Allocate()
+    {
+        // Every window sends more than 65 536 messages on each channel, so the receiver's sequence clock (PROTOCOL.md §8)
+        // crosses a wrap in every one of them; keys 8 … 15 stay idle for the whole window and are updated at its end, which
+        // takes the stale-free idle-key path too.
+        ChannelTable table = ChannelTable.Create()
+            .Add(2, "moves16", ChannelMode.UnreliableSequenced, o => { o.Keyed = true; o.SequenceBits = 16; o.ExpiryMicros = 0; })
+            .Add(3, "clock", ChannelMode.UnreliableSequenced, o => o.ExpiryMicros = 0)
+            .Build();
+        using SessionHarness h = new(table: table, client: DatagramKit.Quiet, server: DatagramKit.Quiet);
+        SimulatedNetwork network = h.Network;
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        long received = 0;
+        MessageHandler count = (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++;
+        server.RegisterHandler(2, count);
+        server.RegisterHandler(3, count);
+        byte[] payload = new byte[8];
+        uint tick = 0;
+        void Tick(ulong firstKey)
+        {
+            for (int i = 0; i < 128; i++)
+            {
+                client.SendCopy(new SendHeader(2, firstKey + (ulong)(i & 7)), payload);
+                client.SendCopy(new SendHeader(3), payload);
+            }
+
+            client.Flush(++tick);
+            network.Advance(2_000);
+            server.Poll();
+            server.Flush();
+            client.Poll();
+        }
+
+        void Window()
+        {
+            for (int i = 0; i < 520; i++)
+            {
+                Tick(0);
+            }
+
+            Tick(8);
+        }
+
+        Window();
+        int windows = WindowedAllocation.AssertNone(Window);
+        Assert.Equal((windows + 1) * 521L * 256, received);
+        Assert.Equal(0, DatagramKit.ChannelStats(server, 2).Dropped);
+        Assert.Equal(0, DatagramKit.ChannelStats(server, 3).Dropped);
+        Assert.Equal(0, DatagramKit.Statistics(server).SequenceResyncs);
+    }
+
+    [Fact]
     public void A_Capped_Scheduler_With_Expiring_Messages_Does_Not_Allocate()
     {
         using SessionHarness h = new(table: Table, client: o => o.MaxSendBytesPerSecond = 30_000);

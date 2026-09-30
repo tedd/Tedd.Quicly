@@ -602,8 +602,10 @@ public sealed unsafe partial class MsQuicTransport
     /// streams hold their whole share of the table — what the peer was granted is not theirs to take. A peer stream is
     /// within the grants the table was sized for (MsQuic admitted it); when its slot is still held by streams whose native
     /// close has not run yet, the table grows, up to twice the size it was sized for. Past that — a peer that resets
-    /// streams faster than a starved thread pool closes them — the stream is refused (<see cref="RefusedPeerStreamCount"/>),
-    /// so a peer's churn cannot grow the table without bound.
+    /// streams faster than a starved thread pool closes them, or an honest peer's churning group streams while the pool is
+    /// starved for seconds — the stream is refused (<see cref="RefusedPeerStreamCount"/>) and what it carried can be lost,
+    /// so a peer's churn cannot grow the table without bound. The pending closes cannot run here instead: this runs on
+    /// the MsQuic worker, and a native close waits for callbacks that may be running on it (<see cref="CloseSlotNative"/>).
     /// </summary>
     private StreamSlot? AllocateSlot(bool local, out TransportStatus failure)
     {

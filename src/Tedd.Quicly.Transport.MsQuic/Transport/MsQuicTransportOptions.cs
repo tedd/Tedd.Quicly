@@ -152,7 +152,9 @@ public sealed class MsQuicTransportOptions
     /// A peer stream is not refused for want of a slot. MsQuic admits a stream the peer has credit for, and one that found
     /// no slot could only be dropped below the session with whatever it carried — so the table is sized for what the peer
     /// may open (and grows, up to twice that, while slots of closed streams wait for the thread pool's cleanup work item;
-    /// <c>MsQuicTransport.RefusedPeerStreamCount</c> counts a stream refused past that): the role's initial grant
+    /// <c>MsQuicTransport.RefusedPeerStreamCount</c> counts a stream refused past that, which an honest peer's churning
+    /// group streams can reach too when the thread pool is starved for seconds — a larger value raises that cap with the
+    /// table): the role's initial grant
     /// (<see cref="ClientPeerUnidiStreamCount"/> and
     /// <see cref="ClientPeerBidiStreamCount"/>, or the server's), and whatever
     /// <see cref="Core.Transport.ITransport.UpdatePeerStreamLimits"/> asks for later. When this value has no room for

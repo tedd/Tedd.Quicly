@@ -29,8 +29,9 @@ public class CompletionTableReviewTests
     /// of a pair have to run at once. There is therefore one pair per two logical processors (at most eight), sharing the
     /// 3.2 million iterations that found the race, and a thread that waits longer than a hand-off takes while both run
     /// blocks instead of spinning (<see cref="HandOff"/>), so that on a machine with no core to spare a hand-off costs a
-    /// thread wake-up rather than a scheduler quantum (which made the run take many minutes). The run ends after its
-    /// iterations or after <see cref="Budget"/>, and must have hit the window at least <see cref="RequiredOverlaps"/> times.
+    /// thread wake-up rather than a scheduler quantum (which made the run take many minutes). The run must hit the window
+    /// at least <see cref="RequiredOverlaps"/> times: it ends after its iterations once it has, and otherwise goes on until
+    /// <see cref="Budget"/> runs out.
     /// </remarks>
     [Fact]
     public void Review_Late_Complete_Racing_Release_And_Reallocation_Must_Not_Touch_The_New_Occupant()
@@ -75,12 +76,16 @@ public class CompletionTableReviewTests
                 transport.Start();
 
                 int localCorrupted = 0;
-                int localOverlaps = 0;
                 int i = 0;
                 try
                 {
-                    for (; i < iterationsPerPair && ((i & 255) != 0 || Stopwatch.GetTimestamp() < deadline); i++)
+                    for (; ; i++)
                     {
+                        if ((i & 255) == 0 && Stopwatch.GetTimestamp() >= deadline)
+                            break;
+                        if (i >= iterationsPerPair && Volatile.Read(ref overlaps) >= RequiredOverlaps)
+                            break;
+
                         Assert.True(table.TryAllocate(out SendToken old));
                         published.Put(Pack(old));
 
@@ -95,7 +100,7 @@ public class CompletionTableReviewTests
                         while (!table.TryAllocate(out fresh))
                             Thread.SpinWait(1);
                         if (taken && !completed.HasValue)
-                            localOverlaps++;
+                            Interlocked.Increment(ref overlaps);
 
                         // Let the late Complete(old) finish, then look at the untouched fresh token.
                         completed.Take();
@@ -117,7 +122,6 @@ public class CompletionTableReviewTests
 
                 Interlocked.Add(ref corrupted, localCorrupted);
                 Interlocked.Add(ref iterations, i);
-                Interlocked.Add(ref overlaps, localOverlaps);
             })
             { IsBackground = true, Name = "owner-" + p };
         }
@@ -138,15 +142,17 @@ public class CompletionTableReviewTests
     /// <summary>Iterations of the race test, shared by its pairs: the count that found the race (275 corruptions).</summary>
     private const int TotalIterations = 3_200_000;
 
-    /// <summary>Wall-clock time after which the race test stops, whatever its iteration count.</summary>
+    /// <summary>Wall-clock time after which the race test stops, whatever its iteration count and hits.</summary>
     private static readonly TimeSpan Budget = TimeSpan.FromSeconds(20);
 
     /// <summary>
     /// How often the race test must have hit its window. Against the table before the fix (0c8be2b), one hit in six to
-    /// twelve was a corruption, on sixteen idle cores as on four cores with two busy-looping processes per core; the fixed
-    /// table gets about one hit per thousand iterations.
+    /// twelve was a corruption on sixteen idle cores and on four cores with two busy-looping processes per core, and one in
+    /// eighteen in the whole Core suite on those four busy cores, so 100 hits would have missed it with a probability of
+    /// at most (17/18)^100, about 0.3 %. The fixed table gets about one hit per thousand iterations with a core per thread,
+    /// and one per 7 000 to 15 000 in the whole Core suite on the four busy cores.
     /// </summary>
-    private const int RequiredOverlaps = 500;
+    private const int RequiredOverlaps = 100;
 
     /// <summary>Handed to a transport thread to end it (generation 0x80000000 is even, so no token packs to it).</summary>
     private const long Stop = long.MinValue;

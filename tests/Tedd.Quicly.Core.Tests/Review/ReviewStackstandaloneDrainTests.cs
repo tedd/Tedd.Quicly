@@ -169,10 +169,20 @@ public class ReviewStackstandaloneDrainTests
             return a.Count == Count && b.Count == Count;
         }, 20_000_000);
 
+        // What the rest of the peer sees meanwhile: five datagrams on another channel.
+        for (int i = 0; i < 5; i++)
+        {
+            h.Client.SendCopy(new SendHeader(2), Payload(i, 8));
+            h.Run(2_000);
+        }
+
+        long datagrams = Received(server, 2);
         PeerStatistics statistics = DatagramKit.Statistics(server);
         Assert.True(done && a.SequenceEqual(Enumerable.Range(0, Count)) && b.SequenceEqual(Enumerable.Range(0, Count)),
             $"after 20 s: channel A delivered {a.Count} of {Count}, channel B {b.Count} of {Count}; received A {Received(server, PackedA)}, "
-            + $"B {Received(server, PackedB)}; DecodeFailures {statistics.DecodeFailures}; receive bytes outstanding {statistics.ReceiveBytesOutstanding}");
+            + $"B {Received(server, PackedB)}; DecodeFailures {statistics.DecodeFailures}; receive bytes outstanding {statistics.ReceiveBytesOutstanding}; "
+            + $"HasPendingWork {server.HasPendingWork}; StreamReceivePends {statistics.StreamReceivePends}; "
+            + $"datagrams of another channel received {datagrams} of 5 (OutOfReceiveBuffers {statistics.OutOfReceiveBuffers})");
     }
 
     /// <summary>
@@ -191,12 +201,19 @@ public class ReviewStackstandaloneDrainTests
         {
             GroupKit.Prompt(c);
             c.SendBudgetBytes = 4 * 1024 * 1024;
-        }, server: GroupKit.Prompt);
+        }, server: o =>
+        {
+            GroupKit.Prompt(o);
+            o.DecodedBytesPerSecond = int.MaxValue; // the decode-rate budget is not what drops them: the receive budget is
+        });
         QuiclyPeer server = h.Server!;
         List<int> got = [];
         server.RegisterHandler(Packed, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) =>
             got.Add(BinaryPrimitives.ReadInt32LittleEndian(payload)));
 
+        // 1 200 is what the budget alone costs 256 of. At the default decode rate (8 MiB/s) the same burst loses 1 037:
+        // TryDecode charges the decode-rate bucket before it rents the buffer, so the 256 dropped for want of a buffer
+        // also used up 5 MB of the rate budget.
         const int Count = 1_200;
         SendToALateReceiver(h, Packed, 0, Count, 20_000);
 
@@ -205,5 +222,47 @@ public class ReviewStackstandaloneDrainTests
         Assert.True(done && got.SequenceEqual(Enumerable.Range(0, Count)) && statistics.DecodeFailures == 0,
             $"the handler got {got.Count} of {Count} messages of a ReliableOrdered channel; DecodeFailures {statistics.DecodeFailures}; "
             + $"first gap after {got.TakeWhile((v, i) => v == i).Count()}");
+    }
+
+    /// <summary>
+    /// FINDING (reliable loss to the decode rate). A host that drains a ReliableOrdered LZ4 channel every frame and
+    /// releases each batch — the case 0ba04a7 made wait instead of drop — still loses acknowledged messages when the
+    /// sender's decoded volume exceeds <see cref="PeerOptions.DecodedBytesPerSecond"/> (8 MiB/s by default, a burst of the
+    /// same): 400 messages of 60 000 bytes in 0.8 s. The message is dropped although the receive credit could hold it
+    /// back at the sender (the decode rate is a DoS bound, and the credit already bounds what waits); the release notes'
+    /// "Known limits" do not list it.
+    /// </summary>
+    [Fact]
+    public void FINDING_Drain_Of_A_Compressed_Reliable_Channel_Loses_Nothing_To_The_Decode_Rate()
+    {
+        using SessionHarness h = new(table: OrderedTables.Main, client: c =>
+        {
+            GroupKit.Prompt(c);
+            c.SendBudgetBytes = 4 * 1024 * 1024;
+        }, server: GroupKit.Prompt);
+        QuiclyPeer server = h.Server!;
+        ReceivedMessage[] buffer = new ReceivedMessage[16];
+        List<int> got = [];
+        const int Count = 400;
+        for (int i = 0; i < Count; i++)
+        {
+            Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(i, 60_000)).Status);
+            h.Run(2_000);
+            while (DrainInto(server, Packed, buffer, got) > 0)
+            {
+            }
+        }
+
+        h.RunUntil(() =>
+        {
+            while (DrainInto(server, Packed, buffer, got) > 0)
+            {
+            }
+
+            return got.Count >= Count;
+        }, 5_000_000);
+        PeerStatistics statistics = DatagramKit.Statistics(server);
+        Assert.True(got.SequenceEqual(Enumerable.Range(0, Count)) && statistics.DecodeFailures == 0,
+            $"Drain handed out {got.Count} of {Count} messages of a ReliableOrdered channel; DecodeFailures {statistics.DecodeFailures}");
     }
 }

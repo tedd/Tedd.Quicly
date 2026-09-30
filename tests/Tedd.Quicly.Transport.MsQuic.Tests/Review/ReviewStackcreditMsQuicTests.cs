@@ -20,10 +20,19 @@ public class ReviewStackcreditMsQuicTests
         .Add(12, "read", ChannelMode.ReliableOrdered)
         .Build();
 
+    /// <summary><see cref="Table"/> with a send-queue limit on the group channel (QueueLimitBytes is not part of the table hash).</summary>
+    private static readonly ChannelTable LimitedTable = ChannelTable.Create()
+        .Add(2, "a", ChannelMode.UnreliableUnordered)
+        .Add(11, "group", ChannelMode.ReliableUnordered, o => o.QueueLimitBytes = 96 * 1024)
+        .Add(12, "read", ChannelMode.ReliableOrdered)
+        .Build();
+
     private sealed class TrackingConnector(MsQuicTransportHarness harness, ITransportConnector inner) : ITransportConnector
     {
+        public MsQuicTransport? Transport { get; private set; }
+
         public ITransport Connect(System.Net.EndPoint endpoint, string? serverName, ITransportSink sink) =>
-            harness.Track((MsQuicTransport)inner.Connect(endpoint, serverName, sink));
+            Transport = harness.Track((MsQuicTransport)inner.Connect(endpoint, serverName, sink));
     }
 
     private sealed class AcceptAll : IPeerAdmission
@@ -36,7 +45,7 @@ public class ReviewStackcreditMsQuicTests
         private readonly MsQuicTransportHarness _harness = new();
         private QuiclyPeer? _server;
 
-        public Pair()
+        public Pair(ChannelTable? serverTable = null)
         {
             PeerOptions serverOptions = new() { GroupMinInterval = TimeSpan.Zero };
             AcceptAll admission = new();
@@ -44,7 +53,7 @@ public class ReviewStackcreditMsQuicTests
                 (ITransport transport, in NewConnectionInfo info) =>
                 {
                     _harness.Track((MsQuicTransport)transport);
-                    QuiclyPeer peer = QuiclyPeer.CreateServerPeer(transport, in info, Table, serverOptions, admission);
+                    QuiclyPeer peer = QuiclyPeer.CreateServerPeer(transport, in info, serverTable ?? Table, serverOptions, admission);
                     Volatile.Write(ref _server, peer);
                     return peer.TransportSink;
                 });
@@ -53,11 +62,15 @@ public class ReviewStackcreditMsQuicTests
                 ServerCertificateValidation = ServerCertificateValidationMode.PinnedSpki,
                 PinnedSpkiSha256 = [_harness.Pin],
             };
-            Client = QuiclyPeer.Connect(new TrackingConnector(_harness, _harness.CreateConnector(clientTransport)), listener.LocalEndPoint, "localhost", Table, new PeerOptions());
+            TrackingConnector connector = new(_harness, _harness.CreateConnector(clientTransport));
+            Client = QuiclyPeer.Connect(connector, listener.LocalEndPoint, "localhost", Table, new PeerOptions());
+            ClientTransport = connector.Transport!;
             Assert.True(Pump(() => Client.State == PeerState.Connected && Volatile.Read(ref _server)?.State == PeerState.Connected, 10_000), "the handshake did not complete");
         }
 
         public QuiclyPeer Client { get; }
+
+        public MsQuicTransport ClientTransport { get; }
 
         public QuiclyPeer Server => Volatile.Read(ref _server)!;
 
@@ -116,16 +129,25 @@ public class ReviewStackcreditMsQuicTests
     /// stopped, not the unread channel's sender alone. The test asserts the docs' claims: a message on the read ordered
     /// channel arrives, and a datagram send is admitted and arrives.
     /// </para>
+    /// <para>
+    /// As fixed: an MsQuic client grants no unidirectional streams before it is admitted and then its table's sum (the
+    /// grant of 1 024 was what let held groups reach the window), and the docs say what is true of the sender: its send
+    /// budget is shared, so what it keeps sending into an unread channel ends up refusing its sends on every channel
+    /// (<c>OutOfBuffers</c>) unless the channel's <c>QueueLimitBytes</c> bounds its part (then that channel answers
+    /// <c>QueueFull</c> and the others go on). The test pins both halves: with the queue limit, the read channels keep
+    /// working while the unread one is flooded; without it, the sender is refused, and once the application reads the
+    /// channel every admitted message arrives — none waited on the connection window.
+    /// </para>
     /// </summary>
     [Fact]
-    public void An_Unread_Group_Channel_Stops_Only_Its_Own_Sender_And_Not_The_Datagrams()
+    public void An_Unread_Group_Channel_With_A_Queue_Limit_Stops_Only_Its_Own_Sender_And_Not_The_Datagrams()
     {
         if (!MsQuicApi.TryGetInstance(out _, out _))
         {
             Assert.Skip("MsQuic is not available on this host.");
         }
 
-        using Pair pair = new();
+        using Pair pair = new(LimitedTable);
         QuiclyPeer client = pair.Client;
         List<int> read = [];
         int datagrams = 0;
@@ -168,9 +190,72 @@ public class ReviewStackcreditMsQuicTests
         SendStatus ordered = pair.Server.SendCopy(new SendHeader(12), BitConverter.GetBytes(1)).Status;
         SendStatus datagram = pair.Server.SendCopy(new SendHeader(2), [1, 2, 3, 4]).Status;
         bool arrived = pair.Pump(() => read.Count == 2 && datagrams > 0, 5_000);
-        Assert.True(arrived && ordered == SendStatus.Admitted && datagram == SendStatus.Admitted,
+        Assert.True(arrived && last == SendStatus.QueueFull && ordered == SendStatus.Admitted && datagram == SendStatus.Admitted,
             $"after {admitted} group messages of 32 KiB ({admitted * 32L / 1024} MiB) into the unread channel (its last send answered {last}; the client "
             + $"received {received} and held its streams back {holds} times), a send on the read ordered channel answered {ordered} and one on the "
             + $"datagram channel {datagram}; in five seconds {read.Count - 1} of 1 ordered message and {datagrams} datagrams arrived.");
+    }
+
+    /// <summary>
+    /// The other half of the fix of the finding above: without a queue limit, what the sender keeps sending into the unread
+    /// channel fills its shared send budget, and its sends on every channel are refused (<c>OutOfBuffers</c>; RELEASE-NOTES
+    /// "The sender's queue is shared"). Nothing is lost: once the application reads the channel, every admitted message
+    /// arrives, and the client never held more group streams than its table's sum (it granted no more).
+    /// </summary>
+    [Fact]
+    public void An_Unread_Group_Channel_Without_A_Queue_Limit_Fills_The_Senders_Budget_And_Loses_Nothing_Once_Read()
+    {
+        if (!MsQuicApi.TryGetInstance(out _, out _))
+        {
+            Assert.Skip("MsQuic is not available on this host.");
+        }
+
+        using Pair pair = new();
+        QuiclyPeer client = pair.Client;
+        // The grant in the handshake: none (the session raised it to its table's sum after admission).
+        Assert.Equal(0, pair.ClientTransport.Capabilities.PeerUnidirectionalStreams);
+        byte[] big = new byte[32 * 1024];
+        int admitted = 0;
+        Stopwatch sinceAdmitted = Stopwatch.StartNew();
+        SendStatus last = SendStatus.Admitted;
+        while (sinceAdmitted.ElapsedMilliseconds < 2_000 && admitted < 2_000)
+        {
+            BitConverter.TryWriteBytes(big, admitted);
+            SendResult result = pair.Server.SendCopy(new SendHeader(11), big);
+            last = result.Status;
+            if (result.IsAdmitted)
+            {
+                admitted++;
+                sinceAdmitted.Restart();
+                if ((admitted & 7) == 0)
+                {
+                    pair.Pump(static () => true, 0);
+                }
+
+                continue;
+            }
+
+            pair.Pump(static () => true, 0);
+            Thread.Sleep(1);
+        }
+
+        SendStatus datagram = pair.Server.SendCopy(new SendHeader(2), [1, 2, 3, 4]).Status;
+        Assert.Equal(SendStatus.OutOfBuffers, last);
+        Assert.Equal(SendStatus.OutOfBuffers, datagram);
+
+        // The application reads the channel: every admitted message arrives, once.
+        HashSet<int> got = [];
+        int duplicates = 0;
+        client.RegisterHandler(11, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) =>
+        {
+            if (!got.Add(BitConverter.ToInt32(payload)))
+            {
+                duplicates++;
+            }
+        });
+        bool all = pair.Pump(() => got.Count == admitted, 20_000);
+        client.GetStatistics(out PeerStatistics statistics);
+        Assert.True(all && duplicates == 0 && statistics.StreamsReset == 0,
+            $"{got.Count} of {admitted} admitted group messages arrived once the channel was read ({duplicates} twice); the client reset {statistics.StreamsReset} streams");
     }
 }

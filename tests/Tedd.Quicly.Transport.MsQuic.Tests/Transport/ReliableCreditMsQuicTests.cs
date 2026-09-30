@@ -40,7 +40,7 @@ public class ReliableCreditMsQuicTests
         private readonly MsQuicTransportHarness _harness = new();
         private QuiclyPeer? _server;
 
-        public Pair()
+        public Pair(ushort clientPeerUnidiStreams = 0)
         {
             PeerOptions serverOptions = new() { GroupMinInterval = TimeSpan.Zero };
             AcceptAll admission = new();
@@ -56,6 +56,7 @@ public class ReliableCreditMsQuicTests
             {
                 ServerCertificateValidation = ServerCertificateValidationMode.PinnedSpki,
                 PinnedSpkiSha256 = [_harness.Pin],
+                ClientPeerUnidiStreamCount = clientPeerUnidiStreams,
             };
             Client = QuiclyPeer.Connect(new TrackingConnector(_harness, _harness.CreateConnector(clientTransport)), listener.LocalEndPoint, "localhost", Table, new PeerOptions());
             Assert.True(Pump(() => Client.State == PeerState.Connected && Volatile.Read(ref _server)?.State == PeerState.Connected, 10_000), "the handshake did not complete");
@@ -225,7 +226,9 @@ public class ReliableCreditMsQuicTests
             Assert.Skip("MsQuic is not available on this host.");
         }
 
-        using Pair pair = new();
+        // A client that grants its server 1 024 streams in the handshake (0.2.1's default; now an application's choice), so
+        // that hundreds of groups can be held.
+        using Pair pair = new(clientPeerUnidiStreams: 1024);
         QuiclyPeer client = pair.Client;
         List<int> read = [];
         client.RegisterHandler(12, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => read.Add(BitConverter.ToInt32(payload)));
@@ -281,9 +284,10 @@ public class ReliableCreditMsQuicTests
         Stopwatch watch = Stopwatch.StartNew();
         while (got.Count < 20_000 && watch.ElapsedMilliseconds < 30_000)
         {
-            // At most a thousand messages on their way (64 KiB of buffer blocks): half of what a drained channel may have
-            // waiting, so a moment in which the transport delivers several frames at once is still not a hold.
-            for (int i = 0; i < 500 && sent < 20_000 && sent - got.Count < 1_000; i++)
+            // At most three hundred messages on their way (19 KiB of buffer blocks): half of what a drained channel may have
+            // waiting — its share of half the receive budget among the table's three reliable channels, 42 KiB — so a
+            // moment in which the transport delivers several frames at once is still not a hold.
+            for (int i = 0; i < 500 && sent < 20_000 && sent - got.Count < 300; i++)
             {
                 BitConverter.TryWriteBytes(payload, sent);
                 if (!pair.Server.SendCopy(new SendHeader(10), payload).IsAdmitted)

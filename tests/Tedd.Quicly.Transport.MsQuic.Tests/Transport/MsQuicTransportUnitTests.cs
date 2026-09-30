@@ -141,7 +141,8 @@ public unsafe class MsQuicTransportUnitTests
 
         MsQuicSettings client = options.CreateClientSettings();
         Assert.Equal((ushort)0, client.PeerBidiStreamCount);
-        Assert.Equal((ushort)1024, client.PeerUnidiStreamCount);
+        // None before admission: the session raises it to its table's sum, as a server does (third review round, GR3-1).
+        Assert.Equal((ushort)0, client.PeerUnidiStreamCount);
         Assert.Equal(TimeSpan.FromSeconds(10), client.KeepAliveInterval);
     }
 

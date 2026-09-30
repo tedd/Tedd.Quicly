@@ -478,7 +478,8 @@ public unsafe class ReviewGroup2SwapTransportTests
 
         MsQuicTransportOptions inner = loopback.ClientOptions();
         inner.Alpns = [WebTransportOptions.Alpn];
-        inner.ClientPeerUnidiStreamCount = (ushort)(inner.ClientPeerUnidiStreamCount + 3);
+        // 0.2.1's default grant of 1 024 (the default is 0 since the third review round, GR3-1), plus the HTTP/3 streams.
+        inner.ClientPeerUnidiStreamCount = 1024 + 3;
         WebTransportOptions carrierOptions = new() { Diagnostic = (_, message, _) => { lock (diagnostics) diagnostics.Add(message); } };
         if (carrierMaxStreams is int table)
         {
@@ -646,7 +647,10 @@ public unsafe class ReviewGroup2SwapTransportTests
                 Volatile.Write(ref server, peer);
                 return peer.TransportSink;
             });
-            WebTransportConnector connector = loopback.Own(WebTransportConnector.CreateMsQuic(loopback.ClientOptions(), null, loopback.Registration));
+            // 0.2.1's default grant of 1 024 (the default is 0 since the third review round, GR3-1).
+            MsQuicTransportOptions granting = loopback.ClientOptions();
+            granting.ClientPeerUnidiStreamCount = 1024;
+            WebTransportConnector connector = loopback.Own(WebTransportConnector.CreateMsQuic(granting, null, loopback.Registration));
             client = QuiclyPeer.Connect(new TrackingConnector(loopback, connector), listener.LocalEndPoint, "localhost", Table, clientOptions);
             Assert.True(Pump(() => client.State == PeerState.Connected && Volatile.Read(ref server)?.State == PeerState.Connected, 10_000, client, () => Volatile.Read(ref server)),
                 "the handshake did not complete");

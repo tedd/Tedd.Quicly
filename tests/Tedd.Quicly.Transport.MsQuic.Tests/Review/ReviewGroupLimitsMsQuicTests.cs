@@ -64,11 +64,13 @@ public class ReviewGroupLimitsMsQuicTests
                     return peer.TransportSink;
                 });
 
-            // The library's defaults, plus the pin of the test certificate.
+            // The library's defaults as they were when this was written (a grant of 1 024; the default is 0 since the third
+            // review round, GR3-1), plus the pin of the test certificate.
             MsQuicTransportOptions clientTransport = new()
             {
                 ServerCertificateValidation = ServerCertificateValidationMode.PinnedSpki,
                 PinnedSpkiSha256 = [harness.Pin],
+                ClientPeerUnidiStreamCount = 1024,
             };
             Assert.Equal(1024, clientTransport.ClientPeerUnidiStreamCount);
             client = QuiclyPeer.Connect(new TrackingConnector(harness, harness.CreateConnector(clientTransport)), listener.LocalEndPoint, "localhost", Table, clientOptions);

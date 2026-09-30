@@ -123,16 +123,25 @@ public sealed class MsQuicTransportOptions
 
     /// <summary>
     /// Unidirectional streams the server may have open towards the client from the first packet on (per-channel ordered
-    /// streams, groups and bulk transfers; ARCHITECTURE section 7 caps the sum at 4 096). Default 1 024.
+    /// streams, groups and bulk transfers; ARCHITECTURE section 7 caps the sum at 4 096). Default 0: a QUICLY client raises it
+    /// to its channel table's sum once it is admitted (<see cref="Core.Transport.ITransport.UpdatePeerStreamLimits"/>, after
+    /// the HelloAck, PROTOCOL.md §3.4), as a server does for its client; the server's streams wait for that credit.
     /// </summary>
     /// <remarks>
     /// This is a grant in the connection's transport parameters, and QUIC never takes granted credit back: when a QUICLY
     /// session later asks for fewer (its channel table's sum, after admission), the server can still have up to this many
     /// open. The session is told (<see cref="Core.Transport.TransportCapabilities.PeerUnidirectionalStreams"/>) and keeps a
-    /// receive record for each of them (64 bytes, plus 8 in a ring), so a client that falls behind its server holds the
+    /// receive record for each of them (64 bytes, plus 12 in a ring), so a client that falls behind its server holds the
     /// streams instead of resetting them. The stream table has room for them whatever <see cref="MaxStreams"/> says.
+    /// <para>
+    /// A grant above the table's sum costs more than memory. The bytes of every stream a late client holds stay in MsQuic
+    /// and count against the connection's flow-control window (16 MiB by default); held streams of the whole grant can use
+    /// all of it, and once they do, the server can send nothing more on any stream until the client reads — and a message
+    /// the client has begun to receive, whose tail is still at the server, waits for window that only the other held
+    /// streams can free. 0.2.1 defaulted to 1 024.
+    /// </para>
     /// </remarks>
-    public ushort ClientPeerUnidiStreamCount { get; set; } = 1024;
+    public ushort ClientPeerUnidiStreamCount { get; set; }
 
     /// <summary>
     /// Size of each connection's stream table (local and peer streams open at once, including streams whose close is still
@@ -140,9 +149,11 @@ public sealed class MsQuicTransportOptions
     /// </summary>
     /// <remarks>
     /// <para>
-    /// A peer stream is never refused for want of a slot. MsQuic admits a stream the peer has credit for, and one that
-    /// found no slot could only be dropped below the session with whatever it carried — so the table is sized for what
-    /// the peer may open: the role's initial grant (<see cref="ClientPeerUnidiStreamCount"/> and
+    /// A peer stream is not refused for want of a slot. MsQuic admits a stream the peer has credit for, and one that found
+    /// no slot could only be dropped below the session with whatever it carried — so the table is sized for what the peer
+    /// may open (and grows, up to twice that, while slots of closed streams wait for the thread pool's cleanup work item;
+    /// <c>MsQuicTransport.RefusedPeerStreamCount</c> counts a stream refused past that): the role's initial grant
+    /// (<see cref="ClientPeerUnidiStreamCount"/> and
     /// <see cref="ClientPeerBidiStreamCount"/>, or the server's), and whatever
     /// <see cref="Core.Transport.ITransport.UpdatePeerStreamLimits"/> asks for later. When this value has no room for
     /// that next to the local streams, the connection's table is made larger (<see cref="StreamTableFor"/>) and

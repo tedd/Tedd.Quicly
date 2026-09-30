@@ -283,7 +283,7 @@ public struct PeerStatistics
     /// Non-zero means a channel receives traffic that nobody drains, or that is not drained empty between two Polls (a
     /// host that polls several times per Drain, or drains with a span it fills and does not call again). Register a
     /// handler, or drain the channel completely once per Poll — a channel that is loses nothing here, however large the
-    /// burst. A larger <see cref="PeerOptions.ReceiveBudgetBytes"/> raises the byte limit of the backlog;
+    /// burst and however many channels are read that way. A larger <see cref="PeerOptions.ReceiveBudgetBytes"/> raises the byte limit of the backlog;
     /// <see cref="PeerOptions.ReceiveRingCapacity"/> does not raise the node limit beyond 1 024. Game thread; a total since
     /// the peer was created.
     /// </remarks>

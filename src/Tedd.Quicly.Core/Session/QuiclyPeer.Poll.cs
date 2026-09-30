@@ -41,17 +41,21 @@ public sealed unsafe partial class QuiclyPeer
     /// <para>
     /// An <em>unreliable</em> channel (UnreliableUnordered or UnreliableSequenced without <c>CoalesceOnReceive</c>) that is
     /// drained every frame loses nothing the receive ring and the receive budget took, in whatever order the host calls
-    /// Poll and Drain: a burst larger than the queue pool waits in the pool, one held message and the ring until the
-    /// Drain. What such a channel still has queued when the <em>next</em> Poll begins — nobody drained it empty in
+    /// Poll and Drain and however many channels it reads this way: a burst larger than the queue pool waits in the pool,
+    /// one held message and the ring until the Drain. That includes what arrived with the handshake: the Poll in which
+    /// the peer became Connected — <c>QuiclyClient.ConnectAsync</c> runs it for a client — counts as drained for every
+    /// channel. What such a channel still has queued when the <em>next</em> Poll begins — nobody drained it empty in
     /// between — is its <em>backlog</em>, and the backlog of all these channels together is bounded: at most the part of
     /// the queue pool that is not reserved for reliable channels (the pool is <see cref="PeerOptions.ReceiveRingCapacity"/>
     /// messages, at most 1 024; half of it is reserved when the table has a ReliableOrdered or ReliableUnordered
     /// channel) and at most a quarter of <see cref="PeerOptions.ReceiveBudgetBytes"/>, counted in buffer blocks. Poll cuts
     /// it to that where it starts, and a later message of a backlogged channel that does not fit drops the
     /// <em>oldest</em> queued one, counted in <see cref="ChannelStatistics.DrainQueueDrops"/> and
-    /// <see cref="PeerStatistics.DrainQueueDrops"/>. So a host that polls several times between two drains keeps only
-    /// that much of a burst, and a channel nobody drains keeps the ring closed for one Poll interval at most (the message
-    /// held for a Drain that did not come) and afterwards costs only its own oldest messages.
+    /// <see cref="PeerStatistics.DrainQueueDrops"/>. So a host that polls several times between two drains — a server
+    /// that polls at network rate and drains at simulation rate — keeps only that much of a burst. A channel nobody
+    /// drains keeps the ring closed once, for one Poll interval (the message held for a Drain that did not come), and
+    /// afterwards costs only its own oldest messages: it stays backlog, and is never held again, until it has been
+    /// drained. A channel that was drained and then no longer is can keep the ring closed for a second interval.
     /// </para>
     /// <para>
     /// A <em>reliable</em> channel (ReliableOrdered, ReliableUnordered) loses nothing, so once the queue pool is full Poll
@@ -156,7 +160,8 @@ public sealed unsafe partial class QuiclyPeer
     /// that is not filled): a channel that was drained empty since the last <see cref="Poll"/> began loses nothing the
     /// receive ring and the receive budget took, whether the Drain comes before or after the Poll. A channel that was not
     /// becomes backlog at the next Poll, which is bounded and evicts its oldest messages
-    /// (<see cref="ChannelStatistics.DrainQueueDrops"/>; see <see cref="Poll"/>).
+    /// (<see cref="ChannelStatistics.DrainQueueDrops"/>; see <see cref="Poll"/>), and stays backlog until a Drain finds
+    /// or leaves its queue empty.
     /// </para>
     /// <para>
     /// The queue pool is bounded. A message of another channel that finds it full makes room by evicting the oldest
@@ -164,8 +169,9 @@ public sealed unsafe partial class QuiclyPeer
     /// receive ring. How long a hold lasts depends on the held message's channel: one <em>with a handler</em> is never
     /// evicted and never dropped — the next <see cref="Poll"/> dispatches its queue, the held message and the ring, in
     /// order, so the two styles can be mixed in either order without loss; an <em>unreliable</em> channel without a
-    /// handler is held until its own Drain, or until the next Poll makes it backlog; a <em>reliable</em> channel without
-    /// a handler is held until that channel is drained.
+    /// handler is held until its own Drain — across the next Poll too while the channel is being drained, so a host that
+    /// drains several channels one after the other every frame loses nothing — or, when nobody drains it, until a Poll
+    /// makes it backlog; a <em>reliable</em> channel without a handler is held until that channel is drained.
     /// </para>
     /// </remarks>
     /// <param name="channel">The channel.</param>
@@ -403,9 +409,10 @@ public sealed unsafe partial class QuiclyPeer
                 // Still no room for it: the ring stays closed (the loop below is guarded by the held slot), but the
                 // mailboxes do not pass through the ring and are dispatched all the same. Returning here would stop
                 // every coalescing and ReliableLatest handler for as long as one reliable channel is not drained —
-                // while the transport thread keeps acknowledging those values to the sender. Only a reliable channel
-                // (or a replaced engine's) gets here: an unreliable message that was held across a pass start is
-                // queued by evicting backlog, or dropped (mayHold is false).
+                // while the transport thread keeps acknowledging those values to the sender. A reliable channel (or a
+                // replaced engine's) gets here, and an unreliable one the application drained since the last pass
+                // began: its Drain is about to take the message. An unreliable message of a channel nobody drained
+                // is queued by evicting backlog, or dropped (mayHold is false).
                 _held = held;
                 _hasHeld = true;
             }
@@ -482,19 +489,23 @@ public sealed unsafe partial class QuiclyPeer
     /// <item>an unreliable channel <em>without</em> a handler that is not backlogged (the
     /// application drained it, as a host that polls and then drains every frame does): until its <see cref="Drain"/>,
     /// which takes the queue, the held message and the ring, in that order — nothing is lost that the ring and the
-    /// budget took. If nobody drains it, the next Poll makes everything it has queued backlog: the held message is
-    /// then queued by evicting the oldest (<paramref name="mayHold"/> is <see langword="false"/> for it, so it cannot
-    /// be held twice), and from then on the channel never holds again until it has been drained empty.</item>
+    /// budget took. A Poll that comes first holds the message again while the channel was drained since the Poll before
+    /// it (a host that drains several channels in turn reaches this one's Drain after the Poll). If nobody drained it,
+    /// that Poll makes everything the channel has queued backlog: the held message is then queued by evicting the
+    /// oldest (<paramref name="mayHold"/> is <see langword="false"/> for it), and from then on the channel never holds
+    /// again until it has been drained — also when other channels evict its whole queue meanwhile.</item>
     /// </list>
     /// <para>
-    /// So an unreliable channel that nobody drains closes the ring for one Poll interval at most, once, and afterwards
-    /// costs only its own oldest messages (<see cref="ChannelStatistics.DrainQueueDrops"/>).
+    /// So an unreliable channel that nobody drains closes the ring once, for one Poll interval, and afterwards costs
+    /// only its own oldest messages (<see cref="ChannelStatistics.DrainQueueDrops"/>); several such channels close it
+    /// once each, not in turns for ever. One that was drained and is then abandoned can close it for two intervals:
+    /// the one in which it was last drained and the one after.
     /// </para>
     /// </remarks>
     /// <param name="entry">The message.</param>
     /// <param name="mayHold">
     /// <see langword="false"/> for a message that was held when this pass began: an unreliable message without a handler
-    /// is then queued or dropped, never held again.
+    /// is then held again only if its channel was drained since the pass before began, and otherwise queued or dropped.
     /// </param>
     /// <returns><see langword="false"/> when the caller has to hold the message.</returns>
     private bool TryQueue(in ReceiveEntry entry, bool mayHold)

@@ -621,6 +621,7 @@ public class DrainBackpressureTests
         // Channels 0-2 unreliable, 3 reliable. 8 nodes: 2 reserved for the reliable channel, 6 for the backlog of the
         // unreliable ones, a fair share of 2 each; 1 024 bytes of backlog, a fair share of 256 each.
         using ReceiveQueues queues = new(new ReceiveQueueLayout(8, 2, 6, 1024, 2, 256), [d, d, d, ReceiveQueueClass.Reliable]);
+        queues.BeginPass(core); // the session's first pass, in which every channel counts as drained
         Assert.True(queues.IsDatagram(0));
         Assert.False(queues.IsDatagram(3));
 
@@ -719,6 +720,7 @@ public class DrainBackpressureTests
         // Plenty of nodes; 1 024 bytes of backlog, a fair share of 512 per channel. The blocks are 256 bytes (a 100-byte
         // message).
         using ReceiveQueues queues = new(new ReceiveQueueLayout(64, 0, 64, 1024, 32, 512), [d, d]);
+        queues.BeginPass(core); // the session's first pass, in which every channel counts as drained
 
         // In the pass that queues them there is no byte limit: they were charged to the budget when they arrived.
         for (uint i = 1; i <= 5; i++)
@@ -829,6 +831,8 @@ public class DrainBackpressureTests
         // The whole pool is taken by a channel that is never evicted (more than its reservation: a reliable backlog may
         // take every free node).
         using ReceiveQueues queues = new(new ReceiveQueueLayout(2, 1, 1, 1024, 1, 1024), [ReceiveQueueClass.Datagram, ReceiveQueueClass.Reliable]);
+        queues.BeginPass(core); // the session's first pass, in which every channel counts as drained
+        queues.BeginPass(core);
         Assert.True(queues.TryAppend(1, Entry(core, 1)));
         Assert.True(queues.TryAppend(1, Entry(core, 2)));
 
@@ -838,7 +842,14 @@ public class DrainBackpressureTests
         Assert.Equal(0, queues.Drops(0));
         Assert.Equal(0, core.Counters.DrainQueueDrops);
 
-        // Held across a pass start and still no room: an unreliable message is not held a second time.
+        // Held across a pass start and still no room. The application drained the channel in the pass that ended (a take
+        // that found it empty), so it is held again: its next Drain takes it.
+        Assert.False(queues.TryTake(0, out _));
+        queues.BeginPass(core);
+        Assert.False(queues.TryAppendDatagram(0, in entry, core, mayHold: false));
+        Assert.Equal(0, core.Counters.DrainQueueDrops);
+
+        // Another pass start, and nobody drained the channel in between: not held a third time.
         queues.BeginPass(core);
         Assert.True(queues.TryAppendDatagram(0, in entry, core, mayHold: false));
 
@@ -852,12 +863,130 @@ public class DrainBackpressureTests
     }
 
     [Fact]
+    public void ReceiveQueues_The_First_Pass_Of_A_Session_Counts_As_Drained()
+    {
+        using SessionHarness h = new(connect: false);
+        PeerCore core = h.Client.Core;
+        byte d = ReceiveQueueClass.Datagram;
+        using ReceiveQueues queues = new(new ReceiveQueueLayout(4, 0, 2, 1024, 1, 512), [d, d]);
+
+        // The pass in which the session is established (QuiclyClient.ConnectAsync polls the peer itself): nobody could
+        // drain before it, so what it queues is not backlog at the next pass start — more than the backlog limit of two
+        // nodes stays — and a message held for it is held again.
+        queues.BeginPass(core);
+        for (uint i = 1; i <= 4; i++)
+        {
+            Assert.True(queues.TryAppendDatagram(0, Entry(core, i), core, mayHold: true));
+        }
+
+        Assert.False(queues.TryAppendDatagram(0, default, core, mayHold: true));
+        queues.BeginPass(core);
+        Assert.False(queues.IsBacklogged(0));
+        Assert.Equal(4, queues.Count(0));
+        Assert.False(queues.TryAppendDatagram(0, default, core, mayHold: false));
+        Assert.Equal(0, core.Counters.DrainQueueDrops);
+
+        // Still not drained one pass later: backlog, cut to its limit.
+        queues.BeginPass(core);
+        Assert.True(queues.IsBacklogged(0));
+        Assert.Equal(2, queues.Count(0));
+        Assert.Equal(2, queues.Drops(0));
+
+        // Released queues (the peer reconnected) start a session again.
+        queues.ReleaseAll(core);
+        queues.BeginPass(core);
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 10), core, mayHold: true));
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 11), core, mayHold: true));
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 12), core, mayHold: true));
+        queues.BeginPass(core);
+        Assert.False(queues.IsBacklogged(1));
+        Assert.Equal(3, queues.Count(1));
+        queues.ReleaseAll(core);
+        Assert.Equal(0, core.ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void ReceiveQueues_A_Backlog_Evicted_To_Nothing_Stays_Backlog_Until_It_Is_Drained()
+    {
+        using SessionHarness h = new(connect: false);
+        PeerCore core = h.Client.Core;
+        byte d = ReceiveQueueClass.Datagram;
+        using ReceiveQueues queues = new(new ReceiveQueueLayout(4, 0, 4, 1024, 2, 512), [d, d]);
+        queues.BeginPass(core);
+        queues.BeginPass(core);
+
+        // Channel 0 fills the pool and becomes backlog; channel 1, new, takes the whole pool from it and is then held.
+        for (uint i = 1; i <= 4; i++)
+        {
+            Assert.True(queues.TryAppendDatagram(0, Entry(core, i), core, mayHold: true));
+        }
+
+        queues.BeginPass(core);
+        Assert.True(queues.IsBacklogged(0));
+        for (uint i = 100; i < 104; i++)
+        {
+            Assert.True(queues.TryAppendDatagram(1, Entry(core, i), core, mayHold: true));
+        }
+
+        Assert.Equal(0, queues.Count(0));
+        Assert.Equal(4, queues.Drops(0));
+        Assert.False(queues.TryAppendDatagram(1, default, core, mayHold: true));
+
+        // The next pass: channel 1 is backlog, and channel 0 still is although its queue is empty — nobody drained it.
+        // So its next burst takes its room by eviction and is never held: the two cannot take turns at closing the ring.
+        queues.BeginPass(core);
+        Assert.True(queues.IsBacklogged(1));
+        Assert.True(queues.IsBacklogged(0));
+        Assert.Equal(4, queues.BacklogNodes);
+        for (uint i = 5; i <= 12; i++)
+        {
+            Assert.True(queues.TryAppendDatagram(0, Entry(core, i), core, mayHold: true));
+        }
+
+        Assert.Equal(4, queues.Used);
+        Assert.Equal(4, queues.BacklogNodes);
+        Assert.Equal(2, queues.Count(0));
+        Assert.Equal(2, queues.Count(1));
+
+        // The application drains channel 1, which ends that backlog; its next burst then evicts all of channel 0's.
+        ReceiveEntry taken;
+        while (queues.TryTake(1, out taken))
+        {
+            core.ReturnReceive(in taken.Lease);
+        }
+
+        Assert.False(queues.IsBacklogged(1));
+        for (uint i = 200; i < 204; i++)
+        {
+            Assert.True(queues.TryAppendDatagram(1, Entry(core, i), core, mayHold: true));
+        }
+
+        Assert.Equal(0, queues.Count(0));
+        while (queues.TryTake(1, out taken))
+        {
+            core.ReturnReceive(in taken.Lease);
+        }
+
+        // Passes with nothing queued at all keep channel 0's mark; a Drain that finds its queue empty ends the backlog.
+        Assert.Equal(0, queues.Used);
+        queues.BeginPass(core);
+        queues.BeginPass(core);
+        Assert.True(queues.IsBacklogged(0));
+        Assert.False(queues.TryTake(0, out _));
+        Assert.False(queues.IsBacklogged(0));
+        queues.BeginPass(core);
+        Assert.False(queues.IsBacklogged(0));
+        Assert.Equal(0, core.ReceiveBytesOutstanding);
+    }
+
+    [Fact]
     public void ReceiveQueues_Count_What_A_Poll_Has_To_Dispatch_And_Never_Evict_A_Handled_Channel()
     {
         using SessionHarness h = new(connect: false);
         PeerCore core = h.Client.Core;
         byte d = ReceiveQueueClass.Datagram;
         using ReceiveQueues queues = new(new ReceiveQueueLayout(4, 0, 4, 1024, 2, 512), [d, d]);
+        queues.BeginPass(core); // the session's first pass, in which every channel counts as drained
 
         Assert.True(queues.TryAppendDatagram(0, Entry(core, 1), core, mayHold: true));
         Assert.True(queues.TryAppendDatagram(0, Entry(core, 2), core, mayHold: true));

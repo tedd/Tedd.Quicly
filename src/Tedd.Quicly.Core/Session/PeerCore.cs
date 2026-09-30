@@ -192,7 +192,7 @@ internal sealed unsafe class PeerCore : IDisposable
 
         // What a reliable channel nobody reads may have waiting is what the drain queues keep for it: the nodes the layout
         // reserves per reliable channel, and an equal share of a quarter of the receive budget, counted in the pool's
-        // blocks. One the application drains: the ring, and an equal share of half the budget.
+        // blocks. One the application drains: the ring, and half the budget shared by the channels no handler reads.
         ReceiveQueueLayout queueLayout = ReceiveQueueLayout.Compute(_channels, options.ReceiveRingCapacity, options.ReceiveBudgetBytes);
         ReadOnlySpan<SizeClassDefinition> sizeClasses = _allocator.SizeClasses;
         Span<int> blockSizes = stackalloc int[sizeClasses.Length];
@@ -208,7 +208,7 @@ internal sealed unsafe class PeerCore : IDisposable
             queueLayout.ReliableNodes,
             ReceiveCredit.ByteLimitFor(options.ReceiveBudgetBytes, reliableChannels),
             ReceiveRing.Capacity,
-            ReceiveCredit.DrainedByteLimitFor(options.ReceiveBudgetBytes, reliableChannels),
+            ReceiveCredit.DrainedByteLimitFor(options.ReceiveBudgetBytes),
             blockSizes);
         Streams = new StreamTable();
         SessionMaxMessageSize = role == PeerRole.Server ? options.MaxMessageSize : 0;

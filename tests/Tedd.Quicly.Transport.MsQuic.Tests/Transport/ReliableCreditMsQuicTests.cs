@@ -284,10 +284,10 @@ public class ReliableCreditMsQuicTests
         Stopwatch watch = Stopwatch.StartNew();
         while (got.Count < 20_000 && watch.ElapsedMilliseconds < 30_000)
         {
-            // At most three hundred messages on their way (19 KiB of buffer blocks): half of what a drained channel may have
-            // waiting — its share of half the receive budget among the table's three reliable channels, 42 KiB — so a
-            // moment in which the transport delivers several frames at once is still not a hold.
-            for (int i = 0; i < 500 && sent < 20_000 && sent - got.Count < 300; i++)
+            // At most a thousand messages on their way (64 KiB of buffer blocks): half of what a drained channel may have
+            // waiting (half the receive budget, shared with the other reliable channels no handler reads, which have
+            // nothing waiting), so a moment in which the transport delivers several frames at once is still not a hold.
+            for (int i = 0; i < 500 && sent < 20_000 && sent - got.Count < 1_000; i++)
             {
                 BitConverter.TryWriteBytes(payload, sent);
                 if (!pair.Server.SendCopy(new SendHeader(10), payload).IsAdmitted)

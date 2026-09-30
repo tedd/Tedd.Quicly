@@ -11,7 +11,7 @@ namespace Tedd.Quicly.Core.Tests.Session;
 /// fails on d567ba5 for the reason its comment gives; a test marked GUARD passes and pins a promise.
 /// </summary>
 /// <remarks>
-/// Fixed since (third review round): the reliable channels share half the receive budget as their Drained threshold (<c>ReceiveCredit.DrainedByteLimitFor</c>; SC-1), and a handled compressed channel gets its decode buffer past the budget when the budget is full (S1, S3). The descriptions and numbers below are what the tests found at d567ba5; the tests now pin the fix.
+/// Fixed since (third review round): the reliable channels no handler reads share half the receive budget as the Drained threshold (<c>ReceiveCredit.DrainedByteLimit</c>, counted over those channels since the recheck round's RC-2; SC-1), and a handled compressed channel gets its decode buffer past the budget when the budget is full (S1, S3). The descriptions and numbers below are what the tests found at d567ba5; the tests now pin the fix.
 /// </remarks>
 public class ReviewStackcreditTests
 {

@@ -19,7 +19,9 @@ internal enum CreditState : byte
     /// Nobody reads the channel: it has no handler, and the application has not drained it empty since the Poll before
     /// last (or ever). It is held to its share: <see cref="ReceiveCredit.CountLimit"/> messages and
     /// <see cref="ReceiveCredit.ByteLimit"/> bytes of buffer blocks, and the byte share is strict — a message whose block
-    /// does not fit in what is left of it waits in the transport, even on an empty channel, until the channel is read.
+    /// does not fit in what is left of it, or in what the channels no handler reads leave of
+    /// <see cref="ReceiveCredit.DrainedByteLimit"/>, waits in the transport, even on an empty channel, until the channel
+    /// is read.
     /// A handler registered over a backlog keeps this until the backlog is dispatched.
     /// </summary>
     Unread = 1,
@@ -28,12 +30,13 @@ internal enum CreditState : byte
     /// The application drains the channel: <see cref="QuiclyPeer.Drain"/> emptied its queue since the Poll before last.
     /// Its limits are the ring's and the budget's: <see cref="ReceiveCredit.DrainedCountLimit"/> messages (the ring's
     /// capacity, so that the drain queues always have a node for what was accepted) and, once something waits,
-    /// <see cref="ReceiveCredit.DrainedByteLimit"/> bytes of buffer blocks — an equal share of half the receive budget
-    /// among the reliable channels (<see cref="ReceiveCredit.DrainedByteLimitFor"/>), because a channel keeps what it
-    /// accepted when the application stops draining it: the channels drained and then abandoned together keep at most that
-    /// half, plus one message each, and the other half is what is left for the channels that are read. The limit is a
-    /// threshold: a message is started while less than it waits, and one message is always accepted on an empty channel,
-    /// whatever its size.
+    /// <see cref="ReceiveCredit.DrainedByteLimit"/> bytes of buffer blocks — half the receive budget, counted over every
+    /// reliable channel no handler reads (this one, the other drained ones and the unread ones), because a channel keeps
+    /// what it accepted when the application stops draining it: the channels drained and then abandoned, and the channels
+    /// nobody reads, together keep at most that half, plus one message each, and the other half is what is left for the
+    /// channels that are read. Channels with a handler do not count, and neither does a channel with nothing waiting. The
+    /// limit is a threshold: a message is started while less than it waits, and one message is always accepted on an
+    /// empty channel, whatever its size.
     /// </summary>
     Drained = 2,
 }
@@ -57,14 +60,17 @@ internal enum CreditState : byte
 /// what the unread channels of a peer pin of the receive budget, for as long as nobody comes for it, is at most the
 /// quarter <see cref="ByteLimitFor"/> divides among them. A channel with a handler has no limit: its messages leave the
 /// ring at every <see cref="QuiclyPeer.Poll"/>, so the ring's own back-pressure is all it needs. A channel the
-/// application drains is limited by the ring's capacity and by its equal share of half the receive budget: what it takes
-/// in a frame is what a handler would have been given up to that share, and the drained channels together never keep more
-/// than that half (plus a message each) if the application stops coming for them. Both are still counted, so that the
-/// count is right the moment the handler is removed or the application stops draining.
+/// application drains is limited by the ring's capacity and by half the receive budget, shared with every other reliable
+/// channel no handler reads (<see cref="DrainedByteLimit"/>): what it takes in a frame is what a handler would have been
+/// given up to what the others leave of that half, and those channels together never keep more than that half (plus a
+/// message each) if the application stops coming for them. A channel nobody reads is held to that half as well, next to
+/// its strict share. Both are still counted, so that the count is right the moment the handler is removed or the
+/// application stops draining.
 /// </para>
 /// <para>
 /// Threads (ADR 0008 invariants 4 and 5). The transport thread owns what it took (<see cref="Taken"/>, with a private copy
-/// of what came back) and only looks at the game thread's counters when its copy says the channel is blocked. The game
+/// of what came back) and only looks at the game thread's counters when its copies say the channel is blocked — by its
+/// own limit, or by the half the channels no handler reads share (then it refreshes its copy of each of them). The game
 /// thread owns what it gave back and the limits; it reads the transport thread's counters only to decide which held-back
 /// streams to resume. Both count in wrapping 32-bit arithmetic: the difference is what matters, and it is bounded by the
 /// ring, the queues and the receive budget.
@@ -102,6 +108,11 @@ internal sealed unsafe class ReceiveCredit : IDisposable
 
     // Block sizes of the receive pool, ascending: what a message of a given length takes of the receive budget.
     private readonly int[] _blockSizes;
+
+    // The accounted channels' dense indices (Enable; fixed once the engines are initialized): the channels whose waiting
+    // bytes the shared half counts when they are not handled (IsSharedFull, SharedWaiting).
+    private readonly int[] _accounted;
+    private int _accountedCount;
     private NativeArray<Pended> _parked;
     private SpscRing<Pended> _pended;
 
@@ -135,7 +146,10 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     /// <param name="countLimit">Messages a channel nobody reads may have waiting.</param>
     /// <param name="byteLimit">Lease bytes a channel nobody reads may have waiting before a further message is held back.</param>
     /// <param name="drainedCountLimit">Messages a channel the application drains may have waiting (the receive ring's capacity).</param>
-    /// <param name="drainedByteLimit">Lease bytes a channel the application drains may have waiting before a further message is held back.</param>
+    /// <param name="drainedByteLimit">
+    /// Lease bytes the channels no handler reads may have waiting together: a channel the application drains starts no
+    /// further message past it, and a channel nobody reads no message that does not fit in it.
+    /// </param>
     /// <param name="blockSizes">
     /// Block sizes of the receive pool in ascending order (a message is counted with the smallest block that holds it), or
     /// <see langword="null"/> when a message is counted with its own length.
@@ -163,6 +177,7 @@ internal sealed unsafe class ReceiveCredit : IDisposable
         _streamCapacity = _pended.Capacity;
         _parked = new NativeArray<Pended>(_pended.Capacity);
         _enabled = new bool[count];
+        _accounted = new int[count];
         _state = new byte[count];
         _countLimit = Math.Max(countLimit, 1);
         _byteLimit = Math.Max(byteLimit, 1);
@@ -180,7 +195,11 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     /// <summary>Messages a channel the application drains may have waiting.</summary>
     public int DrainedCountLimit => _drainedCountLimit;
 
-    /// <summary>Lease bytes a channel the application drains may have waiting before a further message is held back.</summary>
+    /// <summary>
+    /// Lease bytes the reliable channels no handler reads may have waiting together: a channel the application drains
+    /// starts no further message once that much waits in them (its own waiting messages included), and a channel nobody
+    /// reads no message whose block does not fit in what is left of it.
+    /// </summary>
     public int DrainedByteLimit => _drainedByteLimit;
 
     /// <summary>Channels in <see cref="CreditState.Drained"/> (game thread): whether a pass start has any to judge.</summary>
@@ -199,16 +218,15 @@ internal sealed unsafe class ReceiveCredit : IDisposable
         reliableChannels == 0 ? 1 : (int)Math.Clamp(receiveBudget / 4 / reliableChannels, 1, int.MaxValue - 1);
 
     /// <summary>
-    /// Lease bytes a channel the application drains may have waiting before a further message is held back: the reliable
-    /// channels share half of the receive budget. A channel keeps what it accepted when the application stops draining it,
-    /// so the channels that were drained and then abandoned together pin at most that half (plus the one message each may
-    /// start on top of its threshold), and the other half stays for the traffic that is read.
+    /// Lease bytes the reliable channels no handler reads may have waiting together (<see cref="DrainedByteLimit"/>): half
+    /// of the receive budget. A channel keeps what it accepted when the application stops draining it, so the channels
+    /// that were drained and then abandoned, with the channels nobody reads, pin at most that half (plus the one message
+    /// each may start on top of the threshold), and the other half stays for the traffic that is read. It is shared, not
+    /// divided: a channel with a handler, or with nothing waiting, leaves a drained channel all of it.
     /// </summary>
     /// <param name="receiveBudget">The receive budget (<see cref="PeerOptions.ReceiveBudgetBytes"/>).</param>
-    /// <param name="reliableChannels">ReliableOrdered and ReliableUnordered channels in the table.</param>
     /// <returns>The limit, at least 1.</returns>
-    public static int DrainedByteLimitFor(long receiveBudget, int reliableChannels) =>
-        reliableChannels == 0 ? 1 : (int)Math.Clamp(receiveBudget / 2 / reliableChannels, 1, int.MaxValue - 1);
+    public static int DrainedByteLimitFor(long receiveBudget) => (int)Math.Clamp(receiveBudget / 2, 1, int.MaxValue - 1);
 
     // ------------------------------------------------------------------ construction (engine Initialize)
 
@@ -219,6 +237,11 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     /// <param name="channel">Dense channel index.</param>
     public void Enable(int channel)
     {
+        if (!_enabled[channel])
+        {
+            _accounted[_accountedCount++] = channel;
+        }
+
         _enabled[channel] = true;
         _state[channel] = (byte)CreditState.Unread;
         _limits[channel] = new Limit { Count = _countLimit, Bytes = -_byteLimit };
@@ -259,14 +282,52 @@ internal sealed unsafe class ReceiveCredit : IDisposable
 
         // A strict byte limit (negative, see Limit) counts the message that asks: its block has to fit as well.
         int need = bytes < 0 ? BlockSizeOf(length) : 0;
-        if (!IsBlocked(in taken, count, bytes, need))
+        if (!IsBlocked(in taken, count, bytes, need) && !IsSharedFull(in taken, bytes, need, refresh: false))
         {
             return true;
         }
 
-        // Only now the game thread's line: the private copy says the channel is full.
+        // Only now the game thread's lines: the private copies say the channel, or the shared half, is full.
         Refresh(ref taken, channel);
-        return !IsBlocked(in taken, count, bytes, need);
+        return !IsBlocked(in taken, count, bytes, need) && !IsSharedFull(in taken, bytes, need, refresh: true);
+    }
+
+    /// <summary>
+    /// Whether the reliable channels no handler reads have <see cref="DrainedByteLimit"/> waiting between them (transport
+    /// thread), by this thread's copies of what came back — which can only make them look fuller than they are — or,
+    /// with <paramref name="refresh"/>, after refreshing each copy. A threshold (<paramref name="bytes"/> positive) lets
+    /// a message start on an empty channel; a strict limit asks whether <paramref name="need"/> fits in what is left.
+    /// </summary>
+    /// <remarks>
+    /// One pass over the accounted channels, for a message of a limited channel only: a channel with a handler never gets
+    /// here, and with a single accounted channel the channel's own limit says it all.
+    /// </remarks>
+    private bool IsSharedFull(in Taken own, int bytes, int need, bool refresh)
+    {
+        if (_accountedCount < 2 || (bytes > 0 && own.Count == own.SeenCount))
+        {
+            return false;
+        }
+
+        ulong waiting = 0;
+        for (int i = 0; i < _accountedCount; i++)
+        {
+            int channel = _accounted[i];
+            if (Volatile.Read(ref _limits[channel].Count) == Unlimited)
+            {
+                continue;
+            }
+
+            ref Taken taken = ref _taken[channel];
+            if (refresh)
+            {
+                Refresh(ref taken, channel);
+            }
+
+            waiting += unchecked(taken.Bytes - taken.SeenBytes);
+        }
+
+        return bytes < 0 ? waiting + (uint)need > (uint)_drainedByteLimit : waiting >= (uint)_drainedByteLimit;
     }
 
     /// <summary>What a message of <paramref name="length"/> bytes takes of the receive budget: the smallest block that holds it.</summary>
@@ -347,9 +408,11 @@ internal sealed unsafe class ReceiveCredit : IDisposable
         }
 
         // Asked for the stream's own message: under a strict byte share a look for a message that still does not fit
-        // would resume the stream only for it to be held back again, at every Poll.
+        // would resume the stream only for it to be held back again, at every Poll. The shared half likewise: what the
+        // other channels give back of it marks them changed (NoteReturned), and that brings the look.
         int bytes = Volatile.Read(ref _limits[channel].Bytes);
-        if (count == Unlimited || !IsBlocked(in taken, count, bytes, bytes < 0 ? need : 0))
+        int asked = bytes < 0 ? need : 0;
+        if (count == Unlimited || (!IsBlocked(in taken, count, bytes, asked) && !IsSharedFull(in taken, bytes, asked, refresh: true)))
         {
             Interlocked.Or(ref _recheck, Look);
         }
@@ -708,12 +771,19 @@ internal sealed unsafe class ReceiveCredit : IDisposable
             return 0;
         }
 
+        // A drained channel's threshold is the half the channels no handler reads share (IsSharedFull).
+        if (waiting != 0 && state == (byte)CreditState.Drained && _accountedCount > 1 && SharedWaiting() >= (uint)_drainedByteLimit)
+        {
+            return 0;
+        }
+
         return limit - (int)waiting;
     }
 
     /// <summary>
-    /// Bytes left of a strict byte share (game thread): what the block of a waiting stream's message has to fit in, or
-    /// <see cref="Unlimited"/> for a channel whose byte limit is a threshold. Read like <see cref="CreditLeft"/>.
+    /// Bytes left of a strict byte share (game thread): what the block of a waiting stream's message has to fit in — the
+    /// channel's own share, or what the channels no handler reads leave of <see cref="DrainedByteLimit"/> when that is less
+    /// — or <see cref="Unlimited"/> for a channel whose byte limit is a threshold. Read like <see cref="CreditLeft"/>.
     /// </summary>
     private int StrictBytesLeft(int channel)
     {
@@ -723,7 +793,33 @@ internal sealed unsafe class ReceiveCredit : IDisposable
         }
 
         uint waiting = unchecked(Volatile.Read(ref _taken[channel].Bytes) - _returned[channel].Bytes);
-        return waiting >= (uint)_byteLimit ? 0 : _byteLimit - (int)waiting;
+        int left = waiting >= (uint)_byteLimit ? 0 : _byteLimit - (int)waiting;
+        if (left != 0 && _accountedCount > 1)
+        {
+            ulong shared = SharedWaiting();
+            left = shared >= (uint)_drainedByteLimit ? 0 : Math.Min(left, _drainedByteLimit - (int)shared);
+        }
+
+        return left;
+    }
+
+    /// <summary>
+    /// Lease bytes waiting in the reliable channels no handler reads (game thread), from the transport thread's counts as
+    /// they are: a moment old, they can only be lower, which lets a stream go that is then held back again.
+    /// </summary>
+    private ulong SharedWaiting()
+    {
+        ulong waiting = 0;
+        for (int i = 0; i < _accountedCount; i++)
+        {
+            int channel = _accounted[i];
+            if (_state[channel] != (byte)CreditState.Handled)
+            {
+                waiting += unchecked(Volatile.Read(ref _taken[channel].Bytes) - _returned[channel].Bytes);
+            }
+        }
+
+        return waiting;
     }
 
     /// <summary>Moves the streams the transport thread held back into the game thread's own list.</summary>

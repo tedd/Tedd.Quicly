@@ -424,8 +424,8 @@ public struct ChannelStatistics
     /// application (ReliableOrdered and ReliableUnordered; always 0 for the other modes, and for a channel that has always
     /// had a handler). A reliable channel that nobody reads — no handler, and not drained empty since the
     /// <see cref="QuiclyPeer.Poll"/> before last — may have only its share of the drain queues and of the receive budget
-    /// waiting; one that is drained, as many messages as the receive ring holds and half the receive budget (see
-    /// <see cref="QuiclyPeer.Poll"/>). Nothing is lost and the receive ring stays open for the other channels: QUIC flow
+    /// waiting; one that is drained, as many messages as the receive ring holds and half the receive budget, shared with
+    /// the other reliable channels no handler reads (see <see cref="QuiclyPeer.Poll"/>). Nothing is lost and the receive ring stays open for the other channels: QUIC flow
     /// control holds that stream's sender until the application takes messages of the channel or registers a handler for
     /// it. A number that keeps rising on a channel the other end sends on means that nobody reads the channel, or that it
     /// is read more slowly than it is written. Each hold is also counted in

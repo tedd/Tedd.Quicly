@@ -82,9 +82,12 @@ public sealed unsafe partial class QuiclyPeer
     /// <para>
     /// A channel with a handler has no such limit. A channel the application drains is not held to the share either: a
     /// Drain that leaves the channel's queue empty (an empty Drain counts) shows that it is read, and from then on its
-    /// limits are the receive ring's capacity in messages and, in bytes, an equal share of half the receive budget among
-    /// the reliable channels of the table (a message is started while less than that waits, and one message is always
-    /// accepted on an empty channel). It goes back to its share at the first Poll that finds messages queued for it
+    /// limits are the receive ring's capacity in messages and, in bytes, half the receive budget, shared with the other
+    /// reliable channels no handler reads (a message is started while less than that waits in them, this channel's own
+    /// messages included, and one message is always accepted on an empty channel; a channel with a handler, or with
+    /// nothing waiting, takes nothing of it). A channel nobody reads starts no message that does not fit in what they
+    /// leave of it either, so the channels drained and then abandoned and the channels nobody reads keep at most that
+    /// half between them (and a message each). It goes back to its share at the first Poll that finds messages queued for it
     /// which no Drain took during the whole Poll interval before, and keeps what it accepted until then. A
     /// ReliableOrdered channel is one stream, so what follows an unread message on it — a response to this end's own
     /// request included — waits behind it.

@@ -636,11 +636,11 @@ public class ReviewCreditAccountingTests
 
         PumpSenderOnly(h, h.Client, 40);
 
-        // As fixed: a channel the application drains may have its equal share of half the receive budget waiting (the
-        // reliable channels share that half), so that what the drained channels keep when the application stops coming
-        // leaves the other half. (As reviewed, it took all 64 messages: the budget.)
+        // As fixed: the reliable channels no handler reads may have half the receive budget waiting between them, so that
+        // what the drained channels keep when the application stops coming leaves the other half. (As reviewed, it took
+        // all 64 messages: the budget.)
         int accepted = server.Core.Credit.DrainedByteLimit / 4_096;
-        Assert.True(server.Core.Credit.DrainedByteLimit <= h.ServerOptions.ReceiveBudgetBytes / 2);
+        Assert.Equal(h.ServerOptions.ReceiveBudgetBytes / 2, server.Core.Credit.DrainedByteLimit);
         Assert.Equal(accepted, Waiting(server, Ordered));
         Assert.True(accepted < Ring);
         server.Poll();

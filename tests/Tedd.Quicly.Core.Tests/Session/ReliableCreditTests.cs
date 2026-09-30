@@ -621,26 +621,61 @@ public class ReliableCreditTests
     }
 
     [Fact]
-    public void A_Channel_The_Application_Drains_Takes_One_Message_Of_Any_Size_And_Its_Share_Of_Half_The_Budget()
+    public void A_Channel_The_Application_Drains_Takes_One_Message_Of_Any_Size_And_Half_The_Budget()
     {
         using SessionHarness h = new(table: Table, client: o => { GroupKit.Prompt(o); OrderedKit.Roomy(o); }, server: GroupKit.Prompt);
         QuiclyPeer server = h.Server!;
         ReceiveCredit credit = server.Core.Credit;
 
-        // The reliable channels share half the 256 KiB budget: channels drained and then abandoned keep no more together.
-        Assert.Equal(128 * 1024 / CountReliable(server), credit.DrainedByteLimit);
+        // The channels no handler reads share half the 256 KiB budget; the other reliable channel has nothing waiting, so
+        // this one may take all of it.
+        Assert.Equal(128 * 1024, credit.DrainedByteLimit);
 
         // The consumer's first frame: nothing to take, and from then on the channel is one the application reads.
         Assert.Empty(DrainAll(server, Ordered));
         Assert.Equal(CreditState.Drained, credit.State(server.Core.ChannelIndexOf(Ordered)));
 
-        // Messages of 60 000 bytes take a 64 KiB block each: as many as the share holds are accepted (a message is started
-        // while less than the share waits), and the next waits. Only the sender and the network run meanwhile (the
-        // receiving host is late), so the channel stays one that is drained.
-        int accepted = (credit.DrainedByteLimit + 65_535) / 65_536;
-        for (int i = 0; i < 5; i++)
+        // Messages of 60 000 bytes take a 64 KiB block each: two of them are half the budget, and the third waits. Only the
+        // sender and the network run meanwhile (the receiving host is late), so the channel stays one that is drained.
+        SendSlowly(h, Ordered, 0, 5, 60_000);
+        Assert.Equal(2, Waiting(server, Ordered));
+        Assert.Equal(1, Channel(server, Ordered).BacklogHolds);
+        Assert.Equal(Enumerable.Range(0, 5), DrainUntil(h, server, Ordered, 5));
+    }
+
+    /// <summary>
+    /// The half is shared by the reliable channels no handler reads, not divided among the table's channels: a second
+    /// drained channel takes what the first leaves of it (one message on an empty channel always), and a channel with a
+    /// handler takes nothing of it (review RC-2 of the recheck round; SC-1 of the third).
+    /// </summary>
+    [Fact]
+    public void The_Channels_No_Handler_Reads_Share_Half_The_Budget()
+    {
+        using SessionHarness h = new(table: Table, client: o => { GroupKit.Prompt(o); OrderedKit.Roomy(o); }, server: GroupKit.Prompt);
+        QuiclyPeer server = h.Server!;
+        Assert.Empty(DrainAll(server, Ordered));
+        Assert.Empty(DrainAll(server, Groups));
+
+        // The first drained channel takes the half: two 64 KiB blocks.
+        SendSlowly(h, Ordered, 0, 3, 60_000);
+        Assert.Equal(2, Waiting(server, Ordered));
+
+        // The second one: its first message (an empty channel takes one), and nothing more while the half is full.
+        SendSlowly(h, Groups, 0, 3, 60_000);
+        Assert.Equal(1, Waiting(server, Groups));
+        Assert.True(Channel(server, Groups).BacklogHolds >= 1);
+
+        // Both are read in the end, in full.
+        Assert.Equal(Enumerable.Range(0, 3), DrainUntil(h, server, Ordered, 3));
+        Assert.Equal(Enumerable.Range(0, 3), DrainUntil(h, server, Groups, 3).Order());
+    }
+
+    /// <summary>Sends <paramref name="count"/> messages while only the sender and the network run (the receiving host is late).</summary>
+    private static void SendSlowly(SessionHarness h, ushort channel, int first, int count, int size)
+    {
+        for (int i = first; i < first + count; i++)
         {
-            Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Ordered), Payload(i, 60_000)).Status);
+            Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(channel), Payload(i, size)).Status);
             for (int step = 0; step < 50; step++)
             {
                 h.Client.Poll();
@@ -648,21 +683,6 @@ public class ReliableCreditTests
                 h.Network.AdvanceTo(h.Network.NowMicros + 1_000);
             }
         }
-
-        Assert.Equal(accepted, Waiting(server, Ordered));
-        Assert.Equal(1, Channel(server, Ordered).BacklogHolds);
-        Assert.Equal(Enumerable.Range(0, 5), DrainUntil(h, server, Ordered, 5));
-    }
-
-    private static int CountReliable(QuiclyPeer peer)
-    {
-        int count = 0;
-        foreach (ChannelDefinition channel in peer.Core.Channels)
-        {
-            count += channel.Mode is ChannelMode.ReliableOrdered or ChannelMode.ReliableUnordered ? 1 : 0;
-        }
-
-        return count;
     }
 
     // ------------------------------------------------------------------ what is not counted, and what is given back

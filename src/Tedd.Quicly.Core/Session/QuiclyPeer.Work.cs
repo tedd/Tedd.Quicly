@@ -35,19 +35,31 @@ public sealed unsafe partial class QuiclyPeer
     /// thread other than the game thread never misses work the transport published. The game thread's own bookkeeping
     /// (queued transitions, drain queues, the held entry) is read without synchronisation: for a foreign caller those parts
     /// are advisory, which is why a host wakes on the edge (<see cref="IPeerWorkSignal"/>) and decides on this probe from
-    /// the game thread. It is the level behind every publication that raises the edge, so a host that woke and finds it
-    /// set polls (re-arming the edge) and flushes; the part that needs a Flush stays set until one runs, and ack and
-    /// progress work may wait out <see cref="PeerOptions.AckDelay"/> or the bulk progress window in it. A Flush-only
-    /// deadline that has not passed is not work: use <see cref="NextFlushDeadlineMicros"/> for that, which a
-    /// <see cref="Poll"/> brings forward to the engine work above.
+    /// the game thread. It is the level behind the edge, so a host that woke and finds it set polls (re-arming the edge)
+    /// and flushes; the part that needs a Flush stays set until one runs, and ack and progress work may wait out
+    /// <see cref="PeerOptions.AckDelay"/> or the bulk progress window in it. A Flush-only deadline that has not passed is
+    /// not work: use <see cref="NextFlushDeadlineMicros"/> for that, which a <see cref="Poll"/> brings forward to the
+    /// engine work above.
+    /// <para>
+    /// <b>The probe and the edge.</b> The edge (<see cref="IPeerWorkSignal"/>) is raised once and stays consumed until it
+    /// is re-armed. A <see cref="Poll"/> re-arms it, and so does a call of this property that returns
+    /// <see langword="false"/>: a host that is told there is nothing to do will not poll, so the probe re-arms the edge
+    /// (and then reads the level once more, behind a full fence) before it answers. Without that, a publication the probe
+    /// does not count — a mailbox value of a channel without a handler — or work a <see cref="Drain"/> took before the
+    /// host asked would leave the edge consumed, and every later publication silent. A host can therefore rely on
+    /// either order of events: work published before the answer is in the answer, work published after it raises the
+    /// signal. A call that returns <see langword="true"/> leaves the edge alone, so a burst still costs one host call.
+    /// </para>
     /// <para>
     /// Messages waiting for a channel without a handler are not work — they wait for the application's
     /// <see cref="Drain"/>, which no <see cref="Poll"/> can do for it — whether they wait in a drain queue or in a mailbox
     /// (a coalescing channel, ReliableLatest). So a host that loops on the probe must not expect it to announce them: it
-    /// drains on its own tick, or on the edge (<see cref="IPeerWorkSignal"/>), which every arrival still raises. An
-    /// unreliable channel nobody drains leaves the probe clear: its backlog is bounded and evicts (see <see cref="Poll"/>).
-    /// The one exception lasts a single Poll: when a burst fills the queue pool, the next message is held for the Drain
-    /// that may follow in the same frame and the probe is set; the following Poll queues it and clears the probe. A
+    /// drains on its own tick, or on the edge, which the first such arrival after a Poll or after a probe that answered
+    /// <see langword="false"/> raises. An unreliable channel nobody drains leaves the probe clear: its backlog is bounded
+    /// and evicts (see <see cref="Poll"/>). The one exception is short: when a burst fills the queue pool, the next
+    /// message is held for the Drain that may follow in the same frame and the probe is set; a Poll that finds the
+    /// channel undrained queues or drops it and clears the probe (the first Poll after the hold, or the second when the
+    /// channel had been drained just before). A
     /// <em>reliable</em> channel without a handler that is not drained is different: once the queue pool is full its next
     /// message is held and the ring behind it is not emptied, and the probe stays set for as long as that lasts, because
     /// there is work that no <see cref="Poll"/> can consume. A host that polls while the probe is set then polls every
@@ -63,12 +75,31 @@ public sealed unsafe partial class QuiclyPeer
                 return false;
             }
 
-            // Engine work only a scheduler pass consumes: only a Connected peer runs a pass.
-            return HasQueuedPollWork()
-                || (_state == PeerState.Connected && (_latest is { HasUnsentControl: true } || _bulk is { HasPassWork: true }))
-                || _nextDeadlineMicros <= _clock.NowMicros;
+            if (HasWorkNow())
+            {
+                return true;
+            }
+
+            // Nothing is waiting, so the host will not poll — and only a Poll re-arms the edge. If the edge was consumed
+            // (by work another call took meanwhile, or by a publication this probe does not count, such as a mailbox
+            // value of a channel without a handler), re-arm it here, or every later publication would stay silent. The
+            // exchange is a full fence and the level is read again after it: work published before the fence is seen
+            // by that second read, work published after it finds the edge armed and raises the signal.
+            if (_workSignal is not null && Volatile.Read(ref _workSignalled) != 0)
+            {
+                Interlocked.Exchange(ref _workSignalled, 0);
+                return HasWorkNow();
+            }
+
+            return false;
         }
     }
+
+    // Engine work only a scheduler pass consumes: only a Connected peer runs a pass.
+    private bool HasWorkNow() =>
+        HasQueuedPollWork()
+        || (_state == PeerState.Connected && (_latest is { HasUnsentControl: true } || _bulk is { HasPassWork: true }))
+        || _nextDeadlineMicros <= _clock.NowMicros;
 
     /// <summary>
     /// What a <see cref="Poll"/> still has to serve: <see cref="HasPendingWork"/> without the engine work left for the next
@@ -139,8 +170,9 @@ public sealed unsafe partial class QuiclyPeer
     /// <summary>
     /// Publishes that the peer has game-thread work and tells <see cref="PeerOptions.WorkSignal"/> once (any thread; the
     /// transport thread for received traffic, the game thread for work an application call created). Set-once until the next
-    /// <see cref="Poll"/> clears it, so a burst of messages costs one host call; allocation-free, and a host exception is
-    /// recorded and turned into a queued close instead of reaching the transport.
+    /// <see cref="Poll"/>, or a <see cref="HasPendingWork"/> probe that finds nothing, clears it, so a burst of messages
+    /// costs one host call; allocation-free, and a host exception is recorded and turned into a queued close instead of
+    /// reaching the transport.
     /// </summary>
     internal void NoteWork()
     {

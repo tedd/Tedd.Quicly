@@ -515,8 +515,9 @@ public sealed partial class QuiclyServer
 
         if (PollOverride is null && !peer.HasPendingWork)
         {
-            // Nothing is waiting. The peer's work signal is an edge that only a Poll re-arms, so the slot keeps its bit
-            // instead of being cleared silently: the next PollAll probes again, and no publication can be missed.
+            // Nothing is waiting. The probe that answers false re-arms the peer's work signal itself (HasPendingWork), so
+            // no publication can be missed; the slot keeps its bit all the same, as it did when only a Poll re-armed
+            // the edge: the next PollAll probes again.
             MarkWork(slot);
             UpdateDeadlines(slot, peer);
             return 0;

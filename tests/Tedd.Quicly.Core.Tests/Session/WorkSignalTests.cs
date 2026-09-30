@@ -80,6 +80,53 @@ public class WorkSignalTests
     }
 
     [Fact]
+    public void A_Probe_That_Finds_Nothing_Rearms_The_Edge_And_One_That_Finds_Work_Does_Not()
+    {
+        RecordingWorkSignal clientSignal = new();
+        RecordingWorkSignal serverSignal = new();
+        using SessionHarness h = NewPair(clientSignal, serverSignal);
+        QuiclyPeer server = h.Server!;
+        server.Poll();
+        server.Flush();
+        serverSignal.Take();
+        Assert.False(server.HasPendingWork);
+
+        // Work the probe reports: the edge stays consumed however often the host asks, so a burst still costs one call.
+        h.Client.SendCopy(new SendHeader(2), [1]);
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        Assert.Equal(1, serverSignal.Calls);
+        Assert.True(server.HasPendingWork);
+        Assert.True(server.HasPendingWork);
+        h.Client.SendCopy(new SendHeader(2), [2]);
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        Assert.Equal(1, serverSignal.Calls);
+
+        // A Drain takes the work out of the ring without a Poll. The host that then asks the probe is told there is
+        // nothing, will not poll, and so the probe re-arms the edge itself: the next arrival wakes the host again.
+        ReceivedMessage[] buffer = new ReceivedMessage[8];
+        int n = server.Drain(2, buffer);
+        Assert.Equal(2, n);
+        server.Release(buffer.AsSpan(0, n));
+        Assert.False(server.HasPendingWork);
+        h.Client.SendCopy(new SendHeader(2), [3]);
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        Assert.Equal(2, serverSignal.Calls);
+
+        // An armed edge is left alone by a probe that finds nothing.
+        n = server.Drain(2, buffer);
+        server.Release(buffer.AsSpan(0, n));
+        Assert.False(server.HasPendingWork);
+        Assert.False(server.HasPendingWork);
+        h.Client.SendCopy(new SendHeader(2), [4]);
+        h.Client.Flush();
+        h.Network.Advance(1_000);
+        Assert.Equal(3, serverSignal.Calls);
+    }
+
+    [Fact]
     public void An_Idle_Peer_Never_Signals_And_Has_No_Pending_Work()
     {
         RecordingWorkSignal clientSignal = new();

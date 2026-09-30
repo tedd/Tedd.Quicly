@@ -109,8 +109,9 @@ public sealed unsafe partial class QuiclyPeer
 
     /// <summary>
     /// Stands in for a <see cref="Flush"/> that <see cref="CanSkipFlush"/> proved empty (game thread): records the tick
-    /// (carried by the containers of later Immediate sends), the pass clock (engines stamp expiry deadlines from it) and the
-    /// ping clock's slew, which are the only things such a Flush changes.
+    /// (carried by the containers of later Immediate sends), the pass clock (ReliableLatest arms its version budgets and retry
+    /// timers from it) and the ping clock's slew, which are the only things such a Flush changes. No expiry deadline can be
+    /// waiting for a pass here: every admission moves <see cref="PeerCore.LastAdmissionStamp"/>, which refuses the skip.
     /// </summary>
     /// <param name="tick">The tick passed to the flush.</param>
     /// <param name="now">The clock micros <see cref="CanSkipFlush"/> was given.</param>

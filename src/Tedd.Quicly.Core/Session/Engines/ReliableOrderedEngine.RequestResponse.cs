@@ -31,8 +31,9 @@ internal sealed unsafe partial class ReliableOrderedEngine
     /// The request is an ordinary buffered message of the channel with an odd <c>RequestId</c> from the channel's counter
     /// (PROTOCOL.md §3.1); only the wait is asynchronous. The value task is backed by a pooled
     /// <see cref="IValueTaskSource{TResult}"/> that is reused for the life of the peer, so a request allocates nothing once
-    /// the table's slots exist. The timeout is processed by <see cref="RunPollDeadlines"/> in every Poll and Flush; there is
-    /// no timer thread (ADR 0008 invariant 9).
+    /// the table's slots exist. The timeout counts from this call (one clock read per request, the only one on the
+    /// send path) and is processed by <see cref="RunPollDeadlines"/> in every Poll and Flush; there is no timer thread
+    /// (ADR 0008 invariant 9).
     /// </remarks>
     public override ValueTask<ReceiveLease> SendRequestAsync(ref SendRequest request, long timeoutMicros, CancellationToken cancellationToken)
     {
@@ -59,8 +60,10 @@ internal sealed unsafe partial class ReliableOrderedEngine
             return ValueTask.FromException<ReceiveLease>(new InvalidOperationException($"The request was not admitted ({status})."));
         }
 
-        // The pass's clock stamp, not a QPC per request (ADR 0008 invariant 9); 0 = wait until the response or the session ends.
-        long deadline = timeoutMicros > 0 ? _core.CurrentPassMicros + timeoutMicros : 0;
+        // The timeout runs from this call, so the clock is read here, once per request: the last pass's stamp can be older
+        // than the whole timeout (a long frame), and the request would then time out in the next pass without ever having
+        // been sent. 0 = wait until the response or the session ends.
+        long deadline = timeoutMicros > 0 ? _core.Clock.NowMicros + timeoutMicros : 0;
         slot.Arm(local, request.RequestId, deadline);
         _requestCount++;
         if (deadline != 0 && deadline < _requestDeadline)

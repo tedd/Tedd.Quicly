@@ -251,9 +251,9 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
         long expiry = request.Options.ExpiryMicros > 0 ? request.Options.ExpiryMicros : _expiryMicros[local];
         if (expiry > 0)
         {
-            // The pass's clock stamp, not a QPC per message (ADR 0008 invariant 9).
-            long now = _core.CurrentPassMicros;
-            entries.Deadlines[slot] = expiry >= long.MaxValue - now ? long.MaxValue : now + expiry;
+            // Counted from the first scheduler pass after this admission, which resolves it (PeerCore.StampExpiry): no
+            // clock is read here (ADR 0008 invariant 9), and a stale pass stamp can never pre-age the message.
+            _core.StampExpiry(slot, expiry);
         }
 
         ref SendEntry entry = ref entries[slot];

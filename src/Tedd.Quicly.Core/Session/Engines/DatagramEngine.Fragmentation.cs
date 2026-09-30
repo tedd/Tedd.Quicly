@@ -228,14 +228,6 @@ internal abstract unsafe partial class DatagramEngine
         entries.Keys[owner] = header.Key;
         entries.Sequences[owner] = sequence;
         long expiry = request.Options.ExpiryMicros > 0 ? request.Options.ExpiryMicros : _expiryMicros[local];
-        long deadline = 0;
-        if (expiry > 0)
-        {
-            // The pass's clock stamp, not a QPC per message (ADR 0008 invariant 9).
-            long now = _core.CurrentPassMicros;
-            deadline = expiry >= long.MaxValue - now ? long.MaxValue : now + expiry;
-        }
-
         ref SendEntry ownerEntry = ref entries[owner];
         ownerEntry.Aux0 = length;
         ownerEntry.Aux1 = PackOwner(count, count, DeliveryStatus.Pending);
@@ -251,7 +243,13 @@ internal abstract unsafe partial class DatagramEngine
             _core.SetPayload(slot, bytes + (index * size), fragmentSize);
             entries.Keys[slot] = header.Key;
             entries.Sequences[slot] = sequence;
-            entries.Deadlines[slot] = deadline;
+            if (expiry > 0)
+            {
+                // Every fragment expires on its own, all from the same first scheduler pass (PeerCore.StampExpiry); the
+                // owner is never queued, so it carries no deadline.
+                _core.StampExpiry(slot, expiry);
+            }
+
             _fragmentOwner[slot] = owner;
             ref SendEntry entry = ref entries[slot];
             entry.Aux0 = fragmentSize;

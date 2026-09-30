@@ -226,7 +226,9 @@ public sealed unsafe partial class QuiclyPeer
     }
 
     /// <summary>
-    /// The scheduler (docs/design/session-layer.md §7.1), one pass: the send cap is refilled; every channel is offered to
+    /// The scheduler (docs/design/session-layer.md §7.1), one pass: the expiry deadlines of everything admitted since the
+    /// previous pass are anchored at this pass's clock (<see cref="PeerCore.ResolveExpiry"/>, so this pass never expires
+    /// them); the send cap is refilled; every channel is offered to
     /// its engine in priority order (<see cref="PeerCore.ScheduleOrder"/>; within a channel admission order, expiry at
     /// scheduling time, PROTOCOL.md §4.5); every engine's engine-level <see cref="ChannelEngine.Flush"/> follows (retries and
     /// other traffic §4.5 schedules after fresh messages); the packer submits what it still holds. The bytes submitted are
@@ -245,6 +247,9 @@ public sealed unsafe partial class QuiclyPeer
         try
         {
             long now = flush.NowMicros;
+            // Expiry runs from a message's first pass (PROTOCOL.md §4.5): what was admitted since the previous pass gets
+            // its deadline from this pass's clock, before any engine compares one.
+            _core.ResolveExpiry(now);
             flush.BudgetBytes = _sendRate > 0 ? _sendBucket.Available(now) : long.MaxValue;
             flush.CancelBlockedDatagrams = TransportHonoursCancelOnBlocked();
             DatagramPacker packer = _core.Packer;

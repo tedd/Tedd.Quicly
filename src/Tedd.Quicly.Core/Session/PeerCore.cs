@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Tedd.Quicly.Core.Channels;
@@ -57,6 +58,21 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>Mask of the stream serial carried in an engine stream context (24 bits; it wraps).</summary>
     public const uint EngineStreamSerialMask = 0xFF_FFFF;
 
+    /// <summary>
+    /// Base of an expiry deadline that has not met its first scheduler pass yet (<see cref="StampExpiry"/>): the entry's
+    /// <see cref="SendEntryTable.Deadlines"/> value is this plus the relative expiry until <see cref="ResolveExpiry"/> turns
+    /// it into clock micros. It is above every clock value the peer can see, so a check that runs before the resolve
+    /// (<c>now &gt; deadline</c>) never expires the entry.
+    /// </summary>
+    internal const long UnresolvedDeadline = 1L << 62;
+
+    /// <summary>
+    /// A relative expiry at or above this is "never" (<see cref="StampExpiry"/> leaves the deadline at 0): it keeps
+    /// <see cref="UnresolvedDeadline"/> plus the expiry inside a signed 64-bit value, and no clock reaches it (about 73 000
+    /// years of microseconds).
+    /// </summary>
+    internal const long MaxRelativeExpiryMicros = 1L << 61;
+
     private readonly SlabAllocator _allocator;
     private TransportCallbackState _callback;
     private readonly bool _ownsAllocator;
@@ -96,6 +112,10 @@ internal sealed unsafe class PeerCore : IDisposable
     private readonly CompletionEntry[] _localCompletions;
     private readonly NativeArray<long> _stamps;
     private readonly bool _atomicSendBudget;
+    // Game thread: one bit per send-entry slot whose expiry deadline waits for its first scheduler pass (StampExpiry,
+    // ResolveExpiry), and the highest word that may hold one (-1 = none, the only thing a pass reads when nothing waits).
+    private readonly NativeArray<ulong> _expiryPending;
+    private int _expiryWordHigh = -1;
     private long _passMicros;
     private long _stamp;
     private int _localHead;
@@ -142,6 +162,7 @@ internal sealed unsafe class PeerCore : IDisposable
         Segments = new SegmentArena(options.SegmentArenaCapacity);
         _tokens = new NativeArray<SendToken>(capacity);
         _stamps = new NativeArray<long>(capacity);
+        _expiryPending = new NativeArray<ulong>((capacity + 63) >> 6); // zeroed by NativeArray
         _atomicSendBudget = options.ThreadSafeSend;
         _userContexts = new NativeArray<ulong>(capacity);
         _entryOfToken = new int[capacity];
@@ -223,13 +244,103 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>
     /// Clock micros of the current game-thread pass: read once at the start of every <see cref="QuiclyPeer.Poll"/>,
     /// <see cref="QuiclyPeer.Flush"/> and <see cref="SendMode.Immediate"/> pass (ADR 0008 invariant 9), and at
-    /// construction. Engines stamp expiry deadlines from it instead of reading the clock per admitted message.
+    /// construction. The ReliableLatest engine arms its version budgets and retry timers from it instead of reading the
+    /// clock per admitted value. Message expiry does <em>not</em> use it: a stamp can be arbitrarily old by the time a
+    /// message is admitted (a long frame, a quiet server peer), so an expiry counted from it could be over before the
+    /// message met the scheduler once — see <see cref="StampExpiry"/>.
     /// </summary>
     public long CurrentPassMicros => _passMicros;
 
     /// <summary>Records the clock stamp of a game-thread pass (game thread; <paramref name="nowMicros"/> read once by the caller).</summary>
     /// <param name="nowMicros">Clock micros.</param>
     public void NotePass(long nowMicros) => _passMicros = nowMicros;
+
+    /// <summary>
+    /// Whether any entry's expiry still waits for its first scheduler pass (game thread; tests). A bit of an entry that was
+    /// cancelled before that pass counts until the pass clears it.
+    /// </summary>
+    internal bool HasPendingExpiry => _expiryWordHigh >= 0;
+
+    /// <summary>
+    /// Gives an admitted entry a relative expiry (game thread, after the engine's commit point). The expiry clock starts at
+    /// the first scheduler pass after admission (PROTOCOL.md §4.5): the deadline is stored as
+    /// <see cref="UnresolvedDeadline"/> + <paramref name="expiryMicros"/> and the slot is marked, and
+    /// <see cref="ResolveExpiry"/> at the start of that pass turns it into <c>pass now + expiry</c>. Admission reads no
+    /// clock (ADR 0008 invariant 9), and the pass that first offers the message can never expire it.
+    /// </summary>
+    /// <remarks>
+    /// An expiry of <see cref="MaxRelativeExpiryMicros"/> or more is "never": the deadline stays 0, which is what
+    /// <see cref="SendEntryTable.TryAllocate"/> left there.
+    /// </remarks>
+    /// <param name="slot">The entry (allocated by the caller, not submitted).</param>
+    /// <param name="expiryMicros">The relative expiry in microseconds; must be positive.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void StampExpiry(int slot, long expiryMicros)
+    {
+        Debug.Assert(expiryMicros > 0, "a relative expiry is positive");
+        Debug.Assert((uint)slot < (uint)Entries.Capacity, "slot");
+        if (expiryMicros >= MaxRelativeExpiryMicros)
+        {
+            return;
+        }
+
+        Entries.Deadlines.Pointer[slot] = UnresolvedDeadline + expiryMicros;
+        int word = slot >> 6;
+        _expiryPending.Pointer[word] |= 1UL << (slot & 63);
+        if (word > _expiryWordHigh)
+        {
+            _expiryWordHigh = word;
+        }
+    }
+
+    /// <summary>
+    /// The scheduler pass's first step (game thread, <see cref="QuiclyPeer"/>'s <c>FlushEngines</c>): every entry stamped by
+    /// <see cref="StampExpiry"/> since the previous pass gets its absolute deadline, <paramref name="nowMicros"/> plus its
+    /// relative expiry. It runs before any engine looks at a deadline and covers entries no engine visits in this pass
+    /// (behind a blocked head, in a stream that is still starting, in a group that is not sealed), so their clocks start
+    /// here too. One compare when nothing is pending.
+    /// </summary>
+    /// <remarks>
+    /// A marked slot whose entry was freed before the pass (a cancel) is harmless: a free slot's deadline is rewritten at
+    /// allocation, and a slot already reallocated holds 0 or an absolute value below <see cref="UnresolvedDeadline"/>, which
+    /// is left alone.
+    /// </remarks>
+    /// <param name="nowMicros">The pass's clock micros.</param>
+    public void ResolveExpiry(long nowMicros)
+    {
+        int high = _expiryWordHigh;
+        if (high < 0)
+        {
+            return;
+        }
+
+        _expiryWordHigh = -1;
+        ulong* words = _expiryPending.Pointer;
+        long* deadlines = Entries.Deadlines.Pointer;
+        for (int word = 0; word <= high; word++)
+        {
+            ulong bits = words[word];
+            if (bits == 0)
+            {
+                continue;
+            }
+
+            words[word] = 0;
+            do
+            {
+                int slot = (word << 6) + BitOperations.TrailingZeroCount(bits);
+                bits &= bits - 1;
+                long deadline = deadlines[slot];
+                if (deadline >= UnresolvedDeadline)
+                {
+                    long resolved = nowMicros + (deadline - UnresolvedDeadline);
+                    Debug.Assert(resolved > 0 && resolved < UnresolvedDeadline, "the clock is outside the range an expiry deadline can hold");
+                    deadlines[slot] = resolved;
+                }
+            }
+            while (bits != 0);
+        }
+    }
 
     /// <summary>
     /// Gives an admitted entry the next peer-wide admission number (game thread, at commit). Engines keep every channel
@@ -1571,6 +1682,9 @@ internal sealed unsafe class PeerCore : IDisposable
         }
 
         AbandonEntries();
+        // Every entry is gone, so no deadline waits for a pass (a stale bit would be harmless; this keeps the state exact).
+        _expiryPending.Clear();
+        _expiryWordHigh = -1;
         while (CompletionRing.TryDequeue(out _))
         {
         }
@@ -1668,6 +1782,7 @@ internal sealed unsafe class PeerCore : IDisposable
         Completions.Dispose();
         _tokens.Dispose();
         _stamps.Dispose();
+        _expiryPending.Dispose();
         _userContexts.Dispose();
         _sendCounters.Dispose();
         _recvCounters.Dispose();

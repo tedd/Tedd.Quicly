@@ -26,8 +26,8 @@ namespace Tedd.Quicly.Transport.MsQuic.WebTransport;
 /// which the carrier sends as its own first send on the stream and strips from the first receive; the
 /// <c>absoluteOffset</c> Core sees counts from after the preamble.</para>
 /// <para><b>Identity.</b> The carrier mirrors the inner transport's stream slots, so a <see cref="TransportStreamId"/>
-/// means the same thing on both sides of the wrapper and no lookup table is needed.
-/// <see cref="WebTransportOptions.MaxStreams"/> must therefore be at least the inner transport's capacity.</para>
+/// means the same thing on both sides of the wrapper and no lookup table is needed. The mirror follows the slots the
+/// inner transport uses: it starts small and grows on demand, so it needs no size of its own.</para>
 /// <para><b>Threading.</b> As for any transport: <see cref="ITransport"/> members run on the caller's thread, sink
 /// callbacks on the inner transport's threads, serialised per connection.</para>
 /// </remarks>

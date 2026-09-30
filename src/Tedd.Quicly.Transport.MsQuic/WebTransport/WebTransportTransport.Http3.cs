@@ -691,7 +691,7 @@ public sealed unsafe partial class WebTransportTransport
         sink?.OnConnected(in info);
 
         // Streams the peer opened optimistically, before this point, are Core's only now that it has been connected.
-        ReleaseDeferredStreams();
+        ReleaseDeferredStreams(info.Capabilities.PeerUnidirectionalStreams);
     }
 
     /// <summary>Closes the inner connection with an HTTP/3 error; Core learns of it through the inner transport's close.</summary>

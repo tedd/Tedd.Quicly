@@ -356,6 +356,8 @@ public sealed unsafe partial class MsQuicTransport
     /// <c>StreamReceiveSetEnabled(TRUE)</c>, which MsQuic always queues to the connection's worker: it cannot be lost
     /// however it is timed against the callback that held the stream. The bytes credited here are still in MsQuic's
     /// buffer; they lead the next indication and the receive callback skips them. The call does not wait for the worker.
+    /// If MsQuic cannot queue the re-enable (it allocates an operation for it), the stream is left held as it was and the
+    /// failure is reported through the diagnostic sink.
     /// <para>
     /// The transport does not complete a pending receive from this thread (<c>StreamReceiveComplete</c>): a completion of
     /// zero bytes that reaches MsQuic before the receive callback has returned to it is dropped (MsQuic only adds the
@@ -382,7 +384,18 @@ public sealed unsafe partial class MsQuicTransport
                     // No receive callback can run for the stream between the exchange above and the re-enable below (MsQuic
                     // has paused it), so the worker reads the new skip count only after it was written.
                     if (bytesConsumed != 0) Volatile.Write(ref slot.SkipBytes, Volatile.Read(ref slot.SkipBytes) + bytesConsumed);
-                    slot.Stream!.ReceiveSetEnabled(true);
+                    int status = slot.Stream!.ReceiveSetEnabled(true);
+                    if (MsQuicStatus.Failed(status))
+                    {
+                        // MsQuic did not queue the re-enable (it allocates an operation for it), so the stream is still
+                        // paused. Everything goes back to where it was — a later resume finds the stream held — and the
+                        // failure is reported: nothing else would show that the stream stopped.
+                        if (bytesConsumed != 0) Volatile.Write(ref slot.SkipBytes, Volatile.Read(ref slot.SkipBytes) - bytesConsumed);
+                        Interlocked.CompareExchange(ref slot.ReceiveState, ReceivePending, ReceiveIdle);
+                        Diagnose(TransportDiagnosticLevel.Error,
+                            $"A held stream could not be resumed (StreamReceiveSetEnabled: {MsQuicStatus.GetName(status)}); it stays held until it is resumed again.", null);
+                    }
+
                     return;
                 }
                 if (state == ReceiveInCallback)
@@ -822,7 +835,11 @@ public sealed unsafe partial class MsQuicTransport
         }
     }
 
-    /// <summary>Segments of one indication that are trimmed on the stack (MsQuic indicates up to three without a buffer of its own).</summary>
+    /// <summary>
+    /// Segments of one indication that are trimmed on the stack when bytes have to be skipped. MsQuic's default receive
+    /// mode indicates at most two (its event has room for three); an indication with more than this many — which only a
+    /// receive mode the binding does not enable would produce — is trimmed into a managed array instead.
+    /// </summary>
     private const int MaxTrimmedSegments = 8;
 
     /// <summary>

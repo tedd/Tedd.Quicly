@@ -386,7 +386,11 @@ public static unsafe partial class TransportConformance
         segments.Set(0, data.Segment(0, 100));
         s.Require(s.Client.OpenStream(StreamKind.Unidirectional, 1, 32767, out TransportStreamId id) == TransportStatus.Success, "OpenStream failed.");
         s.Require(s.Client.SendStream(id, segments.At(0), 1, 1, TransportSendFlags.Start | TransportSendFlags.Fin) == TransportStatus.Success, "SendStream failed.");
-        s.Wait(() => s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 1, "the rest of the stream after the racing resume");
+        // The resume comes from another thread; the pumping thread waits for that call before it goes on, so that a harness
+        // on virtual time does not run its clock out while the thread waits for a core (the callback has returned by the
+        // time this condition runs, so the call is not held up by it).
+        s.Wait(() => (Volatile.Read(ref resumer)?.Join(TimeSpan.FromSeconds(10)) ?? true) && s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 1,
+            "the rest of the stream after the racing resume");
         s.Require(resumer is null || resumer.Join(TimeSpan.FromSeconds(10)), "the resuming thread did not finish.");
         ulong[] seen;
         lock (offsets) seen = [.. offsets];
@@ -422,6 +426,7 @@ public static unsafe partial class TransportConformance
         int signal = 0;
         int stop = 0;
         int holds = 0;
+        int resumes = 0;
         int calls = 0;
         int errors = 0;
         int finHeld = 0;
@@ -478,6 +483,7 @@ public static unsafe partial class TransportConformance
                 TransportStreamId id;
                 lock (gate) id = announced;
                 server.ResumeStreamReceive(id, 0);
+                Interlocked.Increment(ref resumes);
             }
         })
         {
@@ -487,6 +493,18 @@ public static unsafe partial class TransportConformance
         int Read(ref int value)
         {
             lock (gate) return value;
+        }
+
+        // The pumping thread goes on only when no resume is owed. The resume comes from another thread on purpose, and a
+        // harness on virtual time advances it between two evaluations of a Pump condition as fast as this thread can spin:
+        // without the wait, how much virtual time each resume costs would be the scheduler's choice — not the same run
+        // twice, and on a machine with no core to spare the scenario's timeout would run out over a stream that is not
+        // stalled. On a real transport the wait is a few microseconds and changes nothing.
+        bool Owed()
+        {
+            SpinWait spin = default;
+            while (Volatile.Read(ref resumes) < Read(ref holds) && resumer.IsAlive) spin.SpinOnce();
+            return false;
         }
         void Begin(int next)
         {
@@ -513,7 +531,7 @@ public static unsafe partial class TransportConformance
             segments.Set(0, first.Segment(0, Length));
             s.Require(s.Client.OpenStream(StreamKind.Unidirectional, 1, 32767, out TransportStreamId one) == TransportStatus.Success, "OpenStream failed.");
             s.Require(s.Client.SendStream(one, segments.At(0), 1, 1, TransportSendFlags.Start | TransportSendFlags.Fin) == TransportStatus.Success, "SendStream failed.");
-            bool ended = s.Harness.Pump(() => s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 1 || Read(ref errors) != 0, s.Harness.DefaultTimeout);
+            bool ended = s.Harness.Pump(() => Owed() || s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 1 || Read(ref errors) != 0, s.Harness.DefaultTimeout);
             s.Require(ended, $"a stream that was held and resumed with zero bytes was indicated {Read(ref holds)} times and then never again.");
             s.Require(Read(ref errors) == 0, "an indication of the held stream did not start where the sink had stopped consuming.");
             s.Require(Read(ref holds) == Holds, $"the stream was held {Read(ref holds)} times, expected {Holds}.");

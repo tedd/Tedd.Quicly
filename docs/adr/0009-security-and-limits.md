@@ -29,17 +29,26 @@
   messages `Delivered`. The bound is what the transport admits, and a slot returns only when the receiver has
   closed a stream: the limit the session asks for after admission (Σ max(`MaxGroups`, 1) over the stream
   channels, at most 4 096), or the transport's own initial grant when that is more
-  (`TransportCapabilities.PeerUnidirectionalStreams`; an MsQuic client grants 1 024 in its transport parameters
-  by default, and QUIC never takes granted credit back). The session keeps its per-stream receive state for the
-  larger of the two (`PeerCore.PeerStreamCapacity`): one 64-byte record of the group engine and 8 bytes of the
-  pended-stream ring per stream. **Both numbers are this end's own configuration — its channel table and its
-  transport options — so a peer cannot make the state larger than the host chose.** On a server peer the grant is
-  0 and the state is the table's sum: 0.6 KiB of records for one group channel and one ordered channel. On a
-  client peer at the default grant it is 64 KiB of records and a 16 KiB ring; at the most the option allows
-  (65 535) it would be 4 MiB and 1 MiB. The transport's stream table follows the same two numbers: it is
+  (`TransportCapabilities.PeerUnidirectionalStreams`; what an MsQuic client grants in its transport parameters —
+  `ClientPeerUnidiStreamCount`, 0 by default since the third review round of this amendment and 1 024 before —
+  and QUIC never takes granted credit back). The session keeps its per-stream receive state for the larger of
+  the two (`PeerCore.PeerStreamCapacity`): one 64-byte record of the group engine, 12 bytes of the pended-stream
+  ring (the id and the block the stream waits for) and 16 + 16 bytes of the credit lists (`ReceiveCredit`'s ring
+  of held-back streams and the game thread's copy) per stream, the rings rounded up to a power of two above the
+  capacity. **Both numbers are this end's own configuration — its channel table and its transport options — so a
+  peer cannot make the state larger than the host chose,** but for one factor: the two lists of held-back
+  streams grow, up to eight times, for the entries of streams a peer resets while they are held (see the next
+  item), and a peer that needs more than that is disconnected. On a server peer, and on a client at the default
+  grant, the state is the table's sum: 0.6 KiB of records for one group channel and one ordered channel, and the
+  lists a few hundred bytes. On a client that grants 1 024 it is 64 KiB of records, a 24 KiB pended ring and
+  32 + 32 KiB of credit lists (the rings up to eight times that under churn); at the most the option allows
+  (65 535) it would be 4 MiB, 1.5 MiB and 2 + 2 MiB. The transport's stream table follows the same two numbers: it is
   `MaxStreams` slots (default 2 048) or as many as the grants need next to a quarter for this end's own streams,
   so a stream the peer was allowed to open always finds a slot, and the local streams cannot take the slots of
-  the granted ones; slots are created as streams use them, and the WebTransport carrier's mirror of the table
+  the granted ones; while slots of closed streams wait for their native close (the thread pool's cleanup work
+  item) the table grows, but only to twice that size — a peer that churns streams faster than a starved pool
+  closes them has a stream refused past that (counted) rather than growing the table without bound; slots are
+  created as streams use them, and the WebTransport carrier's mirror of the table
   grows the same way (slot records on first use, preamble storage in chunks of 256 slots). A peer that
   opens every stream it may on a single channel holds one half-received message per stream — a ring reservation
   and a staging lease, the lease inside the receive byte budget. That is more than the per-channel cap allowed
@@ -72,15 +81,23 @@
   together they can pin half the queue pool and a quarter of the budget — the byte share is strict, a message
   whose buffer block does not fit in it is not started — which leaves the other half of each to the traffic that
   is read. A channel with a handler is not held to the share (the ring and the budget bound it, as before). A
-  channel the application drains every frame is bounded by the ring and by half the budget, because it keeps what
-  it accepted when the application stops draining it and falls back to the share (within two Poll intervals): the
-  peer chooses the burst, the application chooses when it stops, and half the budget is what one such channel can
-  then hold. The list of held-back streams is bounded too: a peer that resets held streams and opens new ones
-  leaves an entry per stream until the receiver's next Poll; the list grows to eight times the streams the peer may
-  have open and then the connection is closed (`LimitExceeded`). What an attacker keeps is what QUIC gives it
-  anyway: it can stall its own streams, fill the stream slots of the connection that those streams occupy, and
-  fill the connection's flow-control window with data nobody reads (16 MiB with the MsQuic defaults), which stops
-  its own other streams — not another connection's.
+  channel the application drains every frame is bounded by the ring and by its equal share of half the budget
+  among the reliable channels, because it keeps what it accepted when the application stops draining it and falls
+  back to the share (within two Poll intervals): the peer chooses the burst, the application chooses when it
+  stops, and half the budget is what all such channels together can then hold (plus a message each; the first
+  version gave each of them half, and two abandoned channels held the whole budget). The lists of held-back
+  streams are bounded too — the credit list, and the ring of streams held for the receive ring or the budget: a
+  peer that resets held streams and opens new ones leaves an entry per stream until the receiver's next Poll;
+  each list grows to eight times the streams the peer may have open and then the connection is closed
+  (`LimitExceeded`), and a Poll lets go of the entries beyond what the live streams account for, so a receiver
+  that polls every frame keeps them from growing at all. What an attacker keeps is what QUIC gives it anyway: it
+  can stall its own streams, fill the stream slots of the connection that those streams occupy, and fill the
+  connection's flow-control window with data nobody reads (16 MiB with the MsQuic defaults), which stops its own
+  other streams — not another connection's. A compressed message's decode buffer may take the receive budget past
+  its limit by that one buffer (the budget can be full of the compressed messages that wait for it): a decode is
+  refused once the budget is over its limit, so it is never exceeded by more than one decode buffer, and the
+  transport accepts nothing new until it is back within the limit — a peer gains one buffer of at most the
+  budget's size, not more.
 * **Retransmission cannot be weaponised**: ReliableLatest has per-version and per-peer retry budgets;
   acks are coalesced per key (the highest accepted version); Pong is rate-limited; control message rate is capped.
 * **Sequence numbers give the peer nothing it did not have** (PROTOCOL §8 "sequence clock"). Only the

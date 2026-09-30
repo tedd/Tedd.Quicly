@@ -570,7 +570,7 @@ logging.
 | concurrent reassemblies per channel (`MaxReassemblies`) | 16 | evict oldest; reassembly expiry 2 × RTT + 100 ms; on a channel whose sequence carries ordering (`UnreliableSequenced`), a newer sequence for the same key abandons the older partial |
 | fragmented message size | ≤ 8 × (maxDatagram − header), the §2.1 `FragCount` cap, and ≤ `MaxMessageSize` | drop before any buffer is chosen |
 | control messages per second | 2 000 (per peer, configurable; size it from the channel table, because acks scale with keyed `ReliableLatest` traffic and one ack datagram carries about 170 keys) | connection close `LimitExceeded` |
-| decoded (decompressed) bytes per second per peer | 8 MiB/s | further compressed messages dropped + counted |
+| decoded (decompressed) bytes per second per peer | 8 MiB/s | a compressed message of a reliable channel read with `Drain` waits in its queue (the channel's receive credit then holds its sender back); one dispatched to a handler, or of an unreliable channel, is dropped + counted (`DecodeFailures`) |
 | bulk transfers per direction per peer | 2 transfers, and an outbound range-request table of one more than that (3), so a further range can be asked for while both transfers run | `BulkReject` |
 | drain backlog of channels without a handler | a pool of min(ring depth, 1 024) messages (at least 2 per reliable channel); with a `ReliableOrdered` / `ReliableUnordered` channel in the table half of it is reserved for those, split evenly. What unreliable channels still have queued when a Poll begins, without having been drained empty since the Poll before (their *backlog*), may occupy the rest and pin ¼ of the byte budget (64 KiB, counted in buffer block sizes: 1 024 messages of ≤ 64 B, 256 of ≤ 256 B, 42 of ≤ 1 536 B) | `UnreliableUnordered` / `UnreliableSequenced` (not coalescing): the backlog is cut to the limit when a Poll begins and **drops oldest** + counts (`DrainQueueDrops`) after that — the oldest queued message of the backlogged channel furthest over its even share; a channel that is drained every frame, or has a handler, is not backlog and loses nothing. `ReliableOrdered` / `ReliableUnordered`: nothing is dropped; a channel nobody reads may have its reserved share of the pool and the same part of ¼ of the byte budget waiting, and beyond that the receiver stops consuming that channel's streams (transport back-pressure on those streams only) until the application drains the channel or registers a handler (see below) |
 | receive ring depth per peer | 4 096 entries | see byte budget row (a full ring drops datagrams newest-first, where the drain backlog above drops oldest-first: nothing can be evicted from the ring); latest/coalescing channels use per-key mailboxes instead of ring entries |
@@ -618,13 +618,14 @@ receiver-local; nothing on the wire changes and either end may run it alone.
   each hold is counted per channel (`BacklogHolds`).
 * A reliable channel **with a handler** has no such limit (its messages leave the ring at every Poll). A channel
   the application **drains** is not held to the share either: a Drain that leaves the channel's queue empty (an
-  empty Drain counts) marks it as read, and its limits are then the ring depth in messages and **half the byte
-  budget** (a message is started while less than that waits, and always on an empty channel). It returns to its
-  share at the first Poll that finds messages queued for it which no Drain took during the whole Poll interval
-  before, and it keeps what it accepted until then — which is why a drained channel gets half the budget and not
-  all of it: the other half is what is left for the channels that are read when the application stops coming
-  for this one. So a host that drains a reliable channel once per frame is limited as a handler is, short of
-  that half, and a host that stops draining it is confined within two Poll intervals. A message larger than the
+  empty Drain counts) marks it as read, and its limits are then the ring depth in messages and **an equal share
+  of half the byte budget** among the reliable channels of the table (a message is started while less than that
+  waits, and always on an empty channel). It returns to its share at the first Poll that finds messages queued
+  for it which no Drain took during the whole Poll interval before, and it keeps what it accepted until then —
+  which is why the drained channels share half the budget and do not get all of it: channels drained and then
+  abandoned keep at most that half between them (plus one message each), and the other half is what is left for
+  the channels that are read. So a host that drains a reliable channel once per frame is limited as a handler is,
+  short of that share, and a host that stops draining it is confined within two Poll intervals. A message larger than the
   share of a channel that was never drained arrives after the application's first Drain of it. What the credit
   cannot change is the order inside one stream: on a `ReliableOrdered` channel everything behind an unread
   message waits with it, a response to this end's own request included.
@@ -641,17 +642,33 @@ receiver-local; nothing on the wire changes and either end may run it alone.
   the stream's own (2 MiB per unidirectional stream with the MsQuic transport's defaults) and the connection's
   (16 MiB, `MsQuicSettings.ConnFlowControlWindow`), which every stream of the connection shares. One unread
   ordered channel holds at most its stream's window. When unread channels together hold the connection's window
-  — eight unread ordered channels, or one unread group channel whose held groups add up to it (measured: 524
-  groups of 32 000 bytes) — no stream of the connection receives anything more until the application reads;
-  datagram channels are not affected. The **sender** has a limit of its own as well: the messages it keeps
-  sending on a channel the other end does not read stay in its queue and in flight, and they count against its
-  send table and send budget, which all its channels share. A sender that does not want one unread channel to
-  use them up sets `ChannelOptions.QueueLimitBytes` on it.
+  — eight unread ordered channels, or held groups that add up to it (measured: 514 groups of 32 KiB, with a
+  receiver that grants 1 024 streams) — no stream of the connection receives anything more until the application
+  reads; datagram channels are not affected on the receiving side. A receiver that grants only its table's sum
+  (Σ max(`MaxGroups`, 1); the MsQuic transport's default since this release) holds at most that many groups of at
+  most `GroupMaxBytes` and a message each, far from the window at default options. With a larger grant there is a
+  second effect: a message the receiver has begun to receive, whose tail is still at the sender, waits for
+  window that only the other held streams can free, and it holds its buffer meanwhile — the whole receive budget
+  for a message above 64 KiB with the default pool — so the held streams wait for budget, and the connection's
+  streams stop until `StreamIdleTimeout` gives the message up (the sender sees it `Failed`). The **sender** has a
+  limit of its own as well: the messages it keeps sending on a channel the other end does not read stay in its
+  queue and in flight, and they count against its send table and send budget, which all its channels share —
+  once they are used up, its sends on **every** channel are refused (`OutOfBuffers`), datagrams included, until
+  the receiver reads. A sender that does not want one unread channel to use them up sets
+  `ChannelOptions.QueueLimitBytes` on it; that channel then answers `QueueFull` alone.
 * Two reactions to a peer that is not one of this library's senders. A peer that resets streams this end holds
   back and opens new ones, more than eight times as many as it may have open between two Polls of the receiver,
   is disconnected (`LimitExceeded`): the receiver could not remember a further held stream, and would never
-  resume it. And a `Drain` that cannot get a buffer to decode a compressed message of a reliable channel leaves
-  the message queued and returns what it has, instead of dropping it (§7 table, decoded bytes).
+  resume it. That holds for the streams held back for a channel's credit and for those held back for the receive
+  ring or the byte budget; a Poll also lets go of the entries beyond what the live streams account for, so a host
+  that polls every frame keeps neither list from growing. And a `Drain` that cannot get a buffer to decode a
+  compressed message of a reliable channel, or decode budget for it, leaves the message queued — the channel gives
+  nothing newer in that call, so its order holds — and returns what it has, instead of dropping it (§7 table,
+  decoded bytes). A decode buffer may take the byte budget past its limit by itself (the budget can be full of the
+  very compressed messages that wait), so the first message of a Drain that finds everything released, and a
+  message dispatched to a handler, get one — unless payloads the application still holds (drained and not yet
+  released, or retained) took the budget past its limit already; then a Drain waits and a handler's message is
+  dropped and counted.
 
 The **stream idle mid-message** rule is per receiving stream and applies to every stream mode: a stream that has
 delivered a message's frame header but not the rest of its payload for 30 s (`PeerOptions.StreamIdleTimeout`) is
@@ -671,23 +688,30 @@ the limit. It MUST NOT reset them: the sender has already completed those messag
 their payloads and cannot send them again, so a reset there is a silent loss on a reliable channel. What bounds
 the streams is what the transport admits: the unidirectional stream limit the session asks for after admission
 (Σ max(`MaxGroups`, 1) over the stream-capable channels, at most 4 096), or the transport's own initial grant
-when that is larger — a QUIC stack announces one in its transport parameters and never takes it back, and an
-MsQuic client grants its server 1 024 that way by default. A slot returns only when the receiver has closed a
+when that is larger — a QUIC stack announces one in its transport parameters and never takes it back (an MsQuic
+client grants its server `ClientPeerUnidiStreamCount` that way: 0 by default since this release, 1 024 before,
+see the bullet on flow-control windows above for what a larger grant costs). A slot returns only when the receiver has closed a
 stream, and the receiver keeps one receive record for every stream it can be sent, whatever channel uses it. A
 sender that ignores `MaxGroups` gains nothing but the slots of its own other channels. The transport's own
 stream table must have room for what it admits as well: a stream it had to refuse for want of a slot would
 never reach the session and would be lost in the same way. The MsQuic transport therefore sizes its table from
-the streams it grants, whatever `MaxStreams` says, and keeps a quarter of it for this end's own streams.
+the streams it grants, whatever `MaxStreams` says, and keeps a quarter of it for this end's own streams; while
+slots of closed streams still wait for their native close it grows, up to twice that size, and only a peer that
+churns streams faster than that can have one refused (`RefusedPeerStreamCount`).
 
 This is a receiver-side rule, so it takes effect when the *receiving* end runs it, whatever the sender runs. A
 receiver built before it reset the excess streams, and still loses groups when it falls behind, however new its
 peer is; it counts them in `StreamsReset`. The reset remains the rule for large
-ReliableLatest values and Bulk transfers. There it is not silent, and a sender that keeps the limit does not
-reach it through a late receiver: a value is `Delivered` only when the receiver acknowledged it, and its receive
-path holds no stream open while the host is late with its `Poll`; a Bulk stream can be held (a chunk waits when
-the receive budget is used up), but the sender's transfer slot is given back only by the receiver's final
-`BulkProgress`, which its game thread sends, so the sender does not open the next stream past the limit before
-the receiver has let the last one go.
+ReliableLatest values and Bulk transfers. There it is not silent (the value is retried, the transfer ends with a
+status), and a sender that keeps the limit reaches it through a late receiver only in one case. A value is
+`Delivered` only when the receiver acknowledged it, and its receive path holds no stream open while the host is
+late with its `Poll`. A Bulk stream can be held (a chunk waits when the receive budget is used up), and a
+*completed* transfer's slot is given back to its sender only by the receiver's final `BulkProgress`, which its
+game thread sends. A *canceled* transfer's slot, though, comes back with the reset stream's close, which needs
+only the receiving transport, while the receiver's record of it waits for its game thread to report it. The
+receiver keeps four records per transfer it accepts at once, so a sender that keeps the limit can cancel three
+times `BulkTransfersPerDirection` transfers during one hitch of the receiver's host; the next one past that is
+refused (`LimitExceeded`, the sender's transfer ends `Failed`) until the host polls again.
 
 One consequence is not solved by it: the stream limit is shared by all channels of a connection. A
 ReliableUnordered channel whose receiver never reads it while its sender keeps sending ends up holding every

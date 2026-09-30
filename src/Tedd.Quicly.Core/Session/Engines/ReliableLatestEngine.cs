@@ -1152,7 +1152,15 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         SendEntryTable entries = _core.Entries;
         int value = (int)entries[transmission].Aux0;
         uint version = (uint)entries[transmission].Aux1;
-        int dense = _core.ChannelIndexOf(entries[transmission].Channel);
+        ushort channel = entries[transmission].Channel;
+        int dense = _core.ChannelIndexOf(channel);
+        if (PeerCore.IsTransportDrop(in completion))
+        {
+            // A transmission is one Sent of its channel: one the transport lost or dropped is counted, which is what explains
+            // the retransmission below. A large value travels on a stream, so this never fires for it.
+            _core.CountTransportDrop(channel, _core.MapCompletion(in completion));
+        }
+
         // The transmission owns no payload lease (the value does), so this only frees its slot.
         _core.CompleteEntry(transmission, DeliveryStatus.Delivered);
         int local = dense >= 0 ? _localOf[dense] : -1;

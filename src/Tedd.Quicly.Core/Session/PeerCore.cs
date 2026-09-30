@@ -82,6 +82,8 @@ internal sealed unsafe class PeerCore : IDisposable
     private readonly ChannelEngine[] _engineByIndex;
     private ChannelEngine[] _activeEngines = [];
     private readonly NativeArray<ChannelSendCounters> _sendCounters;
+    // Cold: written only when the game thread drains a datagram the transport dropped (CountTransportDrop).
+    private readonly NativeArray<ChannelSendOutcomeCounters> _sendOutcomes;
     private readonly NativeArray<ChannelRecvCounters> _recvCounters;
     private readonly NativeArray<SendToken> _tokens;
     private readonly NativeArray<ulong> _userContexts;
@@ -175,6 +177,7 @@ internal sealed unsafe class PeerCore : IDisposable
         CompletionRing = new SpscRing<CompletionEntry>(2 * capacity);
         ReceiveRing = new SpscRing<ReceiveEntry>(options.ReceiveRingCapacity);
         _sendCounters = new NativeArray<ChannelSendCounters>(Math.Max(1, _channels.Length));
+        _sendOutcomes = new NativeArray<ChannelSendOutcomeCounters>(Math.Max(1, _channels.Length)); // zeroed by NativeArray
         _recvCounters = new NativeArray<ChannelRecvCounters>(Math.Max(1, _channels.Length));
         PeerUnidirectionalStreamLimit = ComputeUnidirectionalLimit(_channels);
         PendedStreams = new SpscRing<TransportStreamId>(PeerUnidirectionalStreamLimit + 2);
@@ -811,6 +814,85 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>Send-side counters of a channel (game thread).</summary>
     /// <param name="channelIndex">Dense index.</param>
     public ref ChannelSendCounters SendCounters(int channelIndex) => ref _sendCounters[channelIndex];
+
+    /// <summary>
+    /// What the transport did with a channel's messages after they were handed to it (game thread: written when a final
+    /// transport completion is drained, read by the statistics snapshot).
+    /// </summary>
+    /// <param name="channelIndex">Dense index.</param>
+    public ref ChannelSendOutcomeCounters SendOutcomes(int channelIndex) => ref _sendOutcomes[channelIndex];
+
+    /// <summary>
+    /// True for a final completion by which the transport says a datagram was not delivered: it declared the datagram lost
+    /// or dropped it before transmission. Never true for a completion the game thread queued itself
+    /// (<see cref="CompletionKind.Local"/>: expiry, a cancellation, a refused submission) or for a stream completion.
+    /// </summary>
+    /// <param name="completion">A final completion.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool IsTransportDrop(in CompletionEntry completion) =>
+        completion.Kind == CompletionKind.Datagram
+        && (completion.DatagramState == DatagramSendState.LostDiscarded || completion.DatagramState == DatagramSendState.Canceled);
+
+    /// <summary>
+    /// Counts one message of <paramref name="channel"/> that a transport drop finished (game thread, from the completion
+    /// routing). Call it only when <see cref="IsTransportDrop"/> is true for the completion, with the status the entry is
+    /// then completed with (<see cref="MapCompletion"/>), so the counters and the tracked statuses cannot disagree:
+    /// <see cref="DeliveryStatus.Lost"/> counts in <see cref="ChannelSendOutcomeCounters.TransportLost"/>,
+    /// <see cref="DeliveryStatus.Expired"/> in <see cref="ChannelSendOutcomeCounters.TransportCanceled"/>, and
+    /// <see cref="DeliveryStatus.Disconnected"/> — a cancel while the connection is closing, when the transport cancels
+    /// everything it holds — in neither. Off the hot path: reached only for dropped datagrams.
+    /// </summary>
+    /// <param name="channel">The message's channel id.</param>
+    /// <param name="status">The status the message's entry completes with.</param>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public void CountTransportDrop(ushort channel, DeliveryStatus status)
+    {
+        int index = ChannelIndexOf(channel);
+        if (index < 0)
+        {
+            return;
+        }
+
+        if (status == DeliveryStatus.Lost)
+        {
+            _sendOutcomes[index].TransportLost++;
+        }
+        else if (status == DeliveryStatus.Expired)
+        {
+            _sendOutcomes[index].TransportCanceled++;
+        }
+    }
+
+    /// <summary>
+    /// Counts the outcome of one application datagram (game thread). Call it exactly once per final
+    /// <see cref="CompletionKind.Datagram"/> completion, where the completion ring is drained — not where completions are
+    /// routed, because a container's completion is routed again for every member. Control datagrams (channel 0) are outside
+    /// <see cref="PeerCounters.DatagramsSent"/> and are not counted; a final <see cref="DatagramSendState.Sent"/> (a carrier
+    /// that reports no states) and a cancel while the connection is closing count nothing.
+    /// </summary>
+    /// <param name="entryChannel">The channel of the completion's entry (1 for a packed container).</param>
+    /// <param name="state">The final state the transport reported.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void CountDatagramOutcome(ushort entryChannel, DatagramSendState state)
+    {
+        if (entryChannel == ControlChannelId)
+        {
+            return;
+        }
+
+        if (state is DatagramSendState.Acknowledged or DatagramSendState.AcknowledgedSpurious)
+        {
+            Counters.DatagramsAcknowledged++;
+        }
+        else if (state == DatagramSendState.LostDiscarded)
+        {
+            Counters.DatagramsLost++;
+        }
+        else if (state == DatagramSendState.Canceled && !_transportClosing)
+        {
+            Counters.DatagramsCanceled++;
+        }
+    }
 
     /// <summary>Receive-side counters of a channel (transport thread; the game thread may add decode drops).</summary>
     /// <param name="channelIndex">Dense index.</param>
@@ -1785,6 +1867,7 @@ internal sealed unsafe class PeerCore : IDisposable
         _expiryPending.Dispose();
         _userContexts.Dispose();
         _sendCounters.Dispose();
+        _sendOutcomes.Dispose();
         _recvCounters.Dispose();
         if (_ownsAllocator)
         {

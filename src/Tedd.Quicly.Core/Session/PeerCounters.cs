@@ -142,6 +142,21 @@ internal sealed class PeerCounters
     /// <summary>Messages that travelled inside packed containers.</summary>
     public long MessagesPacked;
 
+    /// <summary>
+    /// Datagrams among <see cref="DatagramsSent"/> the transport reported acknowledged. Counted where the game thread drains
+    /// the final completion, like the two below; stays 0 on a transport that reports no datagram states.
+    /// </summary>
+    public long DatagramsAcknowledged;
+
+    /// <summary>Datagrams among <see cref="DatagramsSent"/> the transport declared lost.</summary>
+    public long DatagramsLost;
+
+    /// <summary>
+    /// Datagrams among <see cref="DatagramsSent"/> the transport dropped before transmission while the connection was not
+    /// closing (a cancel drained after a close started is not counted).
+    /// </summary>
+    public long DatagramsCanceled;
+
     /// <summary>Stream sends handed to the transport by the engines (one per gathered submission).</summary>
     public long StreamSends;
 

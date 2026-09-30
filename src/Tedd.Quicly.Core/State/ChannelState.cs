@@ -170,6 +170,36 @@ public struct ChannelSendCounters
 }
 
 /// <summary>
+/// What the transport did with the messages of one channel after they were handed to it: two <see cref="long"/>s,
+/// incremented only by the game thread when it drains a final transport completion, and snapshotted into statistics
+/// (ADR 0008 invariant 13). Both count in the unit of <see cref="ChannelSendCounters.Sent"/> — a fragment is one, a
+/// ReliableLatest transmission is one — and both are totals since the peer was created, kept across an epoch change and an
+/// in-place reconnect.
+/// </summary>
+/// <remarks>
+/// Kept in an array of their own instead of in <see cref="ChannelSendCounters"/>: that struct is one full cache line which
+/// the scheduler writes once per message, and these are written only when a datagram was dropped. The array has a single
+/// owner thread and starts on a cache-line boundary, so its 16-byte elements need no padding.
+/// </remarks>
+[StructLayout(LayoutKind.Explicit, Size = Size)]
+internal struct ChannelSendOutcomeCounters
+{
+    /// <summary>Size in bytes.</summary>
+    public const int Size = 16;
+
+    /// <summary>
+    /// Messages whose datagram the transport dropped before transmission (<see cref="DatagramSendState.Canceled"/> while the
+    /// connection was not closing); their sends completed <c>Expired</c>. Owner: game thread.
+    /// </summary>
+    [FieldOffset(0)] public long TransportCanceled;
+    /// <summary>
+    /// Messages whose datagram the transport declared lost (<see cref="DatagramSendState.LostDiscarded"/>); their sends
+    /// completed <c>Lost</c>. Owner: game thread.
+    /// </summary>
+    [FieldOffset(8)] public long TransportLost;
+}
+
+/// <summary>
 /// Receive-side counters of one channel: eight <see cref="long"/>s in one cache line, incremented only by the
 /// transport thread.
 /// </summary>

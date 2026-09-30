@@ -67,11 +67,23 @@ public sealed unsafe partial class QuiclyPeer
         return index >= 0 && _core.GetEngine(index).TryCancel(slot);
     }
 
+    /// <summary>
+    /// Routes everything in the completion ring, then the completions the game thread queued itself. The ring is also where
+    /// a datagram's outcome is counted (<see cref="PeerCore.CountDatagramOutcome"/>): each final datagram completion passes
+    /// here (or through <see cref="DrainCompletionsMarking"/>) exactly once, whereas the routing below sees a container's
+    /// completion once more for every member. The entry is still allocated at this point — a final completion leaves it
+    /// <c>Completed</c> until the game thread frees it — so its channel can be read.
+    /// </summary>
     private void DrainCompletions()
     {
         SpscRing<CompletionEntry> ring = _core.CompletionRing;
         while (ring.TryDequeue(out CompletionEntry completion))
         {
+            if (completion.Final && completion.Kind == CompletionKind.Datagram)
+            {
+                _core.CountDatagramOutcome(_core.Entries[completion.Slot].Channel, completion.DatagramState);
+            }
+
             RouteCompletion(in completion);
         }
 

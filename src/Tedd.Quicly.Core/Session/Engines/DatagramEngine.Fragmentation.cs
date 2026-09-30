@@ -334,6 +334,12 @@ internal abstract unsafe partial class DatagramEngine
         }
 
         DeliveryStatus status = _core.MapCompletion(in completion);
+        if (PeerCore.IsTransportDrop(in completion))
+        {
+            // Each fragment is one Sent of its channel, so each one the transport lost or dropped is counted on its own.
+            _core.CountTransportDrop(fragment.Channel, status);
+        }
+
         _fragmentOwner[entrySlot] = -1;
         _core.CompleteEntry(entrySlot, status);
         FoldFragmentStatus(owner, status);

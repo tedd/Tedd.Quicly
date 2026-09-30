@@ -353,6 +353,9 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.RequestsSent = c.RequestsSent;
         statistics.RequestsTimedOut = c.RequestsTimedOut;
         statistics.ResponsesUnmatched = c.ResponsesUnmatched;
+        statistics.DatagramsAcknowledged = c.DatagramsAcknowledged;
+        statistics.DatagramsLost = c.DatagramsLost;
+        statistics.DatagramsCanceled = c.DatagramsCanceled;
     }
 
     /// <summary>Copies the counters of one channel into <paramref name="statistics"/>. Allocation-free; game thread.</summary>
@@ -379,6 +382,9 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.TooLarge = send.TooLarge;
         statistics.Retries = send.Retries;
         statistics.SendKeyTableFull = send.KeyTableFull;
+        ref ChannelSendOutcomeCounters outcomes = ref _core.SendOutcomes(index);
+        statistics.TransportCanceled = outcomes.TransportCanceled;
+        statistics.TransportLost = outcomes.TransportLost;
         statistics.Received = Volatile.Read(ref recv.Received);
         statistics.BytesReceived = Volatile.Read(ref recv.Bytes);
         statistics.Dropped = Volatile.Read(ref recv.Dropped);

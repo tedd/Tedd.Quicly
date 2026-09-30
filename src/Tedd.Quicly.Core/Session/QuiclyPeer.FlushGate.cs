@@ -156,15 +156,22 @@ public sealed unsafe partial class QuiclyPeer
     /// <summary>
     /// <see cref="DrainCompletions"/> outside a Flush's pass (Poll, <see cref="DrainForFlushGate"/>): marks the gate when a
     /// completion is routed anywhere but the peer's own control traffic, because an engine may re-queue or re-arm on it.
+    /// Counts each datagram's outcome exactly as <see cref="DrainCompletions"/> does.
     /// </summary>
     private void DrainCompletionsMarking()
     {
         SpscRing<CompletionEntry> ring = _core.CompletionRing;
         while (ring.TryDequeue(out CompletionEntry completion))
         {
-            if (_core.Entries[completion.Slot].Channel != PeerCore.ControlChannelId)
+            ushort channel = _core.Entries[completion.Slot].Channel;
+            if (channel != PeerCore.ControlChannelId)
             {
                 _gate.Touched = true;
+            }
+
+            if (completion.Final && completion.Kind == CompletionKind.Datagram)
+            {
+                _core.CountDatagramOutcome(channel, completion.DatagramState);
             }
 
             RouteCompletion(in completion);

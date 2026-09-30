@@ -132,6 +132,15 @@ public struct PeerStatistics
     /// Application datagrams handed to the transport by the scheduler: messages sent alone and packed containers (Pings
     /// and other control datagrams are not included).
     /// </summary>
+    /// <remarks>
+    /// On a transport that reports datagram send states, every one of them ends in exactly one place:
+    /// <c>DatagramsSent = <see cref="DatagramsAcknowledged"/> + <see cref="DatagramsLost"/> + <see cref="DatagramsCanceled"/>
+    /// + in flight now + ended by a close or a reconnect</c>. The last term is not counted anywhere: datagrams the transport
+    /// cancelled because the connection was closing, and those whose outcome was discarded by an in-place reconnect. The
+    /// three outcome counters move when <see cref="QuiclyPeer.Poll"/> or <see cref="QuiclyPeer.Flush"/> drains the
+    /// transport's report, so with <see cref="CompletionMode.ThreadPool"/> a tracked send can complete a moment before its
+    /// counter moves.
+    /// </remarks>
     public long DatagramsSent;
 
     /// <summary>Bytes of <see cref="DatagramsSent"/> (whole datagram payloads, container overhead included).</summary>
@@ -217,6 +226,31 @@ public struct PeerStatistics
 
     /// <summary>Responses dropped because no outstanding request matched them (PROTOCOL.md §3.1).</summary>
     public long ResponsesUnmatched;
+
+    /// <summary>
+    /// Datagrams among <see cref="DatagramsSent"/> the transport reported acknowledged by the peer's transport. Stays 0 on
+    /// a transport that reports no datagram send states (see <see cref="DatagramsSent"/> for how the outcome counters add up).
+    /// </summary>
+    public long DatagramsAcknowledged;
+
+    /// <summary>
+    /// Datagrams among <see cref="DatagramsSent"/> the transport declared lost. This is the sending transport's verdict: a
+    /// datagram declared lost may still have arrived (a late acknowledgement after a stall), so the receiver can have seen
+    /// more than this suggests. Stays 0 on a transport that reports no datagram send states. The peer decides nothing from
+    /// it, which matters because the remote end can raise it by withholding acknowledgements.
+    /// </summary>
+    public long DatagramsLost;
+
+    /// <summary>
+    /// Datagrams among <see cref="DatagramsSent"/> the transport dropped before transmission while the connection was not
+    /// closing: it could not send them at once and they carried <c>CancelOnBlocked</c>
+    /// (PROTOCOL.md §4.5), or they no longer fitted after the path's datagram limit shrank. Each
+    /// message of such a datagram completes <see cref="Threading.DeliveryStatus.Expired"/> and is counted in its channel's
+    /// <see cref="ChannelStatistics.TransportCanceled"/>. Datagrams the transport cancelled because the connection was
+    /// closing are not counted — that includes a genuine blocked drop whose completion was still waiting when the close
+    /// started.
+    /// </summary>
+    public long DatagramsCanceled;
 }
 
 /// <summary>Per-channel statistics (<see cref="QuiclyPeer.GetChannelStatistics"/>). Fixed layout, no references.</summary>
@@ -226,18 +260,23 @@ public struct ChannelStatistics
     /// <summary>The channel id.</summary>
     public ushort Channel;
 
-    /// <summary>Messages handed to the transport.</summary>
+    /// <summary>
+    /// Messages handed to the transport, including the ones it later dropped before transmission
+    /// (<see cref="TransportCanceled"/>) or declared lost (<see cref="TransportLost"/>): the count never goes back.
+    /// </summary>
     public long Sent;
 
-    /// <summary>Payload bytes handed to the transport.</summary>
+    /// <summary>Payload bytes handed to the transport (of every message in <see cref="Sent"/>).</summary>
     public long BytesSent;
 
     /// <summary>Pending sends replaced by a newer value of the same key.</summary>
     public long SendSuperseded;
 
     /// <summary>
-    /// Sends dropped because the scheduler held them back for longer than their expiry (counted from their first scheduler
-    /// pass, PROTOCOL.md §4.5), and datagrams the transport dropped when blocked.
+    /// Sends dropped before they were handed to the transport, because the scheduler held them back for longer than their
+    /// expiry (counted from their first scheduler pass, PROTOCOL.md §4.5). A datagram the transport dropped is counted in
+    /// <see cref="TransportCanceled"/> instead, although its send also completes
+    /// <see cref="Threading.DeliveryStatus.Expired"/>.
     /// </summary>
     public long Expired;
 
@@ -292,4 +331,33 @@ public struct ChannelStatistics
 
     /// <summary>Payload bytes of <see cref="InFlightMessages"/>.</summary>
     public long InFlightBytes;
+
+    /// <summary>
+    /// Messages among <see cref="Sent"/> whose datagram the transport dropped before transmission while the connection was
+    /// not closing: it could not send the datagram at once and the datagram carried <c>CancelOnBlocked</c>
+    /// (PROTOCOL.md §4.5), or the datagram no longer fitted after the path's datagram limit shrank.
+    /// Counted in the unit of <see cref="Sent"/>: every member of a dropped packed container counts on its own channel, a
+    /// fragment counts as one (the rest of its message still travels and the receiver gives the partial up), and so does a
+    /// ReliableLatest transmission (which is retransmitted). The send completes
+    /// <see cref="Threading.DeliveryStatus.Expired"/>, but <see cref="Expired"/> does not move.
+    /// </summary>
+    /// <remarks>
+    /// <c>Sent − TransportCanceled</c> is what the transport put on the wire or still holds.
+    /// <c>Sent − TransportCanceled − <see cref="TransportLost"/></c> is what was acknowledged, is in flight, completed
+    /// <see cref="Threading.DeliveryStatus.Sent"/> on a carrier that reports no states, or was ended by a close or a
+    /// reconnect. A cancel the transport reported because the connection was closing is not counted, and neither is a blocked
+    /// drop whose report was still waiting when the close started. Counted when <see cref="QuiclyPeer.Poll"/> or
+    /// <see cref="QuiclyPeer.Flush"/> drains the transport's report.
+    /// </remarks>
+    public long TransportCanceled;
+
+    /// <summary>
+    /// Messages among <see cref="Sent"/> whose datagram the transport declared lost, in the unit of <see cref="Sent"/> (see
+    /// <see cref="TransportCanceled"/>); on an unreliable channel the send completes
+    /// <see cref="Threading.DeliveryStatus.Lost"/>, on a ReliableLatest channel the value is retransmitted
+    /// (<see cref="Retries"/>). This is the sending transport's verdict: a datagram declared lost may still have arrived, so
+    /// the receiver's <see cref="Received"/> can exceed <c>Sent − TransportCanceled − TransportLost</c>. Stays 0 on a
+    /// transport that reports no datagram send states.
+    /// </summary>
+    public long TransportLost;
 }

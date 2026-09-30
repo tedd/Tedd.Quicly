@@ -6,6 +6,7 @@ using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Primitives;
 using Tedd.Quicly.Core.Session.Engines;
 using Tedd.Quicly.Core.State;
+using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Core.Transport;
 
 namespace Tedd.Quicly.Core.Session;
@@ -275,12 +276,30 @@ internal sealed unsafe class DatagramPacker
             // transport, which changes the mapping of a canceled datagram. A local completion (refused submission) still
             // goes to the owners, which correct their counters.
             NativeArray<int> links = entries.Next;
-            while (m >= 0)
+            if (!PeerCore.IsTransportDrop(in completion))
             {
-                // Read the link first: finishing a member frees its slot, which a continuation may reuse at once.
-                int next = links[m];
-                _core.CompleteEntry(m, _core.MapCompletion(in completion));
-                m = next;
+                while (m >= 0)
+                {
+                    // Read the link first: finishing a member frees its slot, which a continuation may reuse at once.
+                    int next = links[m];
+                    _core.CompleteEntry(m, _core.MapCompletion(in completion));
+                    m = next;
+                }
+            }
+            else
+            {
+                // The transport lost the container or dropped it before transmission: every member is counted on its own
+                // channel, as its owner would count it (one test per container; the loop above stays as it was).
+                while (m >= 0)
+                {
+                    // Read the link and the channel first: finishing a member frees its slot.
+                    int next = links[m];
+                    ushort channel = entries[m].Channel;
+                    DeliveryStatus status = _core.MapCompletion(in completion);
+                    _core.CountTransportDrop(channel, status);
+                    _core.CompleteEntry(m, status);
+                    m = next;
+                }
             }
         }
         else

@@ -398,7 +398,15 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
             counters.Bytes -= entry.Payload.Length;
         }
 
-        _core.CompleteEntry(entrySlot, _core.MapCompletion(in completion));
+        DeliveryStatus status = _core.MapCompletion(in completion);
+        if (PeerCore.IsTransportDrop(in completion))
+        {
+            // The transport lost the datagram or dropped it before transmission: the message stays counted as sent and is
+            // counted in the channel's transport outcome (a loose message, or a member of a container routed to its owners).
+            _core.CountTransportDrop(entry.Channel, status);
+        }
+
+        _core.CompleteEntry(entrySlot, status);
     }
 
     /// <inheritdoc/>

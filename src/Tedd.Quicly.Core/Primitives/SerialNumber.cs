@@ -18,6 +18,13 @@ namespace Tedd.Quicly.Core.Primitives;
 /// <c>a</c> being <em>older</em> (the signed difference is the most negative value), so
 /// <see cref="IsNewer(ushort, ushort)"/> is never true in both directions at once.
 /// </para>
+/// <para>
+/// A pairwise comparison is therefore only valid between two numbers that are known to be close. State that must
+/// outlive half the space (the last accepted value of a key that may idle while its channel's counter runs on) is kept
+/// as a 64-bit <em>extended</em> sequence instead: <see cref="Extend(ulong, ushort)"/> unwraps each arriving number
+/// against the newest one seen, and extended values compare with plain <c>&gt;</c> however far apart they are
+/// (PROTOCOL.md §8).
+/// </para>
 /// </remarks>
 public static class SerialNumber
 {
@@ -56,4 +63,28 @@ public static class SerialNumber
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int Distance(uint a, uint b) => unchecked((int)(a - b));
+
+    /// <summary>
+    /// Extends a 16-bit sequence to 64 bits against <paramref name="newest"/>, the extended value of the newest sequence
+    /// seen so far: the result is the value nearest to <paramref name="newest"/> whose low 16 bits are
+    /// <paramref name="sequence"/>, in [<paramref name="newest"/> − 32768, <paramref name="newest"/> + 32767]. Exactly
+    /// half the space apart extends <em>behind</em>, consistent with <see cref="IsNewer(ushort, ushort)"/>.
+    /// </summary>
+    /// <param name="newest">The extended newest sequence; at least 2^16 (the caller seeds it as 2^16 + the first sequence), so the result cannot underflow.</param>
+    /// <param name="sequence">The sequence to extend.</param>
+    /// <returns>The extended sequence; greater than <paramref name="newest"/> exactly when <paramref name="sequence"/> is serially newer than its low bits.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ulong Extend(ulong newest, ushort sequence) => unchecked((ulong)((long)newest + Distance(sequence, (ushort)newest)));
+
+    /// <summary>
+    /// Extends a 32-bit sequence to 64 bits against <paramref name="newest"/>, the extended value of the newest sequence
+    /// seen so far: the result is the value nearest to <paramref name="newest"/> whose low 32 bits are
+    /// <paramref name="sequence"/>, in [<paramref name="newest"/> − 2^31, <paramref name="newest"/> + 2^31 − 1]. Exactly
+    /// half the space apart extends <em>behind</em>, consistent with <see cref="IsNewer(uint, uint)"/>.
+    /// </summary>
+    /// <param name="newest">The extended newest sequence; at least 2^32 (the caller seeds it as 2^32 + the first sequence), so the result cannot underflow.</param>
+    /// <param name="sequence">The sequence to extend.</param>
+    /// <returns>The extended sequence; greater than <paramref name="newest"/> exactly when <paramref name="sequence"/> is serially newer than its low bits.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ulong Extend(ulong newest, uint sequence) => unchecked((ulong)((long)newest + Distance(sequence, (uint)newest)));
 }

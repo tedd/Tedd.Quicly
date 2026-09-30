@@ -72,6 +72,59 @@ public class SerialNumberTests
     [InlineData(10u, 0xFFFFFFF6u, 20)]
     public void Distance_32(uint a, uint b, int expected) => Assert.Equal(expected, SerialNumber.Distance(a, b));
 
+    [Theory]
+    [InlineData(0x1_0064UL, (ushort)100, 0x1_0064UL)]        // duplicate of the newest
+    [InlineData(0x1_0064UL, (ushort)101, 0x1_0065UL)]        // ahead
+    [InlineData(0x1_0064UL, (ushort)32_867, 0x1_8063UL)]     // furthest ahead
+    [InlineData(0x1_0064UL, (ushort)32_868, 0x0_8064UL)]     // exactly half the space: behind
+    [InlineData(0x1_0064UL, (ushort)99, 0x1_0063UL)]         // behind
+    [InlineData(0x1_FFFFUL, (ushort)0, 0x2_0000UL)]          // across the wrap: the next cycle
+    [InlineData(0x2_0000UL, (ushort)0xFFFF, 0x1_FFFFUL)]     // ... and back behind it
+    [InlineData(0x1_0000UL, (ushort)0x8000, 0x0_8000UL)]     // the lowest seed, half behind: no underflow
+    [InlineData(0x7_0005UL, (ushort)5, 0x7_0005UL)]          // the cycle count is carried
+    public void Extend_16(ulong newest, ushort sequence, ulong expected)
+    {
+        ulong extended = SerialNumber.Extend(newest, sequence);
+        Assert.Equal(expected, extended);
+        Assert.Equal(sequence, (ushort)extended);
+        Assert.Equal(SerialNumber.IsNewer(sequence, (ushort)newest), extended > newest);
+    }
+
+    [Theory]
+    [InlineData(0x1_0000_0064UL, 100u, 0x1_0000_0064UL)]
+    [InlineData(0x1_0000_0064UL, 101u, 0x1_0000_0065UL)]
+    [InlineData(0x1_0000_0064UL, 0x8000_0063u, 0x1_8000_0063UL)]   // furthest ahead
+    [InlineData(0x1_0000_0064UL, 0x8000_0064u, 0x0_8000_0064UL)]   // exactly half the space: behind
+    [InlineData(0x1_0000_0064UL, 99u, 0x1_0000_0063UL)]
+    [InlineData(0x1_FFFF_FFFFUL, 0u, 0x2_0000_0000UL)]             // across the wrap
+    [InlineData(0x2_0000_0000UL, 0xFFFF_FFFFu, 0x1_FFFF_FFFFUL)]
+    [InlineData(0x1_0000_0000UL, 0x8000_0000u, 0x0_8000_0000UL)]   // the lowest seed, half behind: no underflow
+    public void Extend_32(ulong newest, uint sequence, ulong expected)
+    {
+        ulong extended = SerialNumber.Extend(newest, sequence);
+        Assert.Equal(expected, extended);
+        Assert.Equal(sequence, (uint)extended);
+        Assert.Equal(SerialNumber.IsNewer(sequence, (uint)newest), extended > newest);
+    }
+
+    [Fact]
+    public void Extend_Follows_A_Counter_Through_Many_Wraps()
+    {
+        // A 16-bit counter stepping by 30 000 (under half the space) for more than four wraps: the extended value advances
+        // by exactly the step every time.
+        ulong newest = 0x1_0000UL + 5;
+        ushort sequence = 5;
+        for (int i = 0; i < 12; i++)
+        {
+            sequence = (ushort)(sequence + 30_000);
+            ulong extended = SerialNumber.Extend(newest, sequence);
+            Assert.Equal(newest + 30_000, extended);
+            newest = extended;
+        }
+
+        Assert.True(newest > 0x5_0000UL);
+    }
+
     [Fact]
     public void Exhaustive_16_Bit_Against_Reference_Definition()
     {
@@ -133,6 +186,7 @@ public class SerialNumberTests
                 sink += SerialNumber.IsNewerOrEqual(a, b) ? 1 : 0;
                 sink += SerialNumber.IsNewer(c, d) ? 1 : 0;
                 sink += SerialNumber.IsNewerOrEqual(c, d) ? 1 : 0;
+                sink += (int)SerialNumber.Extend(0x1_0000UL + b, a) + (int)SerialNumber.Extend(0x1_0000_0000UL + d, c);
             }
         }
     }

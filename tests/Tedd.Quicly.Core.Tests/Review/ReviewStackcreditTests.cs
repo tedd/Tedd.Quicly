@@ -234,4 +234,87 @@ public class ReviewStackcreditTests
             + $"ReliableOrdered channel got {packed.Count} of 1 message, {statistics.DecodeFailures} were dropped as DecodeFailures "
             + $"(the channel's Received: {DatagramKit.ChannelStats(server, Packed).Received}).");
     }
+
+    private static List<int> DrainIndices(QuiclyPeer peer, ushort channel)
+    {
+        List<int> got = [];
+        ReceivedMessage[] buffer = new ReceivedMessage[16];
+        int taken;
+        while ((taken = peer.Drain(channel, buffer)) > 0)
+        {
+            for (int i = 0; i < taken; i++)
+            {
+                got.Add(IndexOf(buffer[i].Payload));
+            }
+
+            peer.Release(buffer.AsSpan(0, taken));
+        }
+
+        return got;
+    }
+
+    /// <summary>
+    /// GUARD ("the UnregisterHandler hold is closed", design §2.3 "Remaining holds"). A handled ReliableOrdered channel
+    /// whose receiver is late fills the receive ring (a handled channel has no credit limit); a Drain of another channel
+    /// moves all of that into the queue pool as the handler's; the handler is removed. Repeated five times with a Poll
+    /// that gives the handler back in between. The channel's messages go beyond the pool, the peer never holds one of
+    /// them (the ring stays open, a datagram channel with a handler keeps receiving), and handler plus Drain see every
+    /// message once, in order.
+    /// </summary>
+    [Fact]
+    public void Removing_A_Handler_Over_A_Full_Ring_And_A_Full_Pool_Never_Closes_The_Ring()
+    {
+        using SessionHarness h = new(
+            table: Table,
+            client: o =>
+            {
+                GroupKit.Prompt(o);
+                OrderedKit.Roomy(o);
+            },
+            server: o =>
+            {
+                GroupKit.Prompt(o);
+                o.ReceiveRingCapacity = Ring;
+            });
+        QuiclyPeer server = h.Server!;
+        List<int> handled = [];
+        List<int> datagrams = [];
+        server.RegisterHandler(Datagrams, Collect(datagrams));
+        int sent = 0;
+        int datagramsSent = 0;
+        for (int cycle = 0; cycle < 5; cycle++)
+        {
+            server.RegisterHandler(Ordered, Collect(handled));
+            server.Poll();
+            for (int i = 0; i < 3 * Ring; i++)
+            {
+                Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Ordered), Payload(sent++, 16)).Status);
+            }
+
+            PumpSenderOnly(h, h.Client, 30);
+            Assert.Equal(0, DrainAll(server, 2));
+            Assert.True(server.DrainQueues.Count(server.Core.ChannelIndexOf(Ordered)) >= Ring / 2, $"cycle {cycle}: only {server.DrainQueues.Count(server.Core.ChannelIndexOf(Ordered))} of the handler's messages were queued by the Drain of another channel");
+            Assert.True(server.UnregisterHandler(Ordered));
+            server.Poll();
+            Assert.False(server.HasPendingWork && server.Core.ReceiveRing.IsEmpty && server.DrainQueues.Count(server.Core.ChannelIndexOf(Ordered)) == 0,
+                "nothing to do, and the work probe is set");
+
+            for (int i = 0; i < 8; i++)
+            {
+                Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Datagrams), Payload(datagramsSent++)).Status);
+            }
+
+            Assert.True(h.RunUntil(() => datagrams.Count == datagramsSent, 1_000_000),
+                $"cycle {cycle}: {datagrams.Count} of {datagramsSent} datagrams of a handled channel arrived while the ordered channel lost its handler "
+                + $"over a backlog (queued {server.DrainQueues.Count(server.Core.ChannelIndexOf(Ordered))}, excess nodes used {server.DrainQueues.ExcessUsed})");
+        }
+
+        Assert.True(h.RunUntil(() =>
+        {
+            handled.AddRange(DrainIndices(server, Ordered));
+            return handled.Count >= sent;
+        }, 5_000_000), $"{handled.Count} of {sent} messages came out");
+        Assert.Equal(Enumerable.Range(0, sent), handled);
+        Assert.Equal(0, DatagramKit.Statistics(server).ReceiveRingDrops);
+    }
 }

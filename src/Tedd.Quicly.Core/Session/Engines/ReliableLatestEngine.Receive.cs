@@ -285,6 +285,10 @@ internal sealed unsafe partial class ReliableLatestEngine
         int local = _localOf[dense];
         ref ChannelRecvCounters counters = ref _core.RecvCounters(dense);
         LatestRecvKeys keys = _recvKeys[local];
+
+        // Every arrival moves the channel's version clock, whatever then becomes of the value: the clock follows the
+        // sender's counter, not what this end could keep.
+        ulong extended = ExtendVersion(keys, header.Sequence);
         if (!TryGetRecvSlot(local, header.Key, out int keySlot))
         {
             // PROTOCOL.md §7: a full ReliableLatest key table rejects with reason 4 and never evicts.
@@ -302,7 +306,7 @@ internal sealed unsafe partial class ReliableLatestEngine
             return;
         }
 
-        if ((key.Flags & KeyRecvFlags.HasAccepted) != 0 && !SerialNumber.IsNewer(header.Sequence, key.LastAccepted))
+        if ((key.Flags & KeyRecvFlags.HasAccepted) != 0 && extended <= key.LastAcceptedExtended)
         {
             // An older or duplicate version: re-ack the current one so a lost ack cannot stall the sender (§4.4).
             counters.Dropped++;
@@ -341,7 +345,41 @@ internal sealed unsafe partial class ReliableLatestEngine
         entry.RawLength = header.RawLength;
         entry.ReceivedMicrosDelta = PeerCore.StampReceive(nowMicros);
         entry.SenderTick = _core.CurrentSenderTick;
-        Accept(local, keySlot, ref key, in entry, nowMicros, ref counters);
+        Accept(local, keySlot, ref key, in entry, extended, nowMicros, ref counters);
+    }
+
+    /// <summary>
+    /// Extends a version on the channel's version clock and advances the clock when the version is ahead of it (transport
+    /// thread; PROTOCOL.md §8). The sender takes every version of a channel from one counter, so the newest version that
+    /// arrived for <em>any</em> key says where that counter is, and a version extended against it compares with a key's last
+    /// accepted one as a plain 64-bit number — however many versions of other keys lie between the two. The first version of
+    /// an epoch seeds the clock one span up, which keeps 0 free as "nothing seen" and leaves room below the seed for the half
+    /// span a later arrival may extend behind it.
+    /// </summary>
+    /// <remarks>
+    /// Unlike the sequence clock of an UnreliableSequenced channel, this one never resynchronises on time: a retransmission
+    /// legitimately arrives behind the newest version after any length of quiet, and must stay a duplicate.
+    /// </remarks>
+    /// <param name="keys">The channel's receive keys, which hold the clock.</param>
+    /// <param name="version">The arriving version.</param>
+    /// <returns>The version on the channel's 64-bit scale.</returns>
+    private static ulong ExtendVersion(LatestRecvKeys keys, uint version)
+    {
+        ulong newest = keys.Newest;
+        if (newest == 0)
+        {
+            newest = 0x1_0000_0000UL + version;
+            keys.Newest = newest;
+            return newest;
+        }
+
+        ulong extended = SerialNumber.Extend(newest, version);
+        if (extended > newest)
+        {
+            keys.Newest = extended;
+        }
+
+        return extended;
     }
 
     /// <summary>
@@ -349,7 +387,7 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// reservation, ADR 0008 invariant 6), queues the key's ack and raises the work signal: a mailbox bypasses the receive
     /// ring, whose publication would otherwise have raised it.
     /// </summary>
-    private void Accept(int local, int keySlot, ref KeyRecvSlot key, in ReceiveEntry entry, long nowMicros, ref ChannelRecvCounters counters)
+    private void Accept(int local, int keySlot, ref KeyRecvSlot key, in ReceiveEntry entry, ulong extended, long nowMicros, ref ChannelRecvCounters counters)
     {
         ReceiveMailbox box = _mailboxes[local];
         if (!box.TryPost(keySlot, in entry, out BufferLease displaced, out bool replaced))
@@ -367,6 +405,7 @@ internal sealed unsafe partial class ReliableLatestEngine
         }
 
         key.LastAccepted = entry.Sequence;
+        key.LastAcceptedExtended = extended;
         key.LastUpdateMicros = nowMicros;
         key.Updates++;
         key.Flags |= KeyRecvFlags.HasAccepted;
@@ -605,6 +644,11 @@ internal sealed unsafe partial class ReliableLatestEngine
                 stream.Length = message.Header.Length;
                 stream.RawLength = message.Header.RawLength;
                 stream.Filled = 0;
+
+                // The version moves the channel's clock like a datagram's does, whatever then becomes of the value. The
+                // extended version is not kept with the stream: End derives it again, against a clock that may have moved.
+                LatestRecvKeys keys = _recvKeys[local];
+                ulong extended = ExtendVersion(keys, version);
                 if (message.Header.Length > _maxStage)
                 {
                     counters.TooLarge++;
@@ -619,7 +663,6 @@ internal sealed unsafe partial class ReliableLatestEngine
                     return StreamConsume.ResetStream(QuiclyErrorCode.LimitExceeded);
                 }
 
-                LatestRecvKeys keys = _recvKeys[local];
                 if (!TryGetRecvSlot(local, key, out int keySlot))
                 {
                     counters.KeyTableFull++;
@@ -636,7 +679,7 @@ internal sealed unsafe partial class ReliableLatestEngine
                     return StreamConsume.ResetStream(QuiclyErrorCode.LimitExceeded);
                 }
 
-                if ((keys[keySlot].Flags & KeyRecvFlags.HasAccepted) != 0 && !SerialNumber.IsNewer(version, keys[keySlot].LastAccepted))
+                if ((keys[keySlot].Flags & KeyRecvFlags.HasAccepted) != 0 && extended <= keys[keySlot].LastAcceptedExtended)
                 {
                     // Stale: consume the stream and re-ack the current version at its end.
                     counters.Dropped++;
@@ -678,6 +721,26 @@ internal sealed unsafe partial class ReliableLatestEngine
                     return StreamConsume.Continue;
                 }
 
+                // The value was newer than the key's when the stream started, but a stream takes time and a datagram of the
+                // same key can overtake it: judged again here, or an older value would replace a newer one in the mailbox
+                // and the ack owed for the newer version would be overwritten with the older one.
+                ref KeyRecvSlot slot = ref keys[stream.KeySlot];
+                ulong extended = ExtendVersion(keys, stream.Version);
+                if ((slot.Flags & KeyRecvFlags.HasAccepted) != 0 && extended <= slot.LastAcceptedExtended)
+                {
+                    if (!stream.Lease.IsEmpty)
+                    {
+                        _core.ReturnReceive(in stream.Lease);
+
+                        // OnStreamClosed returns whatever the record still holds.
+                        stream.Lease = BufferLease.Empty;
+                    }
+
+                    counters.Dropped++;
+                    QueueAck(local, stream.KeySlot, slot.LastAccepted);
+                    return StreamConsume.Continue;
+                }
+
                 ReceiveEntry entry = default;
                 entry.Channel = message.Channel;
                 entry.Flags = stream.RawLength > 0 ? ReceiveFlags.Compressed : ReceiveFlags.None;
@@ -688,7 +751,7 @@ internal sealed unsafe partial class ReliableLatestEngine
                 entry.RawLength = stream.RawLength;
                 entry.ReceivedMicrosDelta = PeerCore.StampReceive(message.NowMicros);
                 stream.Lease = BufferLease.Empty;
-                Accept(local, stream.KeySlot, ref keys[stream.KeySlot], in entry, message.NowMicros, ref counters);
+                Accept(local, stream.KeySlot, ref slot, in entry, extended, message.NowMicros, ref counters);
                 return StreamConsume.Continue;
             }
 
@@ -877,27 +940,28 @@ internal sealed unsafe partial class ReliableLatestEngine
                 continue;
             }
 
-            // PROTOCOL.md §4.3: an ack is evidence only for a version that really left this host. A version above the
-            // highest one ever transmitted for this key was never on the wire, so it proves nothing and completes nothing
-            // (it is what an ack of a closed epoch looks like after the counter restarted).
-            uint highestSent = keys.SentVersion(keySlot);
-            if (highestSent == 0 || SerialNumber.IsNewer(notice.Version, highestSent))
+            // PROTOCOL.md §4.3, §4.4: an ack is evidence only for the version this host last put on the wire for the key. The
+            // receiver acks the highest version it accepted for the key, which is never above that one; an ack that names
+            // anything else is of a superseded value, of a closed epoch (the counter restarted and nothing of the new epoch
+            // has been transmitted: sent is 0), or a late duplicate of an earlier value's ack. None of those says the
+            // current value arrived. The test is equality on purpose: no serial arithmetic, so no distance between two
+            // versions of one key — a key may idle for any number of the channel's versions — can make an old ack look new.
+            uint sent = keys.SentVersion(keySlot);
+            if (sent == 0 || notice.Version != sent)
             {
                 continue;
             }
 
-            if (key.AckedVersion == 0 || SerialNumber.IsNewer(notice.Version, key.AckedVersion))
-            {
-                key.AckedVersion = notice.Version;
-            }
-
+            key.AckedVersion = sent;
             int value = key.InFlightEntry;
-            if (value < 0 || !SerialNumber.IsNewerOrEqual(notice.Version, key.CurrentVersion))
+            if (value < 0 || sent != key.CurrentVersion)
             {
+                // Already finished — or a newer value was admitted and has not been transmitted yet, and this is the ack of
+                // the value it replaced.
                 continue;
             }
 
-            // Cumulative per key: this ack covers the current version (PROTOCOL.md §4.4), so the value is Delivered.
+            // The ack names the current version, and that version was transmitted: the value is Delivered.
             key.InFlightEntry = -1;
             key.Flags &= ~(KeySendFlags.RetryArmed | KeySendFlags.Pending);
             keys.Disarm(keySlot);
@@ -1216,7 +1280,9 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// <summary>
     /// Per-key receive state of one channel (transport thread, except the pending-ack version word and the slot high-water
     /// mark, which the game thread reads to send the coalesced acks): the channel's key table and a
-    /// <see cref="KeyRecvSlot"/> per key, growing with the slots in use up to <see cref="ChannelDefinition.MaxKeys"/>.
+    /// <see cref="KeyRecvSlot"/> per key, growing with the slots in use up to <see cref="ChannelDefinition.MaxKeys"/>. It
+    /// also holds the channel's version clock (<see cref="Newest"/>), which lives and dies with the keys:
+    /// <see cref="Clear"/> is the one place both are forgotten.
     /// </summary>
     private sealed class LatestRecvKeys : IDisposable
     {
@@ -1224,6 +1290,12 @@ internal sealed unsafe partial class ReliableLatestEngine
         private readonly int _maxKeys;
         private NativeArray<KeyRecvSlot> _slots;
         private int _used;
+
+        /// <summary>
+        /// The newest version seen on the channel this epoch, for any key, extended to 64 bits and biased by 2^32 so that
+        /// 0 means "nothing seen yet" (<see cref="ExtendVersion"/>). Transport thread.
+        /// </summary>
+        public ulong Newest;
 
         public LatestRecvKeys(ChannelDefinition channel)
         {
@@ -1266,7 +1338,12 @@ internal sealed unsafe partial class ReliableLatestEngine
 
         public void Remove(ulong key) => _table.Remove(key, out _);
 
-        public void Clear() => _table.Clear();
+        /// <summary>Forgets every key and the version clock they were measured on (a new epoch restarts the sender's counter).</summary>
+        public void Clear()
+        {
+            _table.Clear();
+            Newest = 0;
+        }
 
         public void Dispose()
         {

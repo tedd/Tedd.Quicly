@@ -170,6 +170,17 @@ internal static class LatestKit
         return stream.AsSpan(0, written + payload.Length).ToArray();
     }
 
+    /// <summary>The body of a LatestAck control message with one entry, as <see cref="ReliableLatestEngine.OnControl"/> takes it.</summary>
+    public static byte[] AckBody(ushort channel, ulong key, uint version)
+    {
+        byte[] frame = new byte[64];
+        LatestAckBatchWriter writer = new(frame, ControlCarrier.Datagram);
+        Assert.True(writer.TryAdd(new LatestAckEntry(channel, key, version)));
+        int length = writer.Finish();
+        Assert.Equal(ControlParseStatus.Ok, ControlCodec.TryReadDatagram(frame.AsSpan(0, length), out _, out ReadOnlySpan<byte> body, out _));
+        return body.ToArray();
+    }
+
     /// <summary>Every LatestAck entry a raw endpoint received, in arrival order.</summary>
     public static List<LatestAckEntry> AckEntries(RecordingSink sink)
     {

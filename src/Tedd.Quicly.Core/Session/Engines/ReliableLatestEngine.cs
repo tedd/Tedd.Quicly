@@ -27,14 +27,18 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// is marked and completed when its last transmission completes (its lease must stay valid until then), and a still-open
 /// large-value stream is aborted.</para>
 /// <para><b>Retransmission</b> (PROTOCOL.md §4.4). <see cref="DeliveryStatus.Sent"/> and a transport acknowledgement both
-/// mean only "it left this host" — the <c>LatestAck</c> is the sole source of <see cref="DeliveryStatus.Delivered"/>. A
+/// mean only "it left this host" — the <c>LatestAck</c> is the sole source of <see cref="DeliveryStatus.Delivered"/>, and
+/// only one that names exactly the version last transmitted for the key, while that is still the key's current version
+/// (an ack of anything else — a superseded value, a closed epoch, a late duplicate — completes nothing). A
 /// transmission that the transport reports lost, canceled or failed schedules an immediate retry; the timer backstop is
 /// <c>clamp(1.5 × RTT, MinRetry 20 ms, MaxRetry 1 s)</c>, doubled per attempt. A version that reaches
 /// <see cref="MaxTransmissions"/> transmissions or <see cref="VersionBudgetMicros"/> completes
 /// <see cref="DeliveryStatus.Failed"/>. Retries run in <see cref="Flush"/>, after every channel's fresh traffic, and are
 /// bounded by a per-peer byte bucket (<see cref="PeerOptions.MaxRetryBytesPerSecond"/> /
 /// <see cref="PeerOptions.RetryShareOfEstimatedBandwidth"/>).</para>
-/// <para><b>Receive (transport thread).</b> Only a version newer than the key's last accepted one is accepted, into the
+/// <para><b>Receive (transport thread).</b> Only a version newer than the key's last accepted one is accepted — newer on
+/// the channel's <em>version clock</em> (PROTOCOL.md §8): each arriving version is extended to 64 bits against the newest
+/// one seen on the channel for any key, so a key may idle while the channel's counter runs past half its range — into the
 /// channel's coalescing mailbox (ReliableLatest always coalesces, so no receive-ring entry and no reservation); an older or
 /// duplicate version re-acks the current one, so a lost ack cannot stall completion. Local drops answer
 /// <c>LatestReject</c> with the reason. Acks and rejects are coalesced per key (highest version wins) and sent from the
@@ -183,7 +187,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     /// <returns>The number of live keys.</returns>
     internal int LiveKeys(int channelIndex) => _send[_localOf[channelIndex]].LiveKeys;
 
-    /// <summary>The highest version the peer acknowledged for a key, or 0 (game thread; tests).</summary>
+    /// <summary>The last transmitted version the peer acknowledged for a key, or 0 (game thread; tests).</summary>
     /// <param name="channelIndex">Dense index of a channel of this engine.</param>
     /// <param name="key">The key.</param>
     /// <returns>The acknowledged version.</returns>
@@ -804,14 +808,13 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
         valueEntry.Aux1 = WithOutstanding(aux, OutstandingOf(aux) + 1);
 
-        // PROTOCOL.md §4.3: only a version that really left this host can be acknowledged, so the highest version ever
-        // transmitted for the key is what an incoming ack is measured against (DrainNotices).
+        // PROTOCOL.md §4.3: only a version that really left this host can be acknowledged, so the version of the key's most
+        // recent transmission is what an incoming ack must name (DrainNotices). A queue holds only a key's live value —
+        // whatever finishes or replaces one unlinks it (MarkValueFinished), and an epoch reset re-stamps value and key
+        // together (Requeue) — so this is always the key's current version.
         uint transmitted = entries.Sequences[value];
-        ref uint highestSent = ref keys.SentVersion(keySlot);
-        if (highestSent == 0 || SerialNumber.IsNewer(transmitted, highestSent))
-        {
-            highestSent = transmitted;
-        }
+        System.Diagnostics.Debug.Assert(transmitted == key.CurrentVersion, "a queue holds only the key's live value");
+        keys.SentVersion(keySlot) = transmitted;
 
         key.Attempts++;
         key.LastSentMicros = now;
@@ -1538,13 +1541,14 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         public int ArmedNext(int slot) => _next[slot];
 
         /// <summary>
-        /// The highest version of the key that really left this host (0 = none): an ack above it names a version that was
-        /// never transmitted, so it cannot complete anything (PROTOCOL.md §4.3).
+        /// The version of the key's most recent transmission (0 = nothing transmitted since the slot was taken, the epoch
+        /// began or the connection was replaced). An ack completes a value only when it names exactly this version and this
+        /// is the key's current one (PROTOCOL.md §4.3, §4.4); any other ack proves nothing about the current value.
         /// </summary>
         /// <param name="slot">A key slot.</param>
         public ref uint SentVersion(int slot) => ref _sent[slot];
 
-        /// <summary>Forgets every key's highest transmitted version (a new epoch restarts the channel's counter).</summary>
+        /// <summary>Forgets every key's last transmitted version (a new epoch restarts the channel's counter).</summary>
         public void ResetSentVersions() => _sent.AsSpan().Clear();
 
         public bool TryGet(ulong key, out int slot) => _table.TryGetSlot(key, out slot);

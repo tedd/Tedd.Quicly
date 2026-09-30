@@ -8,7 +8,8 @@ namespace Tedd.Quicly.Core.Tests.Session;
 /// Steady-state ReliableLatest traffic must not allocate (ADR 0008): admission with the per-key slots, the transmissions
 /// through the packer, the coalesced acks, the mailbox receive on the transport thread (the simulator raises it on the test
 /// thread) and the completions. Measured on a clean link, where the simulator itself allocates nothing (review of wave C1,
-/// non-blocking performance finding 1); loss and retries are covered by the delivery tests instead.
+/// non-blocking performance finding 1); loss is covered by the delivery tests instead, and the retry, duplicate and
+/// re-ack paths are reached here without loss, by an ack delay longer than the retry timer.
 /// </summary>
 public class LatestZeroAllocationTests
 {
@@ -73,6 +74,70 @@ public class LatestZeroAllocationTests
         Assert.True(DatagramKit.ChannelStats(client, 4).SendSuperseded > 0);
         h.Run(200_000);
         Assert.Equal(0, LatestKit.LiveKeys(client, 4));
+    }
+
+    [Fact]
+    public void Duplicates_Of_An_Accepted_Version_Are_Dropped_And_Re_Acked_Without_Allocating()
+    {
+        // The receiver holds its acks back for longer than the sender's retry timer, so every value is retransmitted on a
+        // clean link: the duplicates take the stale path (extended on the version clock, dropped, re-acked), and the acks
+        // that do not name the version last transmitted take the sender's "proves nothing" path.
+        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 1_000 }, table: Table,
+            client: o =>
+            {
+                LatestKit.Quiet(o);
+                LatestKit.Roomy(o);
+            },
+            server: o =>
+            {
+                LatestKit.Quiet(o);
+                LatestKit.Roomy(o);
+                o.AckDelay = TimeSpan.FromMilliseconds(120);
+            });
+        SimulatedNetwork network = h.Network;
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        long received = 0;
+        server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
+        byte[] payload = new byte[64];
+        uint tick = 0;
+        void Tick()
+        {
+            if ((tick & 3) == 0)
+            {
+                for (ulong key = 0; key < 16; key++)
+                {
+                    client.SendCopy(new SendHeader(2, key), payload);
+                }
+            }
+
+            client.Flush(++tick);
+            network.Advance(16_667);
+            server.Poll();
+            server.Flush();
+            client.Poll();
+        }
+
+        for (int i = 0; i < 600; i++)
+        {
+            Tick();
+        }
+
+        long droppedBefore = DatagramKit.ChannelStats(server, 2).Dropped;
+        long retriesBefore = DatagramKit.ChannelStats(client, 2).Retries;
+        int windows = WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 120; i++)
+            {
+                Tick();
+            }
+        });
+        long dropped = DatagramKit.ChannelStats(server, 2).Dropped - droppedBefore;
+        long retries = DatagramKit.ChannelStats(client, 2).Retries - retriesBefore;
+        Assert.True(dropped > windows * 100L, $"{dropped} duplicates dropped in {windows} windows");
+        Assert.True(retries > windows * 100L, $"{retries} retransmissions in {windows} windows");
+        Assert.True(received > 600 * 4, $"{received} values");
+        Assert.Equal(PeerState.Connected, client.State);
     }
 
     [Fact]

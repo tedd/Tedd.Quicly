@@ -336,7 +336,7 @@ public sealed class QuiclyPeer : IDisposable
 }
 
 public readonly record struct SendHeader(ushort Channel, ulong Key = 0);
-public readonly struct SendOptions { public SendMode Mode; /* Buffered | Immediate */ public bool Track; public ulong Context; public long ExpiryMicros; }
+public readonly struct SendOptions { public SendMode Mode; /* Buffered | Immediate */ public bool Track; public ulong Context; public long ExpiryMicros; /* time held back across scheduler passes, counted from the first pass after the send (PROTOCOL.md §4.5) — not from the Send call */ }
 public readonly record struct SendResult(SendStatus Status, SendToken Token);
 public enum SendStatus { Admitted, QueueFull, TooLarge, OutOfBuffers, ChannelClosed, NotConnected, KeyTableFull, InvalidChannel, NotSupported }
 public enum DeliveryStatus { Pending, Delivered, Superseded, Failed, Canceled, Expired, Lost, Disconnected, Sent }

@@ -60,7 +60,11 @@
    return QUIC_STATUS_INTERNAL_ERROR; }`; strict mode fails fast instead.
 9. **Time-driven work has one owner**: retries, expiry, pings, heartbeat and group flushes run inside
    `Flush`/`Poll` on the game thread; `now` is read once per call; there are no `System.Threading.Timer`s.
-   `NextDeadline` lets a host sleep precisely.
+   `NextDeadline` lets a host sleep precisely. Relative time limits of queued sends (message expiry) are
+   anchored at the `now` of the first scheduler pass after admission (`PeerCore.StampExpiry` /
+   `ResolveExpiry`): admission reads no clock, and it never borrows the stamp of an earlier pass, which can
+   be arbitrarily old. The one clock read on a send path is `SendRequestAsync`, once per call, for the
+   request's timeout.
 10. **Completion delivery is a mode**: `PollOnly` (continuations inline in `Poll`) or `ThreadPool`
    (`RunContinuationsAsynchronously` from the transport thread). Awaiting from an `async` method allocates
    the caller's state machine only when it suspends; the library's own paths are 0 B.

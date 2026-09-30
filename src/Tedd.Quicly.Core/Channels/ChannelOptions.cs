@@ -39,6 +39,12 @@ public sealed class ChannelOptions
     /// Send expiry in microseconds; 0 = never. Default 0 except UnreliableSequenced, whose default is
     /// <see cref="ChannelDefinition.ExpiryTwiceFlushInterval"/>.
     /// </summary>
+    /// <remarks>
+    /// The expiry is the longest the scheduler may hold a message back (the send cap, datagrams unavailable, a blocked
+    /// stream, the group interval), not the message's age since the send call: it is counted from the first scheduler pass
+    /// after the send — the next Flush, or an Immediate send's own pass — and that pass never expires the message
+    /// (PROTOCOL.md §4.5). A long frame or a slow server tick between the send and the Flush does not count against it.
+    /// </remarks>
     public long? ExpiryMicros { get; set; }
 
     /// <summary>Keys per channel per peer. Default 4 096 (or max key + 1 for a dense key space).</summary>

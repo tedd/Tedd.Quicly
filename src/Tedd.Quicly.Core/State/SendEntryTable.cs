@@ -30,7 +30,7 @@ namespace Tedd.Quicly.Core.State;
 /// and ignore it (ADR 0008 invariant 2).</para>
 /// <para><b>Cold side tables</b> (structure of arrays, indexed by slot, game thread): <see cref="Leases"/> (payload
 /// block to return on completion), <see cref="Keys"/>, <see cref="Sequences"/>, <see cref="Contexts"/> (the
-/// transport context), <see cref="Deadlines"/> (expiry in clock micros, scanned every flush), <see cref="Next"/>
+/// transport context), <see cref="Deadlines"/> (expiry in clock micros from the entry's first scheduler pass on, scanned every flush), <see cref="Next"/>
 /// (intrusive link: channel queue while queued, then container membership once packed),
 /// <see cref="BatchHead"/>/<see cref="BatchCount"/> (members of a container entry) and <see cref="PinHandles"/>
 /// (a managed <see cref="nint"/> array for the pin handles of the <c>SendBorrowed</c> convenience path,
@@ -111,7 +111,11 @@ public sealed unsafe class SendEntryTable : IDisposable
     /// <summary>Transport context of the entry (<see cref="MakeContext"/>), stored at allocation.</summary>
     public NativeArray<ulong> Contexts { get; }
 
-    /// <summary>Expiry deadline in clock microseconds (0 = none). Scanned structure-of-arrays every flush.</summary>
+    /// <summary>
+    /// Expiry deadline in clock microseconds (0 = none). Scanned structure-of-arrays every flush. Between an entry's
+    /// admission and its first scheduler pass the session layer keeps a value at or above 2^62 here (the relative expiry,
+    /// not yet anchored to a clock), which compares as "not expired" against any clock value.
+    /// </summary>
     public NativeArray<long> Deadlines { get; }
 
     /// <summary>Intrusive singly linked list link (-1 = end): channel queue while queued, container membership once packed.</summary>

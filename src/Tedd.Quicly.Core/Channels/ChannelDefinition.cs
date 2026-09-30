@@ -39,7 +39,8 @@ public sealed class ChannelDefinition
 
     /// <summary>
     /// <see cref="ExpiryMicros"/> sentinel: expire after twice the peer's flush interval (the default of
-    /// UnreliableSequenced channels, PROTOCOL.md §4.5). The peer resolves it; the table does not know the interval.
+    /// UnreliableSequenced channels, PROTOCOL.md §4.5), counted from the message's first scheduler pass like every expiry.
+    /// The peer resolves it; the table does not know the interval.
     /// </summary>
     public const long ExpiryTwiceFlushInterval = -1;
 
@@ -142,7 +143,9 @@ public sealed class ChannelDefinition
 
     /// <summary>
     /// Configured send expiry in microseconds; 0 = never; <see cref="ExpiryTwiceFlushInterval"/> (−1) = twice the flush
-    /// interval. Never add this to a timestamp directly: use <see cref="ResolveExpiryMicros"/>.
+    /// interval. It is the time a message may be held back across scheduler passes, counted from the first pass after
+    /// its send (PROTOCOL.md §4.5), not its age since the send call. Never add this to a timestamp directly: use
+    /// <see cref="ResolveExpiryMicros"/>.
     /// </summary>
     public long ExpiryMicros { get; }
 

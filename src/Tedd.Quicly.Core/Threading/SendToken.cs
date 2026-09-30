@@ -44,7 +44,10 @@ public enum DeliveryStatus : byte
     /// <summary>The send (or its slot) was canceled or released by the application.</summary>
     Canceled,
 
-    /// <summary>The message's expiry elapsed before it was sent.</summary>
+    /// <summary>
+    /// The message was held back for longer than its expiry before it could be sent (the expiry counts from the message's
+    /// first scheduler pass, PROTOCOL.md §4.5), or the transport dropped its datagram when blocked.
+    /// </summary>
     Expired,
 
     /// <summary>The session ended before the message was delivered.</summary>

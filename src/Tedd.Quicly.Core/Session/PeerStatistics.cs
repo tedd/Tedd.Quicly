@@ -235,7 +235,10 @@ public struct ChannelStatistics
     /// <summary>Pending sends replaced by a newer value of the same key.</summary>
     public long SendSuperseded;
 
-    /// <summary>Sends dropped because their expiry elapsed before transmission.</summary>
+    /// <summary>
+    /// Sends dropped because the scheduler held them back for longer than their expiry (counted from their first scheduler
+    /// pass, PROTOCOL.md §4.5), and datagrams the transport dropped when blocked.
+    /// </summary>
     public long Expired;
 
     /// <summary>Sends rejected with <see cref="SendStatus.QueueFull"/>.</summary>

@@ -403,8 +403,9 @@ is back in `Filling` and still owned by the caller.
   waiter, queued transition, due deadline, ReliableLatest ack/reject/notice (`ReliableLatestEngine.HasUnsentControl`) or canceled
   request (`ReliableOrderedEngine.HasCanceledRequests`) is pending, the caller is the game thread already, and a fragmenting
   table's RTT has not moved. A peer whose only pending item is the completion ring gets it drained first (its own ping traffic
-  touches no engine) and is asked again. A skipped peer still records the tick, the pass clock and the ping clock's slew — the only
-  things an empty Flush changes. The gate is off for tables with a Bulk channel and when `StreamIdleTimeout` is under twice the
+  touches no engine) and is asked again. A skipped peer still records the tick, the pass clock (ReliableLatest's budgets and retry timers are armed
+  from it; no expiry can be waiting for a pass on a skipped peer, since every admission refuses the skip) and the ping clock's slew —
+  the only things an empty Flush changes. The gate is off for tables with a Bulk channel and when `StreamIdleTimeout` is under twice the
   `PingInterval`. A send returned before `FlushAll` is transmitted by that call; a send racing it from another thread goes out in
   this call or the next, as with an unconditional Flush. On real MsQuic loopback with 1 000 idle peers `FlushAll` fell from
   ~1.0–1.5 µs to ~0.3–0.4 µs per peer per tick.
@@ -571,13 +572,19 @@ which record send flags and can refuse datagrams, wired through the new `Session
 statistics, a message sent alone, container tick, container size after an MTU change, a queued message failing after the limit
 shrank, priority and admission order, starvation of low priority under the cap, the cap's byte rate and refill deadline, no message
 older than its expiry delivered under the cap, `Immediate` sends, send flags, refused datagrams, datagrams unavailable);
+`ExpiryAnchorTests` (expiry runs from the first scheduler pass: a send after a stall longer than its expiry, on an explicit and on
+the default-expiry channel, a long frame between Send and Flush, an Immediate send after a stall, a fragmented, an ordered and a
+group message with an expiry, a thread-safe send admitted by a Poll and flushed late — all delivered; a message held back by the
+send cap expiring exactly one microsecond after its expiry, counted from its first pass; `PeerCore.StampExpiry`/`ResolveExpiry`
+at the bitmap's word boundaries, the "never" range, a second resolve, and a mark left on a recycled slot);
 `DatagramDeliveryTests` (unordered under loss/reorder/jitter, sequenced newest-only per key under reorder, the 16-bit wrap,
 coalescing on vs off at 60 Hz, unordered coalescing, ring overflow, receive budget, LRU eviction and the replay window, dense key
 spaces, a second epoch on one engine); `DatagramSendPathTests` (every send path alone and packed, borrowed pins released only when
 the transport is done, owned leases and refusals, tracked Delivered/Lost/Expired/Canceled/Disconnected, a transport-canceled
 datagram completing Expired, container members completing in both completion modes, compression round trip and the RawLength
 rules on the wire, admission refusals, send budget); `DatagramZeroAllocationTests` (60 Hz traffic of 64-byte messages over
-unordered, sequenced, coalescing, compressed and tracked channels; a capped scheduler with expiring messages; a keyed and an
+unordered, sequenced, coalescing, compressed and tracked channels; a capped scheduler with expiring messages; the same traffic on
+channels that keep their expiry, the `UnreliableSequenced` default included; a keyed and an
 unkeyed 16-bit sequenced channel whose receive clock crosses a wrap in every measured window); `SequencedIdleKeyTests` (the
 sequence clock of §7.1 with hand-written frames: a key idle past half a 16-bit and a 32-bit space, across several wraps, on
 hashed, dense, coalescing and fragmenting channels, and end to end behind 40 000 updates of another key; values of different
@@ -598,7 +605,7 @@ re-sent on a new stream, STOP_SENDING closes the channel, a duplicate persistent
 protocol violations, the sender's size limit, a full ring and an exhausted receive budget hold the stream back, a message that can
 never fit closes with LimitExceeded, expiry before the stream, close completes queued messages Disconnected, the send-table reserve,
 the queue limit counts bytes in flight, back-pressure from a receiver that stops polling to QueueFull and back, a segment arena of
-eight entries, an Immediate send without a Flush, a message that expires behind the head left out of the stream send);
+eight entries, an Immediate send without a Flush, a message that, held back by the send cap, expires behind the head and is left out of the stream send);
 `AsyncApiTests` (SendAsync at once, waiting in call order, waiting for the send budget, canceled, unreliable, NotConnected and
 disposed, from another thread while the ThreadSafeSend front is full; FlushAsync at once, under the send cap,
 waiting for stream credit; WaitAsync / Wait / GetDeliveryStatus of both stages; ThreadPool completion; TryCancel while queued);
@@ -699,8 +706,10 @@ internal abstract class ChannelEngine : IDisposable     // Session/Engines/Chann
 `TryRentSend`/`ReturnSend`, `SendCounters(ci)`, `MapDatagramState`, `MapStreamCompletion`, `MapCompletion`,
 `MapSubmitFailure`, `QueueLocalCompletion`/`TryDequeueLocalCompletion`, `Packer`, `ScheduleOrder`, `GetToken`,
 `GetUserContext`, `CreateMailbox` (from `Initialize`), `CreateKeyTable(channel)`, `StampAdmission`/`GetAdmissionStamp`/
-`LastAdmissionStamp`, `CurrentPassMicros`/`NotePass` (the clock stamp of the current Poll/Flush/Immediate pass, so engines never
-read the clock per admitted message: ADR 0008 invariant 9). Transport thread: `TryRentReceive`,
+`LastAdmissionStamp`, `StampExpiry`/`ResolveExpiry` (a message's expiry, anchored at its first scheduler pass: §7.1 step 0; admission
+reads no clock, ADR 0008 invariant 9), `CurrentPassMicros`/`NotePass` (the clock stamp of the current Poll/Flush/Immediate pass,
+from which the ReliableLatest engine arms its version budgets and retry timers; message expiry does not use it, because the stamp
+can be older than the expiry itself). Transport thread: `TryRentReceive`,
 `TryEnqueueReceive`, `TryReserveReceive`/`PublishReserved`/`CancelReservation`, `NotePendedStream`, `RecvCounters(ci)`,
 `CountDatagramDropped`, `CurrentSenderTick`, `Streams`. Any thread: `RequestClose(code)`, `ReturnReceive`, `GetPointer`/`GetSpan`,
 `ChannelIndexOf`, `GetChannel`, `GetEngine`, `EffectiveMaxMessageSize`, `SessionMaxMessageSize`, `MaxDatagramPayload`,
@@ -730,6 +739,20 @@ the slot.
 **Scheduler** (`QuiclyPeer.FlushEngines`, QuiclyPeer.Flush.cs). A pass runs in every `Flush` while Connected (after the engines'
 `Tick`) and at the end of every admitted `Immediate` send (`FlushImmediate`):
 
+0. `PeerCore.ResolveExpiry(now)`: every entry admitted with an expiry since the previous pass gets its absolute deadline,
+   `now + expiry`. Admission only marked it (`PeerCore.StampExpiry`: `Deadlines[slot] = UnresolvedDeadline (2^62) + expiry` and one
+   bit in a per-peer bitmap of `capacity / 64` words, game thread; an expiry of 2^61 µs or more is "never" and stays 0). So a
+   message's expiry runs from its **first pass**, that pass can never expire it (`deadline ≥ now + 1`, and the engines compare
+   `now > deadline`), and an unresolved value is above every clock, so nothing that looks at a deadline before the resolve expires it
+   either. The resolve is a prologue rather than something the engines do when they reach an entry because engines do not reach
+   every entry: a message behind a blocked head, in a stream that is starting, blocked or refused, or in a group that is not sealed
+   yet would never start its clock. It costs one compare when nothing is pending, otherwise a scan of the words up to the highest
+   marked one (slots are handed out low first) and a tzcnt, load, compare and store per marked entry. A mark left by an entry freed
+   before the pass is harmless: the slot is either free (its deadline is rewritten at allocation) or reallocated with 0 or an
+   absolute value below 2^62, which the resolve leaves alone. `ResetForReconnect` clears the bitmap. Why not the clock stamp of
+   the last pass, which admission used before: that stamp is as old as the last Poll or Flush, so after a long frame, on a server
+   peer `PollAll` did not poll, or inside an `Immediate` send, a message could be past its deadline before the scheduler saw it once
+   (with the `UnreliableSequenced` default of two flush intervals: every message of a host ticking slower than 30 Hz);
 1. the send cap refills — a `TokenBucket` of `PeerOptions.MaxSendBytesPerSecond` bytes per second (0, or 2·10⁹ and more, means no
    cap) whose burst is two flush intervals' worth (the interval clamped to 10 … 500 ms) — and `FlushContext.BudgetBytes = Available(now)`;
 2. `FlushContext.CancelBlockedDatagrams = TransportHonoursCancelOnBlocked()` (see send flags);
@@ -794,8 +817,8 @@ registered in `ChannelEngines.Create`).
   `MinCompressSize`) and the block is strictly shorter (the destination is one byte short), giving `RawLength = length`; otherwise
   `RawLength` is 0. Encoded size above the current `MaxDatagramPayload` ⇒ `TooLarge` (fragmenting channels: the `AdmitFragmented`
   hook, `NotSupported` until C2). Tracking (`QueueFull` when the completion table is full). Commit: the sequence from the channel
-  counter (16/32-bit wrap), header, payload, `Sequences`/`Keys`/`Deadlines` (admission clock + `SendOptions.ExpiryMicros`, or the
-  channel's resolved default; 0 = never), the `Immediate` flag, FIFO append. On any rejection the caller keeps its lease or pages.
+  counter (16/32-bit wrap), header, payload, `Sequences`/`Keys`, the expiry (`PeerCore.StampExpiry` with `SendOptions.ExpiryMicros`, or the
+  channel's resolved default; 0 = never — `Deadlines` holds the absolute deadline from the message's first pass on, step 0 above), the `Immediate` flag, FIFO append. On any rejection the caller keeps its lease or pages.
 * `FlushChannel`: from the head — `now > deadline` ⇒ `Expired` counter + local completion `Expired`; `Packer.Add` ⇒ `Accepted`
   (`Sent`, `Bytes`), `TooLarge` (`TooLarge` counter + local `Failed`: the limit shrank after admission), `Blocked`/`Unavailable` ⇒ stop
   with the entry at the head. The queue link is read before `Add` (the packer reuses it).
@@ -804,7 +827,7 @@ registered in `ChannelEngines.Create`).
 * `TryCancel`: only while queued; unlinked, local completion `Canceled` (finished at the next Poll/Flush). `OnPeerClosed`: queued
   entries ⇒ `Disconnected`. `OnEpochReset`: the first call opens the first epoch; a later one on the same engine restarts
   `NextSequence` and has the transport thread clear the receive tables before its next datagram (PROTOCOL.md §4.1). `Tick` and `Flush`
-  do nothing: expiry is evaluated when the scheduler reaches an entry.
+  do nothing: expiry is evaluated when the scheduler reaches an entry, against a deadline counted from the entry's first pass.
 * `OnDatagram` (transport thread): fragments ⇒ the `OnFragment` hook (dropped and counted until C2); acceptance — unordered: always
   (coalescing: the key's slot); sequenced: the sequence is first extended on the channel's **sequence clock** (below), then
   unkeyed: accepted iff the clock advanced; keyed:
@@ -855,7 +878,9 @@ channel owned by the transport thread (the peer's stream, the lease and header f
   drain the queues (`QueueFull` before it is touched, so a full table cannot deadlock); the payload by every send path
   (`EnginePayload`, `OutOfBuffers`; a single gathered page is taken as it is); tracking (`QueueFull`). Commit: the frame header
   (Length, Key, RequestId, RawLength — PROTOCOL.md §3.1, at most 24 bytes) in the entry's header block, the payload segment, the
-  expiry deadline (none by default on reliable channels), the admission stamp, FIFO append. `Aux0` = admitted length, `Aux1` =
+  expiry (none by default on reliable channels; `PeerCore.StampExpiry`, so it runs from the message's first scheduler pass, §7.1
+  step 0 — a message queued behind a stream that is starting or blocked starts its clock at that pass too), the admission stamp,
+  FIFO append. `Aux0` = admitted length, `Aux1` =
   queued, in a carrier, or finished.
 * `FlushChannel` (every scheduler pass, in priority order): the notices of the channel's streams are applied first; a closed
   channel fails its queue; `Starting` and `Refused` wait; `Blocked` waits until `StreamCreditGeneration` changes; expired messages
@@ -970,7 +995,8 @@ free list of `Σ max(MaxGroups, 1)` records. The peer's files are untouched; the
   is a group of its own. With no free group record the open group simply keeps growing (a send is never failed for that), and a
   channel that has no group at all answers `QueueFull`. Checks and commit are the ordered engine's (`EnginePayload` for every
   send path, `EffectiveMaxMessageSize`, `QueueLimitBytes` over queued plus in-flight bytes, the carrier reserve in the entry
-  table, `CurrentPassMicros` for the expiry deadline, `StampAdmission`), with the §3.1 frame header written **without** a request
+  table, `PeerCore.StampExpiry` for the expiry — counted from the message's first scheduler pass, §7.1 step 0, whether or not its
+  group is sealed by then — `StampAdmission`), with the §3.1 frame header written **without** a request
   id.
 * **`FlushChannel`.** The open group is sealed unless `GroupMinIntervalMicros` (default 1 ms) has not passed since the channel
   last opened a stream — then it keeps filling and `NextDeadline` drops to the moment the next stream may open, which is what
@@ -1555,7 +1581,9 @@ Two features that ride on engines that already exist: fragmentation is the secon
   is the bound that keeps the worst case visible.
 * **Cancel, expiry, close.** `TryCancel` names the owner (the token's entry) and works only while *every* fragment is
   still queued; it unlinks them all and they complete `Canceled`. Expiry is per fragment at scheduling time
-  (PROTOCOL.md §4.5), so a message whose deadline passes is dropped as a whole in one pass. `OnPeerClosed` finishes the
+  (PROTOCOL.md §4.5): every fragment is stamped with the message's expiry (`PeerCore.StampExpiry`; the owner, which is never
+  queued, carries none) and all of them resolve in the same first pass, so a message whose deadline passes is dropped as a whole
+  in one pass — one `Expired` count per fragment still queued. `OnPeerClosed` finishes the
   queued fragments and then completes what is left of their messages `Disconnected`; `OnReconnecting` additionally
   forgets the owner map.
 * **Receive** (transport thread). `MaxReassemblies` records per channel (default 16, a contiguous range of one native
@@ -1627,7 +1655,10 @@ Two features that ride on engines that already exist: fragmentation is the secon
   thread. Matching a response is a scan of the 256 slots, which happens once per response and never per message.
 * **Timeouts without a timer.** `ChannelEngine.RunPollDeadlines(now, ref nextDeadline)` is called from the peer's timer
   pass, which both `Poll` and `Flush` run, so a request times out for a host that only polls as well as for one that only
-  flushes (ADR 0008 invariant 9). The engine keeps the earliest deadline and publishes it only while it is **in the
+  flushes (ADR 0008 invariant 9). A request's deadline is `clock now + timeout` read at the `SendRequestAsync` call — one
+  clock read per request, the only one on a send path. It is not the last pass's stamp plus the timeout: that stamp can be
+  older than the timeout, and the Flush that sends the request runs its timer pass first, so the request would time out
+  unsent. The engine keeps the earliest deadline and publishes it only while it is **in the
   future**: a deadline at or before `now` would make a host that sleeps on `NextPollDeadlineMicros` spin. A timeout
   faults the value task with `TimeoutException` and counts `RequestsTimedOut`; `timeout` 0 means "wait until the response
   arrives, the wait is canceled or the session ends". A positive timeout is never that sentinel: `PeerOptions.ToMicros`
@@ -1691,7 +1722,8 @@ leaving no owner marks, cancel, expiry at scheduling time, close, an epoch reset
 engine keeping the closed epoch's partial until its next datagram, and a resume that fragments again after the owner map
 was reset); `RequestResponseTests` (the happy path, keyed and compressed requests, 64 concurrent requests answered in
 reverse order, 32 of them over a lossy, jittering link with plain messages interleaved, timeouts served by Poll and by
-Flush, the published deadline moving on to the next request's timeout, a response after the timeout, cancellation that
+Flush, a request made after a stall longer than its timeout not timing out in the Flush that sends it, the published
+deadline moving on to the next request's timeout, a response after the timeout, cancellation that
 does not cancel the send, a cancellation that loses to the response, an unmatched response, a response
 drained rather than polled — which is also what reclaims a canceled slot — a `Drain` that hands the caller the plain
 message and not the response, a response waiting in the ring behind full drain queues and a held message, taken by

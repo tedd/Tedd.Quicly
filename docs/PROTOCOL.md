@@ -434,7 +434,18 @@ slot is freed at the same event, because no further state will ever be reported.
   timer, which then acts as the game thread.
 * `Immediate` = eligible for transmission now, together with whatever is already buffered for that peer; it
   bypasses only the batching delay. Congestion control and pacing still apply.
-* Expiry is evaluated at scheduling time, never after hand-off. Unreliable datagrams are submitted with
+* Expiry is evaluated at scheduling time, never after hand-off. A message's expiry measures **how long the
+  scheduler has held it back**, not its age since the send call: the clock starts at the first scheduler pass
+  after the message was admitted (the next `Flush`, or the pass an `Immediate` send runs), that pass never
+  expires it, and a later pass drops it when more than its expiry has elapsed since the first one. What holds a
+  message back across passes is the send cap, datagrams being unavailable, a stream that is blocked or still
+  starting, or the group interval. A message that is sent in its first pass is therefore never expired, however
+  long the host took between the send call and the `Flush` — a long frame, a slow server tick, or a peer that
+  was not polled do not drop it. Time before the first pass is not counted; a host that needs a hard age limit
+  from the send call cancels the message (`TryCancel`) instead. (Implementations that counted expiry from
+  admission, against the clock stamp of their last pass, dropped every `UnreliableSequenced` message whenever
+  that stamp was older than the expiry; the rule above replaces that and changes nothing on the wire.)
+  Unreliable datagrams are submitted with
   cancel-on-blocked semantics (`DropWhenBlocked`, default on): a datagram that cannot be sent immediately
   because of congestion is dropped and counted as `Expired`. Default `Expiry` is 0 (none) for reliable
   channels and 2× the flush interval for `UnreliableSequenced`.

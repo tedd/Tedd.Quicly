@@ -29,7 +29,19 @@ public readonly struct SendOptions
     /// <summary>Opaque application value carried with the send (reported with its completion).</summary>
     public ulong Context { get; init; }
 
-    /// <summary>Expiry in microseconds from admission; 0 = the channel's default (PROTOCOL.md §4.5).</summary>
+    /// <summary>
+    /// Expiry in microseconds; 0 = the channel's default (PROTOCOL.md §4.5). It is the longest the scheduler may hold the
+    /// message back, <em>not</em> its age since this send call: the clock starts at the first scheduler pass after the
+    /// send (the next <see cref="QuiclyPeer.Flush"/>, or the pass of an <see cref="SendMode.Immediate"/> send), that pass
+    /// never expires the message, and a later pass drops it (<see cref="DeliveryStatus.Expired"/>) when more than this has
+    /// elapsed since the first.
+    /// </summary>
+    /// <remarks>
+    /// A message that goes out in its first pass is therefore never expired, however long the host took between the send
+    /// and the Flush. Time before that first pass is not counted; to bound a message's age from the send call, track it and
+    /// <see cref="QuiclyPeer.TryCancel"/> it. (Earlier builds counted from the send, against the clock of the peer's last
+    /// Poll or Flush, and dropped messages that had never waited.)
+    /// </remarks>
     public long ExpiryMicros { get; init; }
 
     /// <summary>Options for an immediate, untracked send.</summary>

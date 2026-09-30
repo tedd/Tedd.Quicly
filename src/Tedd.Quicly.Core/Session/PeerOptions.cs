@@ -256,7 +256,12 @@ public sealed class PeerOptions
     /// <summary>Server: how long a session (and its token) survives a lost connection; sent as <c>HelloAck.graceMicros</c>. Default 30 s.</summary>
     public TimeSpan SessionGrace { get; set; } = TimeSpan.FromSeconds(30);
 
-    /// <summary>The host's expected flush period, used to resolve <see cref="ChannelDefinition.ExpiryTwiceFlushInterval"/>. Default 1/60 s.</summary>
+    /// <summary>
+    /// The host's expected flush period, used to resolve <see cref="ChannelDefinition.ExpiryTwiceFlushInterval"/>. Default
+    /// 1/60 s. A host that flushes more slowly does not lose messages to that default: expiry counts the time a message is
+    /// held back from its first scheduler pass on (PROTOCOL.md §4.5), so a message sent in the pass that first sees it
+    /// never expires.
+    /// </summary>
     public TimeSpan FlushInterval { get; set; } = TimeSpan.FromTicks(166_667);
 
     /// <summary>

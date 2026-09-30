@@ -157,7 +157,7 @@ public struct ChannelSendCounters
     [FieldOffset(8)] public long Bytes;
     /// <summary>Pending messages replaced by a newer value of the same key. Owner: game thread.</summary>
     [FieldOffset(16)] public long Superseded;
-    /// <summary>Messages dropped because their expiry elapsed before sending. Owner: game thread.</summary>
+    /// <summary>Messages dropped because they were held back past their expiry, counted from their first scheduler pass. Owner: game thread.</summary>
     [FieldOffset(24)] public long Expired;
     /// <summary>Sends rejected because the channel queue or the send table was full. Owner: game thread.</summary>
     [FieldOffset(32)] public long QueueFull;

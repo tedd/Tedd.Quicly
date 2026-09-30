@@ -131,7 +131,9 @@ public class ReviewResumeThreadingCarrierTests
         }
 
         CarrierLoopbackHarness harness = new();
-        List<string> problems = ReviewResumeThreadingRaceTests.RunChaos(harness, streams: 12, rounds: 2, out long holds);
+        // Six rounds: how often the sink gets to hold depends on how MsQuic cuts the streams into indications, and two rounds
+        // came out at 76 to 135 holds — not always above the guard below. Six give 370 to 400 on an idle machine.
+        List<string> problems = ReviewResumeThreadingRaceTests.RunChaos(harness, streams: 12, rounds: 6, out long holds);
         Assert.True(problems.Count == 0, string.Join("\n", problems.Take(12)));
         Assert.True(holds > 100, $"only {holds} holds: the test did not exercise the resume path");
         Assert.Null(harness.CleanupError);

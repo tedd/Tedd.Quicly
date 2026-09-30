@@ -16,7 +16,7 @@
     <Authors>Tedd Hansen</Authors>
     <Company>Tedd Hansen</Company>
     <Product>Tedd.QUICLY</Product>
-    <!-- Base version of every package: keep it Major.Minor.Patch. nuget.yml adds the GitHub run number to the patch on each deploy, so bump Major.Minor here. -->
+    <!-- Base version of every package: keep it Major.Minor.Patch. nuget-publish.yml adds the GitHub run number to the patch on each deploy, so bump Major.Minor here. -->
     <Version>0.2.0</Version>
     <RepositoryUrl>https://github.com/tedd/Tedd.QUICLY</RepositoryUrl>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>

@@ -57,7 +57,7 @@ Every benchmark change is recorded in `docs/benchmarks/<area>.md` with hypothesi
 
 ## Releasing
 
-Pushing to the `deploy` branch runs `.github/workflows/nuget.yml`: it packs every `src/` project, which builds the
+Pushing to the `deploy` branch runs `.github/workflows/nuget-publish.yml`: it packs every `src/` project, which builds the
 solution, and pushes the packages and their symbol packages to nuget.org; a failed build stops the publish. The same
 push runs `.github/workflows/pages.yml`, so the project site and the packages on nuget.org always describe the same
 version. Ordinary builds and pull requests are covered by `.github/workflows/ci.yml`; nothing is published from them.
@@ -84,9 +84,9 @@ bad merge fails CI whatever the test selection is.
   rerun of the same run keeps its version. Bump `Major.Minor` in `Directory.Build.props` to start a new line. The
   published commit is tagged `v<version>`.
 * **Credentials.** There is no API key secret. The workflow exchanges its GitHub OIDC token for a short-lived
-  nuget.org key (trusted publishing) under the nuget.org user named in `nuget.yml`.
+  nuget.org key (trusted publishing) under the nuget.org user named in `nuget-publish.yml`.
 * **One-time setup on nuget.org.** Under the account's *Trusted Publishing*, add a policy for repository owner
-  `tedd`, repository `Tedd.QUICLY`, workflow file `nuget.yml` (file name only, no environment). It must allow
+  `tedd`, repository `Tedd.QUICLY`, workflow file `nuget-publish.yml` (file name only, no environment). It must allow
   publishing new packages as well as new versions. While the repository is private the policy is only
   temporarily active: it turns permanent after the first successful publish and lapses after 7 days without one
   (it can be restarted from the same page).

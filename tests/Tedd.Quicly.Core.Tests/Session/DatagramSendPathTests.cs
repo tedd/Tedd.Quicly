@@ -177,11 +177,28 @@ public class DatagramSendPathTests
         Assert.True(h.RunUntil(() => client.GetDeliveryStatus(lost.Token) != DeliveryStatus.Pending));
         Assert.Equal(DeliveryStatus.Lost, client.GetDeliveryStatus(lost.Token));
 
-        SendResult expired = client.SendCopy(new SendHeader(2), [3], new SendOptions { Track = true, ExpiryMicros = 1_000 });
-        h.Network.Advance(2_000);
-        client.Flush();
-        Assert.Equal(DeliveryStatus.Expired, client.GetDeliveryStatus(expired.Token));
-        Assert.Equal(1, DatagramKit.ChannelStats(client, 2).Expired);
+        // Expired: held back for longer than its expiry. The expiry runs from the message's first scheduler pass
+        // (PROTOCOL.md §4.5), so it takes something that holds it back across passes — here a send cap that one 900-byte
+        // datagram has overdrawn for most of a second.
+        using (SessionHarness capped = new(table: Table, client: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.MaxSendBytesPerSecond = 1_000;
+        }, server: DatagramKit.Quiet))
+        {
+            QuiclyPeer sender = capped.Client;
+            Assert.True(sender.SendCopy(new SendHeader(2), new byte[900]).IsAdmitted);
+            sender.Flush();
+            Assert.Equal(1, DatagramKit.ChannelStats(sender, 2).Sent);
+            SendResult expired = sender.SendCopy(new SendHeader(2), [3], new SendOptions { Track = true, ExpiryMicros = 1_000 });
+            sender.Flush();
+            Assert.Equal(DeliveryStatus.Pending, sender.GetDeliveryStatus(expired.Token));
+            capped.Network.Advance(2_000);
+            sender.Flush();
+            Assert.Equal(DeliveryStatus.Expired, sender.GetDeliveryStatus(expired.Token));
+            Assert.Equal(1, DatagramKit.ChannelStats(sender, 2).Expired);
+            Assert.Equal(1, DatagramKit.ChannelStats(sender, 2).Sent);
+        }
 
         SendResult canceled = client.SendCopy(new SendHeader(2), [4], SendOptions.Tracked);
         Assert.True(client.TryCancel(canceled.Token));

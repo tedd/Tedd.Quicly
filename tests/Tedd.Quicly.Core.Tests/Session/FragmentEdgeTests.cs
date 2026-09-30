@@ -327,13 +327,28 @@ public unsafe class FragmentEdgeTests
     [Fact]
     public void A_Fragmented_Message_Expires_At_Scheduling_Time()
     {
-        using SessionHarness h = new(table: Table, client: DatagramKit.Quiet, server: DatagramKit.Quiet);
+        // A send cap of 1 000 B/s (a 33-byte burst) that one 900-byte datagram overdraws: every datagram after it is held
+        // back for most of a second.
+        using SessionHarness h = new(table: Table, client: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.MaxSendBytesPerSecond = 1_000;
+        }, server: DatagramKit.Quiet);
         QuiclyPeer client = h.Client;
+        Assert.True(client.SendCopy(new SendHeader(7), new byte[900]).IsAdmitted);
+        client.Flush();
+        Assert.Equal(1, DatagramKit.ChannelStats(client, 7).Sent);
+
         SendResult result = client.SendCopy(
             new SendHeader(2),
             DatagramKit.Payload(1, 4_000),
             new SendOptions { Track = true, ExpiryMicros = 1_000 });
         Assert.Equal(SendStatus.Admitted, result.Status);
+
+        // The first pass starts the expiry of all four fragments and the cap holds them back.
+        client.Flush();
+        Assert.Equal(DeliveryStatus.Pending, client.GetDeliveryStatus(result.Token));
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 2).Expired);
 
         // PROTOCOL.md §4.5: expiry is evaluated when the scheduler reaches the entry, so every fragment is dropped.
         h.Network.Advance(20_000);
@@ -341,6 +356,7 @@ public unsafe class FragmentEdgeTests
         client.Poll();
         Assert.Equal(DeliveryStatus.Expired, client.GetDeliveryStatus(result.Token));
         Assert.Equal(4, DatagramKit.ChannelStats(client, 2).Expired);
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 2).Sent);
         Assert.Equal(0, DatagramKit.Statistics(client).SendBytesOutstanding);
     }
 

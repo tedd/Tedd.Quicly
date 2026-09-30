@@ -97,6 +97,28 @@ public class RequestResponseTests
     }
 
     [Fact]
+    public void A_Request_After_A_Stall_Longer_Than_Its_Timeout_Does_Not_Time_Out_At_Once()
+    {
+        // The timeout counts from the call. Counted from the peer's last pass it would already be over here, and the Flush
+        // that sends the request would time it out first (its timer pass runs before its scheduler pass).
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        Echo(h.Server!, 10);
+        h.Pump();
+        h.Network.Advance(200_000); // no Poll and no Flush: the last pass is four timeouts old
+
+        ValueTask<ReceiveLease> pending = client.SendRequestAsync(new SendHeader(10), new byte[] { 1, 2, 3 }, TimeSpan.FromMilliseconds(50));
+        Assert.Equal(h.Clock.NowMicros + 50_000, OrderedKit.Engine(client).RequestDeadlineMicros);
+        client.Flush();
+        Assert.False(pending.IsCompleted, "the request timed out in the Flush that sent it");
+        Assert.True(h.RunUntil(() => pending.IsCompleted), "no response arrived");
+        ReceiveLease response = pending.Result;
+        Assert.Equal(new byte[] { 3, 2, 1 }, response.Payload.ToArray());
+        client.Release(in response);
+        Assert.Equal(0, DatagramKit.Statistics(client).RequestsTimedOut);
+    }
+
+    [Fact]
     public void Requests_Of_Every_Shape_Are_Answered()
     {
         using SessionHarness h = Harness();

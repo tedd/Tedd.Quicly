@@ -161,7 +161,9 @@ public class FlushAllGateTests
     [Fact]
     public async Task A_Send_After_A_Quiet_Stretch_Keeps_Its_Whole_Expiry()
     {
-        // Engines stamp expiry from the pass clock of the last Poll or Flush: a skipped flush must still move it on.
+        // A send after many skipped flushes is served by the next FlushAll with its whole expiry ahead of it. (The expiry
+        // starts at that pass, PROTOCOL.md §4.5, so this no longer depends on SkipFlush moving the pass clock on; that
+        // clock still serves ReliableLatest's budgets and retry timers.)
         await using ServerFixture f = new(o =>
         {
             o.PeerOptions.PingInterval = TimeSpan.FromSeconds(10);
@@ -177,6 +179,35 @@ public class FlushAllGateTests
         Assert.True(peer.SendCopy(new SendHeader(4), [5, 5], new SendOptions { ExpiryMicros = 50_000 }).IsAdmitted);
         Ticks(f, 5, ref tick);
         Assert.Equal([5, 5], Assert.Single(received));
+        Assert.True(peer.GetChannelStatistics(4, out ChannelStatistics statistics));
+        Assert.Equal(0, statistics.Expired);
+    }
+
+    [Fact]
+    public async Task A_Long_Server_Tick_Does_Not_Expire_Sends_To_A_Quiet_Peer()
+    {
+        // PollAll does not poll a peer without pending work, so a quiet peer's last pass is the previous FlushAll. A server
+        // tick longer than a message's expiry must not expire what that tick sends: the message was never held back.
+        await using ServerFixture f = new(o =>
+        {
+            o.PeerOptions.PingInterval = TimeSpan.FromSeconds(10);
+            o.PeerOptions.FastLockDuration = TimeSpan.Zero;
+        });
+        QuiclyPeer client = f.ConnectAdmitted();
+        List<byte[]> received = [];
+        client.RegisterHandler(4, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => received.Add(payload.ToArray()));
+        QuiclyPeer peer = f.ServerPeerOf(client);
+        uint tick = 0;
+        Ticks(f, 40, ref tick);
+
+        // One 100 ms server tick: the clock moves and nothing on the server runs.
+        f.Network.Advance(100_000);
+        f.PumpClients();
+        Assert.True(peer.SendCopy(new SendHeader(4), [6, 6], new SendOptions { ExpiryMicros = 50_000 }).IsAdmitted);
+        f.Server.PollAll();
+        f.Server.FlushAll(++tick);
+        Deliver(f);
+        Assert.Equal([6, 6], Assert.Single(received));
         Assert.True(peer.GetChannelStatistics(4, out ChannelStatistics statistics));
         Assert.Equal(0, statistics.Expired);
     }

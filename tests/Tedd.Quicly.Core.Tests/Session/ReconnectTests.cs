@@ -124,6 +124,42 @@ public class ReconnectTests
     }
 
     [Fact]
+    public void An_Expiry_Waiting_For_Its_First_Pass_Does_Not_Outlive_The_Lost_Connection()
+    {
+        using SessionHarness h = new(connect: false, client: QuietOptions.Apply, server: QuietOptions.Apply);
+        AcceptResumes(h);
+        Assert.True(h.RunUntilConnected());
+        QuiclyPeer oldServer = h.Server!;
+
+        // Channel 3 has the default expiry; the message is queued and no scheduler pass follows, so its deadline is still
+        // waiting for one when the connection is lost.
+        SendResult pending = h.Client.SendCopy(new SendHeader(3, 1), [1], SendOptions.Tracked);
+        Assert.True(pending.IsAdmitted);
+        Assert.True(h.Client.Core.HasPendingExpiry);
+        CutTheConnection(h);
+        h.Network.Advance(500_000);
+
+        h.Client.Reconnect(h.Connector, h.Listener.LocalEndPoint, "test", default);
+        Assert.Equal(DeliveryStatus.Disconnected, h.Client.GetDeliveryStatus(pending.Token));
+        Assert.False(h.Client.Core.HasPendingExpiry);
+        Assert.True(h.RunUntil(() => h.Client.State == PeerState.Connected && h.Server is not null
+            && !ReferenceEquals(h.Server, oldServer) && h.Server.State == PeerState.Connected));
+        oldServer.Dispose();
+
+        // The resumed connection expires nothing it should not: a new expiring send is delivered.
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server!.RegisterHandler(3, Handlers.Collect(got));
+        SendResult next = h.Client.SendCopy(new SendHeader(3, 1), [2], SendOptions.Tracked);
+        Assert.True(next.IsAdmitted);
+        h.Client.Flush();
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(next.Token) != DeliveryStatus.Pending));
+        Assert.Equal(DeliveryStatus.Delivered, h.Client.GetDeliveryStatus(next.Token));
+        Assert.Equal(new byte[] { 2 }, Assert.Single(got).Payload);
+        Assert.True(h.Client.GetChannelStatistics(3, out ChannelStatistics statistics));
+        Assert.Equal(0, statistics.Expired);
+    }
+
+    [Fact]
     public void An_In_Flight_Carrier_Is_Completed_And_Its_Segments_Reclaimed()
     {
         using SessionHarness h = new(link: new LinkOptions { DelayMicros = 50_000 }, connect: false,

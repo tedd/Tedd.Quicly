@@ -520,24 +520,39 @@ public class OrderedStreamTests
     [Fact]
     public void A_Message_That_Expires_Behind_The_Head_Is_Left_Out_Of_The_Stream_Send()
     {
-        using SessionHarness h = new(table: Table);
+        // A send cap of 20 000 B/s: the burst is 666 bytes, so a 1 000-byte message leaves a debt of some 340 bytes that
+        // takes about 17 ms to repay.
+        using SessionHarness h = new(table: Table, client: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.MaxSendBytesPerSecond = 20_000;
+        }, server: DatagramKit.Quiet);
         List<(ReceiveHeader Header, byte[] Payload)> got = [];
         h.Server!.RegisterHandler(4, Handlers.Collect(got));
         Assert.True(h.Client.SendCopy(new SendHeader(4), [0]).IsAdmitted);
         Assert.True(h.RunUntil(() => got.Count == 1));
+        h.Run(100_000); // the cap's bucket is full again
+        Assert.True(h.Client.SendCopy(new SendHeader(4), new byte[1_000]).IsAdmitted);
+        h.Client.Flush();
+        Assert.Equal(0, OrderedKit.Stats(h.Client, 4).QueuedMessages);
 
-        // Queued with no pass in between: the head never expires, the message behind it expires before the next Flush.
+        // The first pass starts the middle message's expiry and the cap holds all three back; by the next pass, 20 ms
+        // later, it has waited out its 1 ms. The head has no expiry, so the expired message is met behind it.
         Assert.True(h.Client.SendCopy(new SendHeader(4), [1]).IsAdmitted);
         SendToken expiring = h.Client.SendCopy(new SendHeader(4), [2], new SendOptions { Track = true, ExpiryMicros = 1_000 }).Token;
         Assert.True(h.Client.SendCopy(new SendHeader(4), [3]).IsAdmitted);
-        h.Network.Advance(5_000);
         h.Client.Flush();
-        Assert.True(h.RunUntil(() => got.Count == 3 && h.Client.GetDeliveryStatus(expiring) != DeliveryStatus.Pending));
+        Assert.Equal(3, OrderedKit.Stats(h.Client, 4).QueuedMessages);
+        Assert.Equal(DeliveryStatus.Pending, h.Client.GetDeliveryStatus(expiring));
+        h.Network.Advance(20_000);
+        h.Client.Flush();
+        Assert.True(h.RunUntil(() => got.Count == 4 && h.Client.GetDeliveryStatus(expiring) != DeliveryStatus.Pending));
         Assert.Equal(DeliveryStatus.Expired, h.Client.GetDeliveryStatus(expiring));
-        Assert.Equal(new byte[] { 1 }, got[1].Payload);
-        Assert.Equal(new byte[] { 3 }, got[2].Payload);
+        Assert.Equal(1_000, got[1].Payload.Length);
+        Assert.Equal(new byte[] { 1 }, got[2].Payload);
+        Assert.Equal(new byte[] { 3 }, got[3].Payload);
         Assert.Equal(1, OrderedKit.Stats(h.Client, 4).Expired);
         h.Run(100_000);
-        Assert.Equal(3, got.Count);
+        Assert.Equal(4, got.Count);
     }
 }

@@ -63,6 +63,60 @@ public class DatagramZeroAllocationTests
     }
 
     [Fact]
+    public void Expiring_Traffic_Does_Not_Allocate()
+    {
+        // The channels above switch expiry off; these keep it, so every send marks its entry and every Flush resolves the
+        // marks against its clock (PeerCore.StampExpiry / ResolveExpiry). 2 has the UnreliableSequenced default.
+        ChannelTable table = ChannelTable.Create()
+            .Add(2, "moves", ChannelMode.UnreliableSequenced, o => o.Keyed = true)
+            .Add(3, "events", ChannelMode.UnreliableUnordered, o => o.ExpiryMicros = 50_000)
+            .Build();
+        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 10_000, JitterMicros = 2_000 }, table: table);
+        SimulatedNetwork network = h.Network;
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        long received = 0;
+        MessageHandler count = (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++;
+        server.RegisterHandler(2, count);
+        server.RegisterHandler(3, count);
+        byte[] payload = new byte[64];
+        uint tick = 0;
+        void Tick()
+        {
+            for (int i = 0; i < 16; i++)
+            {
+                client.SendCopy(new SendHeader(2, (ulong)i), payload);
+                client.SendCopy(new SendHeader(3), payload);
+            }
+
+            client.SendCopy(new SendHeader(3), payload, new SendOptions { ExpiryMicros = 5_000 });
+            client.Flush(++tick);
+            network.Advance(16_667);
+            server.Poll();
+            server.Flush();
+            client.Poll();
+        }
+
+        for (int i = 0; i < 600; i++)
+        {
+            Tick();
+        }
+
+        WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 120; i++)
+            {
+                Tick();
+            }
+        });
+        Assert.True(received > 600 * 20, $"{received} messages");
+        Assert.False(client.Core.HasPendingExpiry);
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 2).Expired);
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 3).Expired);
+        Assert.Equal(PeerState.Connected, client.State);
+    }
+
+    [Fact]
     public void Sequenced_Receive_Across_The_16_Bit_Wrap_Does_Not_Allocate()
     {
         // Every window sends more than 65 536 messages on each channel, so the receiver's sequence clock (PROTOCOL.md §8)

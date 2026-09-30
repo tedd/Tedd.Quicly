@@ -235,17 +235,51 @@ public class SessionEdgeTests
     [Fact]
     public void Drain_Moves_Held_And_Foreign_Messages_Without_Losing_Order()
     {
-        using SessionHarness h = TestEngines.Create(out _, out _, both: o => o.ReceiveRingCapacity = 2);
+        // Only a message that may not be dropped is ever held, so the held one is a reliable message (channel 10); the
+        // unreliable channels 2 and 3 are the queued and the foreign ones. A ring of 2 gives a pool of 4 nodes: 2 for the
+        // unreliable channels, 1 reserved for each of the table's two reliable channels.
+        using SessionHarness h = TestEngines.Create(out _, out TestEngine engine, ChannelMode.ReliableOrdered, both: o => o.ReceiveRingCapacity = 2);
+        QuiclyPeer client = h.Client;
         QuiclyPeer server = h.Server!;
         ReceivedMessage[] buffer = new ReceivedMessage[8];
-        h.Client.SendCopy(new SendHeader(2), [1]);
-        h.Client.SendCopy(new SendHeader(2), [2]);
-        h.Network.Advance(1_000);
+
+        void Arrive(int streamMessages)
+        {
+            for (int i = 0; i < 100 && engine.Ends < streamMessages; i++)
+            {
+                h.Network.Advance(1_000);
+            }
+
+            h.Network.Advance(1_000);
+            Assert.Equal(streamMessages, engine.Ends);
+        }
+
+        // The pool fills: two unreliable messages, then two reliable ones in the nodes that are left.
+        client.SendCopy(new SendHeader(2), [1]);
+        client.SendCopy(new SendHeader(2), [2]);
+        client.Flush();
+        Arrive(0);
         server.Poll();
-        h.Client.SendCopy(new SendHeader(3), [30]);
-        h.Network.Advance(1_000);
+        client.SendCopy(new SendHeader(10), [10]);
+        client.SendCopy(new SendHeader(10), [11]);
+        Arrive(2);
+        server.Poll();
+
+        // A third reliable message is foreign to a Drain of channel 6 and finds no node: it is held, and stays held.
+        client.SendCopy(new SendHeader(10), [12]);
+        Arrive(3);
         Assert.Equal(0, server.Drain(6, buffer));
         Assert.Equal(0, server.Drain(6, buffer));
+        Assert.True(server.HasPendingWork);
+
+        // A message that arrives behind the held one waits in the ring.
+        client.SendCopy(new SendHeader(3), [30]);
+        client.Flush();
+        Arrive(3);
+        Assert.Equal(0, server.Drain(6, buffer));
+        Assert.Equal(0, server.Drain(3, buffer));
+
+        // Draining channel 2 frees two nodes: the held message moves into its queue and the ring opens again.
         Assert.Equal(2, server.Drain(2, buffer));
         Assert.Equal(1, buffer[0].Payload[0]);
         Assert.Equal(2, buffer[1].Payload[0]);
@@ -255,10 +289,17 @@ public class SessionEdgeTests
         Assert.Equal(1, server.Drain(3, buffer));
         Assert.Equal(30, buffer[0].Payload[0]);
         server.Release(buffer.AsSpan(0, 1));
+        Assert.Equal(3, server.Drain(10, buffer));
+        Assert.Equal(10, buffer[0].Payload[0]);
+        Assert.Equal(11, buffer[1].Payload[0]);
+        Assert.Equal(12, buffer[2].Payload[0]);
+        server.Release(buffer.AsSpan(0, 3));
         Assert.Equal(0, server.Poll());
         Assert.Empty(got);
         server.GetStatistics(out PeerStatistics stats);
         Assert.Equal(0, stats.ReceiveBytesOutstanding);
+        Assert.Equal(0, stats.DrainQueueDrops);
+        Assert.Equal(0, stats.ReceiveRingDrops);
     }
 
     [Fact]
@@ -276,13 +317,21 @@ public class SessionEdgeTests
     [Fact]
     public void Held_And_Queued_Messages_Are_Released_When_The_Session_Closes()
     {
-        using SessionHarness h = TestEngines.Create(out _, out _, both: o => o.ReceiveRingCapacity = 2);
+        // Reliable messages nobody drains: the pool (4 nodes for a ring of 2) fills, the fifth message is held and the ring
+        // fills behind it. (An unreliable channel is never held: it evicts its oldest queued message instead.)
+        using SessionHarness h = TestEngines.Create(out _, out TestEngine engine, ChannelMode.ReliableOrdered, both: o => o.ReceiveRingCapacity = 2);
         QuiclyPeer server = h.Server!;
-        h.Client.SendCopy(new SendHeader(2), [1]);
-        h.Client.SendCopy(new SendHeader(2), [2]);
-        h.Network.Advance(1_000);
-        server.Poll();
+        for (byte i = 0; i < 8; i += 2)
+        {
+            h.Client.SendCopy(new SendHeader(10), [i]);
+            h.Client.SendCopy(new SendHeader(10), [(byte)(i + 1)]);
+            h.Network.Advance(1_000);
+            server.Poll();
+        }
+
+        Assert.True(engine.Pended >= 1, "the ring never filled: no message was held");
         h.Client.SendCopy(new SendHeader(2), [3]);
+        h.Client.Flush();
         h.Network.Advance(1_000);
         server.Poll();
         server.GetStatistics(out PeerStatistics held);

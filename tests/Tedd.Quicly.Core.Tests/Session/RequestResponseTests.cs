@@ -786,14 +786,15 @@ public class RequestResponseTests
         // The invariant that replaces the per-path checks (docs/design/session-layer.md §7.8, "Where responses are
         // intercepted"): a response is taken where it leaves the receive ring, so the per-channel queues and the held slot —
         // which only ever receive what already left the ring — cannot hold one. Here both are really in use when the response
-        // arrives: a Drain-style channel's messages fill the queue pool, the next one is held, and the response waits in the
-        // ring behind it. Drain then walks all three paths in order — queue, held slot, ring — and must hand the caller only
-        // the plain messages while the response completes its request.
+        // arrives: a Drain-style reliable channel's messages fill the queue pool, the next one is held (a reliable message
+        // is never evicted), and the response waits in the ring behind it. Drain then walks all three paths in order —
+        // queue, held slot, ring — and must hand the caller only the plain messages while the response completes its
+        // request.
         using ServerHarness h = HeldBehindHarness(out ValueTask<ReceiveLease> pending);
         QuiclyPeer server = h.Server!;
 
         ReceivedMessage[] drained = new ReceivedMessage[4 * HeldPool];
-        int count = server.Drain(2, drained);
+        int count = server.Drain(4, drained);
         Assert.Equal(HeldPool + 1, count);
         for (int i = 0; i < count; i++)
         {
@@ -819,7 +820,7 @@ public class RequestResponseTests
         using ServerHarness h = HeldBehindHarness(out ValueTask<ReceiveLease> pending);
         QuiclyPeer server = h.Server!;
         List<(ReceiveHeader Header, byte[] Payload)> got = [];
-        server.RegisterHandler(2, Handlers.Collect(got));
+        server.RegisterHandler(4, Handlers.Collect(got));
 
         server.Poll();
         Assert.Equal(HeldPool + 1, got.Count);
@@ -837,13 +838,21 @@ public class RequestResponseTests
         Assert.Equal(0, h.Statistics().ReceiveBytesOutstanding);
     }
 
-    /// <summary>Drain-queue node pool of <see cref="HeldBehindHarness"/> (it is the receive ring's capacity).</summary>
-    private const int HeldPool = 8;
+    /// <summary>
+    /// Drain-queue node pool of <see cref="HeldBehindHarness"/>: the receive ring's capacity (the table's five reliable
+    /// channels need fewer than that; <see cref="ReceiveQueueLayout"/>).
+    /// </summary>
+    private const int HeldPool = 16;
 
     /// <summary>
     /// A server peer (the peer under test) with one request outstanding, whose drain queues are full, whose held slot holds a
     /// plain message and whose receive ring holds the request's response behind it — so nothing has matched it yet.
     /// </summary>
+    /// <remarks>
+    /// The channel that fills the pool is the reliable channel 4: only a message that may not be dropped is ever held. An
+    /// unreliable channel without a handler evicts its oldest queued message instead and never reaches the held slot
+    /// (<see cref="DrainBackpressureTests"/>).
+    /// </remarks>
     private static ServerHarness HeldBehindHarness(out ValueTask<ReceiveLease> pending)
     {
         ServerHarness h = new(table: Table, server: o =>
@@ -851,20 +860,35 @@ public class RequestResponseTests
             DatagramKit.Quiet(o);
             o.ReceiveRingCapacity = HeldPool;
         });
+        Assert.Equal(HeldPool, ReceiveQueueLayout.Compute(Table.All, HeldPool, h.Options.ReceiveBudgetBytes).Capacity);
         Assert.True(h.Admit(), "the raw client was not admitted");
         QuiclyPeer server = h.Server!;
         pending = server.SendRequestAsync(new SendHeader(10), new byte[] { 1 }, TimeSpan.Zero);
         Assert.False(pending.IsCompleted, "the request was refused");
         server.Flush();
 
-        // Channel 2 has no handler, so Poll moves its messages to the channel's drain queue: HeldPool of them fill the node
+        // Channel 4 has no handler, so Poll moves its messages to the channel's drain queue: HeldPool of them fill the node
         // pool and the next one is held, which stops Poll from taking anything else out of the ring.
+        ChannelDefinition chat = Table[4]!;
+        TransportStreamId chatStream = default;
         for (int i = 0; i <= HeldPool; i++)
         {
-            Assert.Equal(TransportStatus.Success, h.Raw.SendDatagram(DatagramKit.Frame(Table, 2, (uint)i, 0, [(byte)i])));
+            byte[] message = new byte[32];
+            int length = i == 0 ? StreamFraming.WritePreamble(message, chat.Id) : 0;
+            StreamMessageHeader plain = default;
+            plain.Length = 1;
+            length += StreamFraming.WriteFrameHeader(message.AsSpan(length), chat, in plain);
+            message[length++] = (byte)i;
+            TransportStatus status = i == 0
+                ? h.Raw.OpenUni(message.AsSpan(0, length), out chatStream)
+                : RawClient.SendStream(h.Raw.Transport, chatStream, message.AsSpan(0, length), TransportSendFlags.None);
+            Assert.Equal(TransportStatus.Success, status);
             h.Network.Advance(1_000);
             server.Poll();
         }
+
+        Assert.True(server.GetChannelStatistics(4, out ChannelStatistics flooded));
+        Assert.Equal(HeldPool + 1, flooded.Received);
 
         // The peer's response to request 1 (RequestId 2, PROTOCOL.md §3.1) arrives behind the held message.
         ChannelDefinition rpc = Table[10]!;

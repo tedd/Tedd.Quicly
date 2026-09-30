@@ -838,7 +838,7 @@ internal abstract unsafe partial class DatagramEngine
     /// </summary>
     private void PublishReassembled(int local, int dense, in MessageHeader header, in BufferLease lease, int length, long nowMicros, ref ChannelRecvCounters counters)
     {
-        if (!Accept(local, in header, out int keySlot, ref counters))
+        if (!Accept(local, in header, out int keySlot, nowMicros, ref counters))
         {
             _core.ReturnReceive(in lease);
             return;

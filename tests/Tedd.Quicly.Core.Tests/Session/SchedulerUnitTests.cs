@@ -83,24 +83,46 @@ public class SchedulerUnitTests
         })
         .Build();
 
+    /// <summary>The tracker takes sequences extended on the channel's clock: the first sequence of a 32-bit channel is seeded one span up.</summary>
+    private const ulong Wide = 0x1_0000_0000UL;
+
+    /// <summary>The seed of a 16-bit channel's clock.</summary>
+    private const ulong Narrow = 0x1_0000UL;
+
+    [Fact]
+    public void Key_Tracker_Orders_By_Extended_Value()
+    {
+        // 40 000 channel messages after a key's last value is more than half of a 16-bit space: in serial arithmetic the
+        // new value reads as older. On the extended scale it is simply greater.
+        using ReceiveKeyTracker keys = new(KeyTables[3]!);
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(1, Narrow, out int slot));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(1, Narrow + 40_000, out int again));
+        Assert.Equal(slot, again);
+        Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(1, Narrow + 40_000, out _));
+        Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(1, Narrow + 39_999, out _));
+
+        // Several cycles later the same low bits are a new value.
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(1, (5 * Narrow) + 40_000, out _));
+    }
+
     [Fact]
     public void Key_Tracker_Accepts_Newer_Values_And_Evicts_The_Least_Recently_Updated_Key()
     {
         using ReceiveKeyTracker keys = new(KeyTables[2]!);
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(10, 5, false, out int slot10));
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(20, 6, false, out _));
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(30, 7, false, out _));
-        Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(10, 5, false, out _));
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(10, 8, false, out int again));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(10, Wide + 5, out int slot10));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(20, Wide + 6, out _));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(30, Wide + 7, out _));
+        Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(10, Wide + 5, out _));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(10, Wide + 8, out int again));
         Assert.Equal(slot10, again);
 
         // Least recently updated first: 20, 30, 10.
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(40, 1, false, out _));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(40, Wide + 1, out _));
         Assert.Equal(1, keys.Evictions);
         Assert.Equal(3, keys.Count);
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(20, 0, false, out _));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(20, Wide + 0, out _));
         Assert.Equal(2, keys.Evictions);
-        Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(10, 8, false, out _));
+        Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(10, Wide + 8, out _));
         Assert.True(keys.TryTouch(30, out _));
         Assert.Equal(3, keys.Evictions);
         Assert.True(keys.TryTouch(30, out _));
@@ -108,18 +130,20 @@ public class SchedulerUnitTests
 
         keys.Clear();
         Assert.Equal(0, keys.Count);
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(10, 0, false, out _));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(10, Wide + 0, out _));
     }
 
     [Fact]
     public void Key_Tracker_Uses_The_Key_As_Slot_In_A_Dense_Key_Space()
     {
         using ReceiveKeyTracker keys = new(KeyTables[3]!);
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(9, 65_535, true, out int slot9));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(9, Narrow + 65_535, out int slot9));
         Assert.Equal(9, slot9);
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(9, 0, true, out _));
-        Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(9, 65_535, true, out _));
-        Assert.Equal(KeyAcceptance.Rejected, keys.TryAcceptSequence(10, 1, true, out int none));
+
+        // The wire sequence wraps to 0; on the channel's clock that is the next cycle, and 65 535 is now behind it.
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(9, Narrow + 65_536, out _));
+        Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(9, Narrow + 65_535, out _));
+        Assert.Equal(KeyAcceptance.Rejected, keys.TryAcceptSequence(10, Narrow + 1, out int none));
         Assert.Equal(-1, none);
         Assert.False(keys.TryTouch(10, out _));
         Assert.True(keys.TryTouch(3, out int slot3));
@@ -128,7 +152,7 @@ public class SchedulerUnitTests
         Assert.Equal(2, keys.Count);
         Assert.Equal(0, keys.Evictions);
         keys.Clear();
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(9, 65_535, true, out _));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(9, Narrow + 65_535, out _));
     }
 
     [Fact]
@@ -137,21 +161,21 @@ public class SchedulerUnitTests
         using ReceiveKeyTracker keys = new(KeyTables[4]!);
         for (ulong key = 0; key < 1_000; key++)
         {
-            Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(key * 7_919, (uint)key, false, out _));
+            Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(key * 7_919, Wide + key, out _));
         }
 
         for (ulong key = 0; key < 1_000; key++)
         {
-            Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(key * 7_919, (uint)key, false, out _));
+            Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(key * 7_919, Wide + key, out _));
         }
 
         Assert.Equal(1_000, keys.Count);
         Assert.Equal(0, keys.Evictions);
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(123_456_789, 1, false, out _));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(123_456_789, Wide + 1, out _));
         Assert.Equal(1, keys.Evictions);
 
         // Key 0 was the least recently updated one, so it was evicted and is new again.
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(0, 0, false, out _));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(0, Wide + 0, out _));
         Assert.Equal(2, keys.Evictions);
     }
 

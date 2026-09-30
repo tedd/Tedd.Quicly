@@ -19,7 +19,7 @@ internal sealed class UnreliableUnorderedEngine : DatagramEngine
     protected override bool TracksKeys(ChannelDefinition channel) => channel.CoalesceOnReceive;
 
     /// <inheritdoc/>
-    protected override bool Accept(int local, in MessageHeader header, out int keySlot, ref ChannelRecvCounters counters)
+    protected override bool Accept(int local, in MessageHeader header, out int keySlot, long nowMicros, ref ChannelRecvCounters counters)
     {
         keySlot = -1;
         ReceiveKeyTracker? keys = KeysOf(local);

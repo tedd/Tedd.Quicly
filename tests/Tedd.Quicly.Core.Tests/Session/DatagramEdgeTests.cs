@@ -188,10 +188,13 @@ public class DatagramEdgeTests
             })
             .Build();
         using ReceiveKeyTracker keys = new(table[2]!);
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(1, 1, false, out _));
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(2, 1, false, out _));
-        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(1, 0, false, out _));
-        Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(1, 0, false, out _));
+
+        // The tracker takes sequences extended on the channel's clock (seeded one 32-bit span up).
+        const ulong Wide = 0x1_0000_0000UL;
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(1, Wide + 1, out _));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(2, Wide + 1, out _));
+        Assert.Equal(KeyAcceptance.Accepted, keys.TryAcceptSequence(1, Wide + 0, out _));
+        Assert.Equal(KeyAcceptance.Stale, keys.TryAcceptSequence(1, Wide + 0, out _));
         Assert.Equal(2, keys.Evictions);
         Assert.Equal(1, keys.Count);
     }

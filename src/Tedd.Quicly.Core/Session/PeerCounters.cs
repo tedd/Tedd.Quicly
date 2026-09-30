@@ -82,6 +82,9 @@ internal sealed class PeerCounters
     /// <summary>Partial reassemblies given up because they were not completed within 2 × RTT + 100 ms.</summary>
     public long ReassembliesExpired;
 
+    /// <summary>Times a sequenced channel's receive clock was resynchronised after a forward jump of half the sequence space or more (PROTOCOL.md §8).</summary>
+    public long SequenceResyncs;
+
     /// <summary>Highest receive ring occupancy seen (including reservations).</summary>
     public int ReceiveRingHighWater;
 

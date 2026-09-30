@@ -199,6 +199,16 @@ public struct PeerStatistics
     /// <summary>Partial reassemblies given up because they were not completed within 2 × RTT + 100 ms (PROTOCOL.md §7).</summary>
     public long ReassembliesExpired;
 
+    /// <summary>
+    /// Times the receive side of an <see cref="Channels.ChannelMode.UnreliableSequenced"/> channel resynchronised its
+    /// sequence clock: a sequence arrived that reads as older than the newest one seen on the channel, more than two
+    /// seconds after that newest one last advanced, and was therefore taken for a forward jump of at least half the
+    /// sequence space (a long blackout, or a sender whose messages expired unsent) instead of a late message
+    /// (PROTOCOL.md §8). Normally zero; a steadily rising value on a slow channel means messages arrive more than two
+    /// seconds late and are being delivered out of order.
+    /// </summary>
+    public long SequenceResyncs;
+
     /// <summary>Requests sent with <see cref="QuiclyPeer.SendRequestAsync"/>.</summary>
     public long RequestsSent;
 
@@ -246,7 +256,11 @@ public struct ChannelStatistics
     /// <summary>Payload bytes accepted.</summary>
     public long BytesReceived;
 
-    /// <summary>Messages dropped as stale or malformed.</summary>
+    /// <summary>
+    /// Messages dropped as malformed or as stale: not newer than the last accepted value of their key (or of the channel,
+    /// when unkeyed), ordered on the channel's sequence clock — so a key that idled for any length of time still has its
+    /// next value accepted (PROTOCOL.md §8).
+    /// </summary>
     public long Dropped;
 
     /// <summary>Received values replaced before the application saw them (coalescing).</summary>

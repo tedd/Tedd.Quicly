@@ -108,9 +108,13 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
     /// <param name="local">The channel's index within this engine.</param>
     /// <param name="header">The parsed header.</param>
     /// <param name="keySlot">The key's slot when the channel tracks keys (the mailbox index of a coalescing channel), else -1.</param>
+    /// <param name="nowMicros">The receive callback's clock stamp (for a reassembled message, that of the fragment that completed it).</param>
     /// <param name="counters">The channel's receive counters.</param>
     /// <returns><see langword="true"/> to deliver.</returns>
-    protected abstract bool Accept(int local, in MessageHeader header, out int keySlot, ref ChannelRecvCounters counters);
+    protected abstract bool Accept(int local, in MessageHeader header, out int keySlot, long nowMicros, ref ChannelRecvCounters counters);
+
+    /// <summary>The peer-level counters (the transport-thread group is this engine's to increment inside a receive callback).</summary>
+    protected PeerCounters PeerCounters => _core.Counters;
 
     /// <summary>The channel at <paramref name="local"/>.</summary>
     /// <param name="local">Index within this engine.</param>
@@ -556,7 +560,7 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
             return;
         }
 
-        if (!Accept(local, in header, out int keySlot, ref counters))
+        if (!Accept(local, in header, out int keySlot, nowMicros, ref counters))
         {
             return;
         }

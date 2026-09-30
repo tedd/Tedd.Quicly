@@ -19,7 +19,9 @@ internal enum KeyAcceptance : byte
 
 /// <summary>
 /// Receive-side per-key state of one datagram channel (transport thread only, ADR 0008 invariant 4): the channel's key
-/// table (hashed or dense), the last accepted sequence of every key and — for a hashed table — a least-recently-updated
+/// table (hashed or dense), the last accepted sequence of every key — as a 64-bit extended sequence on the channel's
+/// sequence clock (PROTOCOL.md §8), so a key's value stays comparable however long the key idles — and, for a hashed
+/// table, a least-recently-updated
 /// list, so a full table evicts the key updated longest ago (PROTOCOL.md §7: an evicted key re-accepts any sequence when
 /// it returns; that is the documented replay window). Slots come from the key table; they index the per-key arrays here
 /// and the channel's mailboxes. The arrays grow with the slots in use (fresh slots are handed out in increasing order) up
@@ -32,7 +34,7 @@ internal sealed class ReceiveKeyTracker : IDisposable
     private readonly KeyTable? _hashed;
     private readonly DenseKeyTable? _dense;
     private readonly int _maxKeys;
-    private NativeArray<uint> _last;
+    private NativeArray<ulong> _last;
     private NativeArray<ulong>? _keys;
     private NativeArray<int>? _older;
     private NativeArray<int>? _newer;
@@ -45,7 +47,7 @@ internal sealed class ReceiveKeyTracker : IDisposable
     {
         _maxKeys = channel.MaxKeys;
         int initial = Math.Min(_maxKeys, InitialSlots);
-        _last = new NativeArray<uint>(initial);
+        _last = new NativeArray<ulong>(initial);
         if (channel.KeySpace.IsDense)
         {
             _dense = new DenseKeyTable(_maxKeys);
@@ -66,26 +68,28 @@ internal sealed class ReceiveKeyTracker : IDisposable
     public long Evictions { get; private set; }
 
     /// <summary>
-    /// Sequenced acceptance of a value of <paramref name="key"/> (PROTOCOL.md §5: only values newer than the key's last
-    /// accepted one, in serial arithmetic of the channel's width). A new key accepts any sequence.
+    /// Sequenced acceptance of a value of <paramref name="key"/>: only a value newer than the key's last accepted one. The
+    /// comparison is a plain one between 64-bit extended sequences (PROTOCOL.md §8), so it holds however many channel
+    /// messages lie between the two. A new key accepts any sequence. A stale value leaves the key's slot and its place in
+    /// the least-recently-updated list untouched.
     /// </summary>
     /// <param name="key">The key.</param>
-    /// <param name="sequence">The value's sequence (the low 16 bits on a 16-bit channel).</param>
-    /// <param name="sixteenBit">The channel's sequences are 16 bits wide.</param>
+    /// <param name="extended">
+    /// The value's sequence extended on the channel's sequence clock by the caller
+    /// (<see cref="UnreliableSequencedEngine"/>; <see cref="SerialNumber.Extend(ulong, ushort)"/>).
+    /// </param>
     /// <param name="slot">The key's slot (valid unless <see cref="KeyAcceptance.Rejected"/>).</param>
     /// <returns>Whether to deliver the value.</returns>
-    public KeyAcceptance TryAcceptSequence(ulong key, uint sequence, bool sixteenBit, out int slot)
+    public KeyAcceptance TryAcceptSequence(ulong key, ulong extended, out int slot)
     {
         if (TryGetSlot(key, out slot))
         {
-            uint last = _last[slot];
-            bool newer = sixteenBit ? SerialNumber.IsNewer((ushort)sequence, (ushort)last) : SerialNumber.IsNewer(sequence, last);
-            if (!newer)
+            if (extended <= _last[slot])
             {
                 return KeyAcceptance.Stale;
             }
 
-            _last[slot] = sequence;
+            _last[slot] = extended;
             Touch(slot);
             return KeyAcceptance.Accepted;
         }
@@ -95,7 +99,7 @@ internal sealed class ReceiveKeyTracker : IDisposable
             return KeyAcceptance.Rejected;
         }
 
-        _last[slot] = sequence;
+        _last[slot] = extended;
         return KeyAcceptance.Accepted;
     }
 

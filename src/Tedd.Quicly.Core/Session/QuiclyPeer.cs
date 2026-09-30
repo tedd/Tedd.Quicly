@@ -349,6 +349,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.FragmentsDropped = Volatile.Read(ref c.FragmentsDropped);
         statistics.ReassembliesAbandoned = Volatile.Read(ref c.ReassembliesAbandoned);
         statistics.ReassembliesExpired = Volatile.Read(ref c.ReassembliesExpired);
+        statistics.SequenceResyncs = Volatile.Read(ref c.SequenceResyncs);
         statistics.RequestsSent = c.RequestsSent;
         statistics.RequestsTimedOut = c.RequestsTimedOut;
         statistics.ResponsesUnmatched = c.ResponsesUnmatched;

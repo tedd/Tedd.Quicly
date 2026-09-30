@@ -52,10 +52,23 @@ separately (`HelloAck.table`) and never adopted by the receiver.
 
 Sequence counters are **per channel**, not per key (one counter serves every key of a channel), and restart
 at 0 in every epoch. A key is therefore never confused with an earlier holder of the same key: the first
-message for a reused key is always newer than anything the receiver remembers. Comparison is RFC 1982 serial
-arithmetic in the channel's width; the maximum tolerated gap is 2^(bits−1)−1 *messages on the channel*. A
-channel sending N messages per second with 16-bit sequences therefore tolerates a receiver stall of at most
-32767/N seconds (≈ 5 min at 100 msg/s, ≈ 33 s at 1 000 msg/s); use 32 bits when in doubt.
+message for a reused key is always newer than anything the receiver remembers.
+
+A receiver orders values by their **position on the channel**, not by comparing two wire sequences of one key:
+it extends every arriving sequence (or `ReliableLatest` version) to 64 bits against the newest one it has seen
+on the channel, *for any key*, and remembers each key's last accepted value as that extended number (§8
+"sequence clock"). RFC 1982 serial arithmetic in the channel's width is used only for that one step, between an
+arrival and the channel's newest, which are close on a live channel. A **key may therefore idle indefinitely**
+while other keys of its channel are busy — 40 000 updates of one key between two updates of another on a 16-bit
+channel are fine.
+
+What remains is a limit on the channel as a whole: at most 2^(bits−1)−1 *consecutive messages of the channel
+that do not arrive* (a blackout, or sends that expire or are canceled before transmission, which use up
+numbers). Beyond it the next arrival reads as older than the newest. An `UnreliableSequenced` receiver then
+resynchronises as soon as its newest sequence has not advanced for 2 s (§8); a `ReliableLatest` receiver does
+not (a retransmission is legitimately old), so the affected values end `Failed` until the counter is back
+within range. A channel sending N messages per second with 16-bit sequences reaches the limit after a blackout
+of 32767/N seconds (≈ 5 min at 100 msg/s, ≈ 33 s at 1 000 msg/s); use 32 bits when in doubt.
 
 ## 2. Datagram frames
 
@@ -122,7 +135,7 @@ Body
 |---|---|---|
 | 0x01 | Ping | `t u32 LE` — sender's monotonic micros relative to the sender's connection start, truncated |
 | 0x02 | Pong | `t u32 LE` (echoed), `recv u32 LE`, `send u32 LE` — responder's relative micros at receipt and at send |
-| 0x03 | LatestAck | `count varint`, repeat `channel varint, key varint, version u32 LE` — cumulative: the highest version accepted for that key |
+| 0x03 | LatestAck | `count varint`, repeat `channel varint, key varint, version u32 LE` — the highest version accepted for that key (highest on the channel's version clock, §8); the sender completes a value only on an entry naming exactly the version it last transmitted for the key (§4.4) |
 | 0x04 | LatestReject | `count varint`, repeat `channel varint, key varint, version u32 LE, reason u8` — the receiver dropped this version locally (1 ring full, 2 too large, 3 decode error, 4 key table full); the sender MAY retry after a back-off |
 | 0x05 | BulkProgress | `transferId varint, bytesAccepted varint` |
 | 0x06–0x0F | reserved | (former Receipt/GroupReceipt/Applied ids; reserved for later versions) |
@@ -378,7 +391,7 @@ data is never used for authentication. Reconnect = new TLS handshake + QUICLY se
 |---|---|---|---|
 | Unreliable* | datagram handed to the network (transport SENT) | transport ack when the transport reports datagram send state (caps bit1); otherwise **never** (the send completes `Sent`) | `Sent`, `Lost`, `Expired`, `Canceled` (dropped when blocked) |
 | ReliableOrdered / ReliableUnordered | stream bytes acknowledged by the peer's QUIC stack | same event | `Disconnected`, `Failed` |
-| ReliableLatest | as above per transmission | `LatestAck` covering the version (cumulative) | `Superseded`, `Failed`, `Disconnected` |
+| ReliableLatest | as above per transmission | `LatestAck` naming the current version, which is the version last transmitted for the key (§4.4) | `Superseded`, `Failed`, `Disconnected` |
 | Bulk | per chunk | transfer complete (`BulkProgress` = Length) | `Canceled`, `Failed` |
 
 A QUIC acknowledgement proves delivery to the peer's transport, not that the peer application processed
@@ -401,7 +414,18 @@ slot is freed at the same event, because no further state will ever be reported.
   retry budget (default 10 % of the estimated bandwidth) scheduled *after* fresh sends.
 * Receiver: a version newer than the accepted one is accepted and acked; an older or duplicate version
   triggers a re-ack of the current version (so a lost ack cannot stall completion); `LatestReject` reports
-  local drops. Acks are cumulative per key: `LatestAck(v)` covers every `v' ≤ v` in serial arithmetic.
+  local drops. "Newer" is measured on the channel's version clock (§1, §8), not between two versions of the
+  key, so a key may idle while the channel's counter advances by 2^31 or more. The test is made when a
+  datagram value arrives and, for a large value, both when its stream starts and again when it ends: a value
+  overtaken by a newer version of its key while it was on its stream is dropped at its end and the newer
+  version is re-acked.
+* Sender: an ack names the highest version the receiver accepted for the key, which within an epoch is never
+  above the version the sender last transmitted for it. The sender therefore completes a value `Delivered` only
+  on a `LatestAck` entry whose version **equals** the version of its most recent transmission for the key, and
+  only while that is still the key's current version. Every other entry completes nothing: the ack of a
+  superseded value, of a closed epoch, a late duplicate of an earlier value's ack that arrives before the new
+  value's first transmission, or the re-ack of an older version by a receiver that dropped the new one. No
+  serial comparison is made, so no distance between two versions of a key can turn an old ack into a new one.
 
 ### 4.5 Scheduling
 
@@ -515,7 +539,7 @@ logging.
 | Limit | Default | On violation |
 |---|---|---|
 | per-peer receive byte budget (pooled leases + reassembly + stream staging) | 256 KiB | datagram channels: drop newest + count; stream channels: stop consuming (transport back-pressure), resume from Poll |
-| keys per channel per peer (`MaxKeys`) | 4 096 | UnreliableSequenced: evict least-recently-updated key (evicted keys re-accept any sequence; replay window documented); ReliableLatest: reject with `LatestReject(4)`, never evict |
+| keys per channel per peer (`MaxKeys`) | 4 096 | UnreliableSequenced: evict least-recently-updated key (evicted keys re-accept any sequence; replay window documented — a key still in the table that has idled for more than half the sequence range is in the same position for its next value, no wider: every wire value then extends above what the key holds, §8); ReliableLatest: reject with `LatestReject(4)`, never evict |
 | concurrent peer streams per channel (`MaxGroups`) | 8 (ReliableUnordered), 4 (large ReliableLatest), 2 (Bulk) | further streams are reset `LimitExceeded` |
 | stream idle mid-message | 30 s | stream reset `Timeout` |
 | concurrent reassemblies per channel (`MaxReassemblies`) | 16 | evict oldest; reassembly expiry 2 × RTT + 100 ms; on a channel whose sequence carries ordering (`UnreliableSequenced`), a newer sequence for the same key abandons the older partial |
@@ -554,6 +578,47 @@ Byte-exact examples are in [protocol-vectors.md](protocol-vectors.md).
   **11 729 bytes** always fits; each channel costs 6 … 75 bytes (≈ 1 950 unnamed channels). A server whose table
   section does not fit the frame MUST send `tableIncluded = 0` instead of an oversized frame; implementations should
   check the section length (`ChannelTableCodec.GetLengthWithNames`) against this budget when the table is built.
+* **§1 sequence clock (receiver-local; nothing here is on the wire).** Per channel and epoch a receiver keeps
+  `newest`, a 64-bit number, 0 = nothing seen. Let `span` = 2^bits and `half` = span / 2.
+  * *First arrival* `s`: `newest = span + s` (the bias keeps 0 free and leaves room below the seed).
+  * *Later arrival* `s`: `d` = (`s` − low bits of `newest`) as a signed number of the channel's width, in
+    [−half, half − 1]; its extended value is `ext = newest + d`. Exactly half the range apart is `d = −half`,
+    "behind", as in RFC 1982 serial comparison. If `d > 0`, `newest = ext`.
+  * *Per key*: a value is accepted iff the key has no state, or `ext` is greater than the key's last accepted
+    extended value, which it then replaces. The comparison is a plain 64-bit one. An unkeyed
+    `UnreliableSequenced` channel accepts iff `newest` advanced.
+  * *Resynchronisation, `UnreliableSequenced` only*: an arrival with `d < 0` more than **2 s** after `newest` last
+    advanced (on the receiver's clock) is taken for a forward jump of `span − |d|` — at least half the range —
+    instead of a late message: `ext = newest + span + d`, `newest = ext`, and the value is judged like any other
+    (counted in `PeerStatistics.SequenceResyncs`). QUIC never retransmits a DATAGRAM frame, so a late datagram
+    arrives near its successors and a two-second-old one is not plausible; a duplicate of the newest (`d = 0`)
+    never resynchronises. "Quiet" means `newest` did not advance, not that nothing arrived, so a clock left too
+    far ahead (a peer's mistake, or a message that really was 2 s late) heals within 2 s. The cost of a wrong
+    guess is one stale value delivered per key of the late burst, superseded by the key's next update. A 16-bit
+    channel faster than 16 384 msg/s can use up half its range inside the 2 s and then drops for at most 2 s.
+    A jump of an exact multiple of the range reads as a duplicate and costs one message.
+  * *`ReliableLatest`* uses the same clock with bits = 32 over its versions (datagram values and group-stream
+    values alike; version 0 is never sent, which only makes each wrap one number shorter) and **never**
+    resynchronises on time: a retransmission arrives behind the newest version after any length of quiet.
+  * *Lifetime*: the clock is forgotten with the keys — at an epoch reset and, for the datagram modes, when the
+    connection is replaced.
+  * *Hostile peers*: only the authenticated peer can produce datagrams, and it could always send any sequence.
+    A sequence far ahead moves the clock by less than half a range and makes that peer's own later values
+    stale; per-channel state stays fixed-size and per-message work O(1).
+  * *Interoperating with an implementation that compares per key in serial arithmetic* (the reference
+    implementation before this clarification). `UnreliableSequenced` is decided by the receiver of each
+    direction alone: a clock-keeping receiver is correct whatever the sender; a per-key receiver keeps dropping
+    the values of a key that idled past half the range until the counter comes round, and the sender cannot help
+    it. `ReliableLatest`, for a key idle for 2^31 versions or more:
+
+    | Sender | Receiver | Outcome |
+    |---|---|---|
+    | exact-version ack rule | version clock | accepted, acked, `Delivered` |
+    | cumulative ack rule | version clock | accepted, acked, `Delivered` (the ack names the new version) |
+    | exact-version ack rule | per-key serial | dropped and the old version re-acked; the sender ignores that ack and the value ends `Failed` after its budget — never `Delivered` |
+    | cumulative ack rule | per-key serial | dropped, and for distances above 2^31 the re-ack of the old version completes the new value: a `Delivered` for a value that never arrived |
+
+    Below 2^31 all four combinations behave identically.
 * **§1 defaults.** A channel's local `ExpiryMicros` default is 0 (none) for every mode except
   `UnreliableSequenced` (2 × the flush interval, §4.5), including `UnreliableUnordered`. `MaxGroups` defaults to 1
   for `ReliableOrdered` and 0 for datagram-only modes.

@@ -4,6 +4,38 @@ What an application that upgrades has to know, newest release first. The protoco
 [PROTOCOL.md](PROTOCOL.md), what is merged and measured in [STATUS.md](STATUS.md), and which counter explains a
 missing message in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
+## Unreleased: groups of a receiver that falls behind
+
+**There is no wire change**, and the fix is receiver-local: the end that receives is the end to upgrade.
+
+### Fixed
+
+* **A `ReliableUnordered` receiver that fell behind its sender lost whole groups, and the sender reported them
+  `Delivered`** (the first known limit of the release below). A sender counts a group's stream as closed when the
+  transport has acknowledged its data, which can be before the receiving application has read any of it, and
+  opens the next group then. A receiver that was behind — a late `Poll`, a full receive ring — therefore saw more
+  than `MaxGroups` streams of a channel from a conforming sender, and reset the excess (`StreamsReset`): 80 ms
+  without a `Poll` lost 128 of 320 messages in the test that found it, with nothing `Failed` on the sender.
+  `MaxGroups` is now a sender's bound only. A receiver accepts every group the connection's stream limit admits,
+  and its per-stream receive state is sized for that limit, including the 1 024 streams an MsQuic client grants
+  in its handshake. PROTOCOL.md §7, "`MaxGroups` is a sender's bound".
+* **`ReliableLatest`: a large value whose stream the peer's stream limit refused was counted as sent.** A value
+  that travels on a stream is now counted when its stream has started, a refused start goes out again as the
+  value's first transmission, and values that wait for a stream no longer hold up the small values behind them.
+* **A `Poll` resumed more held streams than the receive ring had room for**, so with many streams waiting every
+  Poll resumed all of them only for most to be held again. It now resumes as many as the ring can take.
+
+### Behaviour changes
+
+* `MsQuicTransportOptions.MaxStreams` no longer limits the streams a peer may open: the transport's stream table
+  is sized from what it grants the peer (the diagnostic sink says once when that raised the table), and the
+  option is the table's size when that is enough. It still limits this end's own streams: `OpenStream` answers
+  `OutOfMemory` once they hold everything the table has beyond the peer's grants.
+* `WebTransportOptions.MaxStreams` is no longer a limit (the carrier's table follows the streams in use), and the
+  carrier shows the session no more peer streams than it reported it would admit.
+* A large `ReliableLatest` channel and a `Bulk` channel still reset streams beyond their limit on the receiver.
+  That is not silent there: the value is not acknowledged and retried, the transfer ends with a status.
+
 ## 2026-09-30: messages dropped on localhost
 
 Packages are numbered by the publish workflow (`0.2.<run number>`), so this section is named by its date: it

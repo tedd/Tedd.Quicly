@@ -171,7 +171,7 @@ public class WorkSignalTests
     }
 
     [Fact]
-    public void A_Coalescing_Mailbox_Signals_And_Shows_Up_In_HasPendingWork()
+    public void A_Coalescing_Mailbox_Signals_And_Shows_Up_In_HasPendingWork_Once_It_Has_A_Handler()
     {
         RecordingWorkSignal clientSignal = new();
         RecordingWorkSignal serverSignal = new();
@@ -179,15 +179,20 @@ public class WorkSignalTests
         h.Server!.Poll();
         serverSignal.Take();
 
-        // A coalescing channel bypasses the receive ring: the mailbox raises the signal instead (ADR 0008 §6).
+        // A coalescing channel bypasses the receive ring: the mailbox raises the signal instead (ADR 0008 §6). Without a
+        // handler the value waits for Drain, which no Poll can do: it is not work for the probe, or a host that polls
+        // while there is work would poll for good.
         h.Client.SendCopy(new SendHeader(3, 42), [1, 2]);
         h.Client.Flush();
         h.Network.Advance(1_000);
         Assert.Equal(1, serverSignal.Calls);
-        Assert.True(h.Server.HasPendingWork);
+        Assert.False(h.Server.HasPendingWork);
+        Assert.False(h.Server.HasPendingPollWork);
 
+        // With a handler it is work for the next Poll, without a second arrival.
         int received = 0;
         h.Server.RegisterHandler(3, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
+        Assert.True(h.Server.HasPendingWork);
         h.Server.Poll();
         Assert.Equal(1, received);
         Assert.False(h.Server.HasPendingWork);

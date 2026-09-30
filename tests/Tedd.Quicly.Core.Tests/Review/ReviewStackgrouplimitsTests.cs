@@ -189,4 +189,62 @@ public class ReviewStackgrouplimitsTests
             + $"StreamReceivePends {after.StreamReceivePends}; the server still holds {GroupKit.OpenPeerGroups(server, Groups)} "
             + $"peer group stream(s) open; {received.Count(x => x < fillIndex)} of the {fillIndex} fill messages arrived");
     }
+
+    /// <summary>
+    /// The Bulk counterpart of the original group defect: a receiver that is behind rejects a stream of a sender that kept
+    /// the limit. An honest sender that cancels its transfers gets its slot back on the reset stream's close — on the
+    /// receiving end's transport thread, no Poll involved — and may start the next transfer at once. The receiving end,
+    /// though, has <c>BulkTransfersPerDirection</c> receive records, and a record of a finished transfer returns to the free
+    /// list only when its game thread has sent the final progress (BulkEngine.Receive OnStreamClosed → _retired → _recycle).
+    /// So after two cancels during one receiver hitch, the third transfer — started with nothing else live — is rejected
+    /// with LimitExceeded (StreamsReset++) and fails, although the sender never had more than one transfer live.
+    /// </summary>
+    [Fact]
+    public async Task A_Transfer_Started_After_Two_Cancels_During_A_Receiver_Hitch_Completes()
+    {
+        const ushort World = 5;
+        AcceptRouter router = AcceptRouter.Pattern();
+        using SessionHarness h = new(table: BulkTables.Main, client: BulkKit.Quiet, server: BulkKit.Receiver(router));
+        QuiclyPeer server = h.Server!;
+
+        // Only the client and the network run: the server's game thread is late.
+        bool ClientOnly(Func<bool> condition, long maxMicros = 5_000_000)
+        {
+            long end = h.Network.NowMicros + maxMicros;
+            while (!condition())
+            {
+                if (h.Network.NowMicros >= end)
+                {
+                    return false;
+                }
+
+                h.Network.AdvanceTo(h.Network.NowMicros + 1_000);
+                h.Client.Poll();
+                h.Client.Flush();
+            }
+
+            return true;
+        }
+
+        for (int i = 0; i < 2; i++)
+        {
+            int accepted = router.Accepted.Count;
+            BulkTransfer canceled = await h.Client.BeginBulkSendAsync(new BulkDescriptor(World, (ulong)(10 + i), 1, 4 * 1024 * 1024), new PatternSource(4 * 1024 * 1024));
+            Assert.True(ClientOnly(() => router.Accepted.Count > accepted), $"transfer {i} never reached the receiver's router");
+            canceled.Cancel();
+            Assert.True(ClientOnly(() => canceled.IsFinished && BulkKit.SendTransfers(h.Client, World) == 0 && BulkKit.SendStreams(h.Client, World) == 0),
+                $"cancel {i} did not give the sender its slot back without the receiver's game thread");
+        }
+
+        server.GetStatistics(out PeerStatistics before);
+        BulkTransfer third = await h.Client.BeginBulkSendAsync(new BulkDescriptor(World, 20, 1, 64 * 1024), new PatternSource(64 * 1024));
+        ClientOnly(() => third.IsFinished, 200_000);
+
+        // The server's game thread is back.
+        Assert.True(h.RunUntil(() => third.IsFinished, 10_000_000), "the third transfer never finished");
+        server.GetStatistics(out PeerStatistics after);
+        Assert.True(third.Status == BulkStatus.Completed,
+            $"a transfer started with nothing else live ended {third.Status} ({third.Result.Code}); the receiver reset "
+            + $"{after.StreamsReset - before.StreamsReset} stream(s) during its hitch and its router accepted {router.Accepted.Count} transfer(s)");
+    }
 }

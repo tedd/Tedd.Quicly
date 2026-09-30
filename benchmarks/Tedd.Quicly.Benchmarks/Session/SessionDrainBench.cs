@@ -15,6 +15,13 @@ namespace Tedd.Quicly.Benchmarks.Session;
 /// the drain queues' node pool (1 024 with the fixture's ring), so they measure what the path costs per message.
 /// <c>OrderedDrain64Burst</c> lets 1 000 messages arrive before the receiver polls once — a late frame, and nearly the
 /// whole pool in one Poll — and the cycle polls and drains until everything has arrived.
+/// <para>
+/// The channel takes receive credit (<see cref="QuiclyPeer.Poll"/>, "a reliable channel"). Every cycle drains it empty,
+/// so after the first one it counts as read and the ring is its limit: no stream is held back in any of the three, and
+/// what they measure of the credit is its bookkeeping — the count per message on both threads, the state check at the
+/// end of each Drain and at each pass start. The burst is about twice the channel's reserved share of the pool (512
+/// here), so half of it waits in nodes beyond the pool.
+/// </para>
 /// </remarks>
 [Config(typeof(InProcessShortRunConfig))]
 public class SessionDrainBench
@@ -45,6 +52,12 @@ public class SessionDrainBench
             OrderedDrain64();
             OrderedDrain4K();
             OrderedDrain64Burst();
+        }
+
+        // What the remarks promise: a channel that is drained every cycle is never held back for its credit.
+        if (!_server.GetChannelStatistics(Ordered, out ChannelStatistics statistics) || statistics.BacklogHolds != 0)
+        {
+            throw new InvalidOperationException($"The drained channel was held back {statistics.BacklogHolds} times during warm-up.");
         }
     }
 

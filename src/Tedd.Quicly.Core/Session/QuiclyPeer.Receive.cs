@@ -725,6 +725,7 @@ public sealed unsafe partial class QuiclyPeer
         ChannelTable table = _core.Table;
         int consumed = 0;
         StreamFrameParser snapshot = default;
+        record.WaitsForCredit = false;
         for (int i = 0; i < segments.Length; i++)
         {
             ReadOnlySpan<byte> segment = segments[i].AsSpan();
@@ -814,7 +815,9 @@ public sealed unsafe partial class QuiclyPeer
                 switch (result.Action)
                 {
                     case StreamConsumeAction.Pend:
-                        // Un-read the event; the transport holds the rest until Poll resumes the stream.
+                    case StreamConsumeAction.PendCredit:
+                        // Un-read the event; the transport holds the rest until the stream is resumed: by the next Poll, or
+                        // — held back for its channel's credit — once the application takes messages of the channel.
                         if (copy)
                         {
                             record.Parser = snapshot;
@@ -824,7 +827,24 @@ public sealed unsafe partial class QuiclyPeer
                             record.Parser.Rewind(in mark);
                         }
 
-                        _core.NotePendedStream(id);
+                        if (result.Action == StreamConsumeAction.PendCredit)
+                        {
+                            if (!_core.NoteCreditPendedStream(id, record.ChannelIndex, context.Header.Length))
+                            {
+                                // The list of held-back streams is full, many times over, of streams the peer reset while
+                                // they waited: this one would never be resumed. No sender of this library does that.
+                                NotifyEngineClosed(ref record, id, aborted: true, (ulong)QuiclyErrorCode.LimitExceeded);
+                                RequestLocalClose(QuiclyErrorCode.LimitExceeded);
+                                return ReceiveResult.Consumed(total);
+                            }
+
+                            record.WaitsForCredit = true;
+                        }
+                        else
+                        {
+                            _core.NotePendedStream(id);
+                        }
+
                         return ReceiveResult.PendingAfter(consumed + before);
                     case StreamConsumeAction.ResetStream:
                         AbortEngineStream(ref record, id, result.Code);
@@ -919,6 +939,13 @@ public sealed unsafe partial class QuiclyPeer
     {
         // The engine releases whatever the half-received message held, so the idle watch stops here either way.
         StreamTable.NoteProgress(ref record, 0);
+        if (record.WaitsForCredit)
+        {
+            // It will not take the credit it waits for: the streams waiting behind it must not wait for its turn.
+            record.WaitsForCredit = false;
+            _core.NoteCreditStreamGone();
+        }
+
         if (record.Tag == StreamTag.Engine)
         {
             record.Tag = StreamTag.Discard;

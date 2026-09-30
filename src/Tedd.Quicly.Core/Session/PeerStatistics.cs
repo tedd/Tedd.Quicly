@@ -100,9 +100,9 @@ public struct PeerStatistics
 
     /// <summary>
     /// Complete messages dropped on arrival because the receive ring was full: the game thread did not take messages out
-    /// fast enough, or a reliable channel without a handler is not drained and holds the ring (see
-    /// <see cref="QuiclyPeer.Poll"/>). An unreliable channel nobody drains does not cause this; its own backlog is
-    /// bounded and counted in <see cref="DrainQueueDrops"/>.
+    /// fast enough. A channel nobody drains does not cause this: an unreliable one has a bounded backlog, counted in
+    /// <see cref="DrainQueueDrops"/>, and a reliable one has its own streams held back
+    /// (<see cref="ChannelStatistics.BacklogHolds"/>; see <see cref="QuiclyPeer.Poll"/>).
     /// </summary>
     public long ReceiveRingDrops;
 
@@ -169,10 +169,11 @@ public struct PeerStatistics
     public long StreamBytesSent;
 
     /// <summary>
-    /// Stream receives held back by back-pressure (receive ring full or receive budget used up) and resumed from Poll. A
-    /// value that keeps rising while the peer is polled every tick means the ring is not being emptied: a reliable channel
-    /// has no handler and is not drained (see <see cref="QuiclyPeer.Poll"/>), and every Poll resumes the streams only for
-    /// them to be held back again.
+    /// Stream receives held back by back-pressure and resumed by the game thread: the receive ring was full or the receive
+    /// budget used up (resumed by the next Poll), or the stream's channel had its share waiting for the application
+    /// (<see cref="ChannelStatistics.BacklogHolds"/>; resumed when the application takes messages of that channel). A
+    /// value that keeps rising while no channel's <c>BacklogHolds</c> does means the ring or the budget is too small for
+    /// what arrives between two Polls.
     /// </summary>
     public long StreamReceivePends;
 
@@ -417,4 +418,18 @@ public struct ChannelStatistics
     /// arrival because the receive ring itself was full. Survives a reconnect.
     /// </summary>
     public long DrainQueueDrops;
+
+    /// <summary>
+    /// Times a stream of this channel was held back because too many of the channel's messages were waiting for the
+    /// application (ReliableOrdered and ReliableUnordered; always 0 for the other modes, and for a channel that has always
+    /// had a handler). A reliable channel that nobody reads — no handler, and not drained empty since the
+    /// <see cref="QuiclyPeer.Poll"/> before last — may have only its share of the drain queues and of the receive budget
+    /// waiting; one that is drained, as many messages as the receive ring holds and half the receive budget (see
+    /// <see cref="QuiclyPeer.Poll"/>). Nothing is lost and the receive ring stays open for the other channels: QUIC flow
+    /// control holds that stream's sender until the application takes messages of the channel or registers a handler for
+    /// it. A number that keeps rising on a channel the other end sends on means that nobody reads the channel, or that it
+    /// is read more slowly than it is written. Each hold is also counted in
+    /// <see cref="PeerStatistics.StreamReceivePends"/>. Survives a reconnect.
+    /// </summary>
+    public long BacklogHolds;
 }

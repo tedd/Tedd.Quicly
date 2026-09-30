@@ -163,6 +163,7 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             int dense = core.ChannelIndexOf(channel.Id);
             _localOf[dense] = local;
             _denseOf[local] = dense;
+            core.Credit.Enable(dense);
             _expiryMicros[local] = channel.ResolveExpiryMicros(core.FlushIntervalMicros);
             ref GroupSendState send = ref _send[local];
             send.ListHead = -1;
@@ -1450,6 +1451,12 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
                     return StreamConsume.ResetStream(QuiclyErrorCode.LimitExceeded);
                 }
 
+                // Before the ring slot and the lease: a channel that is out of credit takes neither.
+                if (!_core.Credit.TryTake(message.ChannelIndex, length))
+                {
+                    return StreamConsume.PendCredit;
+                }
+
                 if (!_core.TryReserveReceive())
                 {
                     return StreamConsume.Pend;
@@ -1462,6 +1469,8 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
                     return StreamConsume.Pend;
                 }
 
+                // Counted from here until the game thread hands the message on, or ReleaseReceive gives it up.
+                _core.Credit.NoteTaken(message.ChannelIndex, lease.Length);
                 recv.Lease = lease;
                 recv.Length = length;
                 recv.Filled = 0;
@@ -1535,6 +1544,11 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             return StreamConsume.ResetStream(QuiclyErrorCode.ProtocolViolation);
         }
 
+        if (!_core.Credit.TryTake(message.ChannelIndex, length))
+        {
+            return StreamConsume.PendCredit;
+        }
+
         if (!_core.TryReserveReceive())
         {
             return StreamConsume.Pend;
@@ -1552,6 +1566,7 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             message.Chunk.CopyTo(new Span<byte>(_core.GetPointer(in lease), length));
         }
 
+        _core.Credit.NoteTaken(message.ChannelIndex, lease.Length);
         ReceiveEntry entry = default;
         entry.Channel = message.Channel;
         int rawLength = message.Header.RawLength;
@@ -1672,6 +1687,9 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
     {
         if ((recv.Flags & RecvReserved) != 0)
         {
+            // A staged message is counted against its channel's credit; before the lease goes back, because its block
+            // size is what the message was counted with. recv.Local is valid here: a record in use staged it.
+            _core.ReturnStagedCredit(_denseOf[recv.Local], recv.Lease.Length);
             _core.CancelReservation();
             recv.Flags = (byte)(recv.Flags & ~RecvReserved);
         }

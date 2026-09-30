@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.State;
+using Tedd.Quicly.Core.Threading;
 
 namespace Tedd.Quicly.Core.Session;
 
@@ -26,10 +27,15 @@ internal static class ReceiveQueueClass
     public const byte Datagram = 1;
 
     /// <summary>
-    /// ReliableOrdered and ReliableUnordered: never dropped. Appended while a node is free and held by the peer when none
-    /// is, which stops the receive ring and back-pressures the streams; a share of the pool is reserved for these channels
-    /// (<see cref="ReceiveQueueLayout.ReliableNodes"/>) that the backlog of the <see cref="Datagram"/> class can never
-    /// occupy.
+    /// ReliableOrdered and ReliableUnordered: never dropped, and never the reason the receive ring stops. A share of the
+    /// pool is reserved for each of these channels (<see cref="ReceiveQueueLayout.ReliableNodes"/>) that the backlog of
+    /// the <see cref="Datagram"/> class can never occupy, and the channel's receive credit (<see cref="ReceiveCredit"/>)
+    /// keeps a channel without a handler within that share. What can exceed it — the messages a channel had on the way
+    /// when its handler was removed — goes to nodes beyond the pool (<see cref="ReceiveQueueLayout.ExcessNodes"/>).
+    /// A channel <em>with</em> a handler that a <see cref="QuiclyPeer.Drain"/> of another channel meets is appended while
+    /// a node of the pool is free and held by the peer when none is, until the next <see cref="QuiclyPeer.Poll"/>
+    /// dispatches it. A channel whose engine was replaced by one that takes no credit
+    /// (<see cref="PeerOptions.EngineFactory"/>) is queued like <see cref="Other"/>.
     /// </summary>
     public const byte Reliable = 2;
 
@@ -70,7 +76,8 @@ internal readonly struct ReceiveQueueLayout
     /// <param name="datagramBytes">Most block bytes the <see cref="ReceiveQueueClass.Datagram"/> channels pin together.</param>
     /// <param name="nodeFair">A datagram channel's fair share of <paramref name="datagramNodes"/>.</param>
     /// <param name="byteFair">A datagram channel's fair share of <paramref name="datagramBytes"/>.</param>
-    public ReceiveQueueLayout(int capacity, int reliableNodes, int datagramNodes, int datagramBytes, int nodeFair, int byteFair)
+    /// <param name="excessNodes">Most nodes beyond the pool that reliable channels without a handler may come to need.</param>
+    public ReceiveQueueLayout(int capacity, int reliableNodes, int datagramNodes, int datagramBytes, int nodeFair, int byteFair, int excessNodes = 0)
     {
         Capacity = capacity;
         ReliableNodes = reliableNodes;
@@ -78,6 +85,7 @@ internal readonly struct ReceiveQueueLayout
         DatagramBytes = datagramBytes;
         NodeFair = nodeFair;
         ByteFair = byteFair;
+        ExcessNodes = excessNodes;
     }
 
     /// <summary>Node pool size (messages held at once across all channels).</summary>
@@ -97,6 +105,23 @@ internal readonly struct ReceiveQueueLayout
 
     /// <summary>A datagram channel's fair share of <see cref="DatagramBytes"/> (0 without such a channel).</summary>
     public int ByteFair { get; }
+
+    /// <summary>
+    /// Most nodes beyond the pool that <see cref="ReceiveQueueClass.Reliable"/> channels without a handler may come to
+    /// need (0 without such a channel); none is allocated until one is needed (<see cref="ReceiveQueues.TryAppend"/>).
+    /// </summary>
+    /// <remarks>
+    /// A reliable channel nobody reads has at most <see cref="ReliableNodes"/> messages between the transport thread and
+    /// the application, because its credit stops the streams there (<see cref="CreditState.Unread"/>). Two kinds of
+    /// channel can have more, and neither may be dropped or stop the ring for the other channels. A channel the
+    /// application drains (<see cref="CreditState.Drained"/>) is limited by the receive ring, so a Poll can move up to a
+    /// ring of its messages into the queue before the Drain of that frame comes. And a channel whose handler is removed
+    /// keeps what was accepted for the handler without a limit: what it had in the receive ring (at most the ring,
+    /// reservations included, and one held message) and what a <see cref="QuiclyPeer.Drain"/> of another channel had
+    /// queued for the handler (at most the pool). That sum is the bound, per channel: the credit takes nothing more for
+    /// a channel until the application has taken what waits down to the limit of its state.
+    /// </remarks>
+    public int ExcessNodes { get; }
 
     /// <summary>Computes the layout of a peer.</summary>
     /// <param name="channels">Every application channel, by dense index.</param>
@@ -128,7 +153,8 @@ internal readonly struct ReceiveQueueLayout
         int datagramBytes = (int)Math.Clamp(receiveBudget / 4, 1, int.MaxValue);
         int nodeFair = datagram == 0 ? 0 : Math.Max(1, datagramNodes / datagram);
         int byteFair = datagram == 0 ? 0 : Math.Max(1, datagramBytes / datagram);
-        return new ReceiveQueueLayout(capacity, reliableNodes, datagramNodes, datagramBytes, nodeFair, byteFair);
+        long excess = (long)reliable * ((long)SpscRing<ReceiveEntry>.RoundUpCapacity(Math.Max(ringCapacity, 1)) + 1 + capacity);
+        return new ReceiveQueueLayout(capacity, reliableNodes, datagramNodes, datagramBytes, nodeFair, byteFair, (int)Math.Min(excess, int.MaxValue / 2));
     }
 }
 
@@ -146,27 +172,37 @@ internal readonly struct ReceiveQueueLayout
 /// loses nothing: its messages are queued while a node is free, and then held by the peer until its next
 /// <see cref="QuiclyPeer.Drain"/>. A channel nobody drains is held like that once, for one Poll interval: the next Poll
 /// finds it undrained and makes it backlog, and only a drain (or a handler) ends a backlog;</item>
-/// <item>a reliable channel (<see cref="ReceiveQueueClass.Reliable"/>) and a channel of a replaced engine
-/// (<see cref="ReceiveQueueClass.Other"/>) lose nothing: <see cref="TryAppend"/> fails, the peer holds the message and
-/// stops taking from the ring, and the ring's own rules apply (datagrams are dropped newest-first, streams are
-/// back-pressured) until the application drains the channel or registers a handler.</item>
+/// <item>a reliable channel (<see cref="ReceiveQueueClass.Reliable"/>) without a handler loses nothing and holds nothing
+/// up: its receive credit keeps it within the nodes reserved for it, and the messages of a channel whose handler was
+/// removed while more than that were on the way go to nodes beyond the pool (<see cref="TryAppend"/>,
+/// <see cref="ReceiveQueueLayout.ExcessNodes"/>);</item>
+/// <item>a reliable channel <em>with</em> a handler, met by a Drain of another channel, and a channel of a replaced engine
+/// (<see cref="ReceiveQueueClass.Other"/>) lose nothing either: <see cref="TryAppend"/> fails when the pool is full, the
+/// peer holds the message and stops taking from the ring, and the ring's own rules apply (datagrams are dropped
+/// newest-first, streams are back-pressured) — for the handled channel until the next Poll dispatches it, for the
+/// replaced engine's until the application drains the channel or registers a handler.</item>
 /// </list>
 /// </summary>
 /// <remarks>
 /// Built with the peer (never lazily in <see cref="QuiclyPeer.Poll"/>: ARCHITECTURE.md §3, nothing in the hot path
 /// allocates after warm-up) and backed by native memory (ADR 0008 invariant 12), so a first message on a channel
 /// without a handler costs nothing on the GC heap. The pool holds <see cref="ReceiveQueueLayout.Capacity"/> messages: the
-/// receive ring's capacity, capped at <see cref="MaxNodes"/> (and at least two per reliable channel). Everything here —
-/// the queues, the byte totals, the backlog marks, the drop counters and the handled-channel count — is the game
-/// thread's; nothing is shared with the transport thread.
+/// receive ring's capacity, capped at <see cref="MaxNodes"/> (and at least two per reliable channel). The nodes beyond the
+/// pool are the one thing that is allocated later, on the game thread and in native memory, in chunks that double up to
+/// <see cref="ReceiveQueueLayout.ExcessNodes"/>: when a reliable channel without a handler has more waiting than its
+/// share of the pool — a frame's burst on a channel the application drains, or a channel that lost its handler over a
+/// backlog. A peer whose reliable channels all have handlers never allocates them.
+/// Everything here — the queues, the byte totals, the backlog marks, the drop counters and the handled-channel count —
+/// is the game thread's; nothing is shared with the transport thread.
 /// </remarks>
 internal sealed class ReceiveQueues : IDisposable
 {
     /// <summary>Largest node pool built for a peer (messages held across all handler-less channels at once).</summary>
     public const int MaxNodes = 1024;
 
-    private readonly NativeArray<ReceiveEntry> _nodes;
-    private readonly NativeArray<int> _next;
+    // Nodes 0 .. _baseCapacity - 1 are the pool; the nodes behind them are the excess (grown on demand, see GrowExcess).
+    private NativeArray<ReceiveEntry> _nodes;
+    private NativeArray<int> _next;
     private readonly NativeArray<int> _head;
     private readonly NativeArray<int> _tail;
     private readonly NativeArray<int> _count;
@@ -185,8 +221,16 @@ internal sealed class ReceiveQueues : IDisposable
     private readonly NativeArray<int> _emptiedPass;
     // Dense indices of the Datagram-class channels: the only ones a pass start or a victim scan has to look at.
     private readonly NativeArray<int> _datagramChannels;
+    // Pool nodes (not excess nodes) a channel's queue occupies.
+    private readonly NativeArray<int> _poolCount;
+    // Per channel: its engine takes receive credit, which is what bounds the nodes beyond the pool it can need.
+    private readonly bool[] _credited;
     private readonly int _datagramChannelCount;
     private readonly int _channels;
+    private readonly int _baseCapacity;
+    private readonly int _reliableNodes;
+    private readonly int _excessLimit;
+    private int _freeExcess = -1;
     private readonly int _datagramNodes;
     private readonly int _datagramBytes;
     private readonly int _nodeFair;
@@ -220,15 +264,23 @@ internal sealed class ReceiveQueues : IDisposable
     /// <summary>Creates the queues of a peer.</summary>
     /// <param name="layout">The sizes (<see cref="ReceiveQueueLayout.Compute"/>).</param>
     /// <param name="classes">The <see cref="ReceiveQueueClass"/> of every channel, by dense index.</param>
-    public ReceiveQueues(in ReceiveQueueLayout layout, ReadOnlySpan<byte> classes)
-        : this(in layout, classes, classes.Length)
+    /// <param name="credited">
+    /// Per dense channel: the channel's engine takes receive credit (<see cref="ReceiveCredit.EnabledChannels"/>; the
+    /// array is read, not copied, because the engines fill it after the queues are built). Null: every
+    /// <see cref="ReceiveQueueClass.Reliable"/> channel does.
+    /// </param>
+    public ReceiveQueues(in ReceiveQueueLayout layout, ReadOnlySpan<byte> classes, bool[]? credited = null)
+        : this(in layout, classes, classes.Length, credited)
     {
     }
 
-    private ReceiveQueues(in ReceiveQueueLayout layout, ReadOnlySpan<byte> classes, int channels)
+    private ReceiveQueues(in ReceiveQueueLayout layout, ReadOnlySpan<byte> classes, int channels, bool[]? credited = null)
     {
         int capacity = layout.Capacity;
         _channels = channels;
+        _baseCapacity = capacity;
+        _reliableNodes = layout.ReliableNodes;
+        _excessLimit = layout.ExcessNodes;
         _datagramNodes = layout.DatagramNodes;
         _datagramBytes = layout.DatagramBytes;
         _nodeFair = layout.NodeFair;
@@ -252,6 +304,8 @@ internal sealed class ReceiveQueues : IDisposable
         _backlogged = new NativeArray<byte>(slots);
         _emptiedPass = new NativeArray<int>(slots);
         _datagramChannels = new NativeArray<int>(slots);
+        _poolCount = new NativeArray<int>(slots);
+        _poolCount.Fill(0);
         _head.Fill(-1);
         _tail.Fill(-1);
         _count.Fill(0);
@@ -261,6 +315,16 @@ internal sealed class ReceiveQueues : IDisposable
         _handled.Fill(0);
         _backlogged.Fill(0);
         _emptiedPass.Fill(0);
+        if (credited is null)
+        {
+            credited = new bool[slots];
+            for (int ci = 0; ci < classes.Length; ci++)
+            {
+                credited[ci] = classes[ci] == ReceiveQueueClass.Reliable;
+            }
+        }
+
+        _credited = credited;
         for (int ci = 0; ci < classes.Length; ci++)
         {
             _class[ci] = classes[ci];
@@ -276,8 +340,14 @@ internal sealed class ReceiveQueues : IDisposable
     /// <returns>The pool size, at most <see cref="MaxNodes"/>.</returns>
     public static int NodesFor(int ringCapacity) => Math.Clamp(ringCapacity, 1, MaxNodes);
 
-    /// <summary>Pool size.</summary>
-    public int Capacity => _nodes.Length;
+    /// <summary>Pool size (without the excess nodes).</summary>
+    public int Capacity => _baseCapacity;
+
+    /// <summary>Nodes beyond the pool that exist now (<see cref="ReceiveQueueLayout.ExcessNodes"/> at most).</summary>
+    public int ExcessCapacity => _nodes.Length - _baseCapacity;
+
+    /// <summary>Messages queued in nodes beyond the pool.</summary>
+    public int ExcessUsed { get; private set; }
 
     /// <summary>Messages queued across all channels.</summary>
     public int Used { get; private set; }
@@ -316,6 +386,14 @@ internal sealed class ReceiveQueues : IDisposable
     /// <param name="channelIndex">Dense channel index.</param>
     public bool IsBacklogged(int channelIndex) => _backlogged[channelIndex] != 0;
 
+    /// <summary>
+    /// Whether <paramref name="channelIndex"/> has messages queued that no take for the application found or left empty
+    /// during the pass before the current one (call it after <see cref="BeginPass"/>): the application had a whole Poll
+    /// interval and did not drain the channel. The rule that makes an unreliable channel backlogged, for any channel.
+    /// </summary>
+    /// <param name="channelIndex">Dense channel index.</param>
+    public bool LeftUndrained(int channelIndex) => _count[channelIndex] > 0 && _emptiedPass[channelIndex] != unchecked(_pass - 1);
+
     /// <summary>Messages queued for backlogged channels (at most <see cref="ReceiveQueueLayout.DatagramNodes"/>).</summary>
     public int BacklogNodes => _backlogNodes;
 
@@ -325,7 +403,8 @@ internal sealed class ReceiveQueues : IDisposable
     /// <summary>
     /// Records that <paramref name="channelIndex"/> got or lost its handler (<see cref="QueuedHandled"/>). A channel that
     /// gets a handler stops being backlog: the next <see cref="QuiclyPeer.Poll"/> dispatches what it has queued. One that
-    /// loses its handler is judged at the next pass start like any other.
+    /// loses its handler is judged at the next pass start like any other; a reliable one keeps only its reserved share of
+    /// the pool, and the rest of what was queued for the handler moves to nodes beyond the pool.
     /// </summary>
     /// <param name="channelIndex">Dense channel index.</param>
     /// <param name="handled">Whether the channel has a handler now.</param>
@@ -345,6 +424,112 @@ internal sealed class ReceiveQueues : IDisposable
             _backlogNodes -= _count[channelIndex];
             _backlogBytes -= _bytes[channelIndex];
         }
+
+        if (!handled && _credited[channelIndex] && _poolCount[channelIndex] > _reliableNodes)
+        {
+            LeavePoolToTheOthers(channelIndex);
+        }
+    }
+
+    /// <summary>
+    /// Moves what a reliable channel without a handler has queued beyond its reserved share out of the pool: those
+    /// messages stay until the application drains the channel, and the pool is what every other channel queues in.
+    /// The queue's order is kept (a node is replaced where it stands).
+    /// </summary>
+    private void LeavePoolToTheOthers(int channelIndex)
+    {
+        int kept = 0;
+        int previous = -1;
+        int node = _head[channelIndex];
+        while (node >= 0)
+        {
+            int next = _next[node];
+            if (node < _baseCapacity && ++kept > _reliableNodes)
+            {
+                int excess = TakeExcessNode();
+                if (excess < 0)
+                {
+                    return; // every excess node is in use: the rest stays where it is
+                }
+
+                _nodes[excess] = _nodes[node];
+                _next[excess] = next;
+                if (previous < 0)
+                {
+                    _head[channelIndex] = excess;
+                }
+                else
+                {
+                    _next[previous] = excess;
+                }
+
+                if (next < 0)
+                {
+                    _tail[channelIndex] = excess;
+                }
+
+                _nodes[node] = default;
+                _next[node] = _free;
+                _free = node;
+                _poolCount[channelIndex]--;
+                node = excess;
+            }
+
+            previous = node;
+            node = next;
+        }
+    }
+
+    /// <summary>A free node beyond the pool, or -1 when <see cref="ReceiveQueueLayout.ExcessNodes"/> of them are in use.</summary>
+    private int TakeExcessNode()
+    {
+        int node = _freeExcess;
+        if (node < 0)
+        {
+            if (!GrowExcess())
+            {
+                return -1;
+            }
+
+            node = _freeExcess;
+        }
+
+        _freeExcess = _next[node];
+        ExcessUsed++;
+        return node;
+    }
+
+    /// <summary>
+    /// Adds nodes beyond the pool (game thread; native memory, ADR 0008 invariant 12): 64 the first time, then twice what
+    /// there is, up to <see cref="ReceiveQueueLayout.ExcessNodes"/>. The arrays are replaced, so nothing may hold a
+    /// reference into them across an append.
+    /// </summary>
+    private bool GrowExcess()
+    {
+        int excess = _nodes.Length - _baseCapacity;
+        if (excess >= _excessLimit)
+        {
+            return false;
+        }
+
+        int grown = (int)Math.Min(_excessLimit, Math.Max(64L, 2L * excess));
+        int length = _baseCapacity + grown;
+        NativeArray<ReceiveEntry> nodes = new(length);
+        NativeArray<int> next = new(length);
+        _nodes.AsSpan().CopyTo(nodes.AsSpan());
+        _next.AsSpan().CopyTo(next.AsSpan());
+        nodes.AsSpan(_nodes.Length, length - _nodes.Length).Clear();
+        for (int i = _nodes.Length; i < length; i++)
+        {
+            next[i] = i + 1 < length ? i + 1 : _freeExcess;
+        }
+
+        _freeExcess = _nodes.Length;
+        _nodes.Dispose();
+        _next.Dispose();
+        _nodes = nodes;
+        _next = next;
+        return true;
     }
 
     /// <summary>
@@ -445,19 +630,39 @@ internal sealed class ReceiveQueues : IDisposable
         }
     }
 
-    /// <summary>Appends a message to the queue of <paramref name="channelIndex"/>.</summary>
+    /// <summary>
+    /// Appends a message to the queue of <paramref name="channelIndex"/>. A reliable channel without a handler
+    /// (<see cref="ReceiveQueueClass.Reliable"/>, with an engine that takes receive credit) takes a node of the pool
+    /// while it is within its reserved share and one is free, and a node beyond the pool otherwise, so its message is
+    /// never the one the peer has to hold.
+    /// </summary>
     /// <param name="channelIndex">Dense channel index.</param>
     /// <param name="entry">The message (its lease moves into the queue).</param>
-    /// <returns><see langword="false"/> when the pool is full.</returns>
+    /// <returns><see langword="false"/> when the pool is full (and, for a reliable channel without a handler, every node beyond it).</returns>
     public bool TryAppend(int channelIndex, in ReceiveEntry entry)
     {
         int node = _free;
+        if (_credited[channelIndex] && _handled[channelIndex] == 0 && (node < 0 || _poolCount[channelIndex] >= _reliableNodes))
+        {
+            int excess = TakeExcessNode();
+            if (excess >= 0)
+            {
+                return Link(channelIndex, excess, in entry);
+            }
+        }
+
         if (node < 0)
         {
             return false;
         }
 
         _free = _next[node];
+        _poolCount[channelIndex]++;
+        return Link(channelIndex, node, in entry);
+    }
+
+    private bool Link(int channelIndex, int node, in ReceiveEntry entry)
+    {
         _nodes[node] = entry;
         _next[node] = -1;
         int tail = _tail[channelIndex];
@@ -733,8 +938,19 @@ internal sealed class ReceiveQueues : IDisposable
         int length = entry.Lease.Length;
         _bytes[channelIndex] -= length;
         _nodes[node] = default;
-        _next[node] = _free;
-        _free = node;
+        if (node < _baseCapacity)
+        {
+            _next[node] = _free;
+            _free = node;
+            _poolCount[channelIndex]--;
+        }
+        else
+        {
+            _next[node] = _freeExcess;
+            _freeExcess = node;
+            ExcessUsed--;
+        }
+
         Used--;
         QueuedHandled -= _handled[channelIndex];
         if (_class[channelIndex] == ReceiveQueueClass.Datagram)
@@ -788,5 +1004,6 @@ internal sealed class ReceiveQueues : IDisposable
         _backlogged.Dispose();
         _emptiedPass.Dispose();
         _datagramChannels.Dispose();
+        _poolCount.Dispose();
     }
 }

@@ -253,6 +253,14 @@ internal enum StreamConsumeAction : byte
 
     /// <summary>Close the connection with the code (malformed persistent ordered stream).</summary>
     CloseConnection = 3,
+
+    /// <summary>
+    /// Back-pressure of one channel: as <see cref="Pend"/>, but the stream is held back because its channel has no handler
+    /// and as many of its messages wait for the application as it may hold (<see cref="ReceiveCredit"/>). Another Poll
+    /// changes nothing about that, so the stream is resumed when the application takes messages of the channel or gives it
+    /// a handler (<see cref="PeerCore.NoteCreditPendedStream"/>). Only for the start of a message.
+    /// </summary>
+    PendCredit = 4,
 }
 
 /// <summary>Answer of <see cref="ChannelEngine.OnStreamMessage"/>.</summary>
@@ -275,6 +283,9 @@ internal readonly struct StreamConsume
 
     /// <summary>Back-pressure (see <see cref="StreamConsumeAction.Pend"/>).</summary>
     public static StreamConsume Pend => new(StreamConsumeAction.Pend, QuiclyErrorCode.NoError);
+
+    /// <summary>Back-pressure of one channel (see <see cref="StreamConsumeAction.PendCredit"/>).</summary>
+    public static StreamConsume PendCredit => new(StreamConsumeAction.PendCredit, QuiclyErrorCode.NoError);
 
     /// <summary>Reset the stream.</summary>
     /// <param name="code">The reset code.</param>

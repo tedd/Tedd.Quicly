@@ -65,12 +65,27 @@ public sealed unsafe partial class QuiclyPeer
     /// drained. A channel that was drained and then no longer is can keep the ring closed for a second interval.
     /// </para>
     /// <para>
-    /// A <em>reliable</em> channel (ReliableOrdered, ReliableUnordered) loses nothing, so once the queue pool is full Poll
-    /// holds its next message and takes nothing more out of the receive ring: every stream channel is then
-    /// back-pressured, datagrams of ring channels are dropped on arrival (<see cref="PeerStatistics.ReceiveRingDrops"/>),
-    /// responses wait and <see cref="HasPendingWork"/> stays set, until the application drains that channel or registers a
-    /// handler for it. Coalescing channels and ReliableLatest keep one value per key in a mailbox and are dispatched even
-    /// then. Register a handler for, or drain, every reliable channel the other end sends on.
+    /// A <em>reliable</em> channel (ReliableOrdered, ReliableUnordered) loses nothing, and one that nobody reads holds
+    /// back only itself. Each of these channels has a receive credit. While a channel has no handler and the application
+    /// has not drained it empty since the Poll before last, only its share may wait for the application: its part of the
+    /// queue pool (the reserved half, divided among the reliable channels of the table — 256 messages each with two such
+    /// channels and default options) and the same part of a quarter of <see cref="PeerOptions.ReceiveBudgetBytes"/>,
+    /// counted in buffer blocks. The byte share is strict: a message whose block does not fit in what is left of it is
+    /// not started, even on an empty channel, so the channels nobody reads never pin more than that quarter. Past the
+    /// share the channel's own streams are held back in the transport, where QUIC flow control stops their sender
+    /// (<see cref="ChannelStatistics.BacklogHolds"/> counts the holds). Nothing is dropped, the receive ring stays open
+    /// for every other channel, and <see cref="HasPendingWork"/> is not set by it. The held streams go on when the
+    /// application reads the channel — a <see cref="Drain"/> that takes it down below its share or leaves it empty —
+    /// or a handler is registered for it.
+    /// </para>
+    /// <para>
+    /// A channel with a handler has no such limit. A channel the application drains is not held to the share either: a
+    /// Drain that leaves the channel's queue empty (an empty Drain counts) shows that it is read, and from then on its
+    /// limits are the receive ring's capacity in messages and half the receive budget in bytes (one message is always
+    /// accepted on an empty channel). It goes back to its share at the first Poll that finds messages queued for it
+    /// which no Drain took during the whole Poll interval before, and keeps what it accepted until then. A
+    /// ReliableOrdered channel is one stream, so what follows an unread message on it — a response to this end's own
+    /// request included — waits behind it.
     /// </para>
     /// </remarks>
     /// <param name="maxItems">Most messages to dispatch to handlers in this call.</param>
@@ -131,6 +146,7 @@ public sealed unsafe partial class QuiclyPeer
             }
 
             ResumePendedStreams();
+            ResumeCreditPended();
             if (_state == PeerState.Closed)
             {
                 FinishClosed();
@@ -178,15 +194,23 @@ public sealed unsafe partial class QuiclyPeer
     /// order, so the two styles can be mixed in either order without loss; an <em>unreliable</em> channel without a
     /// handler is held until its own Drain — across the next Poll too while the channel is being drained, so a host that
     /// drains several channels one after the other every frame loses nothing — or, when nobody drains it, until a Poll
-    /// makes it backlog; a <em>reliable</em> channel without a handler is held until that channel is drained.
+    /// makes it backlog. A <em>reliable</em> channel without a handler is never held: its receive credit keeps what waits
+    /// for it within the queue nodes kept for it (see <see cref="Poll"/>).
+    /// </para>
+    /// <para>
+    /// For a reliable channel (ReliableOrdered, ReliableUnordered) a Drain that leaves the channel's queue empty also
+    /// tells the peer that the application reads the channel: the limit of a channel nobody reads is lifted, and the
+    /// streams the channel held back are resumed by this call, not by the next Poll. So the first message of a channel
+    /// that was never drained, when it is larger than the channel's share, arrives after the first Drain, which itself
+    /// returns nothing.
     /// </para>
     /// <para>
     /// A compressed message is decoded here, into a second buffer of its raw size, and the caller can release nothing
-    /// before the call returns. On a reliable channel (ReliableOrdered, ReliableUnordered) a message for which there is
-    /// no such buffer within the receive budget is not dropped: it stays where it is and the call returns what it has,
-    /// possibly fewer messages than the span holds, or none. Release them and drain again. (A message that could never
-    /// be decoded is dropped and counted in <see cref="PeerStatistics.DecodeFailures"/>, as are compressed messages of
-    /// unreliable channels and those that exceed <see cref="PeerOptions.DecodedBytesPerSecond"/>.)
+    /// before the call returns. On a reliable channel a message for which there is no such buffer within the receive
+    /// budget is not dropped: it stays where it is and the call returns what it has, possibly fewer messages than the
+    /// span holds, or none. Release them and drain again. (A message that could never be decoded is dropped and counted
+    /// in <see cref="PeerStatistics.DecodeFailures"/>, as are compressed messages of unreliable channels and those that
+    /// exceed <see cref="PeerOptions.DecodedBytesPerSecond"/>.)
     /// </para>
     /// </remarks>
     /// <param name="channel">The channel.</param>
@@ -225,6 +249,7 @@ public sealed unsafe partial class QuiclyPeer
             // A response is taken by its engine where it leaves the receive ring (below, and in Route), and that is the only
             // way into a per-channel queue or the held slot, so neither can hold one (see IsResponse).
             Debug.Assert(!IsResponse(in entry), "a response never reaches a per-channel queue");
+            ReturnCredit(index, in entry);
             Emit(ref entry, now, into, ref written, in room);
         }
 
@@ -238,6 +263,7 @@ public sealed unsafe partial class QuiclyPeer
                 {
                     ReceiveEntry entry = _held;
                     _hasHeld = false;
+                    ReturnCredit(index, in entry);
                     Emit(ref entry, now, into, ref written, in room);
                 }
             }
@@ -266,6 +292,7 @@ public sealed unsafe partial class QuiclyPeer
                 }
                 else
                 {
+                    ReturnCredit(index, in entry);
                     Emit(ref entry, now, into, ref written, in room);
                 }
             }
@@ -293,6 +320,10 @@ public sealed unsafe partial class QuiclyPeer
             }
         }
 
+        // The messages taken here gave their channel's credit back, and a Drain that left nothing queued shows how the
+        // channel is read: the streams it held back go on without waiting for the next Poll.
+        SettleCreditAfterDrain(index, channel);
+        ResumeCreditPended();
         return written;
     }
 
@@ -378,6 +409,11 @@ public sealed unsafe partial class QuiclyPeer
     }
 
     /// <summary>Registers the handler of a channel; <see cref="Poll"/> passes it every message of the channel (game thread).</summary>
+    /// <remarks>
+    /// A reliable channel that was held to the share of a channel nobody reads (see <see cref="Poll"/>) loses that limit
+    /// here when nothing is queued for it, and otherwise once the next Poll has dispatched what was queued; the streams
+    /// it held back are resumed then.
+    /// </remarks>
     /// <param name="channel">The channel.</param>
     /// <param name="handler">The handler (one per channel).</param>
     /// <exception cref="ArgumentException">The channel is not in the table.</exception>
@@ -394,13 +430,21 @@ public sealed unsafe partial class QuiclyPeer
 
         _handlers[index] = handler;
         _queues.SetHandled(index, true);
+        SettleCreditLimit(index);
+        ResumeCreditPended();
     }
 
     /// <summary>
     /// Removes the handler of a channel; its messages then wait for <see cref="Drain"/> (game thread), within the limits
     /// described at <see cref="Poll"/>: an unreliable channel that is not drained loses its oldest messages, a reliable one
-    /// that is not drained eventually holds up every other channel.
+    /// that is not drained has its own streams held back and holds up no other channel.
     /// </summary>
+    /// <remarks>
+    /// What a reliable channel had on the way to its handler when it was removed — in the receive ring, or queued by a
+    /// <see cref="Drain"/> of another channel — was accepted without a limit and is kept: it waits for the channel's
+    /// Drain, in queue nodes beyond the pool when the channel's share of the pool is not enough (native memory, grown
+    /// when first needed). The channel accepts nothing more until the application has taken that down to its share.
+    /// </remarks>
     /// <param name="channel">The channel.</param>
     /// <returns><see langword="false"/> when the channel had no handler.</returns>
     /// <exception cref="ArgumentException">The channel is not in the table.</exception>
@@ -415,6 +459,7 @@ public sealed unsafe partial class QuiclyPeer
 
         _handlers[index] = null;
         _queues.SetHandled(index, false);
+        LimitCredit(index);
         return true;
     }
 
@@ -436,6 +481,7 @@ public sealed unsafe partial class QuiclyPeer
         // A new pass: whatever an unreliable channel without a handler still has queued was not drained since the last
         // one, and is backlog from here on (bounded, evicted oldest first).
         _queues.BeginPass(_core);
+        DemoteUndrainedChannels();
         if (_queues.QueuedHandled > 0)
         {
             dispatched = DispatchQueued(maxItems, now);
@@ -451,11 +497,12 @@ public sealed unsafe partial class QuiclyPeer
             {
                 // Still no room for it: the ring stays closed (the loop below is guarded by the held slot), but the
                 // mailboxes do not pass through the ring and are dispatched all the same. Returning here would stop
-                // every coalescing and ReliableLatest handler for as long as one reliable channel is not drained —
-                // while the transport thread keeps acknowledging those values to the sender. A reliable channel (or a
-                // replaced engine's) gets here, and an unreliable one the application drained since the last pass
-                // began: its Drain is about to take the message. An unreliable message of a channel nobody drained
-                // is queued by evicting backlog, or dropped (mayHold is false).
+                // every coalescing and ReliableLatest handler for as long as the hold lasts — while the transport
+                // thread keeps acknowledging those values to the sender. A channel of a replaced engine gets here
+                // (it takes no receive credit, so nothing keeps it within the pool), and an unreliable one the
+                // application drained since the last pass began: its Drain is about to take the message. An
+                // unreliable message of a channel nobody drained is queued by evicting backlog, or dropped (mayHold
+                // is false). A reliable channel with credit does not get here: it always has a node.
                 _held = held;
                 _hasHeld = true;
             }
@@ -477,6 +524,8 @@ public sealed unsafe partial class QuiclyPeer
             dispatched += DispatchMailboxes(boxes, maxItems - dispatched, now);
         }
 
+        // A handler that was registered over a backlog has seen it by now, or will be looked at again by the next Poll.
+        SettleDueCreditLimits();
         return dispatched;
     }
 
@@ -503,11 +552,10 @@ public sealed unsafe partial class QuiclyPeer
                 // Older messages of this channel wait in its queue: a handler of this very Poll drained another channel
                 // and met them, or registered this handler over a backlog, after the queues were dispatched. This one
                 // goes behind them, and the next Poll dispatches the queue first — or the channel would be out of order.
-                // It cannot starve there: a Poll takes nothing from the ring before the queues of channels with a
-                // handler are empty (or maxItems is used up), so the queue is always served first.
                 return TryQueue(in entry, mayHold);
             }
 
+            ReturnCredit(index, in entry);
             Dispatch(handler, ref entry, now);
             dispatched++;
             return true;
@@ -532,9 +580,11 @@ public sealed unsafe partial class QuiclyPeer
     /// taking from the ring. Who can be held, and for how long (<see cref="ReceiveQueues.TryAppendDatagram"/>):
     /// </para>
     /// <list type="bullet">
-    /// <item>a reliable channel (or a replaced engine's): until the application drains it or registers a handler — the
-    /// limit that remains (see <see cref="Poll"/>);</item>
-    /// <item>an unreliable channel <em>with</em> a handler, met by a <see cref="Drain"/> of another channel: until the next
+    /// <item>a reliable channel <em>without</em> a handler: never. Its receive credit bounds what can wait for it, and the
+    /// queues keep a node for all of that (<see cref="ReceiveQueues.TryAppend"/>);</item>
+    /// <item>a channel of a replaced engine (<see cref="PeerOptions.EngineFactory"/>), which takes no receive credit:
+    /// until the application drains it or registers a handler;</item>
+    /// <item>a channel <em>with</em> a handler, met by a <see cref="Drain"/> of another channel: until the next
     /// <see cref="Poll"/>. That Poll dispatches the channel's queue, then the held message, then the ring, all to the
     /// handler and in arrival order, so the hold cannot outlive it (a Poll whose <c>maxItems</c> is used up dispatches
     /// less, and the rest waits like every other message of a handled channel). Nothing of a handled channel is ever
@@ -583,9 +633,16 @@ public sealed unsafe partial class QuiclyPeer
             while (handler is not null && dispatched < maxItems && !_disposed && queues.TryTake(index, out ReceiveEntry entry))
             {
                 Debug.Assert(!IsResponse(in entry), "a response never reaches a per-channel queue");
+                ReturnCredit(index, in entry);
                 Dispatch(handler, ref entry, now);
                 dispatched++;
                 handler = _handlers[index];
+            }
+
+            if (!_disposed)
+            {
+                // The handler has now seen what waited for it: from here on the ring alone limits the channel.
+                SettleCreditLimit(index);
             }
         }
 

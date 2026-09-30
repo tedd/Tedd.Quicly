@@ -189,6 +189,26 @@ internal sealed unsafe class PeerCore : IDisposable
         PeerUnidirectionalStreamLimit = ComputeUnidirectionalLimit(_channels);
         PeerStreamCapacity = PeerUnidirectionalStreamLimit;
         _pendedStreams = new SpscRing<TransportStreamId>(PeerStreamCapacity + 2);
+
+        // What a reliable channel nobody reads may have waiting is what the drain queues keep for it: the nodes the layout
+        // reserves per reliable channel, and an equal share of a quarter of the receive budget, counted in the pool's
+        // blocks. One the application drains: the ring, and half the budget.
+        ReceiveQueueLayout queueLayout = ReceiveQueueLayout.Compute(_channels, options.ReceiveRingCapacity, options.ReceiveBudgetBytes);
+        ReadOnlySpan<SizeClassDefinition> sizeClasses = _allocator.SizeClasses;
+        Span<int> blockSizes = stackalloc int[sizeClasses.Length];
+        for (int i = 0; i < sizeClasses.Length; i++)
+        {
+            blockSizes[i] = sizeClasses[i].BlockSize;
+        }
+
+        Credit = new ReceiveCredit(
+            _channels.Length,
+            PeerStreamCapacity + 2,
+            queueLayout.ReliableNodes,
+            ReceiveCredit.ByteLimitFor(options.ReceiveBudgetBytes, CountReliableQueueChannels(_channels)),
+            ReceiveRing.Capacity,
+            (int)Math.Clamp(options.ReceiveBudgetBytes / 2, 1, int.MaxValue - 1),
+            blockSizes);
         Streams = new StreamTable();
         SessionMaxMessageSize = role == PeerRole.Server ? options.MaxMessageSize : 0;
         FlushIntervalMicros = Math.Max(1, PeerOptions.ToMicros(options.FlushInterval));
@@ -714,6 +734,7 @@ internal sealed unsafe class PeerCore : IDisposable
             Volatile.Write(ref _pendedStreams, new SpscRing<TransportStreamId>(capacity + 2));
         }
 
+        Credit.SetStreamCapacity(capacity + 2);
         foreach (ChannelEngine engine in _activeEngines)
         {
             engine.OnPeerStreamCapacity(capacity);
@@ -747,6 +768,12 @@ internal sealed unsafe class PeerCore : IDisposable
 
     /// <summary>Unidirectional streams the peer may open after admission: Σ max(MaxGroups, 1) over stream-capable channels, capped at 4 096.</summary>
     public int PeerUnidirectionalStreamLimit { get; }
+
+    /// <summary>
+    /// The credit of the reliable stream channels: how much of a channel without a handler may wait for the application
+    /// before its streams are held back (<see cref="ReceiveCredit"/>).
+    /// </summary>
+    public ReceiveCredit Credit { get; }
 
     /// <summary>Clock micros when the transport connected (connection-relative wire timestamps count from here).</summary>
     public long ConnectionStartMicros { get; set; }
@@ -882,6 +909,21 @@ internal sealed unsafe class PeerCore : IDisposable
         }
 
         return (int)Math.Min(total, MaxPeerUnidirectionalStreams);
+    }
+
+    /// <summary>Channels of the drain queues' reliable class (ReliableOrdered, ReliableUnordered): the ones that share the credit.</summary>
+    private static int CountReliableQueueChannels(ChannelDefinition[] channels)
+    {
+        int count = 0;
+        foreach (ChannelDefinition channel in channels)
+        {
+            if (ReceiveQueueClass.Of(channel) == ReceiveQueueClass.Reliable)
+            {
+                count++;
+            }
+        }
+
+        return count;
     }
 
     // ------------------------------------------------------------------ channels, engines, counters (any thread, read-only)
@@ -1450,6 +1492,52 @@ internal sealed unsafe class PeerCore : IDisposable
         NoteTransportWork();
     }
 
+    /// <summary>
+    /// Remembers a stream whose receive was held back because its channel is out of credit (transport thread, the engine
+    /// answered <see cref="StreamConsume.PendCredit"/>). Unlike <see cref="NotePendedStream"/> it is not resumed by the
+    /// next Poll: the game thread resumes it when the application takes messages of the channel, or gives it a handler.
+    /// </summary>
+    /// <param name="id">The stream.</param>
+    /// <param name="channelIndex">Dense index of its channel.</param>
+    /// <param name="length">Payload length of the message the stream is held back with.</param>
+    /// <returns>
+    /// <see langword="false"/> when the stream could not be remembered, so nothing would ever resume it: the peer reset the
+    /// streams this end held back and opened new ones, many times over, since the game thread last looked
+    /// (<see cref="ReceiveCredit.ListGrowth"/>). The caller closes the connection.
+    /// </returns>
+    public bool NoteCreditPendedStream(TransportStreamId id, int channelIndex, int length)
+    {
+        Counters.StreamReceivePends++;
+        bool listed = Credit.NotePended(id, channelIndex, length);
+
+        // The Poll this asks for takes the stream off the list; after that a channel that stays out of credit is not work.
+        NoteTransportWork();
+        return listed;
+    }
+
+    /// <summary>
+    /// Gives back the credit of a message that was being received when its stream ended (the engine's transport-thread
+    /// release of a staged message; also the game thread while a reconnect clears the engines). The streams the channel
+    /// holds back may go on now although the application took nothing, so the host is told: the next Poll resumes them.
+    /// </summary>
+    /// <param name="channelIndex">Dense index of the message's channel.</param>
+    /// <param name="leaseBytes">The block size the message was counted with.</param>
+    public void ReturnStagedCredit(int channelIndex, int leaseBytes)
+    {
+        Credit.Untake(channelIndex, leaseBytes);
+        NoteTransportWork();
+    }
+
+    /// <summary>
+    /// A stream ended while its receive was held back for credit (transport thread): the game thread must not keep a turn
+    /// for it, so the host is told and the next Poll looks at the streams that wait (<see cref="ReceiveCredit.NoteGone"/>).
+    /// </summary>
+    public void NoteCreditStreamGone()
+    {
+        Credit.NoteGone();
+        NoteTransportWork();
+    }
+
     // ------------------------------------------------------------------ streams (game thread)
 
     /// <summary>Opens a local stream (game thread).</summary>
@@ -1948,6 +2036,8 @@ internal sealed unsafe class PeerCore : IDisposable
             }
         }
 
+        // After the engines gave back what a half-received message had taken: the counts start over with the connection.
+        Credit.Reset();
         _localHead = 0;
         _localTail = 0;
         _localCount = 0;
@@ -2043,6 +2133,7 @@ internal sealed unsafe class PeerCore : IDisposable
             }
         }
 
+        Credit.Dispose();
         Completions.Dispose();
         _tokens.Dispose();
         _stamps.Dispose();

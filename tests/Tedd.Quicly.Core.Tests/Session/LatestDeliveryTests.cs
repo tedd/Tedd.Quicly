@@ -75,6 +75,31 @@ public class LatestDeliveryTests
     }
 
     [Fact]
+    public void A_Lost_ReliableLatest_Transmission_Is_Counted()
+    {
+        using SessionHarness h = Harness();
+        List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
+        h.Server!.RegisterHandler(2, LatestKit.Collect(received));
+        PeerStatistics before = DatagramKit.Statistics(h.Client);
+
+        // A transmission is one Sent of its channel: the one the transport declares lost is counted on the channel and as
+        // one lost datagram, and it is what the retransmission answers. The value itself still ends Delivered.
+        DatagramKit.TransportOf(h.Client).DropNextDatagrams(1);
+        SendResult result = h.Client.SendCopy(new SendHeader(2, 3), LatestKit.Payload(9, 100), SendOptions.Tracked);
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(result.Token) == DeliveryStatus.Delivered, 2_000_000),
+            $"status {h.Client.GetDeliveryStatus(result.Token)} after the retry");
+        Assert.True(h.RunUntil(() => DatagramKit.Statistics(h.Client).SendEntriesInUse == 0));
+        Assert.Single(received);
+        ChannelStatistics channel = DatagramKit.ChannelStats(h.Client, 2);
+        Assert.Equal(1, channel.TransportLost);
+        Assert.Equal(0, channel.TransportCanceled);
+        Assert.True(channel.Retries >= 1, $"{channel.Retries} retries");
+        PeerStatistics after = DatagramKit.Statistics(h.Client);
+        Assert.Equal(1, after.DatagramsLost - before.DatagramsLost);
+        Assert.Equal(after.DatagramsSent - before.DatagramsSent, (after.DatagramsAcknowledged - before.DatagramsAcknowledged) + 1);
+    }
+
+    [Fact]
     public void A_Lost_Ack_Is_Recovered_By_The_Re_Ack()
     {
         using SessionHarness h = Harness();

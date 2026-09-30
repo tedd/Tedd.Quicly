@@ -170,6 +170,63 @@ public class DatagramZeroAllocationTests
     }
 
     [Fact]
+    public void Transport_Cancels_Do_Not_Allocate()
+    {
+        // A link that is busy for 8 ms per 1 000-byte datagram: everything sent in the same instant as the first datagram of
+        // a tick is dropped by the transport (CancelOnBlocked) and counted — a loose message by its engine, the members of a
+        // packed container by the packer's fan-out, fragments by the fragment path.
+        using SessionHarness h = new(link: new LinkOptions { BandwidthBitsPerSecond = 1_000_000 }, table: Table,
+            client: DatagramKit.Quiet, server: DatagramKit.Quiet);
+        SimulatedNetwork network = h.Network;
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        long received = 0;
+        MessageHandler count = (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++;
+        server.RegisterHandler(2, count);
+        server.RegisterHandler(3, count);
+        server.RegisterHandler(13, count);
+        byte[] large = new byte[1_000];
+        byte[] small = new byte[8];
+        byte[] fragmented = new byte[FragmentKit.LengthFor(Table[13]!, 2)];
+        uint tick = 0;
+        void Tick()
+        {
+            client.SendCopy(new SendHeader(2), large);
+            client.Flush(++tick);
+            client.SendCopy(new SendHeader(2), large);
+            client.Flush(tick);
+            client.SendCopy(new SendHeader(2), small);
+            client.SendCopy(new SendHeader(3, tick & 7), small);
+            client.Flush(tick);
+            client.SendCopy(new SendHeader(13), fragmented);
+            client.Flush(tick);
+            network.Advance(16_667);
+            server.Poll();
+            server.Flush();
+            client.Poll();
+        }
+
+        for (int i = 0; i < 600; i++)
+        {
+            Tick();
+        }
+
+        WindowedAllocation.AssertNone(() =>
+        {
+            for (int i = 0; i < 120; i++)
+            {
+                Tick();
+            }
+        });
+        Assert.True(received > 600, $"{received} messages");
+        Assert.True(DatagramKit.ChannelStats(client, 2).TransportCanceled > 1_200, $"{DatagramKit.ChannelStats(client, 2).TransportCanceled} cancelled on channel 2");
+        Assert.True(DatagramKit.ChannelStats(client, 3).TransportCanceled > 600, $"{DatagramKit.ChannelStats(client, 3).TransportCanceled} cancelled on channel 3");
+        Assert.True(DatagramKit.ChannelStats(client, 13).TransportCanceled > 1_200, $"{DatagramKit.ChannelStats(client, 13).TransportCanceled} cancelled on channel 13");
+        Assert.True(DatagramKit.Statistics(client).DatagramsCanceled > 2_400, $"{DatagramKit.Statistics(client).DatagramsCanceled} datagrams cancelled");
+        Assert.Equal(PeerState.Connected, client.State);
+    }
+
+    [Fact]
     public void A_Capped_Scheduler_With_Expiring_Messages_Does_Not_Allocate()
     {
         using SessionHarness h = new(table: Table, client: o => o.MaxSendBytesPerSecond = 30_000);

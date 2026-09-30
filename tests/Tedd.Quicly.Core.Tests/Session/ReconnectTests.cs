@@ -124,6 +124,64 @@ public class ReconnectTests
     }
 
     [Fact]
+    public void Transport_Outcome_Counters_Are_Kept_Across_A_Reconnect_And_Keep_Counting()
+    {
+        // 1 Mbit/s: a 1 000-byte datagram keeps the link busy for 8 ms, so a second one sent in the same instant is dropped
+        // by the transport (CancelOnBlocked).
+        using SessionHarness h = new(link: new LinkOptions { BandwidthBitsPerSecond = 1_000_000 }, connect: false,
+            client: QuietOptions.Apply, server: QuietOptions.Apply);
+        AcceptResumes(h);
+        Assert.True(h.RunUntilConnected());
+        QuiclyPeer oldServer = h.Server!;
+        QuiclyPeer client = h.Client;
+        h.Run(50_000);
+
+        void SendTwoAtOnce()
+        {
+            SendResult first = client.SendCopy(new SendHeader(2), new byte[1_000], SendOptions.Tracked);
+            client.Flush();
+            SendResult second = client.SendCopy(new SendHeader(2), new byte[1_000], SendOptions.Tracked);
+            client.Flush();
+            Assert.True(h.RunUntil(() => client.GetDeliveryStatus(first.Token) != DeliveryStatus.Pending
+                && client.GetDeliveryStatus(second.Token) != DeliveryStatus.Pending));
+            Assert.Equal(DeliveryStatus.Delivered, client.GetDeliveryStatus(first.Token));
+            Assert.Equal(DeliveryStatus.Expired, client.GetDeliveryStatus(second.Token));
+        }
+
+        SendTwoAtOnce();
+        client.GetStatistics(out PeerStatistics before);
+        Assert.True(client.GetChannelStatistics(2, out ChannelStatistics channelBefore));
+        Assert.Equal(1, before.DatagramsCanceled);
+        Assert.Equal(1, before.DatagramsAcknowledged);
+        Assert.Equal(1, channelBefore.TransportCanceled);
+
+        CutTheConnection(h);
+        Assert.True(h.RunUntil(() => client.State == PeerState.Closed));
+        client.Reconnect(h.Connector, h.Listener.LocalEndPoint, "test", default);
+        Assert.True(h.RunUntil(() => client.State == PeerState.Connected && h.Server is not null
+            && !ReferenceEquals(h.Server, oldServer) && h.Server.State == PeerState.Connected));
+        oldServer.Dispose();
+        h.Run(50_000);
+
+        // Totals since the peer was created: the reconnect reset nothing.
+        client.GetStatistics(out PeerStatistics resumed);
+        Assert.True(client.GetChannelStatistics(2, out ChannelStatistics channelResumed));
+        Assert.Equal(1, resumed.DatagramsCanceled);
+        Assert.Equal(1, resumed.DatagramsAcknowledged);
+        Assert.Equal(0, resumed.DatagramsLost);
+        Assert.Equal(1, channelResumed.TransportCanceled);
+        Assert.Equal(0, channelResumed.TransportLost);
+
+        SendTwoAtOnce();
+        client.GetStatistics(out PeerStatistics after);
+        Assert.True(client.GetChannelStatistics(2, out ChannelStatistics channelAfter));
+        Assert.Equal(2, after.DatagramsCanceled);
+        Assert.Equal(2, after.DatagramsAcknowledged);
+        Assert.Equal(2, channelAfter.TransportCanceled);
+        Assert.Equal(4, channelAfter.Sent);
+    }
+
+    [Fact]
     public void An_Expiry_Waiting_For_Its_First_Pass_Does_Not_Outlive_The_Lost_Connection()
     {
         using SessionHarness h = new(connect: false, client: QuietOptions.Apply, server: QuietOptions.Apply);

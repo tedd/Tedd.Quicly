@@ -160,6 +160,19 @@ public unsafe class StateLayoutTests
     }
 
     [Fact]
+    public void Send_Outcome_Counters_Are_Two_Longs_Apart_From_The_Send_Counters()
+    {
+        // The transport outcome counters have an array of their own: the send counters stay one full line of eight longs.
+        Assert.Equal(16, sizeof(ChannelSendOutcomeCounters));
+        Assert.Equal(ChannelSendOutcomeCounters.Size, sizeof(ChannelSendOutcomeCounters));
+        ChannelSendOutcomeCounters outcomes = default;
+        byte* b = (byte*)&outcomes;
+        Assert.Equal(0, (int)((byte*)&outcomes.TransportCanceled - b));
+        Assert.Equal(8, (int)((byte*)&outcomes.TransportLost - b));
+        Assert.Equal(64, sizeof(ChannelSendCounters));
+    }
+
+    [Fact]
     public void State_Arrays_Put_Every_Element_On_Its_Own_Cache_Line()
     {
         using var send = new NativeArray<ChannelSendState>(5);

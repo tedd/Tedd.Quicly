@@ -198,6 +198,32 @@ public class PeerSurfaceTests
     }
 
     [Fact]
+    public void Transport_Outcome_Statistics_Start_At_Zero_And_Read_As_Default_After_Dispose()
+    {
+        SessionHarness h = new(client: QuietOptions.Apply, server: QuietOptions.Apply);
+        h.Run(50_000);
+        h.Client.GetStatistics(out PeerStatistics peer);
+        Assert.Equal(0, peer.DatagramsAcknowledged);
+        Assert.Equal(0, peer.DatagramsLost);
+        Assert.Equal(0, peer.DatagramsCanceled);
+        Assert.True(h.Client.GetChannelStatistics(2, out ChannelStatistics channel));
+        Assert.Equal(0, channel.TransportCanceled);
+        Assert.Equal(0, channel.TransportLost);
+
+        // The handshake's control datagrams (the first Ping and its Pong) were acknowledged by now, and are not counted:
+        // the outcome counters cover the datagrams of DatagramsSent only.
+        Assert.True(peer.PingsSent > 0);
+        Assert.Equal(0, peer.DatagramsSent);
+
+        h.DisposeClient();
+        h.Client.GetStatistics(out peer);
+        Assert.Equal(default, peer);
+        Assert.False(h.Client.GetChannelStatistics(2, out channel));
+        Assert.Equal(default, channel);
+        h.Dispose();
+    }
+
+    [Fact]
     public void A_Throwing_StateChanged_Handler_Does_Not_Re_Raise_The_Same_Transition()
     {
         using SessionHarness h = new(connect: false);

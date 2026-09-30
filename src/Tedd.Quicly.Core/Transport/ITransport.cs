@@ -146,7 +146,10 @@ public interface ITransportSink
     /// <summary>The stream is fully shut down in both directions; the sink should call <see cref="ITransport.CloseStream"/>.</summary>
     void OnStreamShutdownComplete(TransportStreamId id);
 
-    /// <summary>Datagram support or the maximum payload changed. May be raised before <see cref="OnConnected"/>.</summary>
+    /// <summary>
+    /// Datagram support or the maximum payload changed. May be raised before or after <see cref="OnConnected"/>.
+    /// An explicit report establishes support or non-support; a negative connection snapshot may precede negotiation.
+    /// </summary>
     void OnDatagramCapabilityChanged(bool enabled, int maxPayload);
 
     /// <summary>The transport recommends keeping about <paramref name="bytes"/> outstanding on the stream.</summary>

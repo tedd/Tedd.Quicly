@@ -241,6 +241,8 @@ public sealed unsafe partial class QuiclyPeer
         _lingerDeadline = 0;
         _transportCloseCalled = false;
         _admissionPending = false;
+        _clientHelloPending = false;
+        _helloAwaitingDatagrams = false;
         _handshakeStatus = HelloStatus.Accepted;
         _remoteTable = null;
         _closedRaised = false;

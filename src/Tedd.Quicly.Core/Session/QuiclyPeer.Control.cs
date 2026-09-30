@@ -29,6 +29,8 @@ public sealed unsafe partial class QuiclyPeer
     private long _lingerDeadline;
     private long _admissionDeadline;
     private bool _admissionPending;
+    private bool _clientHelloPending;
+    private bool _helloAwaitingDatagrams;
     private HelloFlags _helloFlags;
     private ulong _sessionId;
     private ReadOnlyMemory<byte> _sessionToken;
@@ -118,8 +120,14 @@ public sealed unsafe partial class QuiclyPeer
             throw new InvalidOperationException("No admission decision is pending.");
         }
 
+        long now = _clock.NowMicros;
+        if (AdmissionExpired(now))
+        {
+            return;
+        }
+
         _admissionPending = false;
-        ApplyAdmission(in result, _clock.NowMicros);
+        ApplyAdmission(in result, now);
     }
 
     // ------------------------------------------------------------------ signals from the transport thread
@@ -148,6 +156,19 @@ public sealed unsafe partial class QuiclyPeer
             if ((signals & SignalHello) != 0)
             {
                 OnHelloReceived(now);
+            }
+
+            if ((signals & SignalDatagramCapability) != 0)
+            {
+                if (_clientHelloPending)
+                {
+                    TryStartClientHandshake(now);
+                }
+
+                if (_helloAwaitingDatagrams)
+                {
+                    OnHelloReceived(now);
+                }
             }
 
             if ((signals & SignalHelloAck) != 0)
@@ -185,12 +206,47 @@ public sealed unsafe partial class QuiclyPeer
         SetState(PeerState.Handshaking);
         if (_role == PeerRole.Client)
         {
-            StartClientHandshake(now);
+            _clientHelloPending = true;
+            TryStartClientHandshake(now);
         }
+    }
+
+    private void TryStartClientHandshake(long now)
+    {
+        if (!_clientHelloPending || _state != PeerState.Handshaking)
+        {
+            return;
+        }
+
+        if (AdmissionExpired(now))
+        {
+            return;
+        }
+
+        // CONNECTED may precede datagram negotiation. Advertising a provisional negative result is irreversible.
+        if (_needsDatagrams && !_core.DatagramCapabilityKnown)
+        {
+            return;
+        }
+
+        _clientHelloPending = false;
+        StartClientHandshake(now);
+    }
+
+    private bool AdmissionExpired(long now)
+    {
+        if (now < _admissionDeadline)
+        {
+            return false;
+        }
+
+        BeginClose(QuiclyErrorCode.Timeout, "admission timeout", CloseSource.Local, CloseMode.SendClose);
+        return true;
     }
 
     private void StartClientHandshake(long now)
     {
+        RefreshAncillaryTransportCapabilities();
         if (_core.OpenStream(StreamKind.Bidirectional, PeerCore.ControlStreamContext, ushort.MaxValue, out TransportStreamId id) != TransportStatus.Success)
         {
             BeginClose(QuiclyErrorCode.InternalError, "the control stream could not be opened", CloseSource.Local, CloseMode.Immediate);
@@ -230,6 +286,11 @@ public sealed unsafe partial class QuiclyPeer
             return;
         }
 
+        if (AdmissionExpired(now))
+        {
+            return;
+        }
+
         ControlParseStatus status = ControlCodec.TryParse(_helloBody, out Hello hello);
         if (status == ControlParseStatus.UnsupportedVersion)
         {
@@ -244,12 +305,31 @@ public sealed unsafe partial class QuiclyPeer
             return;
         }
 
-        if (_needsDatagrams && ((hello.Caps & PeerCaps.Datagrams) == 0 || !_core.DatagramsEnabled))
+        if (_needsDatagrams)
         {
-            RejectHello(HelloStatus.DatagramsRequired, "the channel table requires datagrams");
-            return;
+            if ((hello.Caps & PeerCaps.Datagrams) == 0)
+            {
+                RejectHello(HelloStatus.DatagramsRequired, "the channel table requires datagrams");
+                return;
+            }
+
+            // Retain this valid Hello until an explicit local capability result; the original deadline still applies.
+            if (!_core.DatagramCapabilityKnown)
+            {
+                _helloAwaitingDatagrams = true;
+                return;
+            }
+
+            if (!_core.DatagramsEnabled)
+            {
+                RejectHello(HelloStatus.DatagramsRequired, "the channel table requires datagrams");
+                return;
+            }
         }
 
+        // Capability changes must not repeat an admission policy that returned Pending.
+        _helloAwaitingDatagrams = false;
+        RefreshAncillaryTransportCapabilities();
         HelloInfo info = new()
         {
             Version = hello.Version,
@@ -400,6 +480,11 @@ public sealed unsafe partial class QuiclyPeer
             return;
         }
 
+        if (AdmissionExpired(now))
+        {
+            return;
+        }
+
         ControlCodec.TryParse(_helloAckBody, out HelloAck ack);
         if (ack.HasTable && ChannelTableCodec.TryParseWithNames(ack.Table, out ChannelTableDescription? description, out _) == ChannelTableParseStatus.Ok)
         {
@@ -479,6 +564,8 @@ public sealed unsafe partial class QuiclyPeer
 
         _transportCloseCalled = true;
         _admissionPending = false;
+        _clientHelloPending = false;
+        _helloAwaitingDatagrams = false;
         _terminalSlot = -1;
         _lingerDeadline = 0;
         SetState(PeerState.Closed);
@@ -498,6 +585,8 @@ public sealed unsafe partial class QuiclyPeer
         _closeReasonUtf8 = source == CloseSource.Local ? EncodeReason(reason) : null;
         _ignoreIncoming = true;
         _admissionPending = false;
+        _clientHelloPending = false;
+        _helloAwaitingDatagrams = false;
         SetState(PeerState.Closing);
         if (mode == CloseMode.SendClose)
         {

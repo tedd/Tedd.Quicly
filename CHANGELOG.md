@@ -1,0 +1,1 @@
+2026-09-30	QUIC admission	Wait for definitive datagram capability before advertising or accepting required channels; preserve negotiated flags across callback ordering and enforce the original deadline for Hello, policy completion and acknowledgements.

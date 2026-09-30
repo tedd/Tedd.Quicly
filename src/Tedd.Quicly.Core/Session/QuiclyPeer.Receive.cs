@@ -62,10 +62,27 @@ public sealed unsafe partial class QuiclyPeer
             Volatile.Write(ref _remoteEndPoint, info.RemoteEndPoint);
         }
 
-        _core.SetDatagramCapability(info.Capabilities.Datagrams, info.Capabilities.MaxDatagramPayload);
-        _core.SetDatagramStatesReported(info.Capabilities.DatagramSendState);
-        _core.SetCancelOnBlocked(info.Capabilities.CancelOnBlocked);
+        // MsQuic can report CONNECTED before its first DATAGRAM_STATE_CHANGED. A negative snapshot is provisional,
+        // and must not overwrite an explicit capability callback that preceded this snapshot.
+        if (!_core.DatagramCapabilityKnown)
+        {
+            _core.SetDatagramStatesReported(info.Capabilities.DatagramSendState);
+            _core.SetCancelOnBlocked(info.Capabilities.CancelOnBlocked);
+            _core.SetDatagramCapability(info.Capabilities.Datagrams, info.Capabilities.MaxDatagramPayload, known: info.Capabilities.Datagrams);
+        }
         Signal(SignalConnected);
+    }
+
+    // A connector can raise capability callbacks before its returned transport is attached. Refresh ancillary flags
+    // again before publishing handshake caps, using the current transport rather than a provisional connect snapshot.
+    private void RefreshAncillaryTransportCapabilities()
+    {
+        if (_core.Transport is { } transport)
+        {
+            TransportCapabilities caps = transport.Capabilities;
+            _core.SetDatagramStatesReported(caps.DatagramSendState);
+            _core.SetCancelOnBlocked(caps.CancelOnBlocked);
+        }
     }
 
     private void HandleClosed(TransportCloseReason reason, ulong errorCode, int transportStatus)
@@ -1210,11 +1227,13 @@ public sealed unsafe partial class QuiclyPeer
 
             try
             {
+                bool wasKnown = peer._core.DatagramCapabilityKnown;
+                // Publish ancillary flags before capability readiness releases a waiting Hello.
+                peer.RefreshAncillaryTransportCapabilities();
                 peer._core.SetDatagramCapability(enabled, maxPayload);
-                if (peer._core.Transport is { } transport)
+                if (!wasKnown)
                 {
-                    // Read again with every change of the datagram capability (a client learns it at OnConnected otherwise).
-                    peer._core.SetCancelOnBlocked(transport.Capabilities.CancelOnBlocked);
+                    peer.Signal(SignalDatagramCapability);
                 }
             }
             catch (Exception exception)

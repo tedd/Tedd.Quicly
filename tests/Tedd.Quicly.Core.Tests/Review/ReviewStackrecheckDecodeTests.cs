@@ -1,0 +1,107 @@
+using System.Buffers.Binary;
+using Tedd.Quicly.Core.Channels;
+using Tedd.Quicly.Core.Session;
+using Tedd.Quicly.Core.Tests.Session;
+using Tedd.Quicly.Testing.Simulation;
+
+namespace Tedd.Quicly.Core.Tests.Review;
+
+/// <summary>
+/// Adversarial review, lens: recheck of the fix commits on fix/stack-review after d567ba5 (b32655c, a184b81: the decode
+/// buffer may take the receive budget past its limit and falls back to a larger size class; CanEverRentDecode no longer
+/// subtracts the block the waiting message holds). A test marked FINDING fails at e8af1f8 for the reason its comment gives.
+/// </summary>
+public class ReviewStackrecheckDecodeTests
+{
+    /// <summary>ReliableOrdered with LZ4 (MinCompressSize 16) and MaxMessageSize 256 KiB (the default is 64 KiB; up to 1 MiB is allowed).</summary>
+    private const ushort Packed = 6;
+
+    /// <summary>ReliableOrdered, no compression, defaults.</summary>
+    private const ushort Chat = 4;
+
+    private static readonly ChannelTable Table = ChannelTable.Create()
+        .Add(2, "moves", ChannelMode.UnreliableUnordered)
+        .Add(Chat, "chat", ChannelMode.ReliableOrdered)
+        .Add(Packed, "packed", ChannelMode.ReliableOrdered, o => { o.Compression = ChannelCompression.Lz4; o.MinCompressSize = 16; o.MaxMessageSize = 256 * 1024; })
+        .Build();
+
+    /// <summary>
+    /// A payload of <paramref name="size"/> bytes whose first <paramref name="noise"/> bytes LZ4 cannot shrink and the rest
+    /// are zeroes: it compresses to a little over <paramref name="noise"/> bytes.
+    /// </summary>
+    private static byte[] Payload(int index, int size, int noise)
+    {
+        byte[] payload = new byte[size];
+        new Random(index + 1).NextBytes(payload.AsSpan(0, noise));
+        BinaryPrimitives.WriteInt32LittleEndian(payload, index);
+        return payload;
+    }
+
+    /// <summary>
+    /// FINDING (critical, regression of b32655c against d567ba5 and v0.2.1). The receiver runs the library's defaults: a
+    /// private compact pool, whose largest class has ONE block of 256 KiB, and a receive budget of 256 KiB; the channel's
+    /// MaxMessageSize is raised to 256 KiB (allowed up to 1 MiB). A compressed ReliableOrdered message of 200 000 bytes that LZ4 packs to about 100 KB arrives in that one 256 KiB block (its
+    /// compressed size is above the 64 KiB class). Its decode needs a 256 KiB block too — there is no second one.
+    /// <para>
+    /// <c>CanEverRentDecode</c> now only asks whether the block is not larger than the budget (256 KiB &lt;= 256 KiB: yes),
+    /// no longer whether it fits next to the block the message itself holds, so <c>TryRentForDecode</c> answers "wait".
+    /// <c>TryRentDecode</c> can never succeed: the only block of the class is the message's own. The message waits at the
+    /// head of the channel for ever, holding the whole receive budget: every Drain of the channel returns 0, the message
+    /// behind it never comes, and every other channel of the peer stops receiving (their messages are held for the budget).
+    /// At d567ba5 the same message was dropped and counted in DecodeFailures (<c>CanEverRentReceive(raw, held)</c>: 256 KiB
+    /// &lt;= 256 KiB - 256 KiB is false) and the peer went on. The Drain remarks promise "a Drain that finds everything
+    /// released gets the next message's buffer (unless a shared pool has no block ...)" — the pool here is the private
+    /// default one.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void A_Compressed_Message_Whose_Block_Is_The_Pools_Only_Block_Of_Its_Decode_Class_Does_Not_Stall_The_Peer()
+    {
+        // The client gets a roomy pool so that it can send the message; the server runs the defaults.
+        using SessionHarness h = new(table: Table, client: o =>
+        {
+            GroupKit.Prompt(o);
+            OrderedKit.Roomy(o);
+        }, server: GroupKit.Prompt);
+        QuiclyPeer server = h.Server!;
+        List<int> chat = [];
+        server.RegisterHandler(Chat, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => chat.Add(BinaryPrimitives.ReadInt32LittleEndian(payload)));
+
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(0, 200_000, 100_000)).Status);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(1, 2_000, 0)).Status);
+
+        // The application drains the channel every frame and releases what it got straight away.
+        List<int> got = [];
+        ReceivedMessage[] buffer = new ReceivedMessage[16];
+        bool chatSent = false;
+        h.RunUntil(() =>
+        {
+            // Once the large message has arrived: a message on a handled channel of the same peer, which should not care
+            // what the drained channel does.
+            if (!chatSent && DatagramKit.ChannelStats(server, Packed).Received >= 1)
+            {
+                Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Chat), BitConverter.GetBytes(42)).Status);
+                chatSent = true;
+            }
+
+            int taken;
+            while ((taken = server.Drain(Packed, buffer)) > 0)
+            {
+                for (int i = 0; i < taken; i++)
+                {
+                    got.Add(BinaryPrimitives.ReadInt32LittleEndian(buffer[i].Payload));
+                }
+
+                server.Release(buffer.AsSpan(0, taken));
+            }
+
+            return got.Contains(1) && chat.Count == 1;
+        }, 2_000_000);
+
+        PeerStatistics statistics = DatagramKit.Statistics(server);
+        Assert.True(got.Contains(1) && chat.Count == 1,
+            $"two seconds of Poll + Drain + Release every frame: the drained channel gave [{string.Join(",", got)}] (message 1 {(got.Contains(1) ? "arrived" : "never came")}), "
+            + $"the handled channel {chat.Count} of 1; ReceiveBytesOutstanding {statistics.ReceiveBytesOutstanding} of 262144, DecodeFailures {statistics.DecodeFailures}, "
+            + $"StreamReceivePends {statistics.StreamReceivePends}, the drained channel's Received {DatagramKit.ChannelStats(server, Packed).Received} (chat sent after it arrived: {chatSent})");
+    }
+}

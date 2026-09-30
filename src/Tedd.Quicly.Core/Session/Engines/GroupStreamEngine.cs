@@ -95,6 +95,12 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
     private SpscRing<StreamNotice> _notices = null!;
     private int _freeGroup = -1;
     private int _freeRecv = -1;
+
+    // Transport thread: receive records in use, and one past the highest record handed out since the free list was last
+    // built. The free list hands out the lowest records first and takes a released one back at its head, so the records in
+    // use stay below the most that were ever open at once: OnStreamClosed looks there and no further.
+    private int _recvInUse;
+    private int _recvHigh;
     private int _carrierReserve;
     private long _maxReceiveMessage;
     private int _maxSegments;
@@ -175,7 +181,8 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         }
 
         // Receive side: one record for every stream the peer can have open at all, whatever channel it names — the
-        // channel's own MaxGroups is not the bound there (see OnStreamOpened), the connection's stream limit is.
+        // channel's own MaxGroups is not the bound there (see OnStreamOpened). That is the session's stream limit here; a
+        // transport that grants more by itself says so when it connects (OnPeerStreamCapacity).
         _groups = new NativeArray<GroupState>(Math.Max(groupSlots, 1));
         _recv = new NativeArray<GroupRecv>(Math.Max(core.PeerUnidirectionalStreamLimit, 1));
         for (int i = _groups.Length - 1; i >= 0; i--)
@@ -528,9 +535,10 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             return;
         }
 
-        // A group that still holds a stream keeps its record: the channel's stream slot (and the peer's stream credit)
-        // return when the stream shuts down, which is also when the receiving end frees the group's slot, so this end never
-        // opens the stream that would push the peer past its MaxGroups.
+        // A group that still holds a stream keeps its record: the channel's stream slot returns when the stream shuts down.
+        // The receiving end may still have the stream open then — it frees its own slot when it has read the stream, and the
+        // peer's stream credit comes back only at that point — which is why MaxGroups is this end's bound and not one the
+        // receiver can enforce (PROTOCOL.md §7).
         if ((state.Flags & GroupCounted) != 0)
         {
             return;
@@ -819,6 +827,9 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             recv.Next = _freeRecv;
             _freeRecv = record;
         }
+
+        _recvInUse = 0;
+        _recvHigh = 0;
     }
 
     /// <summary>Drops messages at the head of a group whose expiry has passed (only while the group has no stream yet).</summary>
@@ -1359,8 +1370,10 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         // as closed once its data and FIN are acknowledged; this end still has that stream open for as long as its receive
         // is held back (the ring is full, the budget is used up, the host is late with a Poll). A sender that keeps the
         // limit can therefore have more than MaxGroups streams open here, and resetting one would destroy a group whose
-        // messages it has already completed as delivered. What bounds the streams is the connection's stream limit, and
-        // there is a record for each of them: without one, the transport let the peer past that limit.
+        // messages it has already completed as delivered. What bounds the streams is what the transport admits — the
+        // session's stream limit, or the transport's own initial grant when that is more (PeerCore.PeerStreamCapacity) — and
+        // there is a record for each of them. Without one the transport admitted a stream beyond what it reported, which
+        // breaks its contract; resetting it is all that is left.
         int record = _freeRecv;
         if (record < 0)
         {
@@ -1376,7 +1389,47 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         recv.Lease = BufferLease.Empty;
         recv.Flags = RecvInUse;
         _openGroups[local]++;
+        _recvInUse++;
+        if (record >= _recvHigh)
+        {
+            _recvHigh = record + 1;
+        }
+
         return StreamAccept.Accept(record);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Grows the receive records to one per stream the peer can have open (transport thread, from OnConnected: no stream of
+    /// the connection exists yet, and the records belong to this thread). Records in use — there are none at that point —
+    /// would keep their index, which is the stream's cookie.
+    /// </remarks>
+    public override void OnPeerStreamCapacity(int streams)
+    {
+        NativeArray<GroupRecv> current = _recv;
+        if (streams <= current.Length)
+        {
+            return;
+        }
+
+        NativeArray<GroupRecv> grown = new(streams);
+        current.AsSpan().CopyTo(grown.AsSpan());
+        _freeRecv = -1;
+        for (int record = grown.Length - 1; record >= 0; record--)
+        {
+            ref GroupRecv recv = ref grown[record];
+            if ((recv.Flags & RecvInUse) != 0)
+            {
+                continue;
+            }
+
+            recv = default;
+            recv.Next = _freeRecv;
+            _freeRecv = record;
+        }
+
+        _recv = grown;
+        current.Dispose();
     }
 
     /// <inheritdoc/>
@@ -1518,13 +1571,17 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
     /// <inheritdoc/>
     public override void OnStreamClosed(TransportStreamId id, bool aborted, ulong errorCode)
     {
-        for (int record = 0; record < _recv.Length; record++)
+        // Every engine hears the close of every locally opened stream, so this runs for streams that are not ours at all:
+        // nothing to look for while no peer group stream is open, and otherwise only the records that were ever in use.
+        int high = _recvInUse != 0 ? _recvHigh : 0;
+        for (int record = 0; record < high; record++)
         {
             ref GroupRecv recv = ref _recv[record];
             if ((recv.Flags & RecvInUse) != 0 && recv.Stream == id)
             {
                 ReleaseReceive(ref recv);
                 _openGroups[recv.Local]--;
+                _recvInUse--;
                 recv.Flags = 0;
                 recv.Stream = default;
                 recv.Next = _freeRecv;

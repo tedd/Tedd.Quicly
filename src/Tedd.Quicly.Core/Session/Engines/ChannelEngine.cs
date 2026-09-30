@@ -260,6 +260,19 @@ internal abstract class ChannelEngine : IDisposable
     }
 
     /// <summary>
+    /// The transport connected and reported how many unidirectional streams the peer can have open on this connection:
+    /// the larger of the session's own limit (<see cref="PeerCore.PeerUnidirectionalStreamLimit"/>) and what the transport
+    /// granted by itself (<see cref="TransportCapabilities.PeerUnidirectionalStreams"/>). An engine that keeps a record per
+    /// peer stream makes room for that many. Transport thread, from <see cref="ITransportSink.OnConnected"/>: before any
+    /// stream of the connection exists, and on the thread that owns the engine's receive state, so nothing can be using
+    /// what the engine replaces. Called again when a reconnect attaches a transport with a larger grant. Default: nothing.
+    /// </summary>
+    /// <param name="streams">Unidirectional streams the peer can have open at once.</param>
+    public virtual void OnPeerStreamCapacity(int streams)
+    {
+    }
+
+    /// <summary>
     /// A control message addressed to this mode (LatestAck/LatestReject → ReliableLatest; BulkProgress/BulkRequest/
     /// BulkCancel/BulkReject → Bulk; KeyRetired → the channel's mode). The peer has validated the frame with
     /// <see cref="ControlCodec"/> (batch structure, channel ranges) and the session is admitted. Transport thread.

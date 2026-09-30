@@ -62,6 +62,9 @@ public sealed unsafe partial class QuiclyPeer
             Volatile.Write(ref _remoteEndPoint, info.RemoteEndPoint);
         }
 
+        // First: no stream of this connection exists yet, so the per-stream receive state can still be sized for what the
+        // transport admits by itself.
+        _core.SetTransportPeerStreams(info.Capabilities.PeerUnidirectionalStreams);
         _core.SetDatagramCapability(info.Capabilities.Datagrams, info.Capabilities.MaxDatagramPayload);
         _core.SetDatagramStatesReported(info.Capabilities.DatagramSendState);
         _core.SetCancelOnBlocked(info.Capabilities.CancelOnBlocked);

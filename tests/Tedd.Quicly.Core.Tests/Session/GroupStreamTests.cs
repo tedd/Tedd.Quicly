@@ -241,6 +241,87 @@ public class GroupStreamTests
         Assert.Equal(0, DatagramKit.Statistics(client).StreamsReset);
     }
 
+    [Fact]
+    public void A_Reconnect_To_A_Transport_That_Grants_More_Streams_Makes_Room_Before_Its_Streams_Arrive()
+    {
+        // The first transport grants nothing by itself, so the session's own limit (9) is all the peer can open and all the
+        // client keeps records for. The transport of the resumed connection grants 1 024 in its own configuration, as an
+        // MsQuic client does by default: the session learns that when the transport connects — before any stream of the
+        // connection exists — and a late client then holds what the server opens instead of resetting it.
+        using SessionHarness h = new(connect: false, table: TestTables.Plumbing, server: GroupKit.Prompt, client: o =>
+        {
+            QuietOptions.Apply(o);
+            o.ReceiveRingCapacity = 64;
+        });
+        h.Admission.Handler = static (in HelloInfo hello, QuiclyPeer _) =>
+            AdmissionResult.Accept(ResumeToken, 4242, epoch: hello.SessionToken.IsEmpty ? 1u : 2u);
+        Assert.True(h.RunUntilConnected());
+        QuiclyPeer client = h.Client;
+        QuiclyPeer oldServer = h.Server!;
+        Assert.Equal(9, client.Core.PeerUnidirectionalStreamLimit);
+        Assert.Equal(9, client.Core.PeerStreamCapacity);
+        List<int> got = [];
+        client.RegisterHandler(11, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => got.Add(BitConverter.ToInt32(payload)));
+
+        oldServer.Core.Transport!.Close((ulong)QuiclyErrorCode.NoError, default);
+        Assert.True(h.RunUntil(() => client.State == PeerState.Closed));
+        SimulatedConnector wide = new(h.Network, new LinkOptions { PeerUnidiStreams = 1024 });
+        client.Reconnect(wide, h.Listener.LocalEndPoint, "test", default);
+        Assert.True(h.RunUntil(() => client.State == PeerState.Connected && h.Server is not null
+            && !ReferenceEquals(h.Server, oldServer) && h.Server.State == PeerState.Connected));
+        oldServer.Dispose();
+        Assert.Equal(1024, client.Core.PeerStreamCapacity);
+        Assert.True(client.Core.PendedStreams.Capacity >= 1026, $"the pended-stream ring holds {client.Core.PendedStreams.Capacity}");
+
+        SendGroupsToALateReceiver(h, h.Server!, 11, 640);
+        int open = GroupKit.OpenPeerGroups(client, 11);
+        Assert.True(h.RunUntil(() => got.Count == 640, 2_000_000),
+            $"received {got.Count} of 640 messages; the client reset {DatagramKit.Statistics(client).StreamsReset} streams");
+        Assert.Equal(Enumerable.Range(0, 640), got.Order());
+        Assert.True(open > 9, $"only {open} peer streams were open at the client while it was behind");
+        PeerStatistics statistics = DatagramKit.Statistics(client);
+        Assert.Equal(0, statistics.StreamsReset);
+        Assert.Equal(0, statistics.CallbackFaults);
+        Assert.True(h.RunUntil(() => GroupKit.OpenPeerGroups(client, 11) == 0));
+        Assert.Equal(0, DatagramKit.Statistics(client).ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void The_Peer_Stream_Capacity_Only_Grows_And_The_Ring_It_Replaces_Stays_Readable()
+    {
+        using SessionHarness h = new(table: TestTables.Plumbing);
+        PeerCore core = h.Server!.Core;
+        int limit = core.PeerUnidirectionalStreamLimit;
+        Assert.Equal(limit, core.PeerStreamCapacity);
+        SpscRing<TransportStreamId> first = core.PendedStreams;
+
+        // A grant at or below the session's own limit changes nothing.
+        core.SetTransportPeerStreams(0);
+        core.SetTransportPeerStreams(limit);
+        Assert.Equal(limit, core.PeerStreamCapacity);
+        Assert.Same(first, core.PendedStreams);
+
+        // A larger one replaces the ring; the old one is kept, because another thread may still be reading it.
+        core.SetTransportPeerStreams(200);
+        Assert.Equal(200, core.PeerStreamCapacity);
+        Assert.NotSame(first, core.PendedStreams);
+        Assert.True(core.PendedStreams.Capacity >= 202);
+        Assert.True(first.IsEmpty);
+        Assert.False(first.TryDequeue(out _));
+
+        // The capacity never shrinks: a transport attached later with a smaller grant keeps what is there.
+        SpscRing<TransportStreamId> second = core.PendedStreams;
+        core.SetTransportPeerStreams(50);
+        Assert.Equal(200, core.PeerStreamCapacity);
+        Assert.Same(second, core.PendedStreams);
+
+        // The session still works, and disposing it frees both rings.
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        h.Server.RegisterHandler(11, Handlers.Collect(got));
+        Assert.True(h.Client.SendCopy(new SendHeader(11), [1, 2, 3]).IsAdmitted);
+        Assert.True(h.RunUntil(() => got.Count == 1));
+    }
+
     /// <summary>
     /// Sends <paramref name="count"/> numbered, tracked messages, one group per sixteen, while only the sender is pumped:
     /// the receiver is late with its Poll for 4 ms per group.

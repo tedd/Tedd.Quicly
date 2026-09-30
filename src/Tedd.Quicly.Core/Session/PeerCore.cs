@@ -90,6 +90,9 @@ internal sealed unsafe class PeerCore : IDisposable
     private readonly int[] _entryOfToken;
     private readonly ReceiveMailbox?[] _mailboxByIndex;
     private ReceiveMailbox[] _mailboxes = [];
+    private SpscRing<TransportStreamId> _pendedStreams;
+    // Rings SetTransportPeerStreams replaced: kept until Dispose, because the game thread may still be reading one.
+    private List<SpscRing<TransportStreamId>>? _retiredPendedStreams;
     // Cold, by slot: the shared payload an entry holds one reference on (SendShared), released in ReleasePayload.
     private readonly SharedLeaseTable?[] _sharedTables;
     private readonly SharedLease[] _sharedLeases;
@@ -180,7 +183,8 @@ internal sealed unsafe class PeerCore : IDisposable
         _sendOutcomes = new NativeArray<ChannelSendOutcomeCounters>(Math.Max(1, _channels.Length)); // zeroed by NativeArray
         _recvCounters = new NativeArray<ChannelRecvCounters>(Math.Max(1, _channels.Length));
         PeerUnidirectionalStreamLimit = ComputeUnidirectionalLimit(_channels);
-        PendedStreams = new SpscRing<TransportStreamId>(PeerUnidirectionalStreamLimit + 2);
+        PeerStreamCapacity = PeerUnidirectionalStreamLimit;
+        _pendedStreams = new SpscRing<TransportStreamId>(PeerStreamCapacity + 2);
         Streams = new StreamTable();
         SessionMaxMessageSize = role == PeerRole.Server ? options.MaxMessageSize : 0;
         FlushIntervalMicros = Math.Max(1, PeerOptions.ToMicros(options.FlushInterval));
@@ -614,7 +618,52 @@ internal sealed unsafe class PeerCore : IDisposable
     public SpscRing<ReceiveEntry> ReceiveRing { get; }
 
     /// <summary>Streams whose receive returned Pending, transport thread → game thread (resumed in Poll).</summary>
-    public SpscRing<TransportStreamId> PendedStreams { get; }
+    public SpscRing<TransportStreamId> PendedStreams => Volatile.Read(ref _pendedStreams);
+
+    /// <summary>
+    /// Unidirectional streams the peer can have open at once on this connection: <see cref="PeerUnidirectionalStreamLimit"/>,
+    /// or what the transport granted by itself when that is more (<see cref="SetTransportPeerStreams"/>). Everything the
+    /// session keeps per peer stream — <see cref="PendedStreams"/>, the engines' receive records — is sized from it, so a
+    /// stream the transport admits always finds its place.
+    /// </summary>
+    public int PeerStreamCapacity { get; private set; }
+
+    /// <summary>
+    /// Makes room for the streams the transport admits by itself (transport thread, <see cref="ITransportSink.OnConnected"/>).
+    /// A QUIC transport grants the peer an initial number of unidirectional streams in its own configuration — an MsQuic
+    /// client 1 024 by default — and never takes them back, whatever the session asks for after admission. When that is more
+    /// than the session's limit, the streams a late receiver holds open can outnumber what the session was built for; a
+    /// stream without a record would have to be reset, and its sender has long completed its messages as delivered.
+    /// </summary>
+    /// <remarks>
+    /// Safe without a lock because of where it runs. No stream of a connection exists before its OnConnected, so the ring
+    /// being replaced is empty and nothing is in flight to it; the engines' receive records belong to the transport thread,
+    /// which is the caller. The game thread may still hold the old ring (a Poll in progress, the work probe of another
+    /// thread): it finds it empty, and the ring stays allocated until the peer is disposed, so that read is never a use
+    /// after free. The capacity only grows, so a reconnect to a transport with a smaller grant keeps what it has.
+    /// </remarks>
+    /// <param name="granted">The transport's own grant (<see cref="TransportCapabilities.PeerUnidirectionalStreams"/>).</param>
+    public void SetTransportPeerStreams(int granted)
+    {
+        int capacity = Math.Min(Math.Max(PeerUnidirectionalStreamLimit, granted), ushort.MaxValue);
+        if (capacity <= PeerStreamCapacity)
+        {
+            return;
+        }
+
+        PeerStreamCapacity = capacity;
+        SpscRing<TransportStreamId> current = _pendedStreams;
+        if (capacity + 2 > current.Capacity)
+        {
+            (_retiredPendedStreams ??= []).Add(current);
+            Volatile.Write(ref _pendedStreams, new SpscRing<TransportStreamId>(capacity + 2));
+        }
+
+        foreach (ChannelEngine engine in _activeEngines)
+        {
+            engine.OnPeerStreamCapacity(capacity);
+        }
+    }
 
     /// <summary>Receive-side stream records (transport thread).</summary>
     public StreamTable Streams { get; }
@@ -1861,6 +1910,14 @@ internal sealed unsafe class PeerCore : IDisposable
         ReceiveRing.Dispose();
         CompletionRing.Dispose();
         PendedStreams.Dispose();
+        if (_retiredPendedStreams is not null)
+        {
+            foreach (SpscRing<TransportStreamId> retired in _retiredPendedStreams)
+            {
+                retired.Dispose();
+            }
+        }
+
         Completions.Dispose();
         _tokens.Dispose();
         _stamps.Dispose();

@@ -229,11 +229,14 @@ public struct PeerStatistics
 
     /// <summary>
     /// Times the receive side of an <see cref="Channels.ChannelMode.UnreliableSequenced"/> channel resynchronised its
-    /// sequence clock: a sequence arrived that reads as older than the newest one seen on the channel, more than two
-    /// seconds after that newest one last advanced, and was therefore taken for a forward jump of at least half the
-    /// sequence space (a long blackout, or a sender whose messages expired unsent) instead of a late message
-    /// (PROTOCOL.md §8). Normally zero; a steadily rising value on a slow channel means messages arrive more than two
-    /// seconds late and are being delivered out of order.
+    /// sequence clock: a sequence arrived that reads as older than the newest one seen on the channel by more than the
+    /// reorder window (1 024 on a 16-bit channel, 65 536 on a 32-bit one), more than two seconds after that newest one
+    /// last advanced, and was therefore taken for a forward jump of at least half the sequence space (a long blackout,
+    /// or a sender whose messages expired unsent) instead of a late message (PROTOCOL.md §8). Normally zero. A value
+    /// that rises without blackouts means messages arrive more than two seconds late after more than a window of later
+    /// ones overtook them, and are delivered out of order: the sender queues datagrams in its transport
+    /// (<see cref="PeerOptions.DropWhenBlocked"/> off, or sequenced messages packed next to ReliableLatest values) on a
+    /// link that stays congested for seconds.
     /// </summary>
     public long SequenceResyncs;
 
@@ -280,7 +283,7 @@ public struct PeerStatistics
     /// Non-zero means a channel receives traffic that nobody drains, or that is not drained empty between two Polls (a
     /// host that polls several times per Drain, or drains with a span it fills and does not call again). Register a
     /// handler, or drain the channel completely once per Poll — a channel that is loses nothing here, however large the
-    /// burst. A larger <see cref="PeerOptions.ReceiveBudgetBytes"/> raises the byte limit of the backlog;
+    /// burst and however many channels are read that way. A larger <see cref="PeerOptions.ReceiveBudgetBytes"/> raises the byte limit of the backlog;
     /// <see cref="PeerOptions.ReceiveRingCapacity"/> does not raise the node limit beyond 1 024. Game thread; a total since
     /// the peer was created.
     /// </remarks>

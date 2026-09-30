@@ -129,6 +129,11 @@ public interface ITransportSink
     /// Stream data arrived as one or more segments (a frame may be split across segments and across calls).
     /// Return how many bytes were consumed and whether the remainder is held back.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="fin"/> is the end of the stream, and it is shown once: a sink that holds an indication carrying it
+    /// with no byte left unconsumed gets no further indication after the resume, only
+    /// <see cref="OnStreamPeerSendShutdown"/> (see <see cref="ReceiveResult"/>).
+    /// </remarks>
     ReceiveResult OnStreamReceived(TransportStreamId id, ReadOnlySpan<TransportSegment> segments, ulong absoluteOffset, bool fin);
 
     /// <summary>A stream send completed; its segment array and buffers may be released. <paramref name="canceled"/> when the data was not delivered.</summary>
@@ -146,7 +151,10 @@ public interface ITransportSink
     /// <summary>The stream is fully shut down in both directions; the sink should call <see cref="ITransport.CloseStream"/>.</summary>
     void OnStreamShutdownComplete(TransportStreamId id);
 
-    /// <summary>Datagram support or the maximum payload changed. May be raised before <see cref="OnConnected"/>.</summary>
+    /// <summary>
+    /// Datagram support or the maximum payload changed. May be raised before or after <see cref="OnConnected"/>.
+    /// An explicit report establishes support or non-support; a negative connection snapshot may precede negotiation.
+    /// </summary>
     void OnDatagramCapabilityChanged(bool enabled, int maxPayload);
 
     /// <summary>The transport recommends keeping about <paramref name="bytes"/> outstanding on the stream.</summary>

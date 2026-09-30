@@ -12,7 +12,10 @@ public enum ControlType : byte
     /// <summary>Answer to a <see cref="Ping"/> (<see cref="Control.Pong"/>).</summary>
     Pong = 0x02,
 
-    /// <summary>Cumulative ReliableLatest acknowledgements (<see cref="LatestAckBatchReader"/>, <see cref="LatestAckBatchWriter"/>).</summary>
+    /// <summary>
+    /// ReliableLatest acknowledgements: per key, the highest version the receiver has accepted
+    /// (<see cref="LatestAckBatchReader"/>, <see cref="LatestAckBatchWriter"/>).
+    /// </summary>
     LatestAck = 0x03,
 
     /// <summary>ReliableLatest versions dropped locally by the receiver (<see cref="LatestRejectBatchReader"/>, <see cref="LatestRejectBatchWriter"/>).</summary>

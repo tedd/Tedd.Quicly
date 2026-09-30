@@ -50,11 +50,20 @@
   other channels.
 * **A channel the application does not read is bounded per class** (PROTOCOL §7 "Channels nobody drains", added
   2026-09-30). A peer chooses which channels it sends on, so it must not be able to stall a receiver through a
-  channel the application happens not to drain. Unreliable ring channels share a capped backlog (the part of the
-  drain-queue pool not reserved for reliable channels, and a quarter of the receive byte budget) with oldest-first
-  eviction from the channel over its share: a flood on one costs that channel its old messages and O(1) work per
-  message (a channel *under* its share that needs room scans the unreliable channels for the longest queue, O(their
-  number), and remembers the answer), never the ring, another channel or more budget. Reliable channels cannot be evicted; an undrained one
+  channel the application happens not to drain. What unreliable ring channels still have queued when a Poll begins,
+  undrained since the Poll before, is their backlog, and it is capped (the part of the drain-queue pool not reserved
+  for reliable channels, and a quarter of the receive byte budget) with oldest-first eviction from the backlogged
+  channel furthest over its share: a flood on a channel nobody reads costs that channel its old messages and O(1)
+  work per message (a backlogged channel *under* its share that needs room scans the unreliable channels for the
+  longest queue, O(their number), and remembers the answer; each Poll with something queued walks them once). The
+  cap is deliberately not applied to a channel the application *is* draining — that would cut bursts the ring and
+  the budget had already accepted — so the first burst on an undrained channel is queued whole and may hold the
+  ring until the next Poll; from that Poll on the channel is backlog and never holds again — the mark is cleared
+  only by the application's own Drain (or a handler), not by other channels evicting its queue to nothing, or two
+  unread channels could take turns at closing the ring. A peer can therefore close the ring through the unread
+  unreliable channels of a table for one Poll interval per channel in total (two for a channel the application
+  stopped draining, and at the start of a session, whose first Poll counts as drained), not longer, and pin more
+  than the quarter of the budget for as long, not longer. Reliable channels cannot be evicted; an undrained one
   still back-pressures the whole ring (a known limit, to be confined to its own streams by per-channel receive
   credit), so a host must handle or drain every reliable channel in its table.
 * **Retransmission cannot be weaponised**: ReliableLatest has per-version and per-peer retry budgets;
@@ -62,11 +71,16 @@
 * **Sequence numbers give the peer nothing it did not have** (PROTOCOL §8 "sequence clock"). Only the
   authenticated peer can produce datagrams (QUIC's AEAD and packet numbers exclude third-party replay and
   duplication), and it could always send any sequence it liked. A tracked key that was updated recently is
-  judged exactly: nothing at or below its value is accepted. A tracked key that idled past half the range accepts
-  its next value whatever the wire sequence — the position an evicted or new key is already in (§7), no wider. A
-  sequence far ahead moves the channel's clock by less than half a range and only makes that peer's own later
-  values stale; the time-based resynchronisation of `UnreliableSequenced` is equivalent to sending a fresh higher
-  sequence. State is fixed-size, work is O(1) per message, nothing allocates. A `ReliableLatest` ack completes a
+  judged exactly — nothing at or below its value is accepted — for as long as the channel's clock does not
+  resynchronise. A tracked key that idled past half the range accepts its next value whatever the wire sequence —
+  the position an evicted or new key is already in (§7), no wider. A sequence far ahead moves the channel's clock
+  by less than half a range and only makes that peer's own later values stale. The resynchronisation of
+  `UnreliableSequenced` (a sequence more than the reorder window behind the clock, after 2 s without an advance)
+  moves the clock forward by up to a range, which re-opens every tracked key of that channel to lower wire
+  sequences once; for the peer that is equivalent to sending a fresh higher sequence, which it always could. It is
+  also the one place where the peer's *own* sender can cause a misjudgment without meaning to: a datagram that
+  more than a window of later messages overtook in its transport queue, arriving after 2 s of quiet, is delivered
+  out of order once (PROTOCOL §8 says when that can happen and how to avoid it). State is fixed-size, work is O(1) per message, nothing allocates. A `ReliableLatest` ack completes a
   value only when it names exactly the version last transmitted for the key, so no ack the peer can forge or
   replay reports a value `Delivered` that was not the one on the wire.
 * **0-RTT is never used for QUICLY frames**; servers default to no TLS resumption.

@@ -13,7 +13,10 @@ public readonly record struct Pong(uint EchoedTimeMicros, uint ReceiveTimeMicros
 /// <summary>One entry of a LatestAck batch (type 0x03, PROTOCOL.md §2.3): the highest version accepted for a key.</summary>
 /// <param name="Channel">Channel id, 2–16383.</param>
 /// <param name="Key">Key, at most 2^62 − 1.</param>
-/// <param name="Version">Cumulative: every version up to this one (serial arithmetic) is covered.</param>
+/// <param name="Version">
+/// The highest version the receiver has accepted for the key. It completes a value only when it equals the version the
+/// sender last transmitted for that key; any other version means the value still has to arrive and changes nothing.
+/// </param>
 public readonly record struct LatestAckEntry(ushort Channel, ulong Key, uint Version);
 
 /// <summary>One entry of a LatestReject batch (type 0x04, PROTOCOL.md §2.3): a version the receiver dropped locally.</summary>

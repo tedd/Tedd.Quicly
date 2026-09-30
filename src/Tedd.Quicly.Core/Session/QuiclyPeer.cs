@@ -21,7 +21,7 @@ namespace Tedd.Quicly.Core.Session;
 /// heartbeat, admission timeout, close linger, engine retries) runs inside <see cref="Poll"/> and <see cref="Flush"/>
 /// with the clock read once per call.</para>
 /// <para><b>Lifecycle.</b> <see cref="PeerState.Connecting"/> → <see cref="PeerState.Handshaking"/> (transport connected;
-/// the client sends Hello) → <see cref="PeerState.Connected"/> (HelloAck accepted) → <see cref="PeerState.Closing"/> →
+/// the client sends Hello once required datagram capability is known) → <see cref="PeerState.Connected"/> (HelloAck accepted) → <see cref="PeerState.Closing"/> →
 /// <see cref="PeerState.Closed"/>. Every change is reported by <see cref="StateChanged"/> from <see cref="Poll"/>; after
 /// the Closed event no handler or event runs. <see cref="Dispose"/> closes the transport if needed; native memory is freed
 /// once the transport reported its close and no <see cref="Poll"/> or <see cref="Flush"/> call is running.</para>
@@ -36,6 +36,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     internal const int SignalCloseRequest = 1 << 5;
     internal const int SignalTableRequest = 1 << 6;
     internal const int SignalTableInfo = 1 << 7;
+    internal const int SignalDatagramCapability = 1 << 8;
 
     // Lifetime word: native memory is freed exactly once, when the transport can no longer call back (ClosedSeen), the
     // application disposed the peer (DisposeRequested) and no game-thread Poll/Flush is running (InCall clear). Whoever
@@ -154,8 +155,8 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
 
     /// <summary>
     /// Connects to a server (client role). The peer passes itself (<see cref="TransportSink"/>) to
-    /// <paramref name="connector"/>; when the transport connects, the next <see cref="Poll"/> opens the control stream and
-    /// sends Hello. Callbacks may arrive before this method returns.
+    /// <paramref name="connector"/>; after the transport connects and required datagram capability is known, the next
+    /// <see cref="Poll"/> opens the control stream and sends Hello. Callbacks may arrive before this method returns.
     /// </summary>
     /// <param name="connector">Creates the transport.</param>
     /// <param name="endpoint">The server.</param>

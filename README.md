@@ -23,7 +23,7 @@ Buypass, Google Trust Services, …).
 
 * [Architecture](docs/ARCHITECTURE.md) · [Wire protocol](docs/PROTOCOL.md) · [Decisions](docs/adr/) ·
   [Benchmarks](docs/benchmarks/) · [Development guide](docs/DEVELOPMENT.md) ·
-  [Troubleshooting](docs/TROUBLESHOOTING.md)
+  [Troubleshooting](docs/TROUBLESHOOTING.md) · [Release notes](docs/RELEASE-NOTES.md)
 
 ## Carriers
 

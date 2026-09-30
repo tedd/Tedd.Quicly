@@ -218,10 +218,15 @@ is chosen:
   application holds outlives its peer when the peer rents from a shared pool (every server peer): `Release`
   after `Dispose` returns the block to that pool (ADR 0004).
   **A channel without a handler must be drained**, and what it costs when it is not depends on its mode
-  (PROTOCOL.md §7, docs/design/session-layer.md §4.4). An unreliable channel keeps a bounded backlog — the
-  unreliable channels together queue at most the part of the drain-queue pool not reserved for reliable
-  channels and pin at most a quarter of the receive budget — and drops its **oldest** messages beyond it
-  (`DrainQueueDrops`, per channel and per peer); it never disturbs another channel. A reliable channel is never
+  (PROTOCOL.md §7, docs/design/session-layer.md §4.4). An unreliable channel that is drained completely
+  once per Poll (before or after it) loses nothing the ring and the budget took — with any number of such
+  channels, and including what arrived with the handshake, because the Poll in which the peer became Connected
+  (run by `QuiclyClient.ConnectAsync` for a client) counts as drained. What such a channel still has
+  queued when the next Poll begins is its backlog, and that is bounded — the backlogs together occupy at most
+  the part of the drain-queue pool not reserved for reliable channels and pin at most a quarter of the receive
+  budget — and drops its **oldest** messages beyond it (`DrainQueueDrops`, per channel and per peer); a channel
+  nobody drains closes the ring to the other channels once, for one Poll interval (two for a channel that was
+  drained before, or when the burst arrives with the session's first Poll), and not again until it has been drained. A reliable channel is never
   dropped, so an undrained one fills the pool and then holds the receive ring: every stream channel is
   back-pressured and datagrams of ring channels are dropped on arrival until it is drained or gets a handler
   (coalescing and `ReliableLatest` handlers keep running). Drain, or register a handler for, every reliable
@@ -312,8 +317,8 @@ public sealed class QuiclyPeer : IDisposable
     public TimeSpan NextDeadline { get; }
     public long NextDeadlineMicros { get; }            // = min(poll, flush), for a host with one loop
     public long NextPollDeadlineMicros { get; }         // the peer's own timers: ping, heartbeat, admission, close linger, stream idle
-    public long NextFlushDeadlineMicros { get; }        // engine work only a Flush can serve (retries, expiry, send-cap refill)
-    public bool HasPendingWork { get; }                 // anything waiting for Poll: rings, mailboxes, transitions, a due timer
+    public long NextFlushDeadlineMicros { get; }        // engine work only a Flush can serve (retries, owed acks, send-cap refill); expiry has no deadline of its own, a held-back message is dropped by the first pass after it expired
+    public bool HasPendingWork { get; }                 // anything waiting for Poll: rings, drain queues and mailboxes of channels that have a handler, transitions, a due timer; answering false re-arms the work signal
     public bool IsDisposed { get; }
 
     public BufferLease RentBuffer(int size);
@@ -354,7 +359,8 @@ public enum SendStatus { Admitted, QueueFull, TooLarge, OutOfBuffers, ChannelClo
 public enum DeliveryStatus { Pending, Delivered, Superseded, Failed, Canceled, Expired, Lost, Disconnected, Sent }
 
 // PeerOptions.WorkSignal: told once per Poll that the peer has game-thread work, so a host wakes instead of polling idle peers.
-// Non-blocking, allocation-free, must not re-enter the peer; HasPendingWork is the level behind this edge.
+// Non-blocking, allocation-free, must not re-enter the peer; HasPendingWork is the level behind this edge. The edge is
+// re-armed by Poll and by a HasPendingWork that answers false, so a host may wake, ask the probe and sleep again.
 public interface IPeerWorkSignal { void OnWork(QuiclyPeer peer); }
 
 // PeerOptions also exposes Clone() (an independent copy sharing the clock, pool and signal) and Validate() (the same checks the
@@ -456,7 +462,7 @@ logs a warning per connection). Session/auth token rules, admission timeouts, re
 | send byte budget | peer | 256 KiB | blocks in flight; reliable throughput ≤ budget / RTT |
 | send table | peer | 1 024 entries × 64 B | tracked and untracked sends in flight |
 | rings | peer | 4 096 × 64 B receive (256 KiB), 2 048 × 16 B completion (32 KiB) | native memory; `ReceiveEntry` is 64 B (52 of them in use) and a send entry produces at most two completions |
-| drain queues | peer | min(receive ring, 1 024) × 68 B (68 KiB), at least 2 nodes per reliable channel; plus 30 B per channel | per-channel queues for `Drain` consumers: a 64 B node plus its link, native, built with the peer; per channel the head, tail, count, queued bytes, drop counter, class, handler flag and an index of the unreliable channels. Half the pool is reserved for `ReliableOrdered` / `ReliableUnordered` channels (split evenly) when the table has one; the unreliable channels share the rest and at most ¼ of the receive byte budget, oldest-first eviction beyond that |
+| drain queues | peer | min(receive ring, 1 024) × 68 B (68 KiB), at least 2 nodes per reliable channel; plus 35 B per channel | per-channel queues for `Drain` consumers: a 64 B node plus its link, native, built with the peer; per channel the head, tail, count, queued bytes, drop counter, class, handler flag, backlog mark, the pass of its last complete drain and an index of the unreliable channels. Half the pool is reserved for `ReliableOrdered` / `ReliableUnordered` channels (split evenly) when the table has one; what unreliable channels leave undrained across a Poll (their backlog) may occupy the rest and at most ¼ of the receive byte budget, oldest-first eviction beyond that |
 | segment arena | peer | 1 024 × 16 B | per-submission gather arrays for stream sends |
 | channel state | peer × channel | 2 × 64 B | send + receive halves |
 | group records | peer × group channel (send), peer (receive) | `(3 × max(MaxGroups, 1) + 4) × 64 B` send per channel + `PeerStreamCapacity × 64 B` receive per peer | `ReliableUnordered`: one send record per live group (filling, waiting, or holding a stream); one receive record for every stream the peer can have open on the connection, because a receiver that is behind holds more than a channel's `MaxGroups` of them (PROTOCOL.md §7). `PeerStreamCapacity` is the session's stream limit (Σ max(MaxGroups, 1), ≤ 4 096) or the transport's own initial grant when that is more: 0.6 KiB on a server peer whose table has one group channel and one ordered channel, 64 KiB on an MsQuic client at its default grant of 1 024 (plus 16 KiB for the pended-stream ring, which is sized from the same number), 256 KiB at the 4 096-stream cap; the engine's notice ring adds `4 × its send records + 8` × 12 B |

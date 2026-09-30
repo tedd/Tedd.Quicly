@@ -98,9 +98,9 @@ public class SessionZeroAllocationTests
     [Fact]
     public void Evicting_From_An_Undrained_Channel_Does_Not_Allocate()
     {
-        // Channel 2 has no handler and is never drained: once its backlog is at the limit (it is, long before the warm-up
-        // ends), every Poll evicts the oldest queued message for the new one. Channel 3 is under its share and drained every
-        // round, so its append takes the victim-scan path instead of the appender's own.
+        // Channel 2 has no handler and is never drained: what it has queued is backlog, cut at every pass start, and once
+        // it is at the limit (it is, long before the warm-up ends) every message a Poll queues for it evicts its oldest.
+        // Channel 3 is drained every round, so it is never backlog: its messages take the free nodes and lose nothing.
         using SessionHarness h = TestEngines.Create(out _, out _, both: o => o.ReceiveRingCapacity = 64);
         SimulatedNetwork network = h.Network;
         QuiclyPeer client = h.Client;

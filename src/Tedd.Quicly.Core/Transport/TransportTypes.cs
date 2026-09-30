@@ -213,6 +213,11 @@ public struct TransportStatistics
 /// delivered on the stream until <see cref="ITransport.ResumeStreamReceive"/> credits further bytes and has the remainder
 /// indicated again. A resume issued on another thread while the receive callback is still returning takes effect once it
 /// has returned. Do not call <see cref="ITransport.ResumeStreamReceive"/> for a stream from inside its own receive callback.</para>
+/// <para><b>Holding the end of a stream.</b> A sink that holds an indication which carried the FIN and left no byte
+/// unconsumed — <c>PendingAfter(all)</c> with the FIN set, or <c>PendingAfter(0)</c> of an indication that carried only the
+/// FIN — has seen the end of the stream and must treat it as seen: nothing is indicated again after the resume, and only
+/// <see cref="ITransportSink.OnStreamPeerSendShutdown"/> follows. When bytes are left, the rest is indicated again, with the
+/// FIN.</para>
 /// </remarks>
 public readonly record struct ReceiveResult(int BytesConsumed, bool Pending)
 {

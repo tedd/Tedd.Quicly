@@ -107,6 +107,7 @@ internal sealed unsafe class PeerCore : IDisposable
     private int _streamCredit;
     private volatile int _maxDatagramPayload;
     private volatile bool _datagramsEnabled;
+    private volatile bool _datagramCapabilityKnown;
     private volatile bool _datagramStatesReported;
     private volatile bool _cancelOnBlocked;
     private volatile bool _admitted;
@@ -775,6 +776,9 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>Datagrams are negotiated.</summary>
     public bool DatagramsEnabled => _datagramsEnabled;
 
+    /// <summary>A positive connect snapshot or an explicit capability report established support or non-support.</summary>
+    public bool DatagramCapabilityKnown => _datagramCapabilityKnown;
+
     /// <summary>The transport reports per-datagram acknowledgement and loss.</summary>
     public bool DatagramStatesReported => _datagramStatesReported;
 
@@ -1023,10 +1027,13 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>Records the datagram capability (transport thread).</summary>
     /// <param name="enabled">Datagrams negotiated.</param>
     /// <param name="maxPayload">Current maximum datagram payload.</param>
-    public void SetDatagramCapability(bool enabled, int maxPayload)
+    /// <param name="known">False for a provisional negative connect snapshot; explicit reports are definitive.</param>
+    public void SetDatagramCapability(bool enabled, int maxPayload, bool known = true)
     {
         _maxDatagramPayload = maxPayload;
         _datagramsEnabled = enabled;
+        // Publish readiness last so the game thread sees the capability associated with this report.
+        if (known) _datagramCapabilityKnown = true;
     }
 
     /// <summary>Records whether the transport reports datagram send states (transport thread, at connect).</summary>
@@ -1035,7 +1042,7 @@ internal sealed unsafe class PeerCore : IDisposable
 
     /// <summary>
     /// Records whether the transport honours <see cref="TransportSendFlags.CancelOnBlocked"/> (transport thread: at connect and
-    /// whenever the datagram capability changes).
+    /// whenever the datagram capability changes, or game thread before publishing handshake capabilities).
     /// </summary>
     /// <param name="honoured">The capability (<see cref="TransportCapabilities.CancelOnBlocked"/>).</param>
     public void SetCancelOnBlocked(bool honoured) => _cancelOnBlocked = honoured;
@@ -1927,6 +1934,7 @@ internal sealed unsafe class PeerCore : IDisposable
         _transportClosing = false;
         _transportClosed = false;
         _admitted = false;
+        _datagramCapabilityKnown = false;
         _datagramsEnabled = false;
         _datagramStatesReported = false;
         _cancelOnBlocked = false;

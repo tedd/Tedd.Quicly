@@ -27,7 +27,10 @@ internal sealed unsafe class FakeTransport : ITransport
     public ulong? ClosedWith;
     public bool Disposed;
 
-    public TransportCapabilities Capabilities => new() { Datagrams = true, MaxDatagramPayload = 1200 };
+    // Tests may expose a provisional connect snapshot and publish negotiated capabilities later.
+    public TransportCapabilities ReportedCapabilities = new() { Datagrams = true, MaxDatagramPayload = 1200 };
+
+    public TransportCapabilities Capabilities => ReportedCapabilities;
 
     public TransportState State => TransportState.Connected;
 
@@ -742,7 +745,7 @@ public class SessionSupportTests
     {
         FakeTransport transport = new() { StreamStatus = TransportStatus.OutOfMemory };
         QuiclyPeer peer = QuiclyPeer.Connect(new FakeConnector(transport), new IPEndPoint(IPAddress.Loopback, 1), null, TestTables.Default, new PeerOptions { Clock = new VirtualClock() });
-        TransportConnectedInfo connected = default;
+        TransportConnectedInfo connected = new() { Capabilities = transport.Capabilities };
         peer.TransportSink.OnConnected(in connected);
         peer.Poll();
         Assert.Equal(PeerState.Closing, peer.State);
@@ -760,7 +763,7 @@ public class SessionSupportTests
     {
         FakeTransport transport = new() { SendStatus = TransportStatus.InvalidState };
         QuiclyPeer peer = QuiclyPeer.Connect(new FakeConnector(transport), new IPEndPoint(IPAddress.Loopback, 1), null, TestTables.Default, new PeerOptions { Clock = new VirtualClock() });
-        TransportConnectedInfo connected = default;
+        TransportConnectedInfo connected = new() { Capabilities = transport.Capabilities };
         peer.TransportSink.OnConnected(in connected);
         peer.Poll();
         Assert.Equal(PeerState.Closing, peer.State);
@@ -780,7 +783,7 @@ public class SessionSupportTests
         byte[] token = new byte[100];
         QuiclyPeer peer = QuiclyPeer.Connect(new FakeConnector(transport), new IPEndPoint(IPAddress.Loopback, 1), null, TestTables.Default,
             new PeerOptions { Clock = new VirtualClock() }, token);
-        TransportConnectedInfo connected = default;
+        TransportConnectedInfo connected = new() { Capabilities = transport.Capabilities };
         peer.TransportSink.OnConnected(in connected);
         peer.Poll();
         Assert.Single(transport.StreamSends);

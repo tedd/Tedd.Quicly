@@ -17,6 +17,11 @@ namespace Tedd.Quicly.Core.Session;
 /// The signal is therefore an edge, not a level: <see cref="QuiclyPeer.HasPendingWork"/> is the authority on whether
 /// anything is actually waiting (work that <see cref="QuiclyPeer.Poll"/> does not consume — a message of a channel without
 /// a handler, engine work that needs a <see cref="QuiclyPeer.Flush"/> — raises no second signal).</para>
+/// <para><b>Re-arming.</b> Two things re-arm the edge: a <see cref="QuiclyPeer.Poll"/>, and a
+/// <see cref="QuiclyPeer.HasPendingWork"/> that answers <see langword="false"/>. So a host may wake on the signal, ask
+/// the probe and go back to sleep without polling when it says there is nothing — after a value arrived for a channel
+/// it reads with <see cref="QuiclyPeer.Drain"/>, say, which the probe does not count: the next publication calls
+/// <see cref="OnWork"/> again. A host that neither polls nor asks the probe after a signal gets no second one.</para>
 /// </remarks>
 public interface IPeerWorkSignal
 {

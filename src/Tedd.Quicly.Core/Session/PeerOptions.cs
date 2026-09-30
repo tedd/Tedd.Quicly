@@ -289,7 +289,13 @@ public sealed class PeerOptions
     /// <para>
     /// The price of <see langword="false"/> is staleness: a channel's expiry is evaluated only while the scheduler holds a
     /// message, so a datagram that waits inside the transport is sent however old it has become, and a sustained overload
-    /// grows the transport's queue instead of shedding load. Read once, when the peer is created.
+    /// grows the transport's queue instead of shedding load. On an UnreliableSequenced channel there is a second price: a
+    /// datagram waiting in that queue can be overtaken by a later <see cref="SendMode.Immediate"/> or high-priority one
+    /// and arrive after it. The receiver drops it as stale — unless more than 1 024 later messages of the channel
+    /// (65 536 on a 32-bit channel) overtook it and the channel then stayed quiet for two seconds, in which case it is
+    /// taken for a forward jump and delivered out of order once (<see cref="PeerStatistics.SequenceResyncs"/>,
+    /// PROTOCOL.md §8). Keep the default for sequenced channels, or do not mix Immediate and buffered sends on one.
+    /// Read once, when the peer is created.
     /// </para>
     /// </remarks>
     public bool DropWhenBlocked { get; set; } = true;

@@ -218,6 +218,15 @@ public struct PeerStatistics
     /// <summary>Partial reassemblies given up because they were not completed within 2 × RTT + 100 ms (PROTOCOL.md §7).</summary>
     public long ReassembliesExpired;
 
+    /// <summary>Requests sent with <see cref="QuiclyPeer.SendRequestAsync"/>.</summary>
+    public long RequestsSent;
+
+    /// <summary>Requests that ended without a response because their timeout elapsed.</summary>
+    public long RequestsTimedOut;
+
+    /// <summary>Responses dropped because no outstanding request matched them (PROTOCOL.md §3.1).</summary>
+    public long ResponsesUnmatched;
+
     /// <summary>
     /// Times the receive side of an <see cref="Channels.ChannelMode.UnreliableSequenced"/> channel resynchronised its
     /// sequence clock: a sequence arrived that reads as older than the newest one seen on the channel, more than two
@@ -227,15 +236,6 @@ public struct PeerStatistics
     /// seconds late and are being delivered out of order.
     /// </summary>
     public long SequenceResyncs;
-
-    /// <summary>Requests sent with <see cref="QuiclyPeer.SendRequestAsync"/>.</summary>
-    public long RequestsSent;
-
-    /// <summary>Requests that ended without a response because their timeout elapsed.</summary>
-    public long RequestsTimedOut;
-
-    /// <summary>Responses dropped because no outstanding request matched them (PROTOCOL.md §3.1).</summary>
-    public long ResponsesUnmatched;
 
     /// <summary>
     /// Datagrams among <see cref="DatagramsSent"/> the transport reported acknowledged by the peer's transport. Stays 0 on

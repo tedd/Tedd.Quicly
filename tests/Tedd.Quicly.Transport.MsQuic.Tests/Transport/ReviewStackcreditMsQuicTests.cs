@@ -4,13 +4,16 @@ using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Transport.MsQuic.Tests.Transport;
 
-namespace Tedd.Quicly.Transport.MsQuic.Tests.Review;
+namespace Tedd.Quicly.Transport.MsQuic.Tests.Transport;
 
 /// <summary>
 /// Adversarial review of the stack on d567ba5, lens: the receive credit, over real MsQuic loopback with the library's
 /// default transport options (a server sending to a client, whose MsQuic grants 1 024 unidirectional streams).
 /// </summary>
 [Collection(MsQuicCollection.Name)]
+/// <remarks>
+/// Fixed since (third review round): an MsQuic client grants no unidirectional streams before admission and its table's sum after it (GR3-1), and the documents say what is true of a sender whose peer does not read a channel (SC-2); the tests pin both.
+/// </remarks>
 public class ReviewStackcreditMsQuicTests
 {
     /// <summary>2 unordered datagrams · 11 group streams (the one nobody reads) · 12 ordered (read).</summary>

@@ -8,7 +8,7 @@ using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Third adversarial review of the group-stream fix (0ee6b8e), lens "group-resources" (threading and resources against
@@ -16,6 +16,9 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// record by its cookie, and exactly-once delivery with every resource back at its baseline under late receivers,
 /// reconnects and disposal mid-burst.
 /// </summary>
+/// <remarks>
+/// Fixed since (third review round): a Poll resumes no more held streams than the ring has slots and the budget has room for their blocks (GR3-2), and a ReliableLatest stream open that fails for any reason but the peer's stream limit is retried at the next pass (GR3-3). The descriptions and numbers below are what the tests found at d567ba5; the tests now pin the fix.
+/// </remarks>
 public class ReviewStackgroupresourcesTests
 {
     private const ushort Groups = 11;

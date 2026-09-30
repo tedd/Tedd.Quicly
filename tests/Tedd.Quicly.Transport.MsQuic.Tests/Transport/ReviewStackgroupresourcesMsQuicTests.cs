@@ -5,7 +5,7 @@ using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Transport.MsQuic.Tests.Transport;
 
-namespace Tedd.Quicly.Transport.MsQuic.Tests.Review;
+namespace Tedd.Quicly.Transport.MsQuic.Tests.Transport;
 
 /// <summary>
 /// Third adversarial review of the group-stream fix (0ee6b8e), lens "group-resources", over real MsQuic loopback. The fix
@@ -15,6 +15,9 @@ namespace Tedd.Quicly.Transport.MsQuic.Tests.Review;
 /// streams: the receive budget, the receive ring, and the connection's flow-control credit.
 /// </summary>
 [Collection(MsQuicCollection.Name)]
+/// <remarks>
+/// Fixed since (third review round): an MsQuic client grants no unidirectional streams before admission and its table's sum after it, so a late client holds at most that many groups and cannot use up the connection's flow-control window with them (GR3-1). The descriptions and numbers below are what the tests found at d567ba5 with the old grant of 1 024; the tests now pin the fix.
+/// </remarks>
 public class ReviewStackgroupresourcesMsQuicTests
 {
     private const ushort Small = 11;

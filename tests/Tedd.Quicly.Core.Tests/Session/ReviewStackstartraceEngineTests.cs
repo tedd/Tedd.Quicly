@@ -7,7 +7,7 @@ using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Adversarial review of the StreamLimitReached answer of <c>SendStream(Start)</c> (2ddf1ed, 8d98702), lens: start-race.
@@ -25,6 +25,9 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// The simulator never produces either shape, so no engine test covered them before this file.
 /// <see cref="CombinedRefusalTransport"/> produces them over the simulator.
 /// </summary>
+/// <remarks>
+/// Fixed since (third review round): the ReliableLatest engine records no refused start on the transport thread and gives the stream's per-channel slot back with the refusal, so a refusal whose shutdown is never reported leaks nothing (SR-1). The description below is what the test found at d567ba5; it now pins the fix.
+/// </remarks>
 public class ReviewStackstartraceEngineTests
 {
     /// <summary>One ReliableLatest channel that may hold one large-value stream at a time (so its tx record table has 2 entries).</summary>

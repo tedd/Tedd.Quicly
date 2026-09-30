@@ -2,7 +2,7 @@ using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Testing.Conformance;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Testing.Tests.Review;
+namespace Tedd.Quicly.Testing.Tests.Conformance;
 
 /// <summary>
 /// Adversarial review of 2ddf1ed, lens: start-race — do the two refused-start scenarios accept exactly the shapes the
@@ -13,6 +13,9 @@ namespace Tedd.Quicly.Testing.Tests.Review;
 /// streams with shapes outside that contract; a scenario that passes against it accepts a transport that breaks the
 /// contract.
 /// </summary>
+/// <remarks>
+/// Fixed since (third review round): the callback scenario accepts exactly the combined shapes of a synchronous refusal (SR-2), and ITransport.StartStream names the combined case of a transport whose start is a send, which the scenarios accept (SR-3).
+/// </remarks>
 public class ReviewStackstartraceConformanceTests
 {
     /// <summary>

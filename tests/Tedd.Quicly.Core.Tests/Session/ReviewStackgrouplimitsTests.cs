@@ -5,7 +5,7 @@ using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Core.Transport;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Adversarial review of the stack on local main at d567ba5, group-limits lens (third round of the group-stream fix,
@@ -13,6 +13,9 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// <c>PeerStreamCapacity + 2</c> on the premise that "a stream can pend only once until resumed", which does not hold for
 /// streams that end while they are held.
 /// </summary>
+/// <remarks>
+/// Fixed since (third review round): the pended-stream ring grows, up to eight times, for the entries of streams a peer resets while they are held, the connection closes <c>LimitExceeded</c> past that, and a Poll lets go of the entries beyond what the live streams account for (GL3-1); a Bulk receiver keeps four records per transfer it accepts at once (GL3-2). The descriptions and numbers below are what the tests found at d567ba5; the tests now pin the fix.
+/// </remarks>
 public class ReviewStackgrouplimitsTests
 {
     private const ushort Groups = 11;

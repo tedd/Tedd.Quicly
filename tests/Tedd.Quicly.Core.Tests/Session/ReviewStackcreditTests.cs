@@ -4,12 +4,15 @@ using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Adversarial review of the stack on d567ba5, lens: the receive credit (9ac4659, d0cd095, e42d7bd). A test marked FINDING
 /// fails on d567ba5 for the reason its comment gives; a test marked GUARD passes and pins a promise.
 /// </summary>
+/// <remarks>
+/// Fixed since (third review round): the reliable channels share half the receive budget as their Drained threshold (<c>ReceiveCredit.DrainedByteLimitFor</c>; SC-1), and a handled compressed channel gets its decode buffer past the budget when the budget is full (S1, S3). The descriptions and numbers below are what the tests found at d567ba5; the tests now pin the fix.
+/// </remarks>
 public class ReviewStackcreditTests
 {
     private const int Ring = 64;

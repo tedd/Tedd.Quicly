@@ -4,7 +4,7 @@ using Tedd.Quicly.Testing.Conformance;
 using Tedd.Quicly.Testing.Simulation;
 using Tedd.Quicly.Transport.MsQuic.Tests.Transport;
 
-namespace Tedd.Quicly.Transport.MsQuic.Tests.Review;
+namespace Tedd.Quicly.Transport.MsQuic.Tests.Transport;
 
 /// <summary>
 /// Adversarial review of 2ddf1ed, lens: start-race. SendStream(Start) on an unstarted stream now spins (yielding, never

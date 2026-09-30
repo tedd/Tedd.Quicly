@@ -4,13 +4,16 @@ using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Adversarial review (lens: standalone) of 17c089b: 6e173a0 (Route queues a ring message behind its channel's queue) and
 /// 0ba04a7 (Drain rents the decode buffer before it takes a compressed message of a reliable channel). A test marked
 /// FINDING fails at d567ba5 for the reason its comment gives; a test marked GUARD passes and pins a promise.
 /// </summary>
+/// <remarks>
+/// Fixed since (third review round): a decode buffer may take the receive budget past its limit by one buffer and falls back to a larger size class within the budget (<c>PeerCore.TryRentDecode</c>; S1, S3); a channel whose message waits for its decode keeps its later messages behind it for the rest of the <c>Drain</c> (S2); <c>Drain</c> of a reliable channel waits for the decode rate, and <c>TryDecode</c> rents before it charges the rate (S4, S3). The descriptions and numbers below are what the tests found at d567ba5; the tests now pin the fix.
+/// </remarks>
 public class ReviewStackstandaloneDrainTests
 {
     /// <summary><see cref="OrderedTables.Main"/>: ReliableOrdered with LZ4, MinCompressSize 16.</summary>

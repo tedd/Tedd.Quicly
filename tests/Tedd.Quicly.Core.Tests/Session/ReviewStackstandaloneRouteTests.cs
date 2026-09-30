@@ -4,7 +4,7 @@ using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Adversarial review (lens: standalone) of 6e173a0: Route puts a ring message of a channel with a handler behind the
@@ -12,6 +12,9 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// together, and the handler and Drain styles mixed on one channel, must keep a ReliableOrdered channel complete and in
 /// order and let the host come to rest.
 /// </summary>
+/// <remarks>
+/// Guards; the finding of the same review about how the order is argued (S5) was fixed in the documents: a channel's queue is dispatched before any ring message of that channel.
+/// </remarks>
 public class ReviewStackstandaloneRouteTests
 {
     private const ushort Datagrams = 3;

@@ -229,11 +229,14 @@ public struct PeerStatistics
 
     /// <summary>
     /// Times the receive side of an <see cref="Channels.ChannelMode.UnreliableSequenced"/> channel resynchronised its
-    /// sequence clock: a sequence arrived that reads as older than the newest one seen on the channel, more than two
-    /// seconds after that newest one last advanced, and was therefore taken for a forward jump of at least half the
-    /// sequence space (a long blackout, or a sender whose messages expired unsent) instead of a late message
-    /// (PROTOCOL.md §8). Normally zero; a steadily rising value on a slow channel means messages arrive more than two
-    /// seconds late and are being delivered out of order.
+    /// sequence clock: a sequence arrived that reads as older than the newest one seen on the channel by more than the
+    /// reorder window (1 024 on a 16-bit channel, 65 536 on a 32-bit one), more than two seconds after that newest one
+    /// last advanced, and was therefore taken for a forward jump of at least half the sequence space (a long blackout,
+    /// or a sender whose messages expired unsent) instead of a late message (PROTOCOL.md §8). Normally zero. A value
+    /// that rises without blackouts means messages arrive more than two seconds late after more than a window of later
+    /// ones overtook them, and are delivered out of order: the sender queues datagrams in its transport
+    /// (<see cref="PeerOptions.DropWhenBlocked"/> off, or sequenced messages packed next to ReliableLatest values) on a
+    /// link that stays congested for seconds.
     /// </summary>
     public long SequenceResyncs;
 

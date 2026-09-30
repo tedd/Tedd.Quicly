@@ -31,8 +31,9 @@ internal sealed unsafe partial class ReliableOrderedEngine
     /// The request is an ordinary buffered message of the channel with an odd <c>RequestId</c> from the channel's counter
     /// (PROTOCOL.md §3.1); only the wait is asynchronous. The value task is backed by a pooled
     /// <see cref="IValueTaskSource{TResult}"/> that is reused for the life of the peer, so a request allocates nothing once
-    /// the table's slots exist. The timeout counts from this call (one clock read per request, the only one on the
-    /// send path) and is processed by <see cref="RunPollDeadlines"/> in every Poll and Flush; there is no timer thread
+    /// the table's slots exist. The timeout counts from this call (one clock read per request — the only clock read of a
+    /// buffered send; an Immediate send reads the clock for its scheduler pass, as every pass does) and is processed by
+    /// <see cref="RunPollDeadlines"/> in every Poll and Flush; there is no timer thread
     /// (ADR 0008 invariant 9).
     /// </remarks>
     public override ValueTask<ReceiveLease> SendRequestAsync(ref SendRequest request, long timeoutMicros, CancellationToken cancellationToken)

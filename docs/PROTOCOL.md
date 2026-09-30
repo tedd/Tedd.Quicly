@@ -65,7 +65,8 @@ channel are fine.
 What remains is a limit on the channel as a whole: at most 2^(bits−1)−1 *consecutive messages of the channel
 that do not arrive* (a blackout, or sends that expire or are canceled before transmission, which use up
 numbers). Beyond it the next arrival reads as older than the newest. An `UnreliableSequenced` receiver then
-resynchronises as soon as its newest sequence has not advanced for 2 s (§8); a `ReliableLatest` receiver does
+resynchronises as soon as its newest sequence has not advanced for 2 s, provided the arrival is further behind
+than a late message plausibly is (§8); a `ReliableLatest` receiver does
 not (a retransmission is legitimately old), so the affected values end `Failed` until the counter is back
 within range. A channel sending N messages per second with 16-bit sequences reaches the limit after a blackout
 of 32767/N seconds (≈ 5 min at 100 msg/s, ≈ 33 s at 1 000 msg/s); use 32 bits when in doubt.
@@ -457,7 +458,10 @@ slot is freed at the same event, because no further state will ever be reported.
   `DropWhenBlocked` off, blocked datagrams wait in the transport's queue and are sent when it can send again;
   expiry is not evaluated after hand-off, so such a datagram goes out however old it has become. A packed
   container carries the flag only when every member is unreliable; `ReliableLatest` and control datagrams
-  never carry it. None of this is visible on the wire: the receiver cannot tell a datagram its sender's
+  never carry it. A datagram without the flag can be **overtaken in the sender's transport queue** by a later
+  one with the priority flag (an Immediate or high-priority member) while the link is busy, and then arrives
+  after it by as long as the congestion lasts; for an `UnreliableSequenced` member that means "late", which the
+  receiver's reorder window covers (§8 "Resynchronisation"). None of this is visible on the wire: the receiver cannot tell a datagram its sender's
   transport dropped from one the network lost.
 * Buffered datagrams are **not** handed over with a delay-send hint (MsQuic's `DELAY_SEND`). Measured on
   loopback, setting it made a tick's burst 16–19 % slower per datagram, and a later re-run found no measurable
@@ -568,20 +572,29 @@ logging.
 | control messages per second | 2 000 (per peer, configurable; size it from the channel table, because acks scale with keyed `ReliableLatest` traffic and one ack datagram carries about 170 keys) | connection close `LimitExceeded` |
 | decoded (decompressed) bytes per second per peer | 8 MiB/s | further compressed messages dropped + counted |
 | bulk transfers per direction per peer | 2 transfers, and an outbound range-request table of one more than that (3), so a further range can be asked for while both transfers run | `BulkReject` |
-| drain backlog of channels without a handler | a pool of min(ring depth, 1 024) messages (at least 2 per reliable channel); with a `ReliableOrdered` / `ReliableUnordered` channel in the table half of it is reserved for those, split evenly. The unreliable channels together may queue the rest and pin ¼ of the byte budget (64 KiB, counted in buffer block sizes) | `UnreliableUnordered` / `UnreliableSequenced` (not coalescing): **drop oldest** + count (`DrainQueueDrops`) — the oldest queued message of the same channel when it is at or over its even share, otherwise of the unreliable channel with the longest queue; never affects another channel. `ReliableOrdered` / `ReliableUnordered`: nothing is dropped; once the pool is full the next message is held and the receiver stops taking from the ring until the application drains the channel or registers a handler (see below) |
+| drain backlog of channels without a handler | a pool of min(ring depth, 1 024) messages (at least 2 per reliable channel); with a `ReliableOrdered` / `ReliableUnordered` channel in the table half of it is reserved for those, split evenly. What unreliable channels still have queued when a Poll begins, without having been drained empty since the Poll before (their *backlog*), may occupy the rest and pin ¼ of the byte budget (64 KiB, counted in buffer block sizes: 1 024 messages of ≤ 64 B, 256 of ≤ 256 B, 42 of ≤ 1 536 B) | `UnreliableUnordered` / `UnreliableSequenced` (not coalescing): the backlog is cut to the limit when a Poll begins and **drops oldest** + counts (`DrainQueueDrops`) after that — the oldest queued message of the backlogged channel furthest over its even share; a channel that is drained every frame, or has a handler, is not backlog and loses nothing. `ReliableOrdered` / `ReliableUnordered`: nothing is dropped; once the pool is full the next message is held and the receiver stops taking from the ring until the application drains the channel or registers a handler (see below) |
 | receive ring depth per peer | 4 096 entries | see byte budget row (a full ring drops datagrams newest-first, where the drain backlog above drops oldest-first: nothing can be evicted from the ring); latest/coalescing channels use per-key mailboxes instead of ring entries |
 
 **Channels nobody drains.** A message of a channel that has no handler waits for `Drain` in a per-channel
 queue, and the two kinds of channel behave differently when the application never comes for it. This is
 receiver-local; nothing on the wire changes and either end may run it alone.
 
-* An *unreliable* ring channel keeps the bounded backlog of the table and loses its **oldest** messages,
-  counted per channel and per peer (`DrainQueueDrops`; `Received` still counts them). A consumer that comes back
-  gets the freshest messages in order — on `UnreliableSequenced` the older queued values are the stale ones.
-  Such a channel never stops another channel, never holds the ring, and keeps no host busy. Note that this
-  backlog is smaller than the whole byte budget: a Drain-style consumer that lets more than ¼ of the budget (or
-  the unreliable share of the pool) accumulate between two drains loses the oldest part; raise
-  `ReceiveBudgetBytes` / `ReceiveRingCapacity` for such a channel, or give it a handler.
+* An *unreliable* ring channel that the application **drains every frame** — completely, once per Poll, before
+  or after it — loses nothing the receive ring and the byte budget took: a burst waits in the queue pool, then in
+  one held message and the ring, until the Drain. The same holds for a channel **with a handler** whose messages
+  a Drain of another channel met: they are never dropped, and the next Poll dispatches them.
+* What an unreliable ring channel without a handler still has queued when the *next* Poll begins, without having
+  been drained empty in between, is its **backlog**. The backlog of all such channels together is bounded by the
+  table row above: the Poll cuts it to the limit, and from then on a message that does not fit drops the
+  **oldest** queued one, counted per channel and per peer (`DrainQueueDrops`; `Received` still counts them). A
+  consumer that comes back gets the freshest messages in order — on `UnreliableSequenced` the older queued values
+  are the stale ones. A channel nobody drains therefore keeps the ring closed for one Poll interval at most (the
+  message held for a Drain that did not come), pins more than ¼ of the byte budget for one Poll interval at
+  most, and keeps no host busy. It stops being backlog when a Drain empties it or it gets a handler. Note what
+  this means for a host that polls several times between two drains, or that drains with a buffer it fills
+  without calling again: what survives a Poll is backlog, so such a host keeps at most the limits above of a
+  burst. Drain completely after every Poll, or give the channel a handler. A larger `ReceiveBudgetBytes` raises
+  the byte limit; `ReceiveRingCapacity` does not raise the node limit beyond 1 024.
 * A *reliable* channel is never dropped, so an undrained one still ends in back-pressure: when the pool is full
   its next message is held, the receiver takes nothing more out of the ring, and the ring's own rules apply to
   **every** channel — stream channels stop consuming (the sender sees ordinary QUIC flow control, and its
@@ -630,16 +643,36 @@ Byte-exact examples are in [protocol-vectors.md](protocol-vectors.md).
   * *Per key*: a value is accepted iff the key has no state, or `ext` is greater than the key's last accepted
     extended value, which it then replaces. The comparison is a plain 64-bit one. An unkeyed
     `UnreliableSequenced` channel accepts iff `newest` advanced.
-  * *Resynchronisation, `UnreliableSequenced` only*: an arrival with `d < 0` more than **2 s** after `newest` last
-    advanced (on the receiver's clock) is taken for a forward jump of `span − |d|` — at least half the range —
-    instead of a late message: `ext = newest + span + d`, `newest = ext`, and the value is judged like any other
-    (counted in `PeerStatistics.SequenceResyncs`). QUIC never retransmits a DATAGRAM frame, so a late datagram
-    arrives near its successors and a two-second-old one is not plausible; a duplicate of the newest (`d = 0`)
-    never resynchronises. "Quiet" means `newest` did not advance, not that nothing arrived, so a clock left too
-    far ahead (a peer's mistake, or a message that really was 2 s late) heals within 2 s. The cost of a wrong
-    guess is one stale value delivered per key of the late burst, superseded by the key's next update. A 16-bit
-    channel faster than 16 384 msg/s can use up half its range inside the 2 s and then drops for at most 2 s.
-    A jump of an exact multiple of the range reads as a duplicate and costs one message.
+  * *Resynchronisation, `UnreliableSequenced` only*: an arrival that is **more than the reorder window behind**
+    `newest` (`d < −W`; `W` = 1 024 on a 16-bit channel, 65 536 on a 32-bit one) **and** comes more than **2 s**
+    after `newest` last advanced (on the receiver's clock) is taken for a forward jump of `span − |d|` — at least
+    half the range — instead of a late message: `ext = newest + span + d`, `newest = ext`, and the value is judged
+    like any other (counted in `PeerStatistics.SequenceResyncs`). A duplicate of the newest (`d = 0`) and an
+    arrival inside the window never resynchronise. "Quiet" means `newest` did not advance, not that nothing
+    arrived, so a clock left more than `W` ahead (a peer's mistake) heals within 2 s, and one left less than that
+    ahead heals when the sender's counter passes it, at most `W` messages later.
+    * *Why both tests.* The wire value cannot tell "late by x" from "ahead by span − x". Time separates them on
+      the path — QUIC never retransmits a DATAGRAM frame, so the network delivers a late datagram near its
+      successors — but **not in the sender**: a datagram sent without cancel-on-blocked (a packed container that
+      also carries a `ReliableLatest` value, or every datagram of a sender that turned the flag off, §4.5) waits
+      in the transport's queue for as long as the link is busy, and a later datagram with the priority flag (an
+      Immediate or high-priority member) overtakes it. It then arrives seconds after its successor, a few numbers
+      behind `newest`. Distance separates those: a late message is behind by the handful of messages that
+      overtook it, whereas a jump of `J` reads as `span − J` behind, which is that small only when almost a whole
+      range was lost.
+    * *What the window costs.* A real jump that lands within `W` of a whole range (more than 64 512 consecutive
+      messages lost on a 16-bit channel) is not resynchronised; the arrivals read as late until the sender's
+      counter has passed `newest`, at most `W` messages — a small fraction of what the gap itself lost.
+    * *What remains.* A message that **more than `W` later messages of its channel overtook**, arriving after
+      the channel then stayed quiet for 2 s, is still read as a jump: it is delivered out of order once (for its
+      key; superseded by the key's next update), and `newest` then sits at that message's low bits, so later
+      genuine sequences are ahead of it and delivery goes on. A sender can produce this only on a link congested
+      for more than 2 s while it sends non-cancellable datagrams with priority ones behind them; keep
+      cancel-on-blocked on (the default) for sequenced channels, or do not mix Immediate and buffered sends on
+      one sequenced channel, where that matters. A resynchronisation re-opens **every** tracked key of the
+      channel to lower wire sequences once (they all extend above the old values).
+    * A 16-bit channel faster than 16 384 msg/s can use up half its range inside the 2 s and then drops for at
+      most 2 s. A jump of an exact multiple of the range reads as a duplicate and costs one message.
   * *`ReliableLatest`* uses the same clock with bits = 32 over its versions (datagram values and group-stream
     values alike; version 0 is never sent, which only makes each wrap one number shorter) and **never**
     resynchronises on time: a retransmission arrives behind the newest version after any length of quiet.

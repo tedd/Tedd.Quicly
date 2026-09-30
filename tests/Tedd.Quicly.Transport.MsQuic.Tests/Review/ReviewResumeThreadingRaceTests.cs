@@ -465,27 +465,142 @@ public unsafe class ReviewResumeThreadingRaceTests
         Assert.Equal(0, harness.SinkExceptionTotal);
     }
 
+    /// <summary>What the receiver's sink was shown for one stream (written on the worker, read by the test when a round fails).</summary>
+    private sealed class HeldTrack
+    {
+        public int Indications;
+        public ulong LastOffset;
+        public int LastTotal;
+        public int LastKept;
+        public bool LastFin;
+        public long Taken;
+        public int Aborted;
+        public int PeerShutdowns;
+        public int ShutdownCompletes;
+    }
+
     private sealed class AlwaysHoldSink : NullTransportSink
     {
         public readonly ConcurrentDictionary<TransportStreamId, int> Held = new();
+        public readonly ConcurrentDictionary<TransportStreamId, HeldTrack> Tracks = new();
         public readonly Random Random = new(5);
         public MsQuicTransport? Transport;
         public volatile bool Closed;
+
+        /// <summary>Set by the test when it lets go of the streams it holds: from then on every indication is consumed whole.</summary>
+        public volatile bool Release;
 
         public override ReceiveResult OnStreamReceived(TransportStreamId id, ReadOnlySpan<TransportSegment> segments, ulong absoluteOffset, bool fin)
         {
             int total = 0;
             foreach (TransportSegment segment in segments) total += (int)segment.Length;
-            Held.AddOrUpdate(id, 1, static (_, n) => n + 1);
+            HeldTrack track = Tracks.GetOrAdd(id, static _ => new HeldTrack());
+            bool release = Release;
 
             // Worker thread only (callbacks of one connection are serialised).
             int roll = Random.Next(4);
-            return ReceiveResult.PendingAfter(roll == 0 ? total : roll == 1 ? Random.Next(0, total + 1) : 0);
+            int kept = release || roll == 0 ? total : roll == 1 ? Random.Next(0, total + 1) : 0;
+            lock (track)
+            {
+                track.Indications++;
+                track.LastOffset = absoluteOffset;
+                track.LastTotal = total;
+                track.LastKept = kept;
+                track.LastFin = fin;
+                track.Taken += kept;
+            }
+
+            Held.AddOrUpdate(id, 1, static (_, n) => n + 1);
+            return release ? ReceiveResult.Consumed(total) : ReceiveResult.PendingAfter(kept);
         }
 
-        public override void OnStreamShutdownComplete(TransportStreamId id) => Transport?.CloseStream(id);
+        public override void OnStreamAborted(TransportStreamId id, ulong errorCode, StreamAbortDirection direction)
+        {
+            HeldTrack track = Tracks.GetOrAdd(id, static _ => new HeldTrack());
+            lock (track) track.Aborted++;
+        }
+
+        public override void OnStreamPeerSendShutdown(TransportStreamId id)
+        {
+            HeldTrack track = Tracks.GetOrAdd(id, static _ => new HeldTrack());
+            lock (track) track.PeerShutdowns++;
+        }
+
+        public override void OnStreamShutdownComplete(TransportStreamId id)
+        {
+            HeldTrack track = Tracks.GetOrAdd(id, static _ => new HeldTrack());
+            lock (track) track.ShutdownCompletes++;
+            Transport?.CloseStream(id);
+        }
 
         public override void OnClosed(TransportCloseReason reason, ulong errorCode, int transportStatus) => Closed = true;
+    }
+
+    /// <summary>The sender's side of the teardown rounds: which sends completed (and how) and which streams shut down.</summary>
+    private sealed class SenderSink : NullTransportSink
+    {
+        public readonly ConcurrentDictionary<TransportStreamId, bool> SendCanceled = new();
+        public readonly ConcurrentDictionary<TransportStreamId, bool> ShutDown = new();
+
+        public override void OnStreamSendCompleted(TransportStreamId id, ulong context, bool canceled) => SendCanceled[id] = canceled;
+
+        public override void OnStreamShutdownComplete(TransportStreamId id) => ShutDown[id] = true;
+    }
+
+    /// <summary>
+    /// One line per stream the receiver still has open: what its sink was shown, the transport's receive state for its slot
+    /// (read by reflection: 0 idle, 1 in the callback, 2 held, 3 resumed early), and what the sender had seen of the same
+    /// QUIC stream before it called <c>AbortStream</c>.
+    /// </summary>
+    private static string DescribeOpenStreams(MsQuicTransport server, AlwaysHoldSink sink, MsQuicTransport client, TransportStreamId[] clientIds, SenderSink sender, bool[]? shutDownBeforeAbort, bool[]? sendDoneBeforeAbort)
+    {
+        const System.Reflection.BindingFlags Any = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+        System.Text.StringBuilder text = new();
+        Array slots = (Array)typeof(MsQuicTransport).GetField("_slots", Any)!.GetValue(server)!;
+        foreach (object? slot in slots)
+        {
+            if (slot is null) continue;
+            Type type = slot.GetType();
+            object? Field(string name) => type.GetField(name, Any)!.GetValue(slot);
+            if (Field("Stream") is null) continue;
+            TransportStreamId id = new((int)Field("Index")!, (uint)Field("Generation")!);
+            long quicId = server.GetQuicStreamId(id);
+            text.Append($"\n    slot {id.Slot} (QUIC stream {quicId}): receive state {Field("ReceiveState")}, skip {Field("SkipBytes")}, FIN held {Field("FinHeld")}, "
+                + $"pending {Field("PendingConsumed")}/{Field("PendingTotal")}, close flags {Field("CloseFlags")}, close queued {Field("CloseQueued")}");
+            if (sink.Tracks.TryGetValue(id, out HeldTrack? track))
+            {
+                lock (track)
+                {
+                    text.Append($"; sink: {track.Indications} indications, last at {track.LastOffset} of {track.LastTotal} bytes (FIN {track.LastFin}) kept {track.LastKept}, "
+                        + $"{track.Taken} taken, aborted {track.Aborted}, peer send shutdown {track.PeerShutdowns}, shutdown complete {track.ShutdownCompletes}");
+                }
+            }
+            else
+            {
+                text.Append("; sink: never indicated");
+            }
+
+            int index = -1;
+            for (int i = 0; i < clientIds.Length; i++)
+            {
+                if (client.GetQuicStreamId(clientIds[i]) == quicId) index = i;
+            }
+
+            if (index < 0)
+            {
+                text.Append("; sender: no such stream (or the sender is gone)");
+                continue;
+            }
+
+            string send = sender.SendCanceled.TryGetValue(clientIds[index], out bool canceled) ? (canceled ? "completed canceled" : "completed (acknowledged)") : "not completed";
+            text.Append($"; sender: send {send}, stream shut down {sender.ShutDown.ContainsKey(clientIds[index])}");
+            if (shutDownBeforeAbort is not null && sendDoneBeforeAbort is not null)
+            {
+                text.Append($", before its AbortStream call: send completed {sendDoneBeforeAbort[index]}, stream shut down {shutDownBeforeAbort[index]}");
+            }
+        }
+
+        return text.ToString();
     }
 
     [Fact]
@@ -506,8 +621,15 @@ public unsafe class ReviewResumeThreadingRaceTests
             Random random = new(99);
             for (int round = 0; round < Rounds; round++)
             {
+                // Case 5 (the sender aborts its streams) alternates: streams left unfinished, which the abort resets, and streams
+                // sent whole, where the abort races the acknowledgement of the FIN.
+                int kind = round % 6;
+                bool fin = kind != 5 || (round / 6) % 2 == 1;
                 AlwaysHoldSink sink = new();
-                ConformancePair pair = harness.CreatePair(new NullTransportSink(), sink, new ConformancePairOptions { ServerPeerUnidiStreams = Streams });
+                SenderSink sender = new();
+                bool[]? shutDownBeforeAbort = null;
+                bool[]? sendDoneBeforeAbort = null;
+                ConformancePair pair = harness.CreatePair(sender, sink, new ConformancePairOptions { ServerPeerUnidiStreams = Streams });
                 MsQuicTransport client = (MsQuicTransport)pair.Client;
                 MsQuicTransport server = (MsQuicTransport)pair.Server;
                 sink.Transport = server;
@@ -521,7 +643,7 @@ public unsafe class ReviewResumeThreadingRaceTests
                 {
                     segments.Set(i, buffer.Segment(0, 5000));
                     Assert.Equal(TransportStatus.Success, client.OpenStream(StreamKind.Unidirectional, (ulong)i, 32767, out clientIds[i]));
-                    Assert.Equal(TransportStatus.Success, client.SendStream(clientIds[i], segments.At(i), 1, (ulong)i, TransportSendFlags.Start | TransportSendFlags.Fin));
+                    Assert.Equal(TransportStatus.Success, client.SendStream(clientIds[i], segments.At(i), 1, (ulong)i, fin ? TransportSendFlags.Start | TransportSendFlags.Fin : TransportSendFlags.Start));
                 }
 
                 Assert.True(Spin.Until(() => sink.Held.Count == Streams, TimeSpan.FromSeconds(10)), $"round {round}: only {sink.Held.Count} of {Streams} streams were indicated");
@@ -555,7 +677,7 @@ public unsafe class ReviewResumeThreadingRaceTests
                 for (int i = 0; i < spins; i++) Thread.SpinWait(1);
                 try
                 {
-                    switch (round % 6)
+                    switch (kind)
                     {
                         case 0:
                             foreach (TransportStreamId id in ids) server.CloseStream(id);
@@ -573,7 +695,15 @@ public unsafe class ReviewResumeThreadingRaceTests
                             client.Close(4, default);
                             break;
                         default:
-                            foreach (TransportStreamId id in clientIds) client.AbortStream(id, 9, StreamAbortDirection.Send);
+                            shutDownBeforeAbort = new bool[Streams];
+                            sendDoneBeforeAbort = new bool[Streams];
+                            for (int i = 0; i < Streams; i++)
+                            {
+                                shutDownBeforeAbort[i] = sender.ShutDown.ContainsKey(clientIds[i]);
+                                sendDoneBeforeAbort[i] = sender.SendCanceled.ContainsKey(clientIds[i]);
+                                client.AbortStream(clientIds[i], 9, StreamAbortDirection.Send);
+                            }
+
                             break;
                     }
                 }
@@ -582,15 +712,56 @@ public unsafe class ReviewResumeThreadingRaceTests
                     faults.Enqueue($"round {round}: the teardown call threw {ex.GetType().Name}: {ex.Message}");
                 }
 
-                Thread.Sleep(random.Next(1, 25));
+                int resumeFor = random.Next(1, 25);
+                long resumeStart = Stopwatch.GetTimestamp();
+                Thread.Sleep(resumeFor);
+
                 Volatile.Write(ref stop, 1);
                 Assert.True(resumer.Join(TimeSpan.FromSeconds(10)), $"round {round}: the resuming thread hung");
-                if (round % 6 is 0 or 1 or 5)
+                double resumedMs = Stopwatch.GetElapsedTime(resumeStart).TotalMilliseconds;
+                if (kind is 0 or 1 or 5)
                 {
-                    // The connection lives on: every stream must end and give its slot back.
-                    if (!Spin.Until(() => server.OpenStreamCount == 0, TimeSpan.FromSeconds(10)))
+                    // The connection lives on: every stream must end and give its slot back. When the receiver closed or
+                    // aborted them, and when the sender reset streams it had not finished, that needs nothing more from the
+                    // sink. A stream the sender had finished is different: once its data and FIN are acknowledged the
+                    // sender's abort does nothing (MsQuic sends no RESET_STREAM for a send direction whose close is
+                    // acknowledged), so a stream the sink still holds when the resumer stops is held rightly, for as long as
+                    // the sink holds it. There the sink lets go, and then nothing may be left behind either.
+                    bool letGo = kind == 5 && fin;
+                    if (letGo) sink.Release = true;
+                    bool ended = Spin.Until(
+                        () =>
+                        {
+                            if (letGo)
+                            {
+                                foreach (TransportStreamId id in ids) server.ResumeStreamReceive(id, 0);
+                            }
+
+                            return server.OpenStreamCount == 0;
+                        },
+                        TimeSpan.FromSeconds(10));
+                    if (!ended)
                     {
-                        faults.Enqueue($"round {round} (case {round % 6}): {server.OpenStreamCount} streams still open at the receiver ten seconds after they were closed or aborted");
+                        faults.Enqueue($"round {round} (case {kind}, streams sent {(fin ? "whole" : "without a FIN")}): {server.OpenStreamCount} streams still open at the receiver ten seconds after "
+                            + $"they were closed or aborted{(letGo ? " and the sink let go of them" : string.Empty)} (resumed for {resumedMs:F1} ms after the teardown, {spins} spins before it)"
+                            + DescribeOpenStreams(server, sink, client, clientIds, sender, shutDownBeforeAbort, sendDoneBeforeAbort));
+                    }
+                    else if (kind == 5 && !fin)
+                    {
+                        // The reset of a stream the sink holds reaches the sink: that is what makes the layer above let go
+                        // of what it keeps for the stream.
+                        foreach (TransportStreamId id in ids)
+                        {
+                            HeldTrack track = sink.Tracks[id];
+                            lock (track)
+                            {
+                                if (track.Aborted != 1 || track.ShutdownCompletes != 1 || track.PeerShutdowns != 0)
+                                {
+                                    faults.Enqueue($"round {round} (case {kind}): the sender reset an unfinished stream the sink held (slot {id.Slot}), and the sink saw {track.Aborted} aborts, "
+                                        + $"{track.PeerShutdowns} peer send shutdowns and {track.ShutdownCompletes} shutdown completions for it");
+                                }
+                            }
+                        }
                     }
                 }
 

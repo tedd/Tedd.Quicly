@@ -477,7 +477,9 @@ with a ring larger than 1 024 (68 bytes a node, per peer).
 * **Work signal.** `PeerOptions.WorkSignal` (`IPeerWorkSignal { void OnWork(QuiclyPeer peer); }`) is called by
   `QuiclyPeer.NoteWork()` the first time the peer publishes game-thread work after each `Poll`, so a host can wake a sleeping game
   thread instead of polling idle peers. It is an **edge with set-once semantics**: one `Interlocked.Exchange` on a word guards the
-  call and `Poll` re-arms it at entry, so a burst of a thousand messages costs one host call — and work that Poll does not consume (a
+  call and `Poll` re-arms it at entry (an interlocked exchange when the word is set: a full fence before the first read
+  of the Poll, so a publication is seen by that Poll or finds the edge armed; a plain store lost wake-ups of thread-safe
+  sends and completions in Release builds, the third review's finding), so a burst of a thousand messages costs one host call — and work that Poll does not consume (a
   message of a channel without a handler, engine work that needs a `Flush`) raises no second call, because `HasPendingWork` is the
   level. The probe re-arms it as well, when it answers `false` (below): the host it sends back to sleep will not poll.
   Raised from the transport thread by `Signal(bit)` (every handshake, close and table signal), `TryEnqueueReceive`,
@@ -500,7 +502,7 @@ with a ring larger than 1 024 (68 bytes a node, per peer).
   the receive ring, the per-channel drain queues of channels that have a handler (`ReceiveQueues.QueuedHandled`; a message
   queued for a channel without one is the application's to drain, not Poll's work) and the held entry (a reliable
   channel's message for as long as nobody drains it; an unreliable channel's until its Drain, or for one Poll interval when
-  nobody drains it, §4.4 "Channels without a handler" — an undrained unreliable channel does not keep the probe set), the
+  nobody drains it (two for a channel that was drained before, or when the burst arrives with the session's first Poll), §4.4 "Channels without a handler" — an undrained unreliable channel does not keep the probe set), the
   mailbox dirty bitsets
   (`Mailboxes.HasDirty`) of channels that have a handler (as with the queues: a value waiting in the mailbox of a channel
   without one is for `Drain`, and counting it kept a host that polls while there is work — and `QuiclyServer.PollAll` —

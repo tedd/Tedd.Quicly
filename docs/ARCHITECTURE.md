@@ -225,8 +225,8 @@ is chosen:
   queued when the next Poll begins is its backlog, and that is bounded — the backlogs together occupy at most
   the part of the drain-queue pool not reserved for reliable channels and pin at most a quarter of the receive
   budget — and drops its **oldest** messages beyond it (`DrainQueueDrops`, per channel and per peer); a channel
-  nobody drains closes the ring to the other channels once, for one Poll interval, and not again until it has
-  been drained. A reliable channel is never
+  nobody drains closes the ring to the other channels once, for one Poll interval (two for a channel that was
+  drained before, or when the burst arrives with the session's first Poll), and not again until it has been drained. A reliable channel is never
   dropped, so an undrained one fills the pool and then holds the receive ring: every stream channel is
   back-pressured and datagrams of ring channels are dropped on arrival until it is drained or gets a handler
   (coalescing and `ReliableLatest` handlers keep running). Drain, or register a handler for, every reliable

@@ -10,9 +10,12 @@ Packages are numbered by the publish workflow (`0.2.<run number>`), so this sect
 describes the first package published on or after 2026-09-30. "Earlier releases" below are the packages before it.
 
 The subject of this release is one report: *messages go missing at random on localhost after the library has run
-for a while*. An audit found four independent causes. All four are fixed, every remaining way to drop a message is
-counted, and [TROUBLESHOOTING.md](TROUBLESHOOTING.md) maps a symptom to its counter. **There is no wire change**:
-either end can be upgraded alone (what an old end still does wrong is listed under "Mixed versions").
+for a while*. An audit found four independent causes in the session layer, and the work on them a fifth in the
+MsQuic transport (a held stream that was never resumed). All five are fixed, every remaining way to drop a message
+is counted, and [TROUBLESHOOTING.md](TROUBLESHOOTING.md) maps a symptom to its counter. One defect that loses
+reliable messages is known and **not** fixed in this release: a `ReliableUnordered` channel whose receiver falls
+far behind, see "Known limits". **There is no wire change**: either end can be upgraded alone (what an old end
+still does wrong is listed under "Mixed versions").
 
 ### Fixed
 
@@ -30,6 +33,15 @@ either end can be upgraded alone (what an old end still does wrong is listed und
   `ReliableLatest` handlers stopped. For *unreliable* channels this is fixed (see "Draining" below); for
   *reliable* channels without a handler it remains, see "Known limits". Coalescing and `ReliableLatest` handlers
   now run whatever is held.
+* **Over MsQuic, a reliable stream held by a late receiver could stall for good.** When the receiver cannot take
+  more — its receive ring is full, `ReceiveBudgetBytes` is used up, the application is not polling — it holds the
+  stream and resumes it later. A resume that had taken no bytes could be lost inside MsQuic when it raced the
+  receive callback that was still returning; the stream was then never indicated again. The sender had already
+  completed the stream's messages `Delivered`, they never arrived, no counter moved and nothing timed out. Every
+  stream channel was exposed (`ReliableOrdered`, `ReliableUnordered`, large `ReliableLatest` values, `Bulk`), also
+  under the WebTransport carrier when it runs over the MsQuic transport. A hold is now answered to MsQuic as a
+  partial consumption and the resume only re-enables receiving, which MsQuic cannot drop. Nothing for the
+  application to do; the fix is on the receiving end.
 * **`Release` after `Dispose` leaked the block** on a peer over a shared allocator — every server peer.
 * **Drops by the transport were not counted.** A datagram the transport cancelled because it could not send it at
   once, or declared lost, left no trace in the statistics. See "New".
@@ -128,13 +140,26 @@ either end can be upgraded alone (what an old end still does wrong is listed und
 * `ReliableLatest`: a fixed receiver is correct against any sender. A fixed sender against an earlier receiver ends
   a value of a key that idled for 2^31 versions or more `Failed`, where an earlier sender reported a false
   `Delivered`; in both cases the receiver did not take the value.
+* The held-stream stall over MsQuic is fixed by upgrading the *receiving* end; an earlier receiver can still
+  stall a stream, whatever the sender runs.
 
 ### Known limits
 
+* **A `ReliableUnordered` channel can still lose whole groups when the receiver falls far behind. Known, not fixed
+  in this release.** The sender frees a group's stream as soon as QUIC acknowledged it, while a receiver that has
+  not processed that stream yet (it is not polling, its ring or budget is full) still counts it open. The sender
+  then opens more group streams than the receiver accepts — `MaxGroups` per channel, 8 by default; over MsQuic a
+  client also grants 1 024 streams in its handshake, more than the receiver has records for. The receiver resets
+  the streams beyond its limit, and the sender has already reported their messages `Delivered`. It shows as
+  `PeerStatistics.StreamsReset` rising on the **receiver**; the sender sees nothing. Until the fix: poll every
+  tick, and use `ReliableOrdered` for messages that must survive a receiver that stops polling for a while (a
+  larger `MaxGroups` moves the point at which it happens, it does not remove it). A fix is in review and ships in
+  the next release.
 * **A `ReliableOrdered` / `ReliableUnordered` channel without a handler that is never drained still holds up all
   receiving on the peer** once the queue pool is full. Give every reliable channel the other end sends on a
   handler, or drain it. (A per-channel receive credit that confines the back-pressure to that channel is designed
-  and being built.)
+  and being built.) If the undrained channel is `ReliableUnordered`, the limit above applies to it as well: its
+  receiver is behind for as long as nobody drains it.
 * An unreliable channel nobody drains keeps the receive ring closed for one `Poll` interval the first time a
   burst fills the queue pool; after that it only loses its own oldest messages, and it is not held again until
   it has been drained. Several such channels do this once each. A channel that was drained and then no longer is

@@ -227,10 +227,15 @@ is chosen:
   budget — and drops its **oldest** messages beyond it (`DrainQueueDrops`, per channel and per peer); a channel
   nobody drains closes the ring to the other channels once, for one Poll interval (two for a channel that was
   drained before, or when the burst arrives with the session's first Poll), and not again until it has been drained. A reliable channel is never
-  dropped, so an undrained one fills the pool and then holds the receive ring: every stream channel is
-  back-pressured and datagrams of ring channels are dropped on arrival until it is drained or gets a handler
-  (coalescing and `ReliableLatest` handlers keep running). Drain, or register a handler for, every reliable
-  channel the other end sends on.
+  dropped, so it is bounded where its messages are accepted: a per-channel receive credit, checked on the
+  transport thread, lets a channel nobody reads have its share of the pool and of a quarter of the budget
+  waiting (strictly: a message whose block does not fit is not started), and then holds back that channel's own
+  streams (QUIC flow control stops their sender; `ChannelStatistics.BacklogHolds`). The ring and the other
+  channels are not affected. A channel with a handler keeps the ring and the budget as its only limits; one that
+  is drained every frame, the ring and half the budget. What remains: an unread `ReliableUnordered` channel ends
+  up holding the connection's free stream slots, and unread channels that hold the transport's connection
+  flow-control window between them (16 MiB by default) stop its streams, so read every reliable channel that can
+  receive that much.
 * **Direct mode** (Bulk and large objects): `IReceiveRouter.SelectTarget(in ReceiveHeader)` runs on the
   transport thread and returns a `ReceiveTarget` — pre-sized caller `Memory<byte>` (never grown, not touched
   by the game thread until `OnMessage`), an `IBufferWriter<byte>` that never grows, a pooled lease, or

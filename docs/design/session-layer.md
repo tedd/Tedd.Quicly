@@ -311,26 +311,15 @@ is back in `Filling` and still owned by the caller.
 4. Dispatch while Connected or Closing (and Closed not yet raised): drain-queued messages of channels that now have a handler
    (`ReceiveQueues.QueuedHandled`), the held entry, then the ring — a channel with a handler is dispatched, others go to
    `ReceiveQueues` ("Channels without a handler" below: a pass starts here, an unreliable backlog left from earlier passes
-   evicts, a reliable channel is held when the pool is full and the ring is then left alone) — then the mailboxes of channels with handlers, **also while an entry is held**: the
+   evicts, a reliable channel the application stopped draining goes back to its share, and a reliable message always finds a
+   node) — then the mailboxes of channels with handlers, **also while an entry is held**: the
    mailboxes do not pass through the ring, and stopping them would silence every coalescing and ReliableLatest handler for as
-   long as one reliable channel is not drained, while the transport thread keeps acknowledging those values to the sender.
+   long as a hold lasts, while the transport thread keeps acknowledging those values to the sender.
    Compressed messages are decoded with `Lz4Block.DecompressExact` into a second lease (decoded-bytes budget; a failure drops and
    counts `DecodeFailures`). The lease is released after the handler unless `Retain` was called; handler exceptions propagate.
-   A ring message of a channel that has messages *queued* is not dispatched past them: it goes behind the queue
-   (`Route`), and the next Poll dispatches the queue first. The queues are dispatched before the ring, so this only
-   happens when a handler of the running Poll put older messages of the channel there — by calling `Drain` for another
-   channel, or by registering the handler over a backlog — and without it a ReliableOrdered channel was delivered out of
-   order (0, 2, 1). The message cannot starve behind the queue: a Poll takes nothing from the ring while a queue of a
-   channel with a handler is not empty or `maxItems` is used up.
-   `Drain` decodes too, and its caller cannot release a payload before the call returns, so a batch can need more decode
-   buffers than the receive budget has. `TryDecode` drops what it cannot decode, and a dropped message does not fill the
-   span, so the loop went on dropping: one `Drain` with a span of sixteen returned 3 of 40 queued messages of a reliable
-   channel and dropped 37. On a reliable channel that compresses (`_decodeWaits`) Drain now rents the decode buffer before
-   it takes the message (`ReceiveQueues.TryPeek`, `TryRentForDecode`); without one the message stays in the queue or the
-   held slot — or, taken from the ring, goes to the held slot — and the call returns what it has. A message that can never
-   be decoded (no block of its raw size within the budget next to the block it arrived in) is still dropped and counted,
-   as is one over the decode rate; the dispatch to a handler, which needs one buffer at a time, is unchanged.
-5. `ResumePendedStreams()`.
+5. `ResumePendedStreams()` (streams the ring or the budget held back: all of them, within the ring's free room), then
+   `ResumeCreditPended()` (streams a channel's receive credit held back: only when something changed, and only as many as
+   the channel has credit for — "Reliable class" below).
 6. Closed: engines' `OnPeerClosed`, requests still in the `ThreadSafeSend` front dropped (leases returned), every receive lease
    released, waiting `SendAsync` calls completed `NotConnected` and `FlushAsync` calls completed, the Closed event raised last;
    afterwards Poll/Flush do nothing and no handler or event runs.
@@ -344,8 +333,8 @@ its definition (`ReceiveQueueClass.Of`; the engines and their mailboxes do not e
 | Class | Channels | When the message does not fit |
 |---|---|---|
 | `Datagram` | UnreliableUnordered / UnreliableSequenced without `CoalesceOnReceive` | `TryAppendDatagram`: a *backlog* (below) evicts its oldest message, counted; a channel that is drained, or has a handler, takes room from a backlog and is otherwise held — until its Drain while the application drains it, and for one Poll interval, once, when nobody does |
-| `Reliable` | ReliableOrdered, ReliableUnordered | never dropped: `TryAppend` fails, the peer holds the entry (`_held`) and stops taking from the ring |
-| `Other` | everything else — a coalescing channel, ReliableLatest and Bulk never enter the ring, so only a replaced engine (`PeerOptions.EngineFactory`) gets here | as `Reliable` |
+| `Reliable` | ReliableOrdered, ReliableUnordered | never dropped, and never held while it has no handler: the channel's receive credit (`ReceiveCredit`) bounds what can wait, and `TryAppend` takes a node beyond the pool when the channel is past its reserved share or the pool is full. With a handler (met by a `Drain` of another channel): a pool node, or held until the next Poll |
+| `Other` | everything else — a coalescing channel, ReliableLatest and Bulk never enter the ring, so only a replaced engine (`PeerOptions.EngineFactory`) gets here | never dropped: `TryAppend` fails when the pool is full, the peer holds the entry (`_held`) and stops taking from the ring until the channel is drained or gets a handler (a replaced engine takes no receive credit) |
 
 Sizes (`ReceiveQueueLayout.Compute`, integer division; `Qr` reliable channels, `Qu` datagram-class channels, `B` the receive
 budget): `Capacity = max(min(ring, 1 024), 2·Qr)`; `ReliableNodes = max(1, (Capacity/2)/Qr)` reserved per reliable channel (0
@@ -354,7 +343,10 @@ without one); `DatagramNodes = Capacity − Qr·ReliableNodes` (at least half th
 two reliable and four unreliable ring channels that is a pool of 1 024, 256 nodes reserved per reliable channel, 512 nodes and
 64 KiB for the *backlog* of the unreliable channels together, and fair shares of 128 nodes and 16 KiB. 64 KiB is counted in
 buffer blocks: 1 024 messages of up to 64 bytes, 256 of 65 to 256 bytes, 42 of 257 to 1 536 bytes. The pool does not grow
-with a ring larger than 1 024 (68 bytes a node, per peer).
+with a ring larger than 1 024 (68 bytes a node, per peer). `ReliableNodes` is also the message limit of a reliable channel
+nobody reads, and `max(1, B/4/Qr)` its byte limit (32 KiB each in the example). `ExcessNodes = Qr·(ring + 1 + Capacity)` is
+the most nodes *beyond* the pool the reliable channels can come to need; none exists until one is needed, and then they are
+allocated in native memory in chunks that double from 64.
 
 * **Datagram class: passes and backlog.** The first version of the bound evicted at queueing time, against the class limits.
   That cut a burst for a host that polls and then drains every frame — everything the Poll moved out of the ring beyond 512
@@ -419,27 +411,123 @@ with a ring larger than 1 024 (68 bytes a node, per peer).
   `PeerStatistics.DrainQueueDrops` — not in `RingDrops`, which the transport thread owns (ADR 0008 invariants 4 and 13);
   `Received` still counts a message that is evicted later. Cost: `BeginPass` is one compare while no datagram channel has
   anything queued, otherwise one walk over the datagram channels; an append is a few loads and adds unless it evicts.
-* **Reliable class: the limit that remains.** A reliable message may not be dropped, and nothing tells the transport thread how
-  much room a channel's queue has, so an undrained reliable channel still fills the pool (it may use every free node; only the
-  datagram backlog is capped), its next message is held, and Poll and Drain stop taking from the ring. The ring then fills and
-  its own rules hit **every** ring channel: streams are pended (`TryReserveReceive` fails, the parser un-reads, QUIC flow control
-  holds the sender — of every stream channel, not only the undrained one), datagrams are dropped newest-first (`RingDrops`),
-  responses wait in the ring so requests time out, and `HasPendingWork` stays set (the held entry, the non-empty ring and the
-  re-pended streams), so a signal-driven host keeps polling. It ends when the application drains the channel or registers a
-  handler. The reservation guarantees only that the *backlog* of the unreliable channels cannot cause this: a pass start cuts
-  it back to `DatagramNodes`, which frees the `Qr·ReliableNodes` nodes a burst may have borrowed. Confining the back-pressure to
-  the undrained channel's own streams needs a per-channel credit the transport thread checks before it reserves a ring slot
-  (designed as "D1b", not built); until then an application must register a handler for, or drain, every reliable channel the
-  other end sends on. Other holds that remain: `Drain(X)` meeting more messages of a *handled* reliable channel than there are
-  free nodes (cleared by the next Poll, which dispatches the queue first), and `UnregisterHandler` on a reliable channel with
-  a backlog.
+* **Reliable class: a receive credit per channel (`ReceiveCredit`, `QuiclyPeer.Credit.cs`).** A reliable message may not be
+  dropped, so the limit on what waits for the application has to hold where the message is *accepted*: on the transport
+  thread, before the ring reservation and the lease. Before the credit an undrained reliable channel filled the pool, its next
+  message was held, Poll and Drain stopped taking from the ring, and the ring's own rules hit every channel (streams pended,
+  datagrams dropped newest-first, requests timed out, `HasPendingWork` stuck). Now:
+  * **Counting.** Per ReliableOrdered / ReliableUnordered channel the transport thread counts what it took (`NoteTaken`:
+    messages and lease bytes, when a message has its reservation and its lease) and the game thread what it gave back
+    (`NoteReturned`, in `ReturnCredit`: when a handler is about to see the message or `Drain` hands it out — before the
+    decode, because the lease the transport thread counted is the one that arrived). Both in wrapping 32-bit arithmetic; the
+    difference is what waits in the ring, the held slot and the queues. A message whose stream ends in the middle of it gives
+    its count back on the transport thread (`Untake`). Responses take no credit (they never reach a queue), and neither does
+    a channel of a replaced engine.
+  * **The check.** The engines ask `TryTake(channel, length)` at the start of a message (`StreamMessagePhase.Start` and
+    `Whole`). A channel at its limit answers `StreamConsume.PendCredit`: the parser un-reads the event, the receive returns `PendingAfter`, the
+    bytes stay in the transport and QUIC flow control holds **that stream's** sender. The transport thread reads only its own
+    line and the read-mostly limits in the common case; it looks at the game thread's counters (`Refresh`) only when its
+    private copy says the channel is full.
+  * **Three states** decide the limit (`CreditState`, written by the game thread):
+    `Handled` — a handler takes the messages at every Poll and nothing is left in the drain queue: no limit but the ring's.
+    `Unread` — no handler, and not drained empty since the Poll before last: `ReliableNodes` messages and `B/4/Qr` lease
+    bytes, **strictly**: `TryTake` adds the block the asking message will take (the receive pool's size classes, copied at
+    construction) and refuses when that would pass the share, on an empty channel too. The first version let one message
+    of any size onto an empty channel; with the pool's 64 KiB block for anything above 16 KiB, four unread channels with one
+    message each then held the whole default budget, datagrams of the channels that were read were dropped for want of a
+    buffer and their streams re-pended at every Poll (the accounting review's finding A). Strict, the unread channels pin
+    at most `B/4` between them. A message larger than the share is not lost and not stuck: the first `Drain` of the channel
+    (it finds nothing, and empties nothing) makes the channel `Drained`, and the message arrives. Every channel starts
+    `Unread`, a channel that loses its handler comes back to it, and a handler registered over a backlog stays in it until
+    a Poll has dispatched the backlog, so a handler that comes and goes between Polls cannot add a ring of messages each
+    time. The settling is asked for again by every Poll until it is done (`_creditSettleDue`, `SettleDueCreditLimits` at
+    the end of `DispatchReceived`): a handler that throws on the last message of its backlog leaves the dispatch loop
+    before the limit is lifted, and nothing else would come back to it.
+    `Drained` — a `Drain` left the channel's queue empty (`SettleCreditAfterDrain`): the ring's capacity in messages and
+    `B/2` lease bytes as a threshold (a message is started while less than that waits, and always on an empty channel). A
+    pass start demotes a `Drained` channel that still has messages queued which no take emptied during the whole pass
+    before (`DemoteUndrainedChannels`, `ReceiveQueues.LeftUndrained`; one compare while no channel is in that state). A
+    narrower limit takes nothing back: the channel keeps what it accepted and accepts nothing more until the application
+    has taken it down to the new limit — which is the reason for `B/2`: what a drained channel holds at the moment the
+    application stops coming for it stays, and the other half of the budget is what the channels that are read then have
+    (two channels abandoned that way can still hold all of it). A host that drains once per frame never meets the share,
+    and meets the half only with more than `B/2` of one channel's messages between two drains.
+  * **Resuming.** A stream held back for credit is *not* retried by every Poll (that would resume and re-pend every stream of
+    an unread channel each frame). The transport thread lists it (`NotePended`, an SPSC ring sized for every stream the peer
+    may open); the game thread collects the list into its own (`Resume`: the end of `Drain`, every Poll, `RegisterHandler`)
+    and resumes streams only when something changed — credit came back (`_changed`, set once per Drain), a limit was lifted,
+    or the transport thread asked for a look (`_recheck`) — and then only as many streams of a channel as it has messages of
+    credit left, oldest first: each takes at least one, so resuming more would only have them held back again, and with
+    hundreds of group streams waiting every Drain would pay for all of them. Under a strict byte share the list entry
+    carries the block of the message the stream waits with, and a stream is let go only when that fits in what is left;
+    the transport thread asks for a look on the same terms, or a stream whose message does not fit would be resumed and
+    held back again at every Poll. Both sides store, fence and then load
+    (`NotePended` publishes the stream, fences and re-reads the counters; `Resume` exchanges `_recheck` — the fence — after
+    the counters were stored and then loads the list), so a stream cannot stay held back while its channel has credit. A
+    stream that ends while it waits would keep a turn nobody uses; `NoteGone` makes the next `Resume` resume everything once
+    (the transport ignores the dead ids, the others are held back again). Its entry stays in the list until then, and its
+    end gives the peer the stream back on the transport thread, so a peer that resets held streams and opens new ones
+    writes more entries than it has streams. The list grows for that by doubling, up to `ListGrowth` (8) times its size;
+    beyond it `NotePended` fails and the receive path closes the connection `LimitExceeded` — the stream could not be
+    remembered and would never be resumed, and no sender of this library resets a stream it started on these channels
+    (the threading review's finding 1: the first version counted a callback fault and left the stream stalled).
+  * **The queues.** A reliable channel without a handler must never be the held entry, so `TryAppend` gives it a node
+    beyond the pool when it is past its reserved share or the pool is full (`ExcessNodes`, above). Two things can put it
+    there: a frame's burst on a `Drained` channel (up to a ring), and a channel whose handler was removed over what the ring
+    and a `Drain` of another channel had accepted for it (`SetHandled(false)` moves what exceeds the share out of the pool
+    at once, `LeavePoolToTheOthers`). The pool's other half is therefore always free of reliable backlog.
+  * **What the host sees.** `HasPendingWork` is set when a stream is first held back, when credit came back without the game
+    thread, when a held stream ended, and while the game thread has given credit back and not looked at the streams since
+    (`ReceiveCredit.HasWork`; the last is one call long unless a handler throws and the Poll ends before its look — then
+    the probe is what brings the host back). The next Poll clears it; a stream that merely waits
+    for the application's Drain is not work, so a signal-driven host sleeps. `ChannelStatistics.BacklogHolds` counts the
+    holds per channel (also in `PeerStatistics.StreamReceivePends`); `ReceiveRingDrops` no longer has this cause.
+  * **Cost** (docs/benchmarks/session.md, "Receive credit"): per stream message on the transport thread one read of the
+    channel's limit, two stores to the thread's own line and, for a limited channel, a compare against that line; per
+    message on the game thread two stores to its own line; per Poll and per Drain one call that finds nothing to do.
+  * **Holds that remain.** `Drain(X)` meeting more messages of a *handled* channel than there are free pool nodes (cleared by
+    the next Poll, which dispatches the queue first); a channel of a replaced engine; and, inside one ReliableOrdered stream,
+    everything behind an unread message — a response included — because the stream is ordered. And one thing that is not a
+    hold of the ring at all: the connection's stream limit is one number for every channel, each group of an unread
+    ReliableUnordered channel keeps its stream until it is read, and the sender keeps opening groups (it counts one as closed
+    when the transport acknowledged it), so an unread group channel ends up with every stream slot the receiver had free. A
+    channel of the same sender that still has to *open* a stream then waits for stream credit until the application drains
+    (`An_Undrained_Group_Channel_Gives_The_Stream_Slots_It_Took_Back_When_It_Is_Drained`); streams that are already open
+    and datagrams are not affected. The same is true one level down for bytes: what a held stream has not delivered stays
+    in the transport and counts against its flow-control windows — 2 MiB per unidirectional stream and 16 MiB per
+    connection with the MsQuic transport's defaults — so unread channels that hold the connection's window between them
+    (eight unread ordered channels; one unread group channel with 16 MiB in held groups, measured on loopback as 524 groups
+    of 32 000 bytes) stop every stream of the connection until the application reads. And the sender's own send table and
+    send budget are shared by its channels: what it keeps sending into a channel nobody reads uses them up unless it sets
+    `ChannelOptions.QueueLimitBytes` there.
+  * **Order of a channel that has messages queued.** `Route` dispatches a ring message to its handler only when the
+    channel has nothing queued; otherwise the message goes behind the queue, and the next Poll dispatches the queue first.
+    `DispatchQueued` runs before the ring loop, so the case needs a handler of the running Poll to have put older messages
+    of the channel there: by calling `Drain` for another channel, or by registering the handler over a backlog. Both
+    reordered a ReliableOrdered channel before (each review met it; the code is older than the credit).
+  * **Drain and compressed messages.** `Drain` decodes into a second lease the caller cannot release before the call
+    returns, so a batch can need more decode buffers than the budget has, and `TryDecode` drops what it cannot decode: one
+    call with a span of sixteen lost 34 of 40 queued messages of a reliable channel (the accounting review's finding B). On
+    a reliable channel that compresses (`_decodeWaits`) Drain therefore rents the decode buffer *before* it takes the
+    message (`TryPeek`, `TryRentForDecode`); without one the message stays in the queue, the held slot, or — taken from the
+    ring — goes to the held slot, and the call returns what it has. A message that can never be decoded (no block of its
+    raw size within the budget) is still dropped and counted, as is one over the decode rate; the dispatch to a handler,
+    which needs one buffer at a time, is unchanged.
 * **`QueuedHandled`.** The number of queued messages whose channel has a handler — what the next Poll dispatches from the queues
   and what the work probe reads — is kept by `ReceiveQueues` itself (`SetHandled` from `RegisterHandler`/`UnregisterHandler`,
   adjusted in `TryAppend`/`Take`), not by the peer, so that every way an entry leaves the queues keeps it exact: a count that
   stayed positive over empty queues would be a permanent `HasPendingWork`.
 * Tests: `DrainBackpressureTests` (a handled channel, the mailboxes, a `Drain` of another channel, a diligent Drain-style
   channel, the byte bound, a burst larger than the pool, Poll and Drain in either order, the backlog cut at a pass start, the
-  one-interval hold and `Poll(0)`, the reserved nodes, the reliable limit, the queue and layout units),
+  one-interval hold and `Poll(0)`, the reserved nodes, the hold of a replaced engine's channel, the queue and layout units),
+  `ReliableCreditTests` (the credit: an unread ordered and an unread group channel hold back only themselves and lose
+  nothing, the three states and their limits, a handler registered or removed over a backlog, streams that end while they
+  wait, the byte limit, responses, a reconnect, the counter wrap, the budgeted resume, the nodes beyond the pool, and two
+  zero-allocation runs), `ReviewCreditThreadingTests` and `ReviewCreditAccountingTests` (the two reviews of the credit: the
+  store-fence-load pair step by step and under two real threads, the list of held-back streams, a handler that throws,
+  the byte share, compressed messages, nested calls from handlers, scripted runs of application moves),
+  `ReliableCreditMsQuicTests` in the MsQuic tests (the same over real loopback: hundreds of group
+  streams held back and resumed with zero bytes from the game thread),
   `ReviewRegressionsDrainTests` and `ReviewPerfthreadingFairnessTests` (the review's scenarios: bursts a Poll-then-Drain host
   must not lose, a handled channel met by a Drain, unreliable messages behind a reliable burst, a drained channel next to a
   hog), `SessionZeroAllocationTests.Evicting_From_An_Undrained_Channel_Does_Not_Allocate`; the held-slot paths are exercised
@@ -1983,9 +2071,12 @@ Two features that ride on engines that already exist: fragmentation is the secon
   use: the drain queues full, a plain message held and the response waiting in the ring behind it, then `Drain` (queue →
   held → ring) and, separately, `Poll` with a newly registered handler (handler-queue loop → held → ring) must hand over
   only the plain messages while the response completes its request. The messages that fill the pool and the held slot are
-  a *reliable* channel's (a second ordered channel without a handler): only such a hold lasts across Polls (§4.4
-  "Channels without a handler"). The same scenario is the remaining cost of an undrained reliable channel —
-  while it lasts, the response waits in the ring and the request runs into its timeout.
+  those of a reliable channel *with* a handler whose host is late with its Poll: a Drain of another channel met them, a
+  handled channel takes no node beyond the pool, and its next message is held until that Poll (§4.4 "Channels without
+  a handler"). A reliable channel without a handler cannot be used for this any more — its receive credit keeps it
+  within its share — and with it went the old cost of an undrained reliable channel, a response that waited in the ring
+  while its request ran into the timeout. A response takes no credit itself, so it is held back only by an unread
+  message in front of it on the same ordered stream.
 * **Statistics.** `RequestsSent`, `RequestsTimedOut`, `ResponsesUnmatched`; a request and its response also count as
   ordinary messages of their channel.
 

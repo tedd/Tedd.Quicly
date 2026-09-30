@@ -4,12 +4,31 @@ What an application that upgrades has to know, newest release first. The protoco
 [PROTOCOL.md](PROTOCOL.md), what is merged and measured in [STATUS.md](STATUS.md), and which counter explains a
 missing message in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
-## Unreleased: groups of a receiver that falls behind
+## Unreleased: reliable channels nobody reads, and groups of a receiver that falls behind
 
-**There is no wire change**, and the fix is receiver-local: the end that receives is the end to upgrade.
+Fixes on the receive side of the stream channels. **There is no wire change**, and they are receiver-local:
+the end that receives is the end to upgrade.
 
 ### Fixed
 
+* **A reliable channel nobody read stopped every other channel of the peer** (the second known limit of the
+  release below). A `ReliableOrdered` / `ReliableUnordered` channel without a handler that was not drained filled the
+  drain-queue pool; the next message was held and nothing more left the receive ring. Reliable channels now have a
+  per-channel **receive credit**: a channel nobody reads may have its share waiting for the application (its
+  reserved part of the queue pool — 256 messages each with two reliable channels at default options — and the same
+  part of a quarter of `ReceiveBudgetBytes`), and past that only **its own streams** are held back, by ordinary
+  QUIC flow control. Every other channel keeps working, nothing is lost, and the held streams go on when the
+  application drains the channel or registers a handler for it. PROTOCOL.md §7, "Channels nobody drains".
+* **A handler, or a `Drain`, called from inside another handler could deliver a `ReliableOrdered` channel out of
+  order.** A `Drain` of another channel from inside a handler queued the older messages it met for "the next
+  `Poll`" while the running `Poll` went on dispatching newer ones; a handler registered from inside a handler over
+  a queued backlog got the ring's messages before the backlog. A message of a channel that has messages queued now
+  goes behind them.
+* **`Drain` dropped compressed messages of a reliable channel when the batch did not fit the receive budget.**
+  Every drained message is decoded into a second buffer that the caller can only release after the call; when
+  there was none left the message was dropped (`DecodeFailures`) and the call went on to drop the rest of the
+  queue. On `ReliableOrdered` / `ReliableUnordered` channels `Drain` now leaves such a message queued and returns
+  what it has.
 * **A `ReliableUnordered` receiver that fell behind its sender lost whole groups, and the sender reported them
   `Delivered`** (the first known limit of the release below). A sender counts a group's stream as closed when the
   transport has acknowledged its data, which can be before the receiving application has read any of it, and
@@ -27,6 +46,28 @@ missing message in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ### Behaviour changes
 
+* **An unread reliable channel now stalls its own sender instead of the whole peer.** If an application relied on
+  the old stall as back-pressure for other channels, it no longer gets it. The sender of the unread channel sees
+  its sends queue up and then `QueueFull`, as before.
+* **How a reliable channel without a handler is limited depends on whether it is read.** A channel the
+  application drains — a `Drain` left its queue empty since the `Poll` before last, and an empty `Drain` counts —
+  may have as many messages waiting as the receive ring holds and **half of `ReceiveBudgetBytes`** (128 KiB at the
+  default; one message is always accepted on an empty channel). Before this release it shared the whole budget
+  with every other channel. A host that receives more than half its receive budget on one drained channel between
+  two drains now has the rest wait at the sender for a frame: raise `ReceiveBudgetBytes`, or register a handler
+  (a handler's channel is limited as before). A channel that is *not* read is held to the share above, strictly:
+  a message whose buffer block is larger than the share (with default options: a message above 16 KiB when the
+  table has two to four reliable channels, above 4 KiB with five to sixteen) is not started until the application
+  drains the channel for the first time. A host that lets a whole `Poll` interval pass without draining a
+  reliable channel that has messages queued, or never empties it (a fixed-size buffer it fills without calling
+  again), is treated as not reading it until a `Drain` empties the queue again. Nothing is lost either way — the
+  rest waits at the sender — but to keep the throughput, drain until `Drain` returns 0, once per `Poll`.
+* **`Drain` can return fewer messages than the span holds while more are queued**, on a reliable channel that
+  compresses: see "Fixed". Loop until it returns 0 *after releasing* what the previous call returned.
+* **A peer that resets the streams this end holds back, over and over, is disconnected** (`LimitExceeded`) once
+  the receiver cannot remember another held stream. No sender of this library does that.
+* **`HasPendingWork` is no longer held `true` by an unread reliable channel.** A host that polls while the probe
+  is set now comes to rest. Streams that wait for the application's `Drain` are not work.
 * `MsQuicTransportOptions.MaxStreams` no longer limits the streams a peer may open: the transport's stream table
   is sized from what it grants the peer (the diagnostic sink says once when that raised the table), and the
   option is the table's size when that is enough. It still limits this end's own streams: `OpenStream` answers
@@ -35,6 +76,37 @@ missing message in [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
   carrier shows the session no more peer streams than it reported it would admit.
 * A large `ReliableLatest` channel and a `Bulk` channel still reset streams beyond their limit on the receiver.
   That is not silent there: the value is not acknowledged and retried, the transfer ends with a status.
+
+### New
+
+* `ChannelStatistics.BacklogHolds`: the times a stream of the channel was held back because the channel's share
+  was waiting for the application. Rising on a channel the other end sends on: nobody reads it, or it is read more
+  slowly than it is written. [TROUBLESHOOTING.md](TROUBLESHOOTING.md) has the row.
+
+### Known limits
+
+* **An unread `ReliableUnordered` channel can take the connection's stream slots.** The stream limit is one number
+  for all channels, every unread group keeps its stream until it is read, and the sender keeps opening groups. The
+  sender's other channels that still have to *open* a stream towards this receiver — the first message of an
+  ordered channel, other groups, large `ReliableLatest` values, bulk transfers — then wait for stream credit until
+  the channel is drained. Streams that are already open and all datagram channels are unaffected, and nothing is
+  lost. Read every `ReliableUnordered` channel the other end sends on.
+* **Unread channels that hold the transport's connection flow-control window between them stop the connection's
+  streams.** The bytes of a held stream stay in the transport: up to 2 MiB per stream and 16 MiB per connection
+  with the MsQuic defaults (`MsQuicSettings`). One unread ordered channel is far from that; eight of them, or an
+  unread group channel with 16 MiB in held groups, reach it, and then no stream channel of the connection
+  receives until the application reads. Datagram channels are not affected.
+* **The sender's queue is shared.** What a sender keeps sending into a channel the other end does not read stays
+  in its send table and send budget, which all its channels share; when they are full its sends on every channel
+  are refused. `ChannelOptions.QueueLimitBytes` bounds one channel's part.
+* **A channel that was drained and is then abandoned keeps what it accepted**, up to half the receive budget, until
+  it is drained again; two such channels can hold all of it.
+* On a `ReliableOrdered` channel everything behind an unread message waits with it (the stream is ordered),
+  including a response to this end's own request on that channel.
+* A compressed message dispatched to a **handler** is still dropped (`DecodeFailures`) when the receive budget
+  has no buffer for its decoded payload, on reliable channels too.
+* A channel whose engine the application replaced (`PeerOptions.EngineFactory`) has no receive credit and can
+  still hold the receive ring when it is not drained.
 
 ## 2026-09-30: messages dropped on localhost
 

@@ -63,9 +63,24 @@
   unread channels could take turns at closing the ring. A peer can therefore close the ring through the unread
   unreliable channels of a table for one Poll interval per channel in total (two for a channel the application
   stopped draining, and at the start of a session, whose first Poll counts as drained), not longer, and pin more
-  than the quarter of the budget for as long, not longer. Reliable channels cannot be evicted; an undrained one
-  still back-pressures the whole ring (a known limit, to be confined to its own streams by per-channel receive
-  credit), so a host must handle or drain every reliable channel in its table.
+  than the quarter of the budget for as long, not longer. Reliable channels cannot be evicted, so they are bounded
+  where a message is accepted: a per-channel **receive credit**, checked on the transport thread before a message
+  takes a ring entry and a buffer. A reliable channel nobody reads may have its reserved share of the queue pool
+  and the same part of a quarter of the byte budget waiting; past that the receiver stops consuming that channel's
+  streams and QUIC flow control holds their sender — the peer that floods the channel is the one that waits. The
+  ring, the other channels and the host's work probe are untouched, for any number of unread reliable channels:
+  together they can pin half the queue pool and a quarter of the budget — the byte share is strict, a message
+  whose buffer block does not fit in it is not started — which leaves the other half of each to the traffic that
+  is read. A channel with a handler is not held to the share (the ring and the budget bound it, as before). A
+  channel the application drains every frame is bounded by the ring and by half the budget, because it keeps what
+  it accepted when the application stops draining it and falls back to the share (within two Poll intervals): the
+  peer chooses the burst, the application chooses when it stops, and half the budget is what one such channel can
+  then hold. The list of held-back streams is bounded too: a peer that resets held streams and opens new ones
+  leaves an entry per stream until the receiver's next Poll; the list grows to eight times the streams the peer may
+  have open and then the connection is closed (`LimitExceeded`). What an attacker keeps is what QUIC gives it
+  anyway: it can stall its own streams, fill the stream slots of the connection that those streams occupy, and
+  fill the connection's flow-control window with data nobody reads (16 MiB with the MsQuic defaults), which stops
+  its own other streams — not another connection's.
 * **Retransmission cannot be weaponised**: ReliableLatest has per-version and per-peer retry budgets;
   acks are coalesced per key (the highest accepted version); Pong is rate-limited; control message rate is capped.
 * **Sequence numbers give the peer nothing it did not have** (PROTOCOL §8 "sequence clock"). Only the

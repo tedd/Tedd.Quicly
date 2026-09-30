@@ -110,6 +110,10 @@ NestedContainer, BadLength, ...
   game thread `Interlocked.Exchange(-1)` out; `PopDirty(Span<int> keys)` scans the bitset with `BitOperations.TrailingZeroCount`.
 * `ChannelSendState` / `ChannelRecvState` (64 B each, per channel): counters, next sequence, queue head/tail/bytes, stream id,
   group state, statistics fields (sent/received/dropped/superseded/expired/queueFull/tooLarge/ringDrops/retries/keyTableFull).
+* `ChannelSendOutcomeCounters` (16 B, per channel, `PeerCore._sendOutcomes`): `TransportCanceled` and `TransportLost`, what the
+  transport did with a channel's messages after hand-off (§7.1 "Transport outcomes"). Game thread only, written when a dropped
+  datagram's completion is drained. An array of its own because `ChannelSendCounters` is a full line that the scheduler writes per
+  message; never reset (totals since the peer was created, kept across an epoch change and an in-place reconnect).
 
 ## 4. QuiclyPeer (as built: wave C1, steps 1–3)
 
@@ -545,8 +549,10 @@ Notes for session-layer tests over the simulator:
     `OnStreamStarted(StreamLimitReached)`, the canceled completion of a send made with Start and `OnStreamShutdownComplete` follow at
     the next step; the stream never starts (a later start returns InvalidState).
 11. The simulator honours `CancelOnBlocked` (`TransportCapabilities.CancelOnBlocked` is true): a datagram that finds its direction's
-    serializer busy is canceled, so a session's unreliable datagrams are dropped (`Expired`) while stream data keeps the link busy.
-    Tests that want queueing wrap the connector (`FlagRecordingConnector(connector, cancelOnBlocked: false)`).
+    serializer busy is canceled, so a session's unreliable datagrams are dropped (their sends complete `Expired` and are counted
+    `TransportCanceled`) while stream data keeps the link busy. A link without a bandwidth limit never blocks, so it never cancels
+    for this reason. Tests that want queueing wrap the connector (`FlagRecordingConnector(connector, cancelOnBlocked: false)`) or
+    set `PeerOptions.DropWhenBlocked = false`.
 
 ## 6. Tests that must exist (Core)
 
@@ -581,7 +587,7 @@ at the bitmap's word boundaries, the "never" range, a second resolve, and a mark
 coalescing on vs off at 60 Hz, unordered coalescing, ring overflow, receive budget, LRU eviction and the replay window, dense key
 spaces, a second epoch on one engine); `DatagramSendPathTests` (every send path alone and packed, borrowed pins released only when
 the transport is done, owned leases and refusals, tracked Delivered/Lost/Expired/Canceled/Disconnected, a transport-canceled
-datagram completing Expired, container members completing in both completion modes, compression round trip and the RawLength
+datagram completing Expired (and staying counted as sent), container members completing in both completion modes, compression round trip and the RawLength
 rules on the wire, admission refusals, send budget); `DatagramZeroAllocationTests` (60 Hz traffic of 64-byte messages over
 unordered, sequenced, coalescing, compressed and tracked channels; a capped scheduler with expiring messages; the same traffic on
 channels that keep their expiry, the `UnreliableSequenced` default included; a keyed and an
@@ -593,7 +599,14 @@ resynchronisation after a gap of more than half the space, its two-second thresh
 resynchronising, the channel going on after a false resync and a clock left too far ahead healing; a new epoch forgetting the
 clock); `SchedulerUnitTests`
 (`TokenBucket` overdraft, `ReceiveKeyTracker` on extended sequences, local completions, the idle packer) and
-`Framing/PackedContainerWriterResumeTests`.
+`Framing/PackedContainerWriterResumeTests`; `TransportOutcomeStatisticsTests` (the transport outcome counters of §7.1: a loose
+datagram the transport cancels, the members of a cancelled container finished by the packer itself and of one routed to its
+owners, the cancelled and the lost fragments of a fragmented message, the members of a lost container, cancels at close not
+counted, a carrier that reports no states counting only cancels, and a lossy, bandwidth-limited workload in both completion modes
+whose counters balance against the simulator's and against what the other end received), with a lost ReliableLatest transmission
+in `LatestDeliveryTests`, the totals surviving an in-place reconnect in `ReconnectTests`, the layout in `StateLayoutTests`, a
+zero-allocation run of cancelled loose, packed and fragmented datagrams in `DatagramZeroAllocationTests`, and
+`PeerOptions.DropWhenBlocked = false` queueing instead of cancelling in `SchedulerTests`.
 
 Step 3 (ordered delivery, async APIs, sends from other threads) adds: `OrderedTestKit.cs` (`OrderedTables.Main`, `OrderedKit` —
 roomy budgets, payload patterns, engine phase accessors — and `AsyncRefusalTransport`/`AsyncRefusalConnector`, which refuse a stream
@@ -774,9 +787,13 @@ a pass may overdraw.
 **Send flags** (`DatagramPacker.SendFlags`, PROTOCOL.md §4.5). `Priority` for messages of channels with priority ≥ 192
 (`DatagramPacker.PriorityThreshold`) and for `Immediate` sends; a container carries it when any member does. `CancelOnBlocked` for
 unreliable datagrams (a container only when every member is unreliable) and only when the pass allows it:
-`QuiclyPeer.TransportHonoursCancelOnBlocked()` is the one place that decides: it returns `TransportCapabilities.CancelOnBlocked`,
+`QuiclyPeer.TransportHonoursCancelOnBlocked()` is the one place that decides: it returns `PeerOptions.DropWhenBlocked` (default
+true, read once at construction) and `TransportCapabilities.CancelOnBlocked`,
 which `PeerCore` records at `OnConnected` and again at every `OnDatagramCapabilityChanged` (MsQuic 2.4 and later and the simulator
-honour the flag; otherwise blocked datagrams are queued by the transport). Within a pass the transport-call order keeps the priority
+honour the flag; otherwise, or with the option off, blocked datagrams are queued by the transport — and sent however old they have
+become, because expiry is not evaluated after hand-off). There is no per-channel switch: it would need `ChannelOptions` plumbing and
+a change to the engines' hints, and nothing measured asks for it yet. What the transport drops because of the flag is counted
+(**Transport outcomes**, below). Within a pass the transport-call order keeps the priority
 order: a stream engine hands the packer's pending container over (`DatagramPacker.SubmitPending`) before its own stream sends, so
 datagrams of channels the scheduler reached earlier never wait behind stream data. `DelaySend` is never set: it measured 16-19 %
 slower per datagram for tick bursts on MsQuic loopback and a later re-run found no measurable effect either way (the original step
@@ -798,7 +815,40 @@ Fan-out (`PeerCore.OnContainerCompleted` → `DatagramPacker.OnContainerComplete
 and, when a member is tracked, passes the notice to every member's owner; the final completion (transport or local) is copied to every
 member (slot and generation replaced) and routed through `QuiclyPeer.RouteCompletion`, so each owner finishes its member with
 `CompleteEntry` (which accepts `Filling`); then the container entry is finished. In ThreadPool mode the transport thread signals neither
-containers nor members; the fan-out on the game thread completes their tokens.
+containers nor members; the fan-out on the game thread completes their tokens. When every member is a plain datagram message
+(`DatagramHints.DirectCompletion`) and the completion came from the transport, the packer finishes the members itself instead of
+routing them; if that completion is a transport drop (lost, or cancelled before transmission) it also counts each member on its
+own channel, exactly as the member's owner would — one test per container, so the loop for delivered containers is unchanged.
+
+**Transport outcomes** (PROTOCOL.md §4.5; `PeerCore.IsTransportDrop`, `CountTransportDrop`, `CountDatagramOutcome`). What the
+transport does with a datagram after hand-off is counted twice, in two units, both on the game thread when the final completion
+is drained:
+
+* *Per peer, in datagrams* — `DatagramsAcknowledged`, `DatagramsLost`, `DatagramsCanceled`, over the datagrams of `DatagramsSent`
+  (a container is one; channel 0 is excluded). Counted in the two loops that empty the completion ring
+  (`QuiclyPeer.DrainCompletions`, `DrainCompletionsMarking`), where each final datagram completion passes exactly once — not in
+  `RouteCompletion`, which sees a container's completion again for every member.
+* *Per channel, in messages* — `TransportCanceled`, `TransportLost`, in the unit of `Sent` (a fragment is one, a ReliableLatest
+  transmission is one). Counted where the message's entry is finished, from the status it is finished with, so a counter and a
+  tracked status cannot disagree: the packer's direct fan-out, `DatagramEngine.OnSendCompleted` (loose messages and routed
+  members), `TryCompleteFragment`, and `ReliableLatestEngine.OnTransmissionCompleted`. N members of one dropped container add N
+  per channel and 1 per peer.
+
+`Sent`/`BytesSent` are **not** taken back: the message was handed to the transport, a drop arrives at a later Poll (a decrement
+would make `Sent` go backwards between two snapshots), and a lost datagram already stayed counted. A cancel while the transport
+is closing (`Disconnected`) counts nowhere — the transport then cancels everything it holds, including datagrams already on the
+wire, and that says nothing about congestion; the price is that a genuine blocked drop still waiting in the ring when `Close`
+starts is not counted either. The identities, on a transport that reports datagram states:
+`DatagramsSent = DatagramsAcknowledged + DatagramsLost + DatagramsCanceled + in flight + ended by close or reconnect` (the last
+term: cancels while closing, completions `ResetForReconnect` discards, entries `AbandonEntries` finishes), and per channel
+`Sent − TransportCanceled − TransportLost` = acknowledged, in flight, final-`Sent` on a carrier without states, or ended by
+close or reconnect. A carrier that reports no states still reports a datagram it never sent, so only the two cancel counters
+move there. `TransportLost` is the sending transport's verdict and may over-state real loss (a datagram declared lost can still
+arrive). The peer counter and the channel counters move at two instants (drain, then fan-out), so a continuation that starts a
+close in the middle of a container's fan-out can leave the datagram counted while later members complete `Disconnected`
+uncounted; and in ThreadPool mode a token can complete on the transport thread before the counter moves at the next Poll or
+Flush. No per-channel acknowledged counter and no byte counters: they would put a channel lookup and a write per member on the
+path for delivered containers, which exists to avoid per-member work.
 
 **Datagram engines** (`Engines/DatagramEngine.cs`, `UnreliableUnorderedEngine`, `UnreliableSequencedEngine`, `ReceiveKeyTracker`;
 registered in `ChannelEngines.Create`).
@@ -823,7 +873,8 @@ registered in `ChannelEngines.Create`).
   (`Sent`, `Bytes`), `TooLarge` (`TooLarge` counter + local `Failed`: the limit shrank after admission), `Blocked`/`Unavailable` ⇒ stop
   with the entry at the head. The queue link is read before `Add` (the packer reuses it).
 * `OnSendCompleted`: the Sent notice ⇒ `ReleasePayload` + BufferReleased; final ⇒ `CompleteEntry(MapCompletion)`; a local completion
-  of an entry the packer had taken (a refused datagram) un-counts `Sent`/`Bytes`.
+  of an entry the packer had taken (a refused datagram) un-counts `Sent`/`Bytes`; a transport drop (lost, or cancelled before
+  transmission) keeps `Sent`/`Bytes` and counts `TransportLost` or `TransportCanceled` ("Transport outcomes" above).
 * `TryCancel`: only while queued; unlinked, local completion `Canceled` (finished at the next Poll/Flush). `OnPeerClosed`: queued
   entries ⇒ `Disconnected`. `OnEpochReset`: the first call opens the first epoch; a later one on the same engine restarts
   `NextSequence` and has the transport thread clear the receive tables before its next datagram (PROTOCOL.md §4.1). `Tick` and `Flush`
@@ -862,7 +913,10 @@ registered in `ChannelEngines.Create`).
 messages sent alone and containers; control datagrams are not included); per channel the send counters `Sent`, `BytesSent`,
 `Expired`, `QueueFull`, `TooLarge`, `SendKeyTableFull` and the receive counters `Received`, `BytesReceived`, `Dropped`,
 `ReceiveSuperseded`, `RingDrops`, `ReceiveKeyTableFull`, `OutOfBuffers`. Per peer, `SequenceResyncs` counts the
-resynchronisations of the sequence clock (normally zero).
+resynchronisations of the sequence clock (normally zero). What the transport did after hand-off: per peer
+`DatagramsAcknowledged`, `DatagramsLost`, `DatagramsCanceled`, per channel `TransportCanceled` and `TransportLost` ("Transport
+outcomes" above). `Expired` counts only messages that expired before hand-off; a datagram the transport dropped completes
+`Expired` too but is counted `TransportCanceled`. docs/TROUBLESHOOTING.md maps every way a message can go missing to its counter.
 
 ### 7.2 Reliable ordered delivery (as built: wave C1, step 3)
 
@@ -1233,7 +1287,9 @@ state of the peer's group streams. Every per-key array grows with the slots in u
   Known residual: a group stream that started in the previous epoch and delivers its `End` after the reset was consumed
   feeds an old-epoch version into the new clock and names a key slot of the cleared table; the affected key's new-epoch
   values then read as stale until the counter passes it, and the sender reports them `Failed`, never `Delivered`.
-* **Statistics.** Per channel: `Sent`/`BytesSent` per transmission, `Retries` (retransmissions), `SendSuperseded`,
+* **Statistics.** Per channel: `Sent`/`BytesSent` per transmission, `Retries` (retransmissions), `TransportLost` /
+  `TransportCanceled` (datagram transmissions the transport lost or dropped — what most retransmissions answer; §7.1
+  "Transport outcomes"; a large value's stream is not counted), `SendSuperseded`,
   `Received`/`BytesReceived`, `Dropped` (stale or duplicate), `ReceiveSuperseded` (mailbox replacements), `RingDrops`,
   `ReceiveKeyTableFull`, `ReceiveTooLarge`, `OutOfBuffers`, and the engine's `QueuedMessages`/`QueuedBytes`/
   `InFlightMessages`/`InFlightBytes`.
@@ -1638,7 +1694,12 @@ Two features that ride on engines that already exist: fragmentation is the secon
   `ReassembliesExpired`. `Reassemblies(channelIndex)` reads the transport thread's count with one volatile read and is
   diagnostics only (ADR 0008 invariant 13). Per channel the
   ordinary counters apply, with one twist worth knowing: **each fragment is one `Sent`** of its channel, because each is
-  a datagram the scheduler hands over separately, while `Received` counts reassembled messages.
+  a datagram the scheduler hands over separately, while `Received` counts reassembled messages. The transport outcome
+  counters (§7.1) use the same unit: a message of N fragments of which the transport dropped k counts `Sent += N`,
+  `TransportCanceled += k` (or `TransportLost`), its token ends with the worst fragment status, the fragments that did
+  travel are wasted, and the receiver shows the partial in `ReassembliesExpired`. There is no per-message counter of failed
+  fragmented messages. Worth knowing when reading the counters: a fragmented message is N datagrams, so it is N times as
+  exposed to a cancel-on-blocked drop as an unfragmented one.
 
 #### Request/response (PROTOCOL.md §3.1, §4.3)
 

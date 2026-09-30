@@ -46,7 +46,10 @@ public enum DeliveryStatus : byte
 
     /// <summary>
     /// The message was held back for longer than its expiry before it could be sent (the expiry counts from the message's
-    /// first scheduler pass, PROTOCOL.md §4.5), or the transport dropped its datagram when blocked.
+    /// first scheduler pass, PROTOCOL.md §4.5), or the transport dropped its datagram before transmission: it could not
+    /// send the datagram at once (<see cref="Session.PeerOptions.DropWhenBlocked"/>), or the datagram no longer fitted after
+    /// the path's datagram limit shrank. Statistics tell the two apart: <see cref="Session.ChannelStatistics.Expired"/>
+    /// counts the first, <see cref="Session.ChannelStatistics.TransportCanceled"/> the second.
     /// </summary>
     Expired,
 

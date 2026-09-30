@@ -8,7 +8,8 @@ allocation-free hot path.
 This document describes the layering, the threading model, the memory model and the public API surface.
 The wire format lives in [PROTOCOL.md](PROTOCOL.md). Decisions and their rationale live in [adr/](adr/);
 ADR 0008 (hot-path memory and threading contract) and ADR 0009 (security and limits) are the two most
-important companions to this document.
+important companions to this document. When messages go missing, [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
+says which statistics counter names the cause.
 
 ## 1. Projects
 
@@ -295,7 +296,7 @@ public sealed class QuiclyPeer : IDisposable
     public IPEndPoint RemoteEndPoint { get; }
     public TransportCapabilities Capabilities { get; }
     public ChannelTable Channels { get; }
-    public void GetStatistics(out PeerStatistics stats);          // fixed-layout struct: RTT (smoothed/min/max/variance, transport + application), one-way jitter, datagram loss %, bytes/packets per second each way, cwnd, bytes in flight, max datagram payload, ring occupancy high-water marks, per-channel counters (sent, received, dropped, superseded, expired, out-of-buffers, queue-full, too-large, ring-drops, retries, key-table-full)
+    public void GetStatistics(out PeerStatistics stats);          // fixed-layout struct: RTT (smoothed/min/max/variance, transport + application), one-way jitter, datagram loss %, bytes/packets per second each way, cwnd, bytes in flight, max datagram payload, ring occupancy high-water marks, per-channel counters (sent, received, dropped, superseded, expired, out-of-buffers, queue-full, too-large, ring-drops, retries, key-table-full, transport-canceled, transport-lost), per-peer datagram outcomes (acknowledged, lost, canceled) — see TROUBLESHOOTING.md for which counter explains a missing message
     public long EstimatedRemoteMicros();
     public TimeSpan NextDeadline { get; }
     public long NextDeadlineMicros { get; }            // = min(poll, flush), for a host with one loop
@@ -409,7 +410,7 @@ public sealed class QuiclyClient
 | `CongestionControlAlgorithm` | CUBIC (BBR option) | |
 | `StreamSchedulingScheme` | ROUND_ROBIN | Bulk must not starve ordered channels |
 | execution profile | LOW_LATENCY (REAL_TIME option) | |
-| datagram flags | Immediate/high priority → `DGRAM_PRIORITY`; unreliable → `CANCEL_ON_BLOCKED`. `DELAY_SEND` is **not** used: measured on MsQuic loopback it made a tick's burst 16–19 % slower per datagram, and a later re-run found no measurable effect either way, so the session layer never sets it — batching comes from packing (PROTOCOL §2.2) instead | packing and stale-data control |
+| datagram flags | Immediate/high priority → `DGRAM_PRIORITY`; unreliable → `CANCEL_ON_BLOCKED` (`PeerOptions.DropWhenBlocked`, default on; a datagram dropped this way is counted in `TransportCanceled` / `DatagramsCanceled`, and setting the option to false makes blocked datagrams queue in the transport instead). `DELAY_SEND` is **not** used: measured on MsQuic loopback it made a tick's burst 16–19 % slower per datagram, and a later re-run found no measurable effect either way, so the session layer never sets it — batching comes from packing (PROTOCOL §2.2) instead | packing and stale-data control |
 
 Bulk sends are windowed on the transport's `IdealSendBufferSize` and additionally capped to a fraction of
 the congestion window (`BulkShareOfCongestionWindow`, default 50 %, re-evaluated per completion) — stream

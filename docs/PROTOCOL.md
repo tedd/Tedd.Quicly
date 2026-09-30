@@ -389,7 +389,7 @@ data is never used for authentication. Reconnect = new TLS handshake + QUICLY se
 
 | Mode | `BufferReleased` | `Delivered` | Other terminal states |
 |---|---|---|---|
-| Unreliable* | datagram handed to the network (transport SENT) | transport ack when the transport reports datagram send state (caps bit1); otherwise **never** (the send completes `Sent`) | `Sent`, `Lost`, `Expired`, `Canceled` (dropped when blocked) |
+| Unreliable* | datagram handed to the network (transport SENT) | transport ack when the transport reports datagram send state (caps bit1); otherwise **never** (the send completes `Sent`) | `Sent`, `Lost`, `Expired` (expiry before hand-off, or dropped by the transport before transmission), `Canceled` (application cancel while queued), `Disconnected` |
 | ReliableOrdered / ReliableUnordered | stream bytes acknowledged by the peer's QUIC stack | same event | `Disconnected`, `Failed` |
 | ReliableLatest | as above per transmission | `LatestAck` naming the current version, which is the version last transmitted for the key (§4.4) | `Superseded`, `Failed`, `Disconnected` |
 | Bulk | per chunk | transfer complete (`BulkProgress` = Length) | `Canceled`, `Failed` |
@@ -445,10 +445,20 @@ slot is freed at the same event, because no further state will ever be reported.
   from the send call cancels the message (`TryCancel`) instead. (Implementations that counted expiry from
   admission, against the clock stamp of their last pass, dropped every `UnreliableSequenced` message whenever
   that stamp was older than the expiry; the rule above replaces that and changes nothing on the wire.)
-  Unreliable datagrams are submitted with
-  cancel-on-blocked semantics (`DropWhenBlocked`, default on): a datagram that cannot be sent immediately
-  because of congestion is dropped and counted as `Expired`. Default `Expiry` is 0 (none) for reliable
-  channels and 2× the flush interval for `UnreliableSequenced`.
+  Default `Expiry` is 0 (none) for reliable channels and 2× the flush interval for `UnreliableSequenced`.
+* Unreliable datagrams are submitted with cancel-on-blocked semantics (`PeerOptions.DropWhenBlocked`, default
+  on, and only on a transport that honours the flag): a datagram the transport cannot send immediately is
+  dropped instead of queueing behind congestion. Its send completes `Expired`, and it is counted in
+  `TransportCanceled` (per channel, one per message) and `DatagramsCanceled` (per peer, one per datagram) —
+  **not** in the channel's `Expired` counter, which counts only messages that expired before hand-off. The
+  messages stay counted in `Sent`: they were handed to the transport. A datagram the transport declares lost
+  is counted the same way in `TransportLost` / `DatagramsLost` and completes `Lost`. Datagrams the transport
+  cancels because the connection is closing complete `Disconnected` and are counted in neither. With
+  `DropWhenBlocked` off, blocked datagrams wait in the transport's queue and are sent when it can send again;
+  expiry is not evaluated after hand-off, so such a datagram goes out however old it has become. A packed
+  container carries the flag only when every member is unreliable; `ReliableLatest` and control datagrams
+  never carry it. None of this is visible on the wire: the receiver cannot tell a datagram its sender's
+  transport dropped from one the network lost.
 * Buffered datagrams are **not** handed over with a delay-send hint (MsQuic's `DELAY_SEND`). Measured on
   loopback, setting it made a tick's burst 16–19 % slower per datagram, and a later re-run found no measurable
   effect in either direction; batching is achieved by packing (§2.2), so the flag is never set

@@ -22,7 +22,8 @@ protocol, and an HTTP/1.1 server that obtains its own certificates from any ACME
 Buypass, Google Trust Services, …).
 
 * [Architecture](docs/ARCHITECTURE.md) · [Wire protocol](docs/PROTOCOL.md) · [Decisions](docs/adr/) ·
-  [Benchmarks](docs/benchmarks/) · [Development guide](docs/DEVELOPMENT.md)
+  [Benchmarks](docs/benchmarks/) · [Development guide](docs/DEVELOPMENT.md) ·
+  [Troubleshooting](docs/TROUBLESHOOTING.md)
 
 ## Carriers
 

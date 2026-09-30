@@ -353,6 +353,57 @@ public class ExpiryAnchorTests
     }
 
     [Fact]
+    public void A_Pass_Reads_Only_The_Words_Between_The_Lowest_And_The_Highest_Stamped_Slot()
+    {
+        // The entry table hands out the slot freed last, so after a burst has completed a lone send sits at the top of the
+        // slots the burst used. A pass — and every Immediate send runs one — must not walk the bitmap from word 0 for it:
+        // at a send table of 2^20 entries that would be 16 384 words per message.
+        using SessionHarness h = new(table: Table, client: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.SendTableCapacity = 4096;
+        }, server: DatagramKit.Quiet);
+        PeerCore core = h.Client.Core;
+        List<int> slots = [];
+        while (core.TryAllocateEntry(14, SendEntryFlags.None, out int slot))
+        {
+            slots.Add(slot);
+        }
+
+        int top = slots.Max();
+        Assert.True(top >> 6 >= 60, "the table is too small for the test");
+        Assert.Equal(0, core.PendingExpiryWords);
+        core.StampExpiry(top, 1_000);
+        Assert.Equal(1, core.PendingExpiryWords);
+
+        const long Now = 5_000_000;
+        core.ResolveExpiry(Now);
+        Assert.Equal(0, core.PendingExpiryWords);
+        Assert.Equal(Now + 1_000, core.Entries.Deadlines[top]);
+
+        // Two slots far apart: the range between them, both resolved, and the range starts over afterwards.
+        int low = slots.First(slot => slot >> 6 == 3);
+        core.Entries.Deadlines[top] = 0;
+        core.StampExpiry(top, 2_000);
+        core.StampExpiry(low, 3_000);
+        Assert.Equal((top >> 6) - 3 + 1, core.PendingExpiryWords);
+        core.ResolveExpiry(Now + 1);
+        Assert.Equal(Now + 1 + 2_000, core.Entries.Deadlines[top]);
+        Assert.Equal(Now + 1 + 3_000, core.Entries.Deadlines[low]);
+
+        int middle = slots.First(slot => slot >> 6 == 10);
+        core.StampExpiry(middle, 4_000);
+        Assert.Equal(1, core.PendingExpiryWords);
+        core.ResolveExpiry(Now + 2);
+        Assert.Equal(Now + 2 + 4_000, core.Entries.Deadlines[middle]);
+        Assert.False(core.HasPendingExpiry);
+        foreach (int slot in slots)
+        {
+            core.DiscardEntry(slot);
+        }
+    }
+
+    [Fact]
     public void A_Mark_Left_On_A_Recycled_Slot_Changes_Nothing()
     {
         using SessionHarness h = new(table: Table, client: DatagramKit.Quiet, server: DatagramKit.Quiet);

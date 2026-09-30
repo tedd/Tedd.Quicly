@@ -31,8 +31,9 @@ public sealed unsafe partial class MsQuicTransport
     /// MsQuic never started sets both flags at once, so exactly one party ever decides to close a slot. The close is queued
     /// at most once per incarnation (<see cref="CloseQueued"/>) and run by the cleanup work item under
     /// <see cref="_cleanupLock"/>, which checks the generation the close was decided for.</para>
-    /// <para><see cref="ReceiveState"/> tracks a pending receive and a resume that arrives while the receive callback is
-    /// still running.</para>
+    /// <para><see cref="ReceiveState"/> tracks a held stream (<see cref="ReceivePending"/>: the sink asked for the rest to be
+    /// held back, and MsQuic has paused the stream) and a resume that arrives while the receive callback is still
+    /// running.</para>
     /// </remarks>
     private sealed class StreamSlot(int index)
     {
@@ -62,9 +63,24 @@ public sealed unsafe partial class MsQuicTransport
         public int DeferredNext = -1;
         public uint DeferredGeneration;
         public int ReceiveState;
+
+        /// <summary>Bytes of the held indication the sink consumed, and the bytes it was given (what a resume may still credit is the difference).</summary>
         public long PendingConsumed;
         public long PendingTotal;
         public long EarlyResumeBytes;
+
+        /// <summary>
+        /// Bytes at the head of the stream's next indication that the sink already has: MsQuic was told less than the sink
+        /// consumed (a resume credited them after the stream was paused, or the sink consumed a whole indication and held
+        /// the stream, where one byte is kept back so that MsQuic pauses it). The receive callback skips them.
+        /// </summary>
+        public long SkipBytes;
+
+        /// <summary>
+        /// The indication the sink held carried the FIN (worker thread only). The sink has seen it, so it is not shown an
+        /// indication again that adds nothing to it: when the bytes before the FIN are all the sink's, the stream is over.
+        /// </summary>
+        public bool FinHeld;
 
         public TransportStreamId Id => new(Index, Generation);
 
@@ -334,10 +350,19 @@ public sealed unsafe partial class MsQuicTransport
 
     /// <inheritdoc/>
     /// <remarks>
-    /// Ignored unless a receive on the stream is pending (or its callback is still running and then returns
-    /// <c>Pending</c>: the resume is applied when it returns). Calls <c>StreamReceiveComplete</c> with every byte of the
-    /// held indication consumed so far and, when bytes remain, <c>StreamReceiveSetEnabled(TRUE)</c> so MsQuic indicates
-    /// them again at once (msquic 2.5.10 pauses a stream after any partial completion). Neither call waits for the worker.
+    /// Ignored unless the stream is held (or its receive callback is still running and then holds it: the resume is
+    /// applied when it returns). A held stream is one MsQuic has paused — the receive callback answered the hold as a
+    /// partial consumption (the class remarks, "Receive") — so the resume is one call,
+    /// <c>StreamReceiveSetEnabled(TRUE)</c>, which MsQuic always queues to the connection's worker: it cannot be lost
+    /// however it is timed against the callback that held the stream. The bytes credited here are still in MsQuic's
+    /// buffer; they lead the next indication and the receive callback skips them. The call does not wait for the worker.
+    /// <para>
+    /// The transport does not complete a pending receive from this thread (<c>StreamReceiveComplete</c>): a completion of
+    /// zero bytes that reaches MsQuic before the receive callback has returned to it is dropped (MsQuic only adds the
+    /// length to the stream's completion counter while a receive call is active, and completes the receive after a
+    /// <c>PENDING</c> return only if that counter is not zero), the re-enable that follows finds a read still pending and
+    /// queues nothing, and the stream is never indicated again.
+    /// </para>
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="bytesConsumed"/> is negative or more than the held-back bytes.</exception>
     public void ResumeStreamReceive(TransportStreamId id, int bytesConsumed)
@@ -351,14 +376,13 @@ public sealed unsafe partial class MsQuicTransport
                 int state = Volatile.Read(ref slot.ReceiveState);
                 if (state == ReceivePending)
                 {
-                    long consumed = slot.PendingConsumed;
-                    long total = slot.PendingTotal;
                     ArgumentOutOfRangeException.ThrowIfNegative(bytesConsumed);
-                    ArgumentOutOfRangeException.ThrowIfGreaterThan(bytesConsumed, total - consumed);
+                    ArgumentOutOfRangeException.ThrowIfGreaterThan(bytesConsumed, slot.PendingTotal - slot.PendingConsumed);
                     if (Interlocked.CompareExchange(ref slot.ReceiveState, ReceiveIdle, ReceivePending) != ReceivePending) continue;
-                    long complete = consumed + bytesConsumed;
-                    slot.Stream!.ReceiveComplete((ulong)complete);
-                    if (complete < total) slot.Stream.ReceiveSetEnabled(true);
+                    // No receive callback can run for the stream between the exchange above and the re-enable below (MsQuic
+                    // has paused it), so the worker reads the new skip count only after it was written.
+                    if (bytesConsumed != 0) Volatile.Write(ref slot.SkipBytes, Volatile.Read(ref slot.SkipBytes) + bytesConsumed);
+                    slot.Stream!.ReceiveSetEnabled(true);
                     return;
                 }
                 if (state == ReceiveInCallback)
@@ -471,6 +495,8 @@ public sealed unsafe partial class MsQuicTransport
         slot.PendingConsumed = 0;
         slot.PendingTotal = 0;
         slot.EarlyResumeBytes = 0;
+        slot.SkipBytes = 0;
+        slot.FinHeld = false;
         Volatile.Write(ref slot.ReceiveState, ReceiveIdle);
         Volatile.Write(ref slot.CloseFlags, 0);
         // DeferredNext is left alone: only a push writes it, and a drain has always unlinked the slot before freeing it.
@@ -711,23 +737,70 @@ public sealed unsafe partial class MsQuicTransport
         if (sink is null) return MsQuicReceiveResult.Consumed(totalLength);
         try
         {
-            slot.PendingTotal = (long)totalLength;
-            Volatile.Write(ref slot.ReceiveState, ReceiveInCallback);
-            ReceiveResult result = sink.OnStreamReceived(slot.Id, new ReadOnlySpan<TransportSegment>(buffers, (int)bufferCount), absoluteOffset, (flags & QUIC_RECEIVE_FLAGS.FIN) != 0);
-            long consumed = result.BytesConsumed;
-            if (consumed < 0 || (ulong)consumed > totalLength)
+            bool fin = (flags & QUIC_RECEIVE_FLAGS.FIN) != 0;
+            if (Volatile.Read(ref slot.ReceiveState) == ReceivePending)
             {
-                throw new InvalidOperationException($"OnStreamReceived consumed {consumed} bytes but {totalLength} were indicated.");
+                // Indicated although the sink holds the stream (MsQuic has it paused, so this is not expected): hold this
+                // indication as well, without showing it to the sink.
+                return totalLength == 0 ? MsQuicReceiveResult.Pending : MsQuicReceiveResult.Consumed(0);
             }
-            if (result.Pending || (consumed == 0 && totalLength != 0))
+
+            // Bytes the sink already has (SkipBytes): MsQuic indicates them again, the sink must not see them twice. The same
+            // goes for a FIN the sink saw on the indication it held: once every byte before it is the sink's, the stream is
+            // complete, and MsQuic reports the peer's send shutdown when this callback returns.
+            var segments = new ReadOnlySpan<TransportSegment>(buffers, (int)bufferCount);
+            long skip = Volatile.Read(ref slot.SkipBytes);
+            bool finHeld = slot.FinHeld;
+            if (skip != 0 || finHeld)
             {
-                // Back-pressure (Consumed(0) of a non-empty indication counts as PendingAfter(0)): hold MsQuic's buffers until
-                // ResumeStreamReceive. Publish the consumed count before the state so a resume on another thread reads it.
+                slot.FinHeld = false;
+                skip = Math.Min(skip, (long)totalLength);
+                Volatile.Write(ref slot.SkipBytes, slot.SkipBytes - skip);
+                if ((ulong)skip == totalLength && (!fin || finHeld)) return MsQuicReceiveResult.Consumed(totalLength); // nothing the sink has not seen
+                if (skip != 0)
+                {
+                    TransportSegment* trimmed = stackalloc TransportSegment[(int)Math.Min(bufferCount, MaxTrimmedSegments)];
+                    segments = TrimSegments(segments, skip, bufferCount <= MaxTrimmedSegments ? new Span<TransportSegment>(trimmed, (int)bufferCount) : new TransportSegment[bufferCount]);
+                }
+            }
+
+            long offered = (long)totalLength - skip;
+            slot.PendingTotal = offered;
+            Volatile.Write(ref slot.ReceiveState, ReceiveInCallback);
+            ReceiveResult result = sink.OnStreamReceived(slot.Id, segments, absoluteOffset + (ulong)skip, fin);
+            long consumed = result.BytesConsumed;
+            if (consumed < 0 || consumed > offered)
+            {
+                throw new InvalidOperationException($"OnStreamReceived consumed {consumed} bytes but {offered} were indicated.");
+            }
+
+            // What MsQuic is told: the bytes skipped above are consumed as well.
+            long done = skip + consumed;
+            if (result.Pending || (consumed == 0 && offered != 0))
+            {
+                // Back-pressure (Consumed(0) of a non-empty indication counts as PendingAfter(0)). The hold is answered as a
+                // partial consumption, which MsQuic completes itself when this callback returns and which pauses the stream
+                // until ResumeStreamReceive re-enables it — not as QUIC_STATUS_PENDING, whose completion from another thread
+                // can be lost (see ResumeStreamReceive). Two indications cannot be held that way:
+                //  - one the sink consumed whole: one byte is kept back, so that the completion is partial, and skipped
+                //    when MsQuic indicates it again;
+                //  - an empty one (only the FIN): it stays pending, and the re-enable alone makes MsQuic indicate it again
+                //    (no completion is involved: MsQuic has no read pending for it).
+                // Publish the counts before the state, so that a resume on another thread reads them.
                 slot.PendingConsumed = consumed;
+                bool keptBack = (ulong)done == totalLength && totalLength != 0;
+                if (keptBack) Volatile.Write(ref slot.SkipBytes, 1);
                 int previous = Interlocked.CompareExchange(ref slot.ReceiveState, ReceivePending, ReceiveInCallback);
-                if (previous == ReceiveInCallback) return MsQuicReceiveResult.Pending;
+                if (previous == ReceiveInCallback)
+                {
+                    slot.FinHeld = fin;
+                    return totalLength == 0 ? MsQuicReceiveResult.Pending : MsQuicReceiveResult.Consumed((ulong)(keptBack ? done - 1 : done));
+                }
+
+                // Not held after all: the byte that was kept back is the sink's, and nothing will indicate it again.
+                if (keptBack) Volatile.Write(ref slot.SkipBytes, 0);
                 if (previous != ReceiveEarlyResume) return MsQuicReceiveResult.Consumed(totalLength); // aborted or closed meanwhile
-                consumed = Math.Min(consumed + Volatile.Read(ref slot.EarlyResumeBytes), (long)totalLength);
+                done = Math.Min(done + Volatile.Read(ref slot.EarlyResumeBytes), (long)totalLength);
                 Volatile.Write(ref slot.ReceiveState, ReceiveIdle);
             }
             else if (Interlocked.CompareExchange(ref slot.ReceiveState, ReceiveIdle, ReceiveInCallback) != ReceiveInCallback)
@@ -735,11 +808,11 @@ public sealed unsafe partial class MsQuicTransport
                 // An early resume without a pending receive is meaningless; an abort or close during the call discards the rest.
                 if (Interlocked.Exchange(ref slot.ReceiveState, ReceiveIdle) != ReceiveEarlyResume) return MsQuicReceiveResult.Consumed(totalLength);
             }
-            if ((ulong)consumed == totalLength) return MsQuicReceiveResult.Consumed(totalLength);
+            if ((ulong)done == totalLength) return MsQuicReceiveResult.Consumed(totalLength);
             // Partial consumption: MsQuic would pause the stream until receives are re-enabled; re-enable them inline so the
             // remainder is indicated again right away (together with anything that arrived since).
             stream.ReceiveSetEnabled(true);
-            return MsQuicReceiveResult.Consumed((ulong)consumed);
+            return MsQuicReceiveResult.Consumed((ulong)done);
         }
         catch (Exception ex)
         {
@@ -747,6 +820,32 @@ public sealed unsafe partial class MsQuicTransport
             OnHandlerException(ex);
             return MsQuicReceiveResult.Consumed(totalLength);
         }
+    }
+
+    /// <summary>Segments of one indication that are trimmed on the stack (MsQuic indicates up to three without a buffer of its own).</summary>
+    private const int MaxTrimmedSegments = 8;
+
+    /// <summary>
+    /// The segments of an indication without its first <paramref name="skip"/> bytes, written to
+    /// <paramref name="destination"/> (at least as long as <paramref name="source"/>).
+    /// </summary>
+    private static ReadOnlySpan<TransportSegment> TrimSegments(ReadOnlySpan<TransportSegment> source, long skip, Span<TransportSegment> destination)
+    {
+        int count = 0;
+        for (int i = 0; i < source.Length; i++)
+        {
+            TransportSegment segment = source[i];
+            if (skip >= segment.Length)
+            {
+                skip -= segment.Length;
+                continue;
+            }
+
+            destination[count++] = new TransportSegment(segment.Buffer + skip, (int)(segment.Length - skip));
+            skip = 0;
+        }
+
+        return destination.Slice(0, count);
     }
 
     void IMsQuicStreamEvents.SendComplete(MsQuicStream stream, void* clientContext, bool canceled)

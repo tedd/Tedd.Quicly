@@ -117,7 +117,16 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         _core = new PeerCore(this, role, table, options);
         _handlers = new MessageHandler?[_core.ChannelCount];
         // Built here, never inside Poll: the drain queues are native memory sized once (ARCHITECTURE.md §3).
-        _queues = new ReceiveQueues(ReceiveQueues.NodesFor(options.ReceiveRingCapacity), _core.ChannelCount);
+        // The class of a channel comes from its definition, not from the engines: they (and their mailboxes) do not exist yet.
+        ReadOnlySpan<ChannelDefinition> channels = _core.Channels;
+        byte[] queueClasses = new byte[channels.Length];
+        for (int i = 0; i < channels.Length; i++)
+        {
+            queueClasses[i] = ReceiveQueueClass.Of(channels[i]);
+        }
+
+        ReceiveQueueLayout layout = ReceiveQueueLayout.Compute(channels, options.ReceiveRingCapacity, options.ReceiveBudgetBytes);
+        _queues = new ReceiveQueues(in layout, queueClasses);
         InitializeSendSide(options);
         long now = _clock.NowMicros;
         _controlBucket.Initialize(options.ControlMessagesPerSecond, options.ControlMessagesPerSecond, now);
@@ -225,8 +234,8 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     /// <summary>
     /// True once <see cref="Dispose"/> has been called: every member that changes the peer then throws
     /// <see cref="ObjectDisposedException"/>, and <see cref="Release(in ReceiveLease)"/>, <see cref="GetStatistics"/> and
-    /// <see cref="Capabilities"/> answer as documented for a disposed peer. Lets a host skip a peer it disposed from a
-    /// handler without catching.
+    /// <see cref="Capabilities"/> answer as documented for a disposed peer (<c>Release</c> still returns a block to a
+    /// shared <see cref="PeerOptions.Allocator"/>). Lets a host skip a peer it disposed from a handler without catching.
     /// </summary>
     public bool IsDisposed => _disposed;
 
@@ -328,6 +337,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.StaleCompletions = Volatile.Read(ref c.StaleCompletions);
         statistics.ReceiveRingDrops = Volatile.Read(ref c.ReceiveRingDrops);
         statistics.OutOfReceiveBuffers = Volatile.Read(ref c.OutOfReceiveBuffers);
+        statistics.DrainQueueDrops = c.DrainQueueDrops;
         statistics.CallbackFaults = Volatile.Read(ref c.CallbackFaults);
         statistics.DecodeFailures = c.DecodeFailures;
         statistics.BulkProgressOverClaims = c.BulkProgressOverClaims;
@@ -396,6 +406,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.ReceiveKeyTableFull = Volatile.Read(ref recv.KeyTableFull);
         statistics.ReceiveTooLarge = Volatile.Read(ref recv.TooLarge);
         statistics.OutOfBuffers = Volatile.Read(ref recv.OutOfBuffers);
+        statistics.DrainQueueDrops = _queues.Drops(index);
         _core.GetEngine(index).AddStatistics(index, ref statistics);
         return true;
     }
@@ -459,8 +470,17 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     /// <summary>
     /// Closes the transport if it is still open (error code 0, no linger) and releases the peer. Native memory is freed as
     /// soon as the transport has reported its close and no <see cref="Poll"/>/<see cref="Flush"/> is running (so disposing
-    /// from a handler is safe). Release retained leases first; afterwards <see cref="Release(in ReceiveLease)"/> is a no-op.
+    /// from a handler is safe).
     /// </summary>
+    /// <remarks>
+    /// The peer does not track the payloads the application holds (a lease from <see cref="Retain"/>, a message from
+    /// <see cref="Drain"/>, a response from <see cref="SendRequestAsync"/>) and does not return them here. Over a private
+    /// pool (no <see cref="PeerOptions.Allocator"/>) they are freed with the peer: their payload is invalid once the
+    /// peer's memory is freed, and a later <see cref="Release(in ReceiveLease)"/> is a no-op, so release them first. Over
+    /// a shared pool (<see cref="PeerOptions.Allocator"/>; every peer of a server) they stay rented and valid, and each
+    /// must still be released exactly once — <see cref="Release(in ReceiveLease)"/> and
+    /// <see cref="Release(ReadOnlySpan{ReceivedMessage})"/> return the block to the shared pool on a disposed peer too.
+    /// </remarks>
     public void Dispose()
     {
         if (_disposed)

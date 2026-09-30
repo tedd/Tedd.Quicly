@@ -45,6 +45,15 @@
   too. The stream idle rule still resets the streams it leaves unfinished, the records are per connection, so
   it takes none from another peer or another channel, and what it does take is the stream slots of its own
   other channels.
+* **A channel the application does not read is bounded per class** (PROTOCOL §7 "Channels nobody drains", added
+  2026-09-30). A peer chooses which channels it sends on, so it must not be able to stall a receiver through a
+  channel the application happens not to drain. Unreliable ring channels share a capped backlog (the part of the
+  drain-queue pool not reserved for reliable channels, and a quarter of the receive byte budget) with oldest-first
+  eviction from the channel over its share: a flood on one costs that channel its old messages and O(1) work per
+  message (a channel *under* its share that needs room scans the unreliable channels for the longest queue, O(their
+  number), and remembers the answer), never the ring, another channel or more budget. Reliable channels cannot be evicted; an undrained one
+  still back-pressures the whole ring (a known limit, to be confined to its own streams by per-channel receive
+  credit), so a host must handle or drain every reliable channel in its table.
 * **Retransmission cannot be weaponised**: ReliableLatest has per-version and per-peer retry budgets;
   acks are coalesced per key (the highest accepted version); Pong is rate-limited; control message rate is capped.
 * **Sequence numbers give the peer nothing it did not have** (PROTOCOL §8 "sequence clock"). Only the

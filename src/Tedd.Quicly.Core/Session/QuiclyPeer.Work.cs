@@ -19,10 +19,10 @@ public sealed unsafe partial class QuiclyPeer
     private readonly bool _passEngines;
 
     /// <summary>
-    /// Whether the peer has game-thread work waiting right now: a received message (ring, per-channel drain queues, a
-    /// coalescing mailbox), a send completion (the transport's completion ring or one the game thread queued itself), a
-    /// control signal from the transport thread (connect, Hello, HelloAck, close, table), a pong or stream-ping sample, a
-    /// stream held back by back-pressure, a send queued by another thread, a <see cref="StateChanged"/> transition that has
+    /// Whether the peer has game-thread work waiting right now: a received message (the ring, or a per-channel drain queue
+    /// or a mailbox of a channel with a handler), a send completion (the transport's completion ring or one the game thread
+    /// queued itself), a control signal from the transport thread (connect, Hello, HelloAck, close, table), a pong or
+    /// stream-ping sample, a stream held back by back-pressure, a send queued by another thread, a <see cref="StateChanged"/> transition that has
     /// not been raised, a deadline that is due (<see cref="NextDeadlineMicros"/> has passed), or engine work left for the
     /// next <see cref="Flush"/>: the ReliableLatest acks and rejects this end owes and the LatestAck and LatestReject entries
     /// the peer sent, which complete or retry values; the Bulk control frames the peer sent (progress, a range request, a
@@ -40,6 +40,19 @@ public sealed unsafe partial class QuiclyPeer
     /// progress work may wait out <see cref="PeerOptions.AckDelay"/> or the bulk progress window in it. A Flush-only
     /// deadline that has not passed is not work: use <see cref="NextFlushDeadlineMicros"/> for that, which a
     /// <see cref="Poll"/> brings forward to the engine work above.
+    /// <para>
+    /// Messages waiting for a channel without a handler are not work — they wait for the application's
+    /// <see cref="Drain"/>, which no <see cref="Poll"/> can do for it — whether they wait in a drain queue or in a mailbox
+    /// (a coalescing channel, ReliableLatest). So a host that loops on the probe must not expect it to announce them: it
+    /// drains on its own tick, or on the edge (<see cref="IPeerWorkSignal"/>), which every arrival still raises. An
+    /// unreliable channel nobody drains leaves the probe clear: its backlog is bounded and evicts (see <see cref="Poll"/>).
+    /// The one exception lasts a single Poll: when a burst fills the queue pool, the next message is held for the Drain
+    /// that may follow in the same frame and the probe is set; the following Poll queues it and clears the probe. A
+    /// <em>reliable</em> channel without a handler that is not drained is different: once the queue pool is full its next
+    /// message is held and the ring behind it is not emptied, and the probe stays set for as long as that lasts, because
+    /// there is work that no <see cref="Poll"/> can consume. A host that polls while the probe is set then polls every
+    /// pass; the cure is to drain that channel or register a handler for it.
+    /// </para>
     /// </remarks>
     public bool HasPendingWork
     {
@@ -88,6 +101,8 @@ public sealed unsafe partial class QuiclyPeer
     /// <summary>
     /// The queues and signals a Poll consumes (not the deadlines): <see cref="HasPendingWork"/> and
     /// <see cref="HasPendingPollWork"/> without their deadline and engine parts. The caller checked the peer is not disposed.
+    /// A mailbox counts only while its channel has a handler: Poll leaves the values of a channel without one for
+    /// <see cref="Drain"/>, so counting them would keep a host that polls while there is work polling for good.
     /// </summary>
     private bool HasQueuedPollWork()
     {
@@ -100,7 +115,7 @@ public sealed unsafe partial class QuiclyPeer
             || !_pongs.IsEmpty
             || !_streamPings.IsEmpty
             || _transitionCount != 0
-            || _queuedWithHandler != 0
+            || _queues.QueuedHandled != 0
             || _hasHeld
             || _hasHeldForeign
             || _front is { IsEmpty: false }
@@ -112,7 +127,7 @@ public sealed unsafe partial class QuiclyPeer
         ReadOnlySpan<ReceiveMailbox> boxes = core.Mailboxes;
         for (int i = 0; i < boxes.Length; i++)
         {
-            if (boxes[i].HasDirty)
+            if (boxes[i].HasDirty && _handlers[boxes[i].ChannelIndex] is not null)
             {
                 return true;
             }

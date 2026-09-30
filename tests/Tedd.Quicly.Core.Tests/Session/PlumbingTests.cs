@@ -237,17 +237,70 @@ public class ReceivePlumbingTests
             h.Server!.Poll();
         }
 
+        // An unreliable channel without a handler keeps a bounded backlog — here 2 of the pool's 4 nodes, the other two are
+        // reserved for the table's two reliable channels — and a message that does not fit evicts the oldest queued one.
+        // Nothing is held, so the ring is emptied by every Poll and drops nothing.
         ReceivedMessage[] buffer = new ReceivedMessage[16];
         int n = h.Server!.Drain(2, buffer);
-        Assert.Equal(5, n);
-        for (int i = 0; i < n; i++)
-        {
-            Assert.Equal((byte)i, buffer[i].Payload[0]);
-        }
+        Assert.Equal(2, n);
+        Assert.Equal(4, buffer[0].Payload[0]);
+        Assert.Equal(5, buffer[1].Payload[0]);
 
         h.Server.Release(buffer.AsSpan(0, n));
         h.Server.GetStatistics(out PeerStatistics stats);
-        Assert.Equal(1, stats.ReceiveRingDrops);
+        Assert.Equal(0, stats.ReceiveRingDrops);
+        Assert.Equal(4, stats.DrainQueueDrops);
+        Assert.True(h.Server.GetChannelStatistics(2, out ChannelStatistics channel));
+        Assert.Equal(4, channel.DrainQueueDrops);
+        Assert.Equal(6, channel.Received);
+        Assert.Equal(0, stats.ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void Drain_Queues_Hold_A_Reliable_Message_And_Keep_The_Order()
+    {
+        // A reliable channel without a handler is never evicted: once the pool (4 nodes) is full the next message is held,
+        // Poll stops taking from the ring, the ring (2) fills and the stream is back-pressured. Draining gets everything,
+        // in order.
+        using SessionHarness h = TestEngines.Create(out _, out TestEngine engine, ChannelMode.ReliableOrdered, both: o => o.ReceiveRingCapacity = 2);
+        QuiclyPeer server = h.Server!;
+        byte next = 0;
+        for (int round = 0; round < 4; round++)
+        {
+            h.Client.SendCopy(new SendHeader(10), [next++]);
+            h.Client.SendCopy(new SendHeader(10), [next++]);
+            h.Network.Advance(1_000);
+            server.Poll();
+        }
+
+        Assert.True(engine.Pended >= 1, "the ring never filled: no message was held");
+        Assert.True(server.HasPendingWork);
+
+        // Queue (4), the held message, and what the ring holds; the rest arrives once Poll resumes the stream.
+        ReceivedMessage[] buffer = new ReceivedMessage[16];
+        int n = server.Drain(10, buffer);
+        Assert.True(n >= 5, $"{n} messages from the queue and the held slot");
+        List<byte> got = [];
+        while (true)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                got.Add(buffer[i].Payload[0]);
+            }
+
+            server.Release(buffer.AsSpan(0, n));
+            if (got.Count == 8)
+            {
+                break;
+            }
+
+            Assert.True(h.RunUntil(() => (n = server.Drain(10, buffer)) > 0), $"{got.Count} of 8 messages arrived");
+        }
+
+        Assert.Equal(new byte[] { 0, 1, 2, 3, 4, 5, 6, 7 }, got);
+        server.GetStatistics(out PeerStatistics stats);
+        Assert.Equal(0, stats.ReceiveRingDrops);
+        Assert.Equal(0, stats.DrainQueueDrops);
         Assert.Equal(0, stats.ReceiveBytesOutstanding);
     }
 

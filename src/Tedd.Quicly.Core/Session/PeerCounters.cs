@@ -115,6 +115,14 @@ internal sealed class PeerCounters
     public long DecodeFailures;
 
     /// <summary>
+    /// Messages of unreliable channels dropped from the backlog of the drain queues to make room for newer ones, or refused
+    /// because the pool held nothing that could be evicted (<see cref="ReceiveQueues.TryAppendDatagram"/>,
+    /// <see cref="ReceiveQueues.BeginPass"/>). Game thread, in <c>Poll</c> and
+    /// <c>Drain</c> — deliberately not <see cref="ReceiveRingDrops"/>, which is the transport thread's.
+    /// </summary>
+    public long DrainQueueDrops;
+
+    /// <summary>
     /// Peer <c>BulkProgress</c> frames claiming more bytes than this end handed to the transport (PROTOCOL.md §2.3, §3.4
     /// control-message bounds, ADR 0009): an impossible field, so the frame is dropped whole (datagram) or closes the
     /// connection <c>ProtocolViolation</c> (control stream). Game thread.

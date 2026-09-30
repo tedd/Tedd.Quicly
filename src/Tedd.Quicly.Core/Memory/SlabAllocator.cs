@@ -175,6 +175,14 @@ public sealed unsafe class SlabAllocator : IDisposable
     public bool ValidateLeases => _validateLeases;
 
     /// <summary>
+    /// True once <see cref="Dispose"/> has run: every lease is invalid and <see cref="Return"/> throws
+    /// <see cref="ObjectDisposedException"/>. Lets an owner that may outlive the allocator (a lease released after its peer
+    /// and the pool are gone) skip the return. A plain read: it is only meaningful to a caller that does not race
+    /// <see cref="Dispose"/>, as for every other member.
+    /// </summary>
+    public bool IsDisposed => _disposed;
+
+    /// <summary>
     /// Rents the smallest block that holds at least <paramref name="minimumLength"/> bytes.
     /// </summary>
     /// <param name="minimumLength">Minimum usable length in bytes (zero rents a block of the smallest class).</param>

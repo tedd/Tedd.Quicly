@@ -245,7 +245,6 @@ public sealed unsafe partial class QuiclyPeer
         _remoteTable = null;
         _closedRaised = false;
         _transitionCount = 0;
-        _queuedWithHandler = 0;
         _lastTick = 0;
         _connectedAtMicros = 0;
         _nextPingMicros = 0;

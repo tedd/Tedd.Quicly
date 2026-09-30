@@ -22,3 +22,10 @@ Message type is not a header field; a channel *is* a type.
   evaluate per-key ordering on a per-channel 64-bit extended sequence (PROTOCOL section 8), and `ReliableLatest`
   completes a value only on an ack naming exactly the version last transmitted for the key, not on a cumulative one
   (added 2026-09-30).
+* What a channel costs the receiver when the application neither handles nor drains it follows from the mode's
+  contract (PROTOCOL section 7, added 2026-09-30): `UnreliableUnordered` / `UnreliableSequenced` keep a bounded
+  backlog and drop their own oldest messages, counted, without touching another channel; coalescing channels and
+  `ReliableLatest` keep one value per key; `ReliableOrdered` / `ReliableUnordered` may not drop, so an undrained
+  one ends in back-pressure — which today reaches every stream channel and the receive ring, not only the
+  undrained channel — until it is drained or gets a handler; `Bulk` never waits in a queue (its data goes to the
+  router's target).

@@ -281,21 +281,64 @@ public class SequencedIdleKeyTests
         Assert.Equal(0, h.Statistics().SequenceResyncs);
     }
 
+    [Theory]
+    [InlineData(Unkeyed16)]
+    [InlineData(Keyed16)]
+    public void A_Straggler_Inside_The_Reorder_Window_Is_Late_However_Long_The_Channel_Was_Quiet(ushort channel)
+    {
+        // A datagram can be seconds later than its successors without any network fault: it waited in the sender's
+        // transport queue while a later one with the priority flag overtook it. It is a few numbers behind the clock, where
+        // a real jump reads as that close only after almost a whole span was lost — so inside the window (1 024 on a
+        // 16-bit channel) the quiet period does not make it a jump.
+        using ServerHarness h = Start(channel, out List<(ReceiveHeader Header, byte[] Payload)> got);
+        Send(h, channel, 1, 2_000);
+        h.Run(3_000_000, step: 100_000);
+        Send(h, channel, 1, 1_999);
+        Send(h, channel, 1, 2_000 - 1_024);   // the edge of the window
+        h.Run(10_000);
+        Assert.Single(got);
+        Assert.Equal(2, DatagramKit.ChannelStats(h.Server!, channel).Dropped);
+        Assert.Equal(0, h.Statistics().SequenceResyncs);
+
+        // The clock did not move: the next genuine value is ahead of it.
+        Send(h, channel, 1, 2_001);
+        h.Run(10_000);
+        Assert.Equal(new uint[] { 2_000, 2_001 }, got.Select(m => m.Header.Sequence).ToArray());
+    }
+
+    [Fact]
+    public void A_Straggler_Inside_The_Reorder_Window_Of_A_32_Bit_Channel_Is_Late()
+    {
+        using ServerHarness h = Start(Keyed32, out List<(ReceiveHeader Header, byte[] Payload)> got);
+        Send(h, Keyed32, 1, 100_000);
+        h.Run(3_000_000, step: 100_000);
+        Send(h, Keyed32, 1, 100_000 - 65_536);   // the edge of the window: late
+        h.Run(10_000);
+        Assert.Single(got);
+        Assert.Equal(0, h.Statistics().SequenceResyncs);
+
+        Send(h, Keyed32, 1, 100_000 - 65_537);   // one past it: a jump of 2^32 − 65 537
+        h.Run(10_000);
+        Assert.Equal(new uint[] { 100_000, 100_000 - 65_537 }, got.Select(m => m.Header.Sequence).ToArray());
+        Assert.Equal(1, h.Statistics().SequenceResyncs);
+    }
+
     [Fact]
     public void After_A_Resync_The_Channel_Keeps_Delivering()
     {
         using ServerHarness h = Start(Unkeyed16, out List<(ReceiveHeader Header, byte[] Payload)> got);
-        Send(h, Unkeyed16, 0, 10);
+        Send(h, Unkeyed16, 0, 2_000);
         h.Run(3_000_000, step: 100_000);
 
-        // A message that really was three seconds late is taken for a jump (the documented false resync): it is delivered
-        // out of order, once, and the channel goes on — the next genuine sequences are ahead of it, older ones behind.
-        Send(h, Unkeyed16, 0, 9);
-        Send(h, Unkeyed16, 0, 11);
-        Send(h, Unkeyed16, 0, 12);
-        Send(h, Unkeyed16, 0, 8);
+        // One past the reorder window, after the quiet period: a jump of 65 536 − 1 025 numbers. (Were it a message that
+        // more than 1 024 later ones overtook by three seconds, this would be the false resync that remains: delivered out
+        // of order, once.) The channel goes on from it — the next sequences are ahead of it, older ones behind.
+        Send(h, Unkeyed16, 0, 975);
+        Send(h, Unkeyed16, 0, 977);
+        Send(h, Unkeyed16, 0, 978);
+        Send(h, Unkeyed16, 0, 974);
         h.Run(10_000);
-        Assert.Equal(new uint[] { 10, 9, 11, 12 }, got.Select(m => m.Header.Sequence).ToArray());
+        Assert.Equal(new uint[] { 2_000, 975, 977, 978 }, got.Select(m => m.Header.Sequence).ToArray());
         Assert.Equal(1, DatagramKit.ChannelStats(h.Server!, Unkeyed16).Dropped);
         Assert.Equal(1, h.Statistics().SequenceResyncs);
     }

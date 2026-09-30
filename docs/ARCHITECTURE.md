@@ -214,7 +214,18 @@ is chosen:
 * **Pooled mode** (default): the payload is copied into a slab lease and delivered via `Poll()` to the
   channel's `MessageHandler(in ReceiveHeader, ReadOnlySpan<byte>)`, or drained in batches with
   `Drain(channel, Span<ReceivedMessage>)` + `Release(...)` for data-oriented consumers. The lease is
-  released when the handler returns unless retained (`ReceiveLease Retain(in ReceiveHeader)`).
+  released when the handler returns unless retained (`ReceiveLease Retain(in ReceiveHeader)`). A lease the
+  application holds outlives its peer when the peer rents from a shared pool (every server peer): `Release`
+  after `Dispose` returns the block to that pool (ADR 0004).
+  **A channel without a handler must be drained**, and what it costs when it is not depends on its mode
+  (PROTOCOL.md §7, docs/design/session-layer.md §4.4). An unreliable channel keeps a bounded backlog — the
+  unreliable channels together queue at most the part of the drain-queue pool not reserved for reliable
+  channels and pin at most a quarter of the receive budget — and drops its **oldest** messages beyond it
+  (`DrainQueueDrops`, per channel and per peer); it never disturbs another channel. A reliable channel is never
+  dropped, so an undrained one fills the pool and then holds the receive ring: every stream channel is
+  back-pressured and datagrams of ring channels are dropped on arrival until it is drained or gets a handler
+  (coalescing and `ReliableLatest` handlers keep running). Drain, or register a handler for, every reliable
+  channel the other end sends on.
 * **Direct mode** (Bulk and large objects): `IReceiveRouter.SelectTarget(in ReceiveHeader)` runs on the
   transport thread and returns a `ReceiveTarget` — pre-sized caller `Memory<byte>` (never grown, not touched
   by the game thread until `OnMessage`), an `IBufferWriter<byte>` that never grows, a pooled lease, or
@@ -445,7 +456,7 @@ logs a warning per connection). Session/auth token rules, admission timeouts, re
 | send byte budget | peer | 256 KiB | blocks in flight; reliable throughput ≤ budget / RTT |
 | send table | peer | 1 024 entries × 64 B | tracked and untracked sends in flight |
 | rings | peer | 4 096 × 64 B receive (256 KiB), 2 048 × 16 B completion (32 KiB) | native memory; `ReceiveEntry` is 64 B (52 of them in use) and a send entry produces at most two completions |
-| drain queues | peer | min(receive ring, 1 024) × 68 B (68 KiB) | per-channel queues for `Drain` consumers: a 64 B node plus its link, native, built with the peer |
+| drain queues | peer | min(receive ring, 1 024) × 68 B (68 KiB), at least 2 nodes per reliable channel; plus 30 B per channel | per-channel queues for `Drain` consumers: a 64 B node plus its link, native, built with the peer; per channel the head, tail, count, queued bytes, drop counter, class, handler flag and an index of the unreliable channels. Half the pool is reserved for `ReliableOrdered` / `ReliableUnordered` channels (split evenly) when the table has one; the unreliable channels share the rest and at most ¼ of the receive byte budget, oldest-first eviction beyond that |
 | segment arena | peer | 1 024 × 16 B | per-submission gather arrays for stream sends |
 | channel state | peer × channel | 2 × 64 B | send + receive halves |
 | group records | peer × group channel (send), peer (receive) | `(3 × max(MaxGroups, 1) + 4) × 64 B` send per channel + `PeerStreamCapacity × 64 B` receive per peer | `ReliableUnordered`: one send record per live group (filling, waiting, or holding a stream); one receive record for every stream the peer can have open on the connection, because a receiver that is behind holds more than a channel's `MaxGroups` of them (PROTOCOL.md §7). `PeerStreamCapacity` is the session's stream limit (Σ max(MaxGroups, 1), ≤ 4 096) or the transport's own initial grant when that is more: 0.6 KiB on a server peer whose table has one group channel and one ordered channel, 64 KiB on an MsQuic client at its default grant of 1 024 (plus 16 KiB for the pended-stream ring, which is sized from the same number), 256 KiB at the 4 096-stream cap; the engine's notice ring adds `4 × its send records + 8` × 12 B |

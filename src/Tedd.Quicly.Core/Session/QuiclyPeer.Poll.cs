@@ -15,7 +15,6 @@ public sealed unsafe partial class QuiclyPeer
 {
     private readonly MessageHandler?[] _handlers;
     private readonly ReceiveQueues _queues;
-    private int _queuedWithHandler;
     private ReceiveEntry _held;
     private bool _hasHeld;
     private ReceiveHeader _dispatchHeader;
@@ -34,6 +33,35 @@ public sealed unsafe partial class QuiclyPeer
     /// <see cref="MessageHandler"/> (messages of channels without a handler wait for <see cref="Drain"/>) and resumes
     /// streams held back by the receive ring. Allocation-free in steady state.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Channels without a handler.</b> Their messages are moved to per-channel queues for <see cref="Drain"/>, and what
+    /// happens when nobody drains depends on the delivery mode.
+    /// </para>
+    /// <para>
+    /// An <em>unreliable</em> channel (UnreliableUnordered or UnreliableSequenced without <c>CoalesceOnReceive</c>) that is
+    /// drained every frame loses nothing the receive ring and the receive budget took, in whatever order the host calls
+    /// Poll and Drain: a burst larger than the queue pool waits in the pool, one held message and the ring until the
+    /// Drain. What such a channel still has queued when the <em>next</em> Poll begins — nobody drained it empty in
+    /// between — is its <em>backlog</em>, and the backlog of all these channels together is bounded: at most the part of
+    /// the queue pool that is not reserved for reliable channels (the pool is <see cref="PeerOptions.ReceiveRingCapacity"/>
+    /// messages, at most 1 024; half of it is reserved when the table has a ReliableOrdered or ReliableUnordered
+    /// channel) and at most a quarter of <see cref="PeerOptions.ReceiveBudgetBytes"/>, counted in buffer blocks. Poll cuts
+    /// it to that where it starts, and a later message of a backlogged channel that does not fit drops the
+    /// <em>oldest</em> queued one, counted in <see cref="ChannelStatistics.DrainQueueDrops"/> and
+    /// <see cref="PeerStatistics.DrainQueueDrops"/>. So a host that polls several times between two drains keeps only
+    /// that much of a burst, and a channel nobody drains keeps the ring closed for one Poll interval at most (the message
+    /// held for a Drain that did not come) and afterwards costs only its own oldest messages.
+    /// </para>
+    /// <para>
+    /// A <em>reliable</em> channel (ReliableOrdered, ReliableUnordered) loses nothing, so once the queue pool is full Poll
+    /// holds its next message and takes nothing more out of the receive ring: every stream channel is then
+    /// back-pressured, datagrams of ring channels are dropped on arrival (<see cref="PeerStatistics.ReceiveRingDrops"/>),
+    /// responses wait and <see cref="HasPendingWork"/> stays set, until the application drains that channel or registers a
+    /// handler for it. Coalescing channels and ReliableLatest keep one value per key in a mailbox and are dispatched even
+    /// then. Register a handler for, or drain, every reliable channel the other end sends on.
+    /// </para>
+    /// </remarks>
     /// <param name="maxItems">Most messages to dispatch to handlers in this call.</param>
     /// <returns>Messages dispatched to handlers.</returns>
     /// <exception cref="ObjectDisposedException">The peer is disposed.</exception>
@@ -122,6 +150,24 @@ public sealed unsafe partial class QuiclyPeer
     /// <see cref="Release(ReadOnlySpan{ReceivedMessage})"/>; every drained message must be released exactly once.
     /// Messages of other channels met on the way wait in per-channel queues. Game thread.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Drain every channel you read this way once per frame, and completely (call until it returns 0, or pass a span
+    /// that is not filled): a channel that was drained empty since the last <see cref="Poll"/> began loses nothing the
+    /// receive ring and the receive budget took, whether the Drain comes before or after the Poll. A channel that was not
+    /// becomes backlog at the next Poll, which is bounded and evicts its oldest messages
+    /// (<see cref="ChannelStatistics.DrainQueueDrops"/>; see <see cref="Poll"/>).
+    /// </para>
+    /// <para>
+    /// The queue pool is bounded. A message of another channel that finds it full makes room by evicting the oldest
+    /// message of such a backlog when there is one; otherwise it is held, and this call then takes nothing more out of the
+    /// receive ring. How long a hold lasts depends on the held message's channel: one <em>with a handler</em> is never
+    /// evicted and never dropped — the next <see cref="Poll"/> dispatches its queue, the held message and the ring, in
+    /// order, so the two styles can be mixed in either order without loss; an <em>unreliable</em> channel without a
+    /// handler is held until its own Drain, or until the next Poll makes it backlog; a <em>reliable</em> channel without
+    /// a handler is held until that channel is drained.
+    /// </para>
+    /// </remarks>
     /// <param name="channel">The channel.</param>
     /// <param name="into">Receives the messages, oldest first (coalesced keys last).</param>
     /// <returns>Messages written.</returns>
@@ -141,11 +187,6 @@ public sealed unsafe partial class QuiclyPeer
         ReceiveQueues queues = _queues;
         while (written < into.Length && queues.TryTake(index, out ReceiveEntry entry))
         {
-            if (_handlers[index] is not null)
-            {
-                _queuedWithHandler--;
-            }
-
             // A response is taken by its engine where it leaves the receive ring (below, and in Route), and that is the only
             // way into a per-channel queue or the held slot, so neither can hold one (see IsResponse).
             Debug.Assert(!IsResponse(in entry), "a response never reaches a per-channel queue");
@@ -161,7 +202,7 @@ public sealed unsafe partial class QuiclyPeer
                 _hasHeld = false;
                 Emit(ref entry, now, into, ref written);
             }
-            else if (TryQueue(in _held))
+            else if (TryQueue(in _held, mayHold: true))
             {
                 _hasHeld = false;
             }
@@ -179,7 +220,7 @@ public sealed unsafe partial class QuiclyPeer
             {
                 Emit(ref entry, now, into, ref written);
             }
-            else if (!TryQueue(in entry))
+            else if (!TryQueue(in entry, mayHold: true))
             {
                 _held = entry;
                 _hasHeld = true;
@@ -206,12 +247,25 @@ public sealed unsafe partial class QuiclyPeer
         return written;
     }
 
-    /// <summary>Returns the payloads of drained messages to the pool (game thread). Each message must be released exactly once.</summary>
+    /// <summary>
+    /// Returns the payloads of drained messages to the pool (game thread). Each message must be released exactly once.
+    /// </summary>
+    /// <remarks>
+    /// Still valid after <see cref="Dispose"/>, and required then for a peer over a shared allocator
+    /// (<see cref="PeerOptions.Allocator"/>; every peer of a server): the blocks go back to the shared pool, which outlives
+    /// the peer. For a peer with its own private pool the call is a no-op once the peer is disposed (the pool is freed with
+    /// the peer). Release before the shared allocator itself is disposed; a release after that is a no-op.
+    /// </remarks>
     /// <param name="messages">Messages from <see cref="Drain"/>.</param>
     public void Release(ReadOnlySpan<ReceivedMessage> messages)
     {
         if (_disposed)
         {
+            for (int i = 0; i < messages.Length; i++)
+            {
+                _core.ReturnReceiveAfterDispose(in messages[i].Lease);
+            }
+
             return;
         }
 
@@ -221,19 +275,34 @@ public sealed unsafe partial class QuiclyPeer
         }
     }
 
-    /// <summary>Returns a retained payload to the pool (game thread). Must be called exactly once per lease.</summary>
+    /// <summary>
+    /// Returns a retained payload, or the payload of a response from <see cref="SendRequestAsync"/>, to the pool (game
+    /// thread). Must be called exactly once per lease.
+    /// </summary>
+    /// <remarks>
+    /// Still valid after <see cref="Dispose"/>, and required then for a peer over a shared allocator
+    /// (<see cref="PeerOptions.Allocator"/>; every peer of a server, which disposes a peer right after its
+    /// <c>PeerClosed</c> event): the block goes back to the shared pool, which outlives the peer. For a peer with its own
+    /// private pool the call is a no-op once the peer is disposed (the pool is freed with the peer, and the lease's
+    /// payload with it). Release before the shared allocator itself is disposed; a release after that is a no-op.
+    /// </remarks>
     /// <param name="lease">A lease from <see cref="Retain"/>.</param>
     public void Release(in ReceiveLease lease)
     {
-        if (!_disposed)
+        if (_disposed)
         {
-            _core.ReturnReceive(in lease.Lease);
+            _core.ReturnReceiveAfterDispose(in lease.Lease);
+            return;
         }
+
+        _core.ReturnReceive(in lease.Lease);
     }
 
     /// <summary>
     /// Keeps the payload of the message being handled beyond its handler. Only valid inside a <see cref="MessageHandler"/>
-    /// for the header it was given; release the lease with <see cref="Release(in ReceiveLease)"/>.
+    /// for the header it was given; release the lease with <see cref="Release(in ReceiveLease)"/> — exactly once, and also
+    /// when the peer was disposed meanwhile (a peer over a shared <see cref="PeerOptions.Allocator"/> returns the block to
+    /// that pool then; see <see cref="Dispose"/>).
     /// </summary>
     /// <param name="header">The header passed to the handler.</param>
     /// <returns>The lease.</returns>
@@ -275,10 +344,14 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         _handlers[index] = handler;
-        _queuedWithHandler += _queues.Count(index);
+        _queues.SetHandled(index, true);
     }
 
-    /// <summary>Removes the handler of a channel; its messages then wait for <see cref="Drain"/> (game thread).</summary>
+    /// <summary>
+    /// Removes the handler of a channel; its messages then wait for <see cref="Drain"/> (game thread), within the limits
+    /// described at <see cref="Poll"/>: an unreliable channel that is not drained loses its oldest messages, a reliable one
+    /// that is not drained eventually holds up every other channel.
+    /// </summary>
     /// <param name="channel">The channel.</param>
     /// <returns><see langword="false"/> when the channel had no handler.</returns>
     /// <exception cref="ArgumentException">The channel is not in the table.</exception>
@@ -292,7 +365,7 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         _handlers[index] = null;
-        _queuedWithHandler -= _queues.Count(index);
+        _queues.SetHandled(index, false);
         return true;
     }
 
@@ -310,27 +383,38 @@ public sealed unsafe partial class QuiclyPeer
     private int DispatchReceived(int maxItems, long now)
     {
         int dispatched = 0;
-        if (_queuedWithHandler > 0)
+
+        // A new pass: whatever an unreliable channel without a handler still has queued was not drained since the last
+        // one, and is backlog from here on (bounded, evicted oldest first).
+        _queues.BeginPass(_core);
+        if (_queues.QueuedHandled > 0)
         {
             dispatched = DispatchQueued(maxItems, now);
         }
 
-        if (_hasHeld && dispatched < maxItems && !_disposed)
+        // A held message whose channel has a handler is a dispatch and waits for room in maxItems; any other is only
+        // moved to its queue, and is retried whatever the limit — a Poll(0) must not keep the ring closed.
+        if (_hasHeld && !_disposed && (dispatched < maxItems || !HasHandler(_held.Channel)))
         {
             ReceiveEntry held = _held;
             _hasHeld = false;
-            if (!Route(ref held, now, ref dispatched))
+            if (!Route(ref held, now, ref dispatched, mayHold: false))
             {
+                // Still no room for it: the ring stays closed (the loop below is guarded by the held slot), but the
+                // mailboxes do not pass through the ring and are dispatched all the same. Returning here would stop
+                // every coalescing and ReliableLatest handler for as long as one reliable channel is not drained —
+                // while the transport thread keeps acknowledging those values to the sender. Only a reliable channel
+                // (or a replaced engine's) gets here: an unreliable message that was held across a pass start is
+                // queued by evicting backlog, or dropped (mayHold is false).
                 _held = held;
                 _hasHeld = true;
-                return dispatched;
             }
         }
 
         SpscRing<ReceiveEntry> ring = _core.ReceiveRing;
         while (dispatched < maxItems && !_disposed && !_hasHeld && ring.TryDequeue(out ReceiveEntry entry))
         {
-            if (!Route(ref entry, now, ref dispatched))
+            if (!Route(ref entry, now, ref dispatched, mayHold: true))
             {
                 _held = entry;
                 _hasHeld = true;
@@ -346,7 +430,13 @@ public sealed unsafe partial class QuiclyPeer
         return dispatched;
     }
 
-    private bool Route(ref ReceiveEntry entry, long now, ref int dispatched)
+    private bool HasHandler(ushort channel)
+    {
+        int index = _core.ChannelIndexOf(channel);
+        return index >= 0 && _handlers[index] is not null;
+    }
+
+    private bool Route(ref ReceiveEntry entry, long now, ref int dispatched, bool mayHold)
     {
         if (IsResponse(in entry))
         {
@@ -369,36 +459,65 @@ public sealed unsafe partial class QuiclyPeer
             return true;
         }
 
-        return TryQueue(in entry);
+        return TryQueue(in entry, mayHold);
     }
 
-    private bool TryQueue(in ReceiveEntry entry)
+    /// <summary>
+    /// Moves a message that left the receive ring into its channel's drain queue (game thread, from <see cref="Poll"/> for a
+    /// channel without a handler and from <see cref="Drain"/> for a message of another channel).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see langword="false"/> means the pool is full and the message may not be dropped: the caller holds it and stops
+    /// taking from the ring. Who can be held, and for how long (<see cref="ReceiveQueues.TryAppendDatagram"/>):
+    /// </para>
+    /// <list type="bullet">
+    /// <item>a reliable channel (or a replaced engine's): until the application drains it or registers a handler — the
+    /// limit that remains (see <see cref="Poll"/>);</item>
+    /// <item>an unreliable channel <em>with</em> a handler, met by a <see cref="Drain"/> of another channel: until the next
+    /// <see cref="Poll"/>. That Poll dispatches the channel's queue, then the held message, then the ring, all to the
+    /// handler and in arrival order, so the hold cannot outlive it (a Poll whose <c>maxItems</c> is used up dispatches
+    /// less, and the rest waits like every other message of a handled channel). Nothing of a handled channel is ever
+    /// evicted;</item>
+    /// <item>an unreliable channel <em>without</em> a handler that is not backlogged (the
+    /// application drained it, as a host that polls and then drains every frame does): until its <see cref="Drain"/>,
+    /// which takes the queue, the held message and the ring, in that order — nothing is lost that the ring and the
+    /// budget took. If nobody drains it, the next Poll makes everything it has queued backlog: the held message is
+    /// then queued by evicting the oldest (<paramref name="mayHold"/> is <see langword="false"/> for it, so it cannot
+    /// be held twice), and from then on the channel never holds again until it has been drained empty.</item>
+    /// </list>
+    /// <para>
+    /// So an unreliable channel that nobody drains closes the ring for one Poll interval at most, once, and afterwards
+    /// costs only its own oldest messages (<see cref="ChannelStatistics.DrainQueueDrops"/>).
+    /// </para>
+    /// </remarks>
+    /// <param name="entry">The message.</param>
+    /// <param name="mayHold">
+    /// <see langword="false"/> for a message that was held when this pass began: an unreliable message without a handler
+    /// is then queued or dropped, never held again.
+    /// </param>
+    /// <returns><see langword="false"/> when the caller has to hold the message.</returns>
+    private bool TryQueue(in ReceiveEntry entry, bool mayHold)
     {
         int index = _core.ChannelIndexOf(entry.Channel);
         ReceiveQueues queues = _queues;
-        if (!queues.TryAppend(index, in entry))
+        if (queues.IsDatagram(index))
         {
-            return false;
+            return queues.TryAppendDatagram(index, in entry, _core, mayHold);
         }
 
-        if (_handlers[index] is not null)
-        {
-            _queuedWithHandler++;
-        }
-
-        return true;
+        return queues.TryAppend(index, in entry);
     }
 
     private int DispatchQueued(int maxItems, long now)
     {
         int dispatched = 0;
         ReceiveQueues queues = _queues;
-        for (int index = 0; index < _handlers.Length && _queuedWithHandler > 0 && dispatched < maxItems && !_disposed; index++)
+        for (int index = 0; index < _handlers.Length && queues.QueuedHandled > 0 && dispatched < maxItems && !_disposed; index++)
         {
             MessageHandler? handler = _handlers[index];
             while (handler is not null && dispatched < maxItems && !_disposed && queues.TryTake(index, out ReceiveEntry entry))
             {
-                _queuedWithHandler--;
                 Debug.Assert(!IsResponse(in entry), "a response never reaches a per-channel queue");
                 Dispatch(handler, ref entry, now);
                 dispatched++;
@@ -652,7 +771,6 @@ public sealed unsafe partial class QuiclyPeer
         }
 
         _queues.ReleaseAll(_core);
-        _queuedWithHandler = 0;
         ReadOnlySpan<ReceiveMailbox> boxes = _core.Mailboxes;
         for (int i = 0; i < boxes.Length; i++)
         {

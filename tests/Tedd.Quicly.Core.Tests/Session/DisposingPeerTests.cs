@@ -1,4 +1,5 @@
 using Tedd.Quicly.Core.Channels;
+using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Testing.Simulation;
@@ -102,5 +103,166 @@ public class DisposingPeerTests
         Assert.Equal(BulkStatus.Disconnected, transfer.Status);
         Assert.Equal(BulkStatus.Disconnected, (await transfer.Completion).Status);
         Assert.Equal(DeliveryStatus.Disconnected, await tracked);
+    }
+
+    // ------------------------------------------------------------------ leases released after the peer is disposed
+    //
+    // A lease the application retained in a handler, took with Drain or received as a response is not tracked by the peer,
+    // so Dispose cannot return it. Over a shared allocator (PeerOptions.Allocator; every peer of a QuiclyServer) the pool
+    // outlives the peer: Release after Dispose has to give the block back, or the pool shrinks by one block per late
+    // release until a size class runs dry for every other peer.
+
+    private static SlabAllocator SharedPool() => new(PeerCore.CreateCompactAllocatorOptions());
+
+    private static void RunUntilFreed(SessionHarness h, QuiclyPeer peer)
+    {
+        h.Network.RunUntilIdle(1_000_000);
+        Assert.True(peer.IsFreed, "the transport's close callback never freed the disposed peer");
+    }
+
+    [Fact]
+    public void Release_After_Dispose_Returns_A_Retained_Block_To_A_Shared_Allocator()
+    {
+        using SlabAllocator shared = SharedPool();
+        using SessionHarness h = new(table: TestTables.Other, client: DatagramKit.Quiet, server: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.Allocator = shared;
+        });
+        QuiclyPeer server = h.Server!;
+        ReceiveLease kept = default;
+        server.RegisterHandler(2, (QuiclyPeer peer, in ReceiveHeader header, ReadOnlySpan<byte> _) => kept = peer.Retain(in header));
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2), [1, 2, 3]).Status);
+        Assert.True(h.RunUntil(() => kept.IsValid), "the message never reached the handler");
+
+        h.DisposeServer();
+        RunUntilFreed(h, server);
+
+        // Everything the peer itself held went back with it; the one block left is the application's.
+        long block = shared.GetStatistics().TotalRentedBytes;
+        Assert.True(block > 0, "the retained block was returned behind the application's back");
+
+        server.Release(in kept);
+
+        Assert.Equal(0, shared.GetStatistics().TotalRentedBytes);
+    }
+
+    [Fact]
+    public void Release_After_Dispose_Returns_Drained_Blocks_To_A_Shared_Allocator()
+    {
+        using SlabAllocator shared = SharedPool();
+        using SessionHarness h = new(table: TestTables.Other, client: DatagramKit.Quiet, server: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.Allocator = shared;
+        });
+        QuiclyPeer server = h.Server!;
+        for (int i = 0; i < 5; i++)
+        {
+            Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2), [(byte)i]).Status);
+        }
+
+        Assert.True(h.RunUntil(() => Channel(server, 2).Received == 5), "the messages never arrived");
+        ReceivedMessage[] drained = new ReceivedMessage[8];
+        Assert.Equal(5, server.Drain(2, drained));
+
+        h.DisposeServer();
+        RunUntilFreed(h, server);
+        Assert.True(shared.GetStatistics().TotalRentedBytes > 0, "the drained blocks were returned behind the application's back");
+
+        server.Release(drained.AsSpan(0, 5));
+
+        Assert.Equal(0, shared.GetStatistics().TotalRentedBytes);
+    }
+
+    [Fact]
+    public void Release_Between_Dispose_And_Free_Returns_The_Block()
+    {
+        using SlabAllocator shared = SharedPool();
+        using SessionHarness h = new(table: TestTables.Other, client: DatagramKit.Quiet, server: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.Allocator = shared;
+        });
+        QuiclyPeer server = h.Server!;
+        ReceiveLease kept = default;
+        server.RegisterHandler(2, (QuiclyPeer peer, in ReceiveHeader header, ReadOnlySpan<byte> _) =>
+        {
+            kept = peer.Retain(in header);
+            peer.Dispose();
+        });
+
+        // The server is driven by hand from here: it disposes itself inside its own Poll.
+        h.StopPumpingServer();
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2), [1, 2, 3]).Status);
+        h.Client.Flush();
+        for (int i = 0; i < 100 && !server.IsDisposed; i++)
+        {
+            h.Network.Advance(1_000);
+            server.Poll();
+        }
+
+        Assert.True(server.IsDisposed, "the handler never ran");
+        Assert.True(kept.IsValid);
+        Assert.False(server.IsFreed, "the transport's close was not pumped yet: the peer's memory is still there");
+
+        server.Release(in kept);
+        RunUntilFreed(h, server);
+
+        Assert.Equal(0, shared.GetStatistics().TotalRentedBytes);
+    }
+
+    [Fact]
+    public void Release_After_Dispose_With_A_Private_Allocator_Is_A_NoOp()
+    {
+        using SessionHarness h = new(table: TestTables.Other, client: DatagramKit.Quiet, server: DatagramKit.Quiet);
+        QuiclyPeer server = h.Server!;
+        ReceiveLease kept = default;
+        server.RegisterHandler(2, (QuiclyPeer peer, in ReceiveHeader header, ReadOnlySpan<byte> _) => kept = peer.Retain(in header));
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2), [1, 2, 3]).Status);
+        Assert.True(h.RunUntil(() => kept.IsValid), "the message never reached the handler");
+        server.UnregisterHandler(2);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2), [4]).Status);
+        Assert.True(h.RunUntil(() => Channel(server, 2).Received == 2), "the second message never arrived");
+        ReceivedMessage[] drained = new ReceivedMessage[4];
+        int count = server.Drain(2, drained);
+        Assert.Equal(1, count);
+
+        h.DisposeServer();
+
+        // Before the peer's memory is freed and after it: the private pool goes with the peer, so there is nothing to return.
+        server.Release(in kept);
+        RunUntilFreed(h, server);
+        server.Release(in kept);
+        server.Release(drained.AsSpan(0, count));
+    }
+
+    [Fact]
+    public void Release_After_The_Shared_Allocator_Was_Disposed_Is_A_NoOp()
+    {
+        using SlabAllocator shared = SharedPool();
+        using SessionHarness h = new(table: TestTables.Other, client: DatagramKit.Quiet, server: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.Allocator = shared;
+        });
+        QuiclyPeer server = h.Server!;
+        ReceiveLease kept = default;
+        server.RegisterHandler(2, (QuiclyPeer peer, in ReceiveHeader header, ReadOnlySpan<byte> _) => kept = peer.Retain(in header));
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(2), [1, 2, 3]).Status);
+        Assert.True(h.RunUntil(() => kept.IsValid), "the message never reached the handler");
+
+        h.DisposeServer();
+        RunUntilFreed(h, server);
+        shared.Dispose();
+        Assert.True(shared.IsDisposed);
+
+        server.Release(in kept);
+    }
+
+    private static ChannelStatistics Channel(QuiclyPeer peer, ushort channel)
+    {
+        Assert.True(peer.GetChannelStatistics(channel, out ChannelStatistics statistics));
+        return statistics;
     }
 }

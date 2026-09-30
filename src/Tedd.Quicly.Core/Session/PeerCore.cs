@@ -1260,8 +1260,11 @@ internal sealed unsafe class PeerCore : IDisposable
     /// for ever. A decode that finds the budget already over its limit (an earlier decoded payload the application still
     /// holds) fails, so the budget is exceeded by at most one decode buffer at a time, and the transport thread takes
     /// nothing new until it is back within it. For the same reason a used-up size class is not the end: a block of a
-    /// larger class within the budget is taken instead (the default private pool has blocks for the whole budget in
-    /// every class, so the waiting messages can never hold all of them and the budget's worth of a larger class too).
+    /// larger class within the budget is taken instead. The waiting messages cannot hold every block of the classes a
+    /// decode may use while the budget holds them (the default private pool has at least the budget's worth in every
+    /// class up to 64 KiB, and one block of 256 KiB), with one exception: a message whose own block is the pool's last
+    /// block that its decode could use — with the default pool, a message whose compressed form takes the 256 KiB
+    /// block and whose raw size needs it too. <see cref="CanEverRentDecode"/> tells that message apart; it is dropped.
     /// </summary>
     /// <param name="length">Bytes needed (the message's raw length).</param>
     /// <param name="lease">The lease, or empty.</param>
@@ -1303,22 +1306,34 @@ internal sealed unsafe class PeerCore : IDisposable
     }
 
     /// <summary>
-    /// Whether <see cref="TryRentDecode"/> can succeed for <paramref name="length"/> bytes at all: the pool has a block that
-    /// holds them, and that block is not larger than the receive budget. When it cannot, waiting for a buffer is pointless.
+    /// Whether <see cref="TryRentDecode"/> can succeed for <paramref name="length"/> bytes at all while the message holds
+    /// its own block (game thread): the pool has a block that holds them, not larger than the receive budget, besides
+    /// <paramref name="heldBlock"/>. When it cannot, waiting for a buffer is pointless — the one block that could take the
+    /// decode is the message's own, and waiting would pin it, and with it the receive budget, for good.
     /// </summary>
     /// <param name="length">Bytes needed.</param>
-    public bool CanEverRentDecode(int length)
+    /// <param name="heldBlock">Block size of the lease the message holds (0 for none): that block cannot take its decode.</param>
+    public bool CanEverRentDecode(int length, int heldBlock)
     {
         ReadOnlySpan<SizeClassDefinition> classes = _allocator.SizeClasses;
+        long blocks = 0;
         for (int i = 0; i < classes.Length; i++)
         {
-            if (classes[i].BlockSize >= length)
+            int block = classes[i].BlockSize;
+            if (block < length)
             {
-                return classes[i].BlockSize <= _receiveBudget;
+                continue;
             }
+
+            if (block > _receiveBudget)
+            {
+                break;
+            }
+
+            blocks += classes[i].BlockCount - (block == heldBlock ? 1 : 0);
         }
 
-        return false;
+        return blocks > 0;
     }
 
     /// <summary>Returns a receive lease (any thread; normally the game thread). Empty leases are ignored.</summary>

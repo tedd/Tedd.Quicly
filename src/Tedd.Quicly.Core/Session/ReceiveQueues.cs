@@ -18,15 +18,17 @@ internal static class ReceiveQueueClass
     public const byte Other = 0;
 
     /// <summary>
-    /// UnreliableUnordered and UnreliableSequenced without <see cref="ChannelDefinition.CoalesceOnReceive"/>: the backlog is
-    /// bounded, and a message that does not fit evicts the oldest queued one (counted). Never held.
+    /// UnreliableUnordered and UnreliableSequenced without <see cref="ChannelDefinition.CoalesceOnReceive"/>: a backlog
+    /// that survives a <see cref="QuiclyPeer.Poll"/> undrained is bounded, and evicts its oldest messages (counted) when
+    /// it is full. Held for one Poll interval at most (<see cref="ReceiveQueues.TryAppendDatagram"/>).
     /// </summary>
     public const byte Datagram = 1;
 
     /// <summary>
     /// ReliableOrdered and ReliableUnordered: never dropped. Appended while a node is free and held by the peer when none
     /// is, which stops the receive ring and back-pressures the streams; a share of the pool is reserved for these channels
-    /// (<see cref="ReceiveQueueLayout.ReliableNodes"/>) that the <see cref="Datagram"/> class can never occupy.
+    /// (<see cref="ReceiveQueueLayout.ReliableNodes"/>) that the backlog of the <see cref="Datagram"/> class can never
+    /// occupy.
     /// </summary>
     public const byte Reliable = 2;
 
@@ -46,13 +48,17 @@ internal static class ReceiveQueueClass
 /// </summary>
 /// <remarks>
 /// The node pool is split in two. Each <see cref="ReceiveQueueClass.Reliable"/> channel has <see cref="ReliableNodes"/>
-/// nodes reserved; the rest, <see cref="DatagramNodes"/>, is the most the <see cref="ReceiveQueueClass.Datagram"/> channels
-/// may occupy together, so a flooded unreliable channel can never take the nodes a reliable channel's backlog needs. The
-/// datagram channels also share a byte cap of a quarter of the receive budget (<see cref="DatagramBytes"/>, counted in
-/// block sizes, which is what the budget is charged): a queue that nobody drains pins at most that, and at least three
-/// quarters of the budget stay for the ring, reassembly, mailboxes and the reliable channels. Inside the datagram class
-/// nothing is partitioned: a channel may use the whole sub-pool while it is alone, and <see cref="NodeFair"/> /
-/// <see cref="ByteFair"/> only decide <em>who</em> loses a message once the sub-pool is full.
+/// nodes reserved; the rest, <see cref="DatagramNodes"/>, is the most the <em>backlog</em> of the
+/// <see cref="ReceiveQueueClass.Datagram"/> channels may occupy — the messages of channels that were left undrained
+/// across a <see cref="QuiclyPeer.Poll"/> (<see cref="ReceiveQueues.BeginPass"/>) — so a flooded unreliable channel that
+/// nobody drains can never keep the nodes a reliable channel's backlog needs. That backlog also has a byte cap of a
+/// quarter of the receive budget (<see cref="DatagramBytes"/>, counted in block sizes, which is what the budget is
+/// charged): queues that nobody drains pin at most that, and at least three quarters of the budget stay for the ring,
+/// reassembly, mailboxes and the reliable channels. Inside the backlog nothing is partitioned: a channel may use all of it
+/// while it is alone, and <see cref="NodeFair"/> / <see cref="ByteFair"/> only decide <em>who</em> loses a message once
+/// it is full. Messages that left the ring in the current Poll pass for a channel whose queue was empty when the pass
+/// began are outside these limits: they are on their way to the <see cref="QuiclyPeer.Drain"/> that follows the Poll, and
+/// were charged to the receive budget when they arrived.
 /// </remarks>
 internal readonly struct ReceiveQueueLayout
 {
@@ -131,10 +137,13 @@ internal readonly struct ReceiveQueueLayout
 /// channel does not block the ring for the others. A fixed node pool bounds it, and what happens when a message does not fit
 /// depends on the channel's <see cref="ReceiveQueueClass"/>:
 /// <list type="bullet">
-/// <item>an unreliable channel (<see cref="ReceiveQueueClass.Datagram"/>) loses its <em>oldest</em> queued message, or —
-/// when the channel is under its fair share — the oldest message of the unreliable channel with the longest queue
-/// (<see cref="AppendEvicting"/>; counted per channel and per peer as <c>DrainQueueDrops</c>). Such a channel never stops
-/// the ring, however long nobody drains it;</item>
+/// <item>an unreliable channel (<see cref="ReceiveQueueClass.Datagram"/>) is queued with
+/// <see cref="TryAppendDatagram"/>. Messages it left undrained across a Poll are its <em>backlog</em>: the backlog of all
+/// such channels together is bounded (<see cref="ReceiveQueueLayout.DatagramNodes"/>,
+/// <see cref="ReceiveQueueLayout.DatagramBytes"/>), and once it is full the oldest message of the channel furthest over
+/// its share is evicted (counted per channel and per peer as <c>DrainQueueDrops</c>). A channel that was drained since
+/// the last Poll loses nothing: its messages are queued while a node is free, and then held by the peer — for one Poll
+/// interval at most, because the next Poll finds them undrained and makes them backlog;</item>
 /// <item>a reliable channel (<see cref="ReceiveQueueClass.Reliable"/>) and a channel of a replaced engine
 /// (<see cref="ReceiveQueueClass.Other"/>) lose nothing: <see cref="TryAppend"/> fails, the peer holds the message and
 /// stops taking from the ring, and the ring's own rules apply (datagrams are dropped newest-first, streams are
@@ -146,8 +155,8 @@ internal readonly struct ReceiveQueueLayout
 /// allocates after warm-up) and backed by native memory (ADR 0008 invariant 12), so a first message on a channel
 /// without a handler costs nothing on the GC heap. The pool holds <see cref="ReceiveQueueLayout.Capacity"/> messages: the
 /// receive ring's capacity, capped at <see cref="MaxNodes"/> (and at least two per reliable channel). Everything here —
-/// the queues, the byte totals, the drop counters and the handled-channel count — is the game thread's; nothing is shared
-/// with the transport thread.
+/// the queues, the byte totals, the backlog marks, the drop counters and the handled-channel count — is the game
+/// thread's; nothing is shared with the transport thread.
 /// </remarks>
 internal sealed class ReceiveQueues : IDisposable
 {
@@ -165,7 +174,13 @@ internal sealed class ReceiveQueues : IDisposable
     private readonly NativeArray<long> _drops;
     private readonly NativeArray<byte> _class;
     private readonly NativeArray<byte> _handled;
-    // Dense indices of the Datagram-class channels: the only ones a victim scan has to look at.
+    // 1 for a Datagram-class channel without a handler that had messages queued when the current pass began and was not
+    // drained empty during the pass before it (BeginPass): everything it has queued is backlog, under the class limits
+    // and open to eviction.
+    private readonly NativeArray<byte> _backlogged;
+    // The pass (_pass) in which a take for the application last found or left the channel's queue empty.
+    private readonly NativeArray<int> _emptiedPass;
+    // Dense indices of the Datagram-class channels: the only ones a pass start or a victim scan has to look at.
     private readonly NativeArray<int> _datagramChannels;
     private readonly int _datagramChannelCount;
     private readonly int _channels;
@@ -174,10 +189,16 @@ internal sealed class ReceiveQueues : IDisposable
     private readonly int _nodeFair;
     private readonly int _byteFair;
     private int _free;
+    // Messages queued for Datagram-class channels, with or without a handler (whether a pass start has anything to mark).
     private int _usedDatagram;
-    private long _bytesDatagram;
-    // The channel the last victim scan found largest, per pressured resource (-1: none): while it stays over its fair
-    // share it is the victim without another scan.
+    // Totals over the backlogged channels: what DatagramNodes and DatagramBytes limit.
+    private int _backlogNodes;
+    private long _backlogBytes;
+    private bool _anyBacklogged;
+    // Pass counter: BeginPass starts the next one. Only ever compared for equality, so its wrap is harmless.
+    private int _pass;
+    // The backlogged channel last seen largest, per pressured resource (-1: none): while it stays strictly over its fair
+    // share, and larger than the appender, it is the victim without a scan.
     private int _hintNodes = -1;
     private int _hintBytes = -1;
 
@@ -224,6 +245,8 @@ internal sealed class ReceiveQueues : IDisposable
         _drops = new NativeArray<long>(slots);
         _class = new NativeArray<byte>(slots);
         _handled = new NativeArray<byte>(slots);
+        _backlogged = new NativeArray<byte>(slots);
+        _emptiedPass = new NativeArray<int>(slots);
         _datagramChannels = new NativeArray<int>(slots);
         _head.Fill(-1);
         _tail.Fill(-1);
@@ -232,6 +255,8 @@ internal sealed class ReceiveQueues : IDisposable
         _drops.Fill(0);
         _class.Fill(ReceiveQueueClass.Other);
         _handled.Fill(0);
+        _backlogged.Fill(0);
+        _emptiedPass.Fill(0);
         for (int ci = 0; ci < classes.Length; ci++)
         {
             _class[ci] = classes[ci];
@@ -256,8 +281,8 @@ internal sealed class ReceiveQueues : IDisposable
     /// <summary>
     /// Messages queued for channels that have a handler (<see cref="SetHandled"/>): what the next
     /// <see cref="QuiclyPeer.Poll"/> dispatches from the queues, and part of the peer's pending-work probe. Kept here, next
-    /// to the queues, because an eviction removes entries too: a count the peer kept by itself would stay positive for
-    /// good after one, and a host that polls while there is work would never sleep again.
+    /// to the queues, so that every way an entry leaves them keeps the count exact: a count that stayed positive over
+    /// empty queues would keep a host that polls while there is work awake for good.
     /// </summary>
     public int QueuedHandled { get; private set; }
 
@@ -271,16 +296,33 @@ internal sealed class ReceiveQueues : IDisposable
 
     /// <summary>
     /// Messages of <paramref name="channelIndex"/> that were queued and then dropped to make room, or could not be queued
-    /// at all (<see cref="AppendEvicting"/>): a total since the queues were created.
+    /// at all (<see cref="TryAppendDatagram"/>, <see cref="BeginPass"/>): a total since the queues were created.
     /// </summary>
     /// <param name="channelIndex">Dense channel index.</param>
     public long Drops(int channelIndex) => _drops[channelIndex];
 
-    /// <summary>Whether <paramref name="channelIndex"/> is queued with <see cref="AppendEvicting"/> (class <see cref="ReceiveQueueClass.Datagram"/>).</summary>
+    /// <summary>Whether <paramref name="channelIndex"/> is queued with <see cref="TryAppendDatagram"/> (class <see cref="ReceiveQueueClass.Datagram"/>).</summary>
     /// <param name="channelIndex">Dense channel index.</param>
-    public bool IsEvicting(int channelIndex) => _class[channelIndex] == ReceiveQueueClass.Datagram;
+    public bool IsDatagram(int channelIndex) => _class[channelIndex] == ReceiveQueueClass.Datagram;
 
-    /// <summary>Records that <paramref name="channelIndex"/> got or lost its handler (<see cref="QueuedHandled"/>).</summary>
+    /// <summary>
+    /// Whether everything queued for <paramref name="channelIndex"/> is backlog: the channel is unreliable, has no handler
+    /// and was left undrained through the pass before the current one (<see cref="BeginPass"/>).
+    /// </summary>
+    /// <param name="channelIndex">Dense channel index.</param>
+    public bool IsBacklogged(int channelIndex) => _backlogged[channelIndex] != 0;
+
+    /// <summary>Messages queued for backlogged channels (at most <see cref="ReceiveQueueLayout.DatagramNodes"/>).</summary>
+    public int BacklogNodes => _backlogNodes;
+
+    /// <summary>Block bytes queued for backlogged channels (at most <see cref="ReceiveQueueLayout.DatagramBytes"/>, or one message).</summary>
+    public long BacklogBytes => _backlogBytes;
+
+    /// <summary>
+    /// Records that <paramref name="channelIndex"/> got or lost its handler (<see cref="QueuedHandled"/>). A channel that
+    /// gets a handler stops being backlog: the next <see cref="QuiclyPeer.Poll"/> dispatches what it has queued. One that
+    /// loses its handler is judged at the next pass start like any other.
+    /// </summary>
     /// <param name="channelIndex">Dense channel index.</param>
     /// <param name="handled">Whether the channel has a handler now.</param>
     public void SetHandled(int channelIndex, bool handled)
@@ -293,6 +335,83 @@ internal sealed class ReceiveQueues : IDisposable
 
         _handled[channelIndex] = value;
         QueuedHandled += handled ? _count[channelIndex] : -_count[channelIndex];
+        if (handled && _backlogged[channelIndex] != 0)
+        {
+            _backlogged[channelIndex] = 0;
+            _backlogNodes -= _count[channelIndex];
+            _backlogBytes -= _bytes[channelIndex];
+        }
+    }
+
+    /// <summary>
+    /// Starts a pass (game thread, once at the start of every <see cref="QuiclyPeer.Poll"/> that dispatches): decides which
+    /// unreliable channels are backlogged and cuts their backlog down to the class limits.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A channel of class <see cref="ReceiveQueueClass.Datagram"/> without a handler is <em>backlogged</em> for this pass
+    /// when its queue is not empty now and no <see cref="TryTake"/> found or left it empty during the pass that ends here:
+    /// the application had a whole Poll interval and did not drain what was queued for it. A host that drains its
+    /// channels every frame never gets there, whatever the order of its Poll and Drain calls — every queue was empty at
+    /// some point of the frame — so nothing it could have received on the receive ring and the receive budget is
+    /// evicted: between the Poll and the Drain the messages wait here while a node is free, then in the held slot and
+    /// the ring, as they did before the backlog was bounded. A channel stops being backlogged as soon as a
+    /// <see cref="TryTake"/> empties it, or it gets a handler.
+    /// </para>
+    /// <para>
+    /// The backlog of all backlogged channels together is limited to <see cref="ReceiveQueueLayout.DatagramNodes"/>
+    /// nodes and <see cref="ReceiveQueueLayout.DatagramBytes"/> block bytes (one message always fits). What exceeds that
+    /// now — a burst that a pass queued for a channel that was then not drained — is evicted here, oldest first, from the
+    /// channel with the most (<see cref="Drops"/>, <see cref="PeerCounters.DrainQueueDrops"/>). So a channel nobody
+    /// drains holds more than those limits for one Poll interval at most, and that excess was in the receive ring, already
+    /// charged to the budget, when the pass that queued it began.
+    /// </para>
+    /// <para>
+    /// Costs one compare while no unreliable channel has anything queued; otherwise one walk over the unreliable channels
+    /// of the table.
+    /// </para>
+    /// </remarks>
+    /// <param name="core">Owner of the receive budget and the peer counters.</param>
+    public void BeginPass(PeerCore core)
+    {
+        int previous = _pass;
+        _pass = unchecked(previous + 1);
+        if (_usedDatagram == 0 && !_anyBacklogged)
+        {
+            return;
+        }
+
+        int nodes = 0;
+        long bytes = 0;
+        for (int i = 0; i < _datagramChannelCount; i++)
+        {
+            int ci = _datagramChannels[i];
+            if (_count[ci] > 0 && _handled[ci] == 0 && _emptiedPass[ci] != previous)
+            {
+                _backlogged[ci] = 1;
+                nodes += _count[ci];
+                bytes += _bytes[ci];
+            }
+            else
+            {
+                _backlogged[ci] = 0;
+            }
+        }
+
+        _backlogNodes = nodes;
+        _backlogBytes = bytes;
+        _anyBacklogged = nodes > 0;
+        while (true)
+        {
+            bool nodePressure = _backlogNodes > _datagramNodes;
+            bool bytePressure = _backlogBytes > _datagramBytes && _backlogNodes > 1;
+            if (!nodePressure && !bytePressure)
+            {
+                break;
+            }
+
+            Evict(PickVictim(-1, byBytes: bytePressure && !nodePressure), core);
+        }
     }
 
     /// <summary>Appends a message to the queue of <paramref name="channelIndex"/>.</summary>
@@ -329,84 +448,157 @@ internal sealed class ReceiveQueues : IDisposable
         if (_class[channelIndex] == ReceiveQueueClass.Datagram)
         {
             _usedDatagram++;
-            _bytesDatagram += length;
+            if (_backlogged[channelIndex] != 0)
+            {
+                _backlogNodes++;
+                _backlogBytes += length;
+            }
         }
 
         return true;
     }
 
     /// <summary>
-    /// Appends a message of an unreliable channel (class <see cref="ReceiveQueueClass.Datagram"/>), making room first when
-    /// the class is at its node or byte limit, or the pool has no free node: the oldest queued message of a victim channel
-    /// is returned to <paramref name="core"/> and counted (<see cref="Drops"/>, <see cref="PeerCounters.DrainQueueDrops"/>),
-    /// as often as it takes. The victim is the appending channel itself when it is at or over its fair share of the
-    /// resource under pressure — a flooded channel loses its own oldest messages, in O(1) — and otherwise the unreliable
-    /// channel with the most queued, so a channel that is drained diligently is not evicted while another one is the hog.
+    /// Queues a message of an unreliable channel (class <see cref="ReceiveQueueClass.Datagram"/>). What happens when it does
+    /// not fit depends on what the channel is in this pass (<see cref="BeginPass"/>):
+    /// <list type="bullet">
+    /// <item><b>backlogged</b> (no handler, and it was not drained empty during the last pass): the backlog is kept at its
+    /// node and byte limits by returning the oldest message of a victim channel to <paramref name="core"/>, counted
+    /// (<see cref="Drops"/>, <see cref="PeerCounters.DrainQueueDrops"/>), as often as it takes. The victim is the
+    /// backlogged channel furthest over its fair share of the resource under pressure — the appender itself only when no
+    /// other one is larger — so one flooded channel loses its own oldest messages, in O(1). Never held;</item>
+    /// <item><b>current</b> (no handler, and not backlogged — the application drained it during the last pass, or the
+    /// channel is new): queued while a node is free, outside the backlog limits. With the pool full, the oldest message of a
+    /// backlogged channel makes room; with no backlog to evict the answer is <see langword="false"/> and the caller holds
+    /// the message, as it does for a reliable channel. That hold ends at the channel's <see cref="QuiclyPeer.Drain"/>, or
+    /// at the next pass start, which makes the channel backlogged: <paramref name="mayHold"/> is <see langword="false"/>
+    /// for a message that was already held when a pass began, and it is then dropped and counted rather than held a
+    /// second time (the pool is full of messages that cannot be evicted);</item>
+    /// <item><b>handled</b> (a <see cref="QuiclyPeer.Drain"/> of another channel met it; the next
+    /// <see cref="QuiclyPeer.Poll"/> dispatches it): never evicted and never dropped. Queued while a node is free, making
+    /// room from the backlog of channels without a handler when there is one, and otherwise held.</item>
+    /// </list>
     /// </summary>
     /// <remarks>
     /// Oldest first for both unreliable modes: a consumer that comes back gets the freshest messages, in order; on an
     /// UnreliableSequenced channel the transport thread has already moved the key's sequence on, so the older queued
-    /// values are the stale ones. An empty class always takes one message of any size, and after an append the class pins
-    /// at most the larger of <see cref="ReceiveQueueLayout.DatagramBytes"/> and that one message. The loop ends because
-    /// every eviction removes one queued message.
+    /// values are the stale ones. An empty backlog always takes one message of any size, and after an append the backlog
+    /// pins at most the larger of <see cref="ReceiveQueueLayout.DatagramBytes"/> and that one message. Every loop ends
+    /// because each eviction removes one queued message.
     /// </remarks>
     /// <param name="channelIndex">Dense index of a <see cref="ReceiveQueueClass.Datagram"/> channel.</param>
     /// <param name="entry">The message (its lease moves into the queue, or back to <paramref name="core"/>).</param>
     /// <param name="core">Owner of the receive budget and the peer counters.</param>
+    /// <param name="mayHold">Whether the caller may hold the message (it left the ring, or was first held, in this pass).</param>
     /// <returns>
-    /// <see langword="false"/> when the message itself was dropped (returned and counted): the pool is full of messages of
-    /// other classes and no unreliable channel has anything to evict.
+    /// <see langword="false"/> when the caller has to hold the message (nothing was done with it). <see langword="true"/>
+    /// when it was queued — or, for a channel without a handler, dropped and counted because nothing could be evicted for
+    /// it and it may not be held.
     /// </returns>
-    public bool AppendEvicting(int channelIndex, in ReceiveEntry entry, PeerCore core)
+    public bool TryAppendDatagram(int channelIndex, in ReceiveEntry entry, PeerCore core, bool mayHold)
     {
-        int length = entry.Lease.Length;
-        while (true)
+        Debug.Assert(_class[channelIndex] == ReceiveQueueClass.Datagram, "only an unreliable channel is queued here");
+        if (_backlogged[channelIndex] != 0)
         {
-            bool nodePressure = _free < 0 || _usedDatagram >= _datagramNodes;
-            bool bytePressure = _bytesDatagram > 0 && _bytesDatagram + length > _datagramBytes;
-            if (!nodePressure && !bytePressure)
+            int length = entry.Lease.Length;
+            while (true)
             {
-                break;
-            }
+                bool nodePressure = _free < 0 || _backlogNodes >= _datagramNodes;
+                bool bytePressure = _backlogBytes > 0 && _backlogBytes + length > _datagramBytes;
+                if (!nodePressure && !bytePressure)
+                {
+                    break;
+                }
 
-            int victim = PickVictim(channelIndex, byBytes: bytePressure && !nodePressure);
-            if (victim < 0)
+                int victim = PickVictim(channelIndex, byBytes: bytePressure && !nodePressure);
+                if (victim < 0)
+                {
+                    // The pool is full of messages that are not backlog (reliable, handled, current) and the backlog is
+                    // empty: a backlogged channel never holds the ring, so its message goes.
+                    DropNew(channelIndex, in entry, core);
+                    return true;
+                }
+
+                Evict(victim, core);
+            }
+        }
+        else
+        {
+            while (_free < 0)
             {
-                core.ReturnReceive(in entry.Lease);
-                _drops[channelIndex]++;
-                core.Counters.DrainQueueDrops++;
-                return false;
+                int victim = PickVictim(-1, byBytes: false);
+                if (victim >= 0)
+                {
+                    Evict(victim, core);
+                }
+                else if (mayHold || _handled[channelIndex] != 0)
+                {
+                    return false;
+                }
+                else
+                {
+                    DropNew(channelIndex, in entry, core);
+                    return true;
+                }
             }
-
-            bool taken = TryTake(victim, out ReceiveEntry oldest);
-            System.Diagnostics.Debug.Assert(taken, "a victim has a queued message");
-            core.ReturnReceive(in oldest.Lease);
-            _drops[victim]++;
-            core.Counters.DrainQueueDrops++;
         }
 
         bool appended = TryAppend(channelIndex, in entry);
-        System.Diagnostics.Debug.Assert(appended, "a node is free after the eviction loop");
-        return appended;
+        Debug.Assert(appended, "a node is free after the eviction loop");
+        return true;
+    }
+
+    private void DropNew(int channelIndex, in ReceiveEntry entry, PeerCore core)
+    {
+        core.ReturnReceive(in entry.Lease);
+        _drops[channelIndex]++;
+        core.Counters.DrainQueueDrops++;
+    }
+
+    private void Evict(int victim, PeerCore core)
+    {
+        bool taken = Take(victim, out ReceiveEntry oldest);
+        Debug.Assert(taken, "a victim has a queued message");
+        core.ReturnReceive(in oldest.Lease);
+        _drops[victim]++;
+        core.Counters.DrainQueueDrops++;
     }
 
     /// <summary>
-    /// The channel that loses its oldest message for an append on <paramref name="channelIndex"/>, or -1 when no unreliable
-    /// channel has one queued.
+    /// The backlogged channel that loses its oldest message, or -1 when no backlogged channel has one queued.
+    /// <paramref name="appender"/> is the backlogged channel the room is for (-1: a channel that is not backlog, or a
+    /// pass start): it is its own victim only when it is at or over its fair share and no other channel is known to be
+    /// further over — so a channel that stays within its share is not cut while another one is the hog.
     /// </summary>
-    private int PickVictim(int channelIndex, bool byBytes)
+    private int PickVictim(int appender, bool byBytes)
     {
-        // The appender, at or over its share: the common case of one flooded channel, without a scan.
-        if (_count[channelIndex] > 0 && (byBytes ? _bytes[channelIndex] >= _byteFair : _count[channelIndex] >= _nodeFair))
+        ref int hintRef = ref _hintNodes;
+        if (byBytes)
         {
-            return channelIndex;
+            hintRef = ref _hintBytes;
         }
 
-        // The last scan's largest, while it is still strictly over its share.
-        int hint = byBytes ? _hintBytes : _hintNodes;
-        if (hint >= 0 && _count[hint] > 0 && (byBytes ? _bytes[hint] > _byteFair : _count[hint] > _nodeFair))
+        int fair = byBytes ? _byteFair : _nodeFair;
+        int own = appender < 0 ? -1 : (byBytes ? _bytes[appender] : _count[appender]);
+
+        // The last known largest, while it is still backlog, strictly over its share and larger than the appender.
+        int hint = hintRef;
+        int hintSize = -1;
+        if (hint >= 0 && hint != appender && _backlogged[hint] != 0 && _count[hint] > 0)
         {
-            return hint;
+            hintSize = byBytes ? _bytes[hint] : _count[hint];
+            if (hintSize > fair && hintSize > own)
+            {
+                return hint;
+            }
+        }
+
+        // The appender, at or over its share with nothing known to be larger: the common case of one flooded channel,
+        // without a scan. It becomes the hint, so that another channel's append finds it.
+        if (appender >= 0 && _count[appender] > 0 && own >= fair && own >= hintSize)
+        {
+            hintRef = appender;
+            return appender;
         }
 
         int victim = -1;
@@ -414,7 +606,7 @@ internal sealed class ReceiveQueues : IDisposable
         for (int i = 0; i < _datagramChannelCount; i++)
         {
             int ci = _datagramChannels[i];
-            if (_count[ci] == 0)
+            if (_backlogged[ci] == 0 || _count[ci] == 0)
             {
                 continue;
             }
@@ -427,23 +619,30 @@ internal sealed class ReceiveQueues : IDisposable
             }
         }
 
-        if (byBytes)
-        {
-            _hintBytes = victim;
-        }
-        else
-        {
-            _hintNodes = victim;
-        }
-
+        hintRef = victim;
         return victim;
     }
 
-    /// <summary>Takes the oldest message of <paramref name="channelIndex"/>.</summary>
+    /// <summary>
+    /// Takes the oldest message of <paramref name="channelIndex"/> for the application (<see cref="QuiclyPeer.Drain"/>, or
+    /// the dispatch to a handler). A take that empties a backlogged channel ends its backlog: the application caught up.
+    /// </summary>
     /// <param name="channelIndex">Dense channel index.</param>
     /// <param name="entry">The message; its lease now belongs to the caller.</param>
     /// <returns><see langword="false"/> when the queue is empty.</returns>
     public bool TryTake(int channelIndex, out ReceiveEntry entry)
+    {
+        bool taken = Take(channelIndex, out entry);
+        if (_count[channelIndex] == 0)
+        {
+            _backlogged[channelIndex] = 0;
+            _emptiedPass[channelIndex] = _pass;
+        }
+
+        return taken;
+    }
+
+    private bool Take(int channelIndex, out ReceiveEntry entry)
     {
         int node = _head[channelIndex];
         if (node < 0)
@@ -471,23 +670,37 @@ internal sealed class ReceiveQueues : IDisposable
         if (_class[channelIndex] == ReceiveQueueClass.Datagram)
         {
             _usedDatagram--;
-            _bytesDatagram -= length;
+            if (_backlogged[channelIndex] != 0)
+            {
+                _backlogNodes--;
+                _backlogBytes -= length;
+            }
         }
 
         return true;
     }
 
-    /// <summary>Returns every queued lease to <paramref name="core"/>; the drop counters keep their totals.</summary>
+    /// <summary>
+    /// Returns every queued lease to <paramref name="core"/> and forgets the backlog marks; the drop counters keep their
+    /// totals.
+    /// </summary>
     /// <param name="core">Owner of the receive budget.</param>
     public void ReleaseAll(PeerCore core)
     {
         for (int ci = 0; ci < _channels; ci++)
         {
-            while (TryTake(ci, out ReceiveEntry entry))
+            while (Take(ci, out ReceiveEntry entry))
             {
                 core.ReturnReceive(entry.Lease);
             }
         }
+
+        _backlogged.Fill(0);
+        _backlogNodes = 0;
+        _backlogBytes = 0;
+        _anyBacklogged = false;
+        _hintNodes = -1;
+        _hintBytes = -1;
     }
 
     /// <summary>Frees the native memory (after <see cref="ReleaseAll"/>).</summary>
@@ -502,6 +715,8 @@ internal sealed class ReceiveQueues : IDisposable
         _drops.Dispose();
         _class.Dispose();
         _handled.Dispose();
+        _backlogged.Dispose();
+        _emptiedPass.Dispose();
         _datagramChannels.Dispose();
     }
 }

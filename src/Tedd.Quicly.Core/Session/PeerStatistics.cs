@@ -266,15 +266,24 @@ public struct PeerStatistics
     /// Received messages of unreliable channels dropped from the drain queues: the sum of
     /// <see cref="ChannelStatistics.DrainQueueDrops"/> over the channels. A message of an UnreliableUnordered or
     /// UnreliableSequenced channel (without <c>CoalesceOnReceive</c>) that has no handler waits for
-    /// <see cref="QuiclyPeer.Drain"/> in a bounded backlog — together these channels queue at most the part of the queue
-    /// pool that is not reserved for reliable channels (the pool is <see cref="ReceiveRingCapacity"/> messages, at most
-    /// 1 024; half of it is reserved when the table has a ReliableOrdered or ReliableUnordered channel) and pin at most a
-    /// quarter of <see cref="PeerOptions.ReceiveBudgetBytes"/> — and when a new message does not fit, the oldest queued
-    /// one is dropped: of the same channel when that channel is at or over its fair share, otherwise of the unreliable
-    /// channel with the longest queue. Non-zero means a channel receives traffic that nobody drains, or that is drained
-    /// too slowly: register a handler, drain every tick, or raise <see cref="PeerOptions.ReceiveBudgetBytes"/> /
-    /// <see cref="PeerOptions.ReceiveRingCapacity"/>. Game thread; a total since the peer was created.
+    /// <see cref="QuiclyPeer.Drain"/>. What such a channel still has queued when the next <see cref="QuiclyPeer.Poll"/>
+    /// begins, without having been drained empty in between, is its backlog, and the backlog of these channels together
+    /// is bounded: at most the part of the queue pool that is not reserved for reliable channels (the pool is
+    /// <see cref="ReceiveRingCapacity"/> messages, at most 1 024 whatever the ring's capacity; half of it is reserved when
+    /// the table has a ReliableOrdered or ReliableUnordered channel) and at most a quarter of
+    /// <see cref="PeerOptions.ReceiveBudgetBytes"/>, counted in buffer blocks — with every option at its default 64 KiB,
+    /// which is 1 024 messages of up to 64 bytes, 256 of 65 to 256 bytes, or 42 of 257 to 1 536 bytes. Poll cuts the
+    /// backlog to that, and a later message of a backlogged channel that does not fit drops the oldest queued one: of the
+    /// backlogged channel furthest over its fair share, which is the same channel when no other one holds more.
     /// </summary>
+    /// <remarks>
+    /// Non-zero means a channel receives traffic that nobody drains, or that is not drained empty between two Polls (a
+    /// host that polls several times per Drain, or drains with a span it fills and does not call again). Register a
+    /// handler, or drain the channel completely once per Poll — a channel that is loses nothing here, however large the
+    /// burst. A larger <see cref="PeerOptions.ReceiveBudgetBytes"/> raises the byte limit of the backlog;
+    /// <see cref="PeerOptions.ReceiveRingCapacity"/> does not raise the node limit beyond 1 024. Game thread; a total since
+    /// the peer was created.
+    /// </remarks>
     public long DrainQueueDrops;
 }
 
@@ -392,11 +401,11 @@ public struct ChannelStatistics
 
     /// <summary>
     /// Received messages of this channel dropped from its drain queue (an unreliable channel without
-    /// <c>CoalesceOnReceive</c>; always 0 for the other modes): the channel had no handler — or its messages were met by a
-    /// <see cref="QuiclyPeer.Drain"/> of another channel before the next <see cref="QuiclyPeer.Poll"/> — and the bounded
-    /// backlog of the unreliable channels was full, so the oldest queued message made room for a newer one (see
-    /// <see cref="PeerStatistics.DrainQueueDrops"/> for the limits and for which channel loses). The dropped messages are
-    /// still counted in <see cref="Received"/>. Distinct from <see cref="RingDrops"/>, which counts messages dropped on
+    /// <c>CoalesceOnReceive</c>; always 0 for the other modes, and for a channel that has always had a handler): the channel
+    /// had no handler and was left undrained across a <see cref="QuiclyPeer.Poll"/>, which made what it had queued backlog,
+    /// and the bounded backlog of the unreliable channels was full, so the oldest queued message made room for a newer one
+    /// (see <see cref="PeerStatistics.DrainQueueDrops"/> for the limits and for which channel loses). The dropped messages
+    /// are still counted in <see cref="Received"/>. Distinct from <see cref="RingDrops"/>, which counts messages dropped on
     /// arrival because the receive ring itself was full. Survives a reconnect.
     /// </summary>
     public long DrainQueueDrops;

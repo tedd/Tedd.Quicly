@@ -8,16 +8,18 @@ namespace Tedd.Quicly.Core.Tests.Review;
 
 /// <summary>
 /// Review (perf-threading lens) of fix/localhost-drops: zero-allocation checks (ADR 0008) of paths the branch added or
-/// changed that its own zero-allocation tests do not reach — a Drain that queues and evicts the messages of a channel
-/// <em>with</em> a handler, the Poll that then dispatches from the queues, datagrams the transport declares lost (counted
+/// changed that its own zero-allocation tests do not reach — a Drain that queues the messages of a channel
+/// <em>with</em> a handler next to the backlog of a channel nobody drains (which evicts, where the handled channel never
+/// does), the Poll that then dispatches from the queues, datagrams the transport declares lost (counted
 /// per channel and per peer, and retransmitted on ReliableLatest), the statistics snapshots with the new fields, and
 /// Release on a disposed peer over a shared pool.
 /// </summary>
 public class ReviewPerfthreadingZeroAllocationTests
 {
-    /// <summary>2 unordered · 6 unordered fragmenting · 8 keyed sequenced 16-bit · 12 ReliableLatest. Nothing expires.</summary>
+    /// <summary>2, 3 unordered · 6 unordered fragmenting · 8 keyed sequenced 16-bit · 12 ReliableLatest. Nothing expires.</summary>
     private static readonly ChannelTable Table = ChannelTable.Create()
         .Add(2, "a", ChannelMode.UnreliableUnordered, o => o.ExpiryMicros = 0)
+        .Add(3, "unread", ChannelMode.UnreliableUnordered, o => o.ExpiryMicros = 0)
         .Add(6, "frag", ChannelMode.UnreliableUnordered, o => { o.Fragmentation = true; o.MaxMessageSize = 4000; o.ExpiryMicros = 0; })
         .Add(8, "keyed", ChannelMode.UnreliableSequenced, o => { o.Keyed = true; o.SequenceBits = 16; o.ExpiryMicros = 0; })
         .Add(12, "state", ChannelMode.ReliableLatest, o => o.MaxKeys = 16)
@@ -58,13 +60,15 @@ public class ReviewPerfthreadingZeroAllocationTests
             }
 
             client.SendCopy(new SendHeader(12, tick & 7), small);
+            client.SendCopy(new SendHeader(3), small);
             client.SendCopy(new SendHeader(6), large);
             client.Flush(tick);
             network.Advance(2_000);
             client.Poll();
 
             // The Drain of channel 2 meets the messages of channel 8, which has a handler: they are queued for the next Poll,
-            // and because only every eighth tick polls, the unreliable backlog fills and evicts.
+            // and only every eighth tick polls. Channel 3 is never drained: what is queued for it is backlog, which evicts
+            // its oldest as the pool fills; nothing of the handled channel is ever evicted.
             int n = server.Drain(2, buffer);
             server.Release(buffer.AsSpan(0, n));
             drained += n;
@@ -101,7 +105,8 @@ public class ReviewPerfthreadingZeroAllocationTests
         Assert.True(handled > 1_000, $"{handled} handled");
         Assert.True(latest > 100, $"{latest} latest values");
         Assert.True(drained > 1_000, $"{drained} drained");
-        Assert.True(DatagramKit.ChannelStats(server, 8).DrainQueueDrops > 1_000, $"{DatagramKit.ChannelStats(server, 8).DrainQueueDrops} evictions of the handled channel");
+        Assert.Equal(0, DatagramKit.ChannelStats(server, 8).DrainQueueDrops);
+        Assert.True(DatagramKit.ChannelStats(server, 3).DrainQueueDrops > 1_000, $"{DatagramKit.ChannelStats(server, 3).DrainQueueDrops} evictions of the channel nobody drains");
         Assert.True(clientStats.DatagramsLost > 1_000, $"{clientStats.DatagramsLost} datagrams lost");
         Assert.True(DatagramKit.ChannelStats(client, 8).TransportLost > 500, "no loss counted on channel 8");
         Assert.True(DatagramKit.ChannelStats(client, 6).TransportLost > 100, "no loss counted on the fragmenting channel");

@@ -8,17 +8,19 @@ namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// What a channel without a handler costs the rest of the peer when nobody drains it (docs/design/session-layer.md §4.4
-/// "Channels without a handler", PROTOCOL.md §7). An unreliable channel keeps a bounded backlog and loses its own oldest
-/// messages, counted in <c>DrainQueueDrops</c>; it never closes the receive ring, never stops mailbox dispatch, never pins
-/// the receive budget and never keeps the host busy. A reliable channel loses nothing and therefore still holds the ring
-/// once the queue pool is full — but the mailboxes are dispatched all the same, and the unreliable channels cannot take the
-/// queue nodes reserved for it.
+/// "Channels without a handler", PROTOCOL.md §7). An unreliable channel that is left undrained across a Poll keeps a
+/// bounded backlog and loses its own oldest messages, counted in <c>DrainQueueDrops</c>; it closes the receive ring for
+/// one Poll interval at most, never stops mailbox dispatch, never pins the receive budget and never keeps the host busy.
+/// A channel that is drained every frame loses nothing the ring and the budget took, and neither does a channel with a
+/// handler whose messages a Drain of another channel met. A reliable channel loses nothing and therefore still holds the
+/// ring once the queue pool is full — but the mailboxes are dispatched all the same, and the backlog of the unreliable
+/// channels cannot keep the queue nodes reserved for it.
 /// </summary>
 /// <remarks>
 /// The server's receive ring holds 64 messages in most tests, so with the table below (four unreliable ring channels, two
-/// reliable ones) the queue pool is 64 nodes: 16 reserved for each reliable channel, 32 for the unreliable channels
-/// together, and a fair share of 8 for each of those. The client sends in batches of at most 32 with the server stepped in
-/// between, so a burst alone never fills the ring: every drop the tests see is a drain-queue drop.
+/// reliable ones) the queue pool is 64 nodes: 16 reserved for each reliable channel, 32 for the backlog of the unreliable
+/// channels together, and a fair share of 8 for each of those. The client sends in batches of at most 32 with the server
+/// stepped in between, so a burst alone never fills the ring: every drop the tests see is a drain-queue drop.
 /// </remarks>
 public class DrainBackpressureTests
 {
@@ -233,12 +235,13 @@ public class DrainBackpressureTests
     }
 
     [Fact]
-    public void Eviction_Of_A_Handled_Channel_Keeps_The_Work_Probe_Exact()
+    public void A_Drain_Of_Another_Channel_Loses_Nothing_Of_A_Handled_Channel_And_Keeps_The_Work_Probe_Exact()
     {
         // A Drain of channel 2 meets the messages of channel 3, which has a handler, and queues them for the next Poll; more
-        // of them than the backlog holds, so the oldest are evicted. The count of queued messages that a Poll still has to
-        // dispatch must follow the evictions, or HasPendingWork stays set for good and a host that polls while there is work
-        // never sleeps again.
+        // of them than the pool holds (64), so the next one is held and the rest stay in the ring. Nothing of a handled
+        // channel is evicted: the Poll dispatches the queue, the held message and the ring, in order. The count of queued
+        // messages that a Poll still has to dispatch must be exact afterwards, or HasPendingWork stays set for good and a
+        // host that polls while there is work never sleeps again.
         using SessionHarness h = Harness();
         QuiclyPeer server = h.Server!;
         List<int> handled = [];
@@ -247,14 +250,235 @@ public class DrainBackpressureTests
 
         Deliver(h, 3, 0, 100, () => Assert.Equal(0, server.Drain(2, buffer)));
         Assert.True(server.HasPendingWork, "queued messages of a handled channel are work for the next Poll");
+        Assert.Equal(0, DatagramKit.Statistics(server).ReceiveRingDrops);
 
         server.Poll();
         server.Flush();
 
-        Assert.Equal(Enumerable.Range(100 - DatagramNodes, DatagramNodes), handled);
-        Assert.Equal(100 - DatagramNodes, Channel(server, 3).DrainQueueDrops);
+        Assert.Equal(Enumerable.Range(0, 100), handled);
+        Assert.Equal(0, Channel(server, 3).DrainQueueDrops);
         Assert.False(server.HasPendingWork, "the peer reports work although every queue is empty");
         Assert.Equal(0, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void A_Handled_Channel_Met_By_A_Drain_Takes_Its_Room_From_The_Backlog_Nobody_Drains()
+    {
+        // Channel 2 is never drained and keeps its backlog of 32; channel 10 (reliable, no handler) holds the other 32
+        // nodes. A Drain of channel 6 then meets 20 messages of channel 3, which has a handler: there is no free node, so
+        // each one evicts the oldest message of the backlog nobody drains — never a message of the handled channel, and
+        // nothing is held.
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        List<int> handled = [];
+        server.RegisterHandler(3, CollectIndices(handled));
+        ReceivedMessage[] buffer = new ReceivedMessage[4];
+
+        Deliver(h, 2, 0, 64, () => server.Poll());
+        for (int i = 0; i < 32; i++)
+        {
+            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
+        }
+
+        Assert.True(h.RunUntil(() => Channel(server, 10).Received == 32), "the reliable messages did not arrive");
+        server.Poll();
+        Assert.Equal(32, Channel(server, 2).DrainQueueDrops);
+
+        Deliver(h, 3, 0, 20, () => Assert.Equal(0, server.Drain(6, buffer)));
+        server.Poll();
+
+        Assert.Equal(Enumerable.Range(0, 20), handled);
+        Assert.Equal(0, Channel(server, 3).DrainQueueDrops);
+        Assert.Equal(32 + 20, Channel(server, 2).DrainQueueDrops);
+        Assert.Equal(Enumerable.Range(64 - 12, 12), DrainAll(server, 2));
+        Assert.Equal(Enumerable.Range(0, 32), DrainAll(server, 10));
+    }
+
+    // ------------------------------------------------------------------ a channel that is drained loses nothing
+
+    [Fact]
+    public void A_Burst_Larger_Than_The_Pool_Survives_Poll_Then_Drain()
+    {
+        // 600 messages in one frame on a channel that is drained after every Poll: more than the 512 nodes the backlog may
+        // keep, more than fits next to a reliable channel's backlog. They are queued while a node is free, the next one is
+        // held, the rest stay in the ring, and the Drain takes all three in order. Nothing is evicted: the channel had
+        // nothing queued when the Poll began.
+        using SessionHarness h = Harness(ring: 4096);
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        for (int i = 0; i < 600; i++)
+        {
+            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
+        }
+
+        Assert.True(h.RunUntil(() => Channel(server, 10).Received == 600), "the reliable messages did not arrive");
+        for (int frame = 0; frame < 3; frame++)
+        {
+            Deliver(h, 2, frame * 600, 600, () => { });
+            server.Poll();
+            Assert.True(server.HasPendingWork, "a held message is work until the Drain");
+            Assert.Equal(Enumerable.Range(frame * 600, 600), DrainAll(server, 2));
+        }
+
+        Assert.Equal(0, Channel(server, 2).DrainQueueDrops);
+        Assert.Equal(0, DatagramKit.Statistics(server).ReceiveRingDrops);
+        Assert.Equal(Enumerable.Range(0, 600), DrainAll(server, 10));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_Channel_Drained_Every_Frame_Loses_Nothing_Whatever_The_Order_Of_Poll_And_Drain(bool pollBetween)
+    {
+        // Channels 2 and 3 are both drained every frame, 400 messages of 100 bytes each per frame (102 KiB of blocks each,
+        // far more than the 64 KiB a backlog may pin). Drain(2) walks the ring and queues channel 3's messages; whether the
+        // Poll comes before both drains or between them, channel 3 was drained empty in the frame before, so what is
+        // queued for it when the Poll begins is not backlog.
+        using SessionHarness h = Harness(ring: 4096);
+        QuiclyPeer server = h.Server!;
+
+        // The frame before the first burst: the host has been running, and drained both channels after its last Poll.
+        server.Poll();
+        Assert.Empty(DrainAll(server, 2));
+        Assert.Empty(DrainAll(server, 3));
+        for (int frame = 0; frame < 4; frame++)
+        {
+            Deliver(h, 3, frame * 400, 400, () => { }, size: 100);
+            Deliver(h, 2, frame * 400, 400, () => { }, size: 100);
+            if (!pollBetween)
+            {
+                server.Poll();
+            }
+
+            Assert.Equal(Enumerable.Range(frame * 400, 400), DrainAll(server, 2));
+            if (pollBetween)
+            {
+                server.Poll();
+            }
+
+            Assert.Equal(Enumerable.Range(frame * 400, 400), DrainAll(server, 3));
+            server.Flush();
+        }
+
+        Assert.Equal(0, DatagramKit.Statistics(server).DrainQueueDrops);
+        Assert.Equal(0, DatagramKit.Statistics(server).ReceiveRingDrops);
+        Assert.Equal(0, DatagramKit.Statistics(server).OutOfReceiveBuffers);
+    }
+
+    // ------------------------------------------------------------------ a channel that is not drained: one Poll interval
+
+    [Fact]
+    public void A_Backlog_That_Survives_A_Poll_Is_Cut_To_Its_Limits()
+    {
+        // 400 messages of 100 bytes (256-byte blocks: 102 400 bytes) arrive in one frame and are queued by the Poll. Nobody
+        // drains, so the next Poll makes them backlog and cuts it to a quarter of the receive budget (64 KiB: 256 of those
+        // blocks), oldest first. A consumer that comes back gets the newest 256, in order.
+        using SessionHarness h = Harness(ring: 4096);
+        QuiclyPeer server = h.Server!;
+
+        Deliver(h, 2, 0, 400, () => { }, size: 100);
+        server.Poll();
+        Assert.Equal(0, Channel(server, 2).DrainQueueDrops);
+        Assert.Equal(400 * 256, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+
+        server.Poll();
+
+        Assert.Equal(144, Channel(server, 2).DrainQueueDrops);
+        Assert.Equal(144, DatagramKit.Statistics(server).DrainQueueDrops);
+        Assert.Equal(65_536, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+        Assert.Equal(Enumerable.Range(144, 256), DrainAll(server, 2));
+    }
+
+    [Fact]
+    public void An_Undrained_Unreliable_Channel_Holds_The_Ring_For_One_Poll_Interval_At_Most()
+    {
+        // Channel 10 (reliable, no handler, not drained) has 40 of the 64 nodes. A burst of 56 on channel 2 then finds 24
+        // free: the 25th is held — the channel might be drained in this frame — and the ring stays closed behind it. It
+        // is not drained, so the next Poll makes its queue backlog: the held message and the rest of the ring are queued by
+        // evicting the channel's own oldest, the ring is open again, and a handled channel behind the burst is served.
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        List<int> handled = [];
+        server.RegisterHandler(3, CollectIndices(handled));
+        for (int i = 0; i < 40; i++)
+        {
+            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
+        }
+
+        Assert.True(h.RunUntil(() => Channel(server, 10).Received == 40), "the reliable messages did not arrive");
+        server.Poll();
+
+        Deliver(h, 2, 0, 56, () => { });
+        Deliver(h, 3, 0, 4, () => { });
+        server.Poll();
+        Assert.Empty(handled);
+        Assert.Equal(0, Channel(server, 2).DrainQueueDrops);
+        Assert.True(server.HasPendingWork, "a held message is work for the next Poll");
+
+        server.Poll();
+        server.Flush();
+
+        Assert.Equal(Enumerable.Range(0, 4), handled);
+        Assert.Equal(32, Channel(server, 2).DrainQueueDrops);
+        Assert.Equal(0, DatagramKit.Statistics(server).ReceiveRingDrops);
+        Assert.False(server.HasPendingWork, "a channel nobody drains keeps the peer reporting work");
+        Assert.Equal(Enumerable.Range(32, 24), DrainAll(server, 2));
+        Assert.Equal(Enumerable.Range(0, 40), DrainAll(server, 10));
+    }
+
+    [Fact]
+    public void A_Poll_That_Dispatches_Nothing_Still_Ends_The_Hold_Of_An_Undrained_Channel()
+    {
+        // The same hold, and a host that polls with maxItems 0: the held message of a channel without a handler is not a
+        // dispatch, so the limit must not keep it — and the ring behind it — waiting.
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        for (int i = 0; i < 40; i++)
+        {
+            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
+        }
+
+        Assert.True(h.RunUntil(() => Channel(server, 10).Received == 40), "the reliable messages did not arrive");
+        server.Poll();
+        Deliver(h, 2, 0, 25, () => { });
+        server.Poll();
+        Assert.Equal(0, Channel(server, 2).DrainQueueDrops);
+
+        server.Poll(0);
+
+        Assert.Equal(1, Channel(server, 2).DrainQueueDrops);
+        Assert.Equal(Enumerable.Range(1, 24), DrainAll(server, 2));
+    }
+
+    [Fact]
+    public void A_Backlog_Cut_At_The_Pass_Start_Frees_The_Nodes_Reserved_For_Reliable_Channels()
+    {
+        // A burst of 60 on channel 2 takes 60 of the 64 nodes in one pass (a channel that might be drained this frame
+        // may borrow the reserved ones). It is not drained. The next Poll cuts the backlog to its 32 nodes before anything
+        // else, so 32 reliable messages that arrive then are queued, not held.
+        using SessionHarness h = Harness();
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+
+        Deliver(h, 2, 0, 60, () => { });
+        server.Poll();
+        Assert.Equal(0, Channel(server, 2).DrainQueueDrops);
+        for (int i = 0; i < 32; i++)
+        {
+            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
+        }
+
+        Assert.True(h.RunUntil(() => Channel(server, 10).Received == 32), "the reliable messages did not arrive");
+        server.Poll();
+        server.Flush();
+
+        Assert.Equal(28, Channel(server, 2).DrainQueueDrops);
+        Assert.False(server.HasPendingWork, "a reliable message is held although its reserved nodes are free");
+        Assert.Equal(Enumerable.Range(0, 32), DrainAll(server, 10));
+        Assert.Equal(Enumerable.Range(28, 32), DrainAll(server, 2));
     }
 
     [Fact]
@@ -388,120 +612,235 @@ public class DrainBackpressureTests
     }
 
     [Fact]
-    public void ReceiveQueues_Evicts_From_The_Longest_Queue()
+    public void ReceiveQueues_Keep_A_Backlog_Within_Its_Limits_And_Evict_From_The_Longest_Queue()
     {
         using SessionHarness h = new(connect: false);
         PeerCore core = h.Client.Core;
         byte d = ReceiveQueueClass.Datagram;
 
-        // Channels 0-2 unreliable, 3 reliable. 8 nodes: 2 reserved for the reliable channel, 6 for the unreliable ones,
-        // a fair share of 2 each; 1 024 bytes for the unreliable ones, a fair share of 256 each.
+        // Channels 0-2 unreliable, 3 reliable. 8 nodes: 2 reserved for the reliable channel, 6 for the backlog of the
+        // unreliable ones, a fair share of 2 each; 1 024 bytes of backlog, a fair share of 256 each.
         using ReceiveQueues queues = new(new ReceiveQueueLayout(8, 2, 6, 1024, 2, 256), [d, d, d, ReceiveQueueClass.Reliable]);
-        Assert.True(queues.IsEvicting(0));
-        Assert.False(queues.IsEvicting(3));
+        Assert.True(queues.IsDatagram(0));
+        Assert.False(queues.IsDatagram(3));
 
-        // One channel alone may use the whole unreliable share; past it, it loses its own oldest.
+        // Queued in one pass and left there: backlog from the next pass on. Past the limit it loses its own oldest.
         for (uint i = 1; i <= 6; i++)
         {
-            Assert.True(queues.AppendEvicting(0, Entry(core, i), core));
+            Assert.True(queues.TryAppendDatagram(0, Entry(core, i), core, mayHold: true));
         }
 
+        Assert.False(queues.IsBacklogged(0));
+        queues.BeginPass(core);
+        queues.BeginPass(core);
+        Assert.True(queues.IsBacklogged(0));
+        Assert.Equal(6, queues.BacklogNodes);
         Assert.Equal(0, queues.Drops(0));
-        Assert.True(queues.AppendEvicting(0, Entry(core, 7), core));
+        Assert.True(queues.TryAppendDatagram(0, Entry(core, 7), core, mayHold: true));
         Assert.Equal(1, queues.Drops(0));
         Assert.Equal(6, queues.Count(0));
         Assert.Equal(6, queues.Used);
 
-        // A channel under its share takes its room from the longest queue, not from itself...
-        Assert.True(queues.AppendEvicting(1, Entry(core, 100), core));
-        Assert.True(queues.AppendEvicting(1, Entry(core, 101), core));
-        Assert.Equal(3, queues.Drops(0));
+        // A channel that is not backlog uses the free nodes, outside the limit...
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 100), core, mayHold: true));
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 101), core, mayHold: true));
+        Assert.Equal(1, queues.Drops(0));
+        Assert.Equal(8, queues.Used);
+
+        // ...and with the pool full it takes its room from the backlog, not from itself.
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 102), core, mayHold: true));
+        Assert.Equal(2, queues.Drops(0));
         Assert.Equal(0, queues.Drops(1));
-        Assert.Equal(4, queues.Count(0));
+        Assert.Equal(5, queues.Count(0));
+        Assert.Equal(3, queues.Count(1));
 
-        // ...and once it is at its share, from its own.
-        Assert.True(queues.AppendEvicting(1, Entry(core, 102), core));
+        // Two passes later it is backlog too (nobody drained it), and the backlog of both is cut to the six nodes at once,
+        // from the channel with the most.
+        queues.BeginPass(core);
+        queues.BeginPass(core);
+        Assert.True(queues.IsBacklogged(1));
+        Assert.Equal(6, queues.BacklogNodes);
+        Assert.Equal(4, queues.Drops(0));
+        Assert.Equal(0, queues.Drops(1));
+        Assert.Equal(3, queues.Count(0));
+
+        // A backlogged channel at its share, and no other one larger: its own oldest goes.
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 103), core, mayHold: true));
         Assert.Equal(1, queues.Drops(1));
-        Assert.Equal(3, queues.Drops(0));
-        Assert.Equal(2, queues.Count(1));
+        Assert.Equal(4, queues.Drops(0));
 
-        // The reserved nodes are still free for the reliable channel, which is never evicted...
+        // A backlogged channel under its share takes its room from the one that is further over — the fix for a channel
+        // that evicted its own messages at its even share while another one held several times as much — and from itself
+        // again once it is the largest.
+        queues.BeginPass(core);
+        Assert.Equal(5u, Take(queues, core, 0));
+        Assert.Equal(6u, Take(queues, core, 0));
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 104), core, mayHold: true));
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 105), core, mayHold: true));
+        Assert.Equal(6, queues.BacklogNodes);
+        Assert.Equal(5, queues.Count(1));
+        Assert.True(queues.TryAppendDatagram(0, Entry(core, 8), core, mayHold: true));
+        Assert.True(queues.TryAppendDatagram(0, Entry(core, 9), core, mayHold: true));
+        Assert.Equal(4, queues.Drops(0));
+        Assert.Equal(3, queues.Drops(1));
+        Assert.True(queues.TryAppendDatagram(0, Entry(core, 10), core, mayHold: true));
+        Assert.Equal(5, queues.Drops(0));
+        Assert.Equal(3, queues.Drops(1));
+
+        // The reserved nodes are still free for the reliable channel, which is never evicted.
         Assert.True(queues.TryAppend(3, Entry(core, 200)));
         Assert.True(queues.TryAppend(3, Entry(core, 201)));
         Assert.Equal(8, queues.Used);
         Assert.False(queues.TryAppend(3, default));
+        Assert.Equal(8, core.Counters.DrainQueueDrops);
 
-        // ...and the unreliable channels keep evicting among themselves with the pool full.
-        Assert.True(queues.AppendEvicting(2, Entry(core, 300), core));
-        Assert.Equal(4, queues.Drops(0));
-        Assert.Equal(2, queues.Count(3));
-        Assert.Equal(5, core.Counters.DrainQueueDrops);
-
-        // Oldest first: channel 0 kept its newest three, channel 1 its newest two.
-        Assert.Equal(5u, Take(queues, core, 0));
-        Assert.Equal(6u, Take(queues, core, 0));
-        Assert.Equal(7u, Take(queues, core, 0));
-        Assert.Equal(101u, Take(queues, core, 1));
-        Assert.Equal(102u, Take(queues, core, 1));
-        Assert.Equal(300u, Take(queues, core, 2));
+        // Oldest first.
+        Assert.Equal(8u, Take(queues, core, 0));
+        Assert.Equal(9u, Take(queues, core, 0));
+        Assert.Equal(10u, Take(queues, core, 0));
+        Assert.False(queues.IsBacklogged(0));
+        Assert.Equal(103u, Take(queues, core, 1));
+        Assert.Equal(104u, Take(queues, core, 1));
+        Assert.Equal(105u, Take(queues, core, 1));
         Assert.Equal(200u, Take(queues, core, 3));
         Assert.Equal(201u, Take(queues, core, 3));
         Assert.Equal(0, queues.Used);
+        Assert.Equal(0, queues.BacklogNodes);
         Assert.Equal(0, core.ReceiveBytesOutstanding);
     }
 
     [Fact]
-    public void ReceiveQueues_Bounds_The_Bytes_Of_Unreliable_Channels()
+    public void ReceiveQueues_Bound_The_Bytes_Of_A_Backlog()
     {
         using SessionHarness h = new(connect: false);
         PeerCore core = h.Client.Core;
         byte d = ReceiveQueueClass.Datagram;
 
-        // Plenty of nodes; 1 024 bytes, a fair share of 512 per channel. The blocks are 256 bytes (a 100-byte message).
+        // Plenty of nodes; 1 024 bytes of backlog, a fair share of 512 per channel. The blocks are 256 bytes (a 100-byte
+        // message).
         using ReceiveQueues queues = new(new ReceiveQueueLayout(64, 0, 64, 1024, 32, 512), [d, d]);
-        for (uint i = 1; i <= 4; i++)
+
+        // In the pass that queues them there is no byte limit: they were charged to the budget when they arrived.
+        for (uint i = 1; i <= 5; i++)
         {
-            Assert.True(queues.AppendEvicting(0, Entry(core, i, 100), core));
+            Assert.True(queues.TryAppendDatagram(0, Entry(core, i, 100), core, mayHold: true));
         }
 
-        Assert.Equal(1024, queues.Bytes(0));
+        Assert.Equal(1280, queues.Bytes(0));
         Assert.Equal(0, queues.Drops(0));
 
-        // Byte pressure, the appender over its byte share: its own oldest goes.
-        Assert.True(queues.AppendEvicting(0, Entry(core, 5, 100), core));
+        // Not drained through a whole pass: backlog, cut to the limit where the next pass starts.
+        queues.BeginPass(core);
+        Assert.Equal(0, queues.Drops(0));
+        queues.BeginPass(core);
         Assert.Equal(1, queues.Drops(0));
+        Assert.Equal(1024, queues.BacklogBytes);
+
+        // Byte pressure, the appender over its byte share: its own oldest goes.
+        Assert.True(queues.TryAppendDatagram(0, Entry(core, 6, 100), core, mayHold: true));
+        Assert.Equal(2, queues.Drops(0));
         Assert.Equal(1024, queues.Bytes(0));
 
-        // Byte pressure, the appender under its share: the channel that pins the most bytes loses.
-        Assert.True(queues.AppendEvicting(1, Entry(core, 100, 100), core));
-        Assert.Equal(2, queues.Drops(0));
+        // The other channel becomes backlog as well; under its share, it takes its room from the one that pins the most.
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 100, 100), core, mayHold: true));
+        queues.BeginPass(core);
+        queues.BeginPass(core);
+        Assert.True(queues.IsBacklogged(1));
+        Assert.Equal(3, queues.Drops(0));
         Assert.Equal(0, queues.Drops(1));
-        Assert.Equal(768, queues.Bytes(0));
-        Assert.Equal(256, queues.Bytes(1));
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 101, 100), core, mayHold: true));
+        Assert.Equal(4, queues.Drops(0));
+        Assert.Equal(0, queues.Drops(1));
+        Assert.Equal(512, queues.Bytes(0));
+        Assert.Equal(512, queues.Bytes(1));
 
-        // One message larger than the whole byte limit empties the class and is then taken: a single message always fits.
-        Assert.True(queues.AppendEvicting(1, Entry(core, 101, 1500), core));
+        // One message larger than the whole byte limit empties the backlog and is then taken: a single message always fits.
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 102, 1500), core, mayHold: true));
         Assert.Equal(1, queues.Used);
-        Assert.Equal(5, queues.Drops(0));
-        Assert.Equal(1, queues.Drops(1));
+        Assert.Equal(6, queues.Drops(0));
+        Assert.Equal(2, queues.Drops(1));
         Assert.Equal(1536, queues.Bytes(1));
-        Assert.Equal(101u, Take(queues, core, 1));
+        Assert.Equal(1536, queues.BacklogBytes);
+        queues.BeginPass(core);
+        Assert.Equal(1, queues.Used);
+        Assert.Equal(102u, Take(queues, core, 1));
         Assert.Equal(0, core.ReceiveBytesOutstanding);
     }
 
     [Fact]
-    public void ReceiveQueues_Drops_The_New_Message_When_Nothing_Can_Be_Evicted()
+    public void ReceiveQueues_A_Drained_Channel_Is_Not_Backlog()
+    {
+        using SessionHarness h = new(connect: false);
+        PeerCore core = h.Client.Core;
+        byte d = ReceiveQueueClass.Datagram;
+        using ReceiveQueues queues = new(new ReceiveQueueLayout(8, 0, 8, 1024, 4, 512), [d, d]);
+
+        // Queued and drained empty in the same pass, then queued again (a Drain of the other channel met its messages):
+        // the next pass start does not make that backlog, because the application had drained the channel.
+        queues.BeginPass(core);
+        Assert.True(queues.TryAppendDatagram(0, Entry(core, 1), core, mayHold: true));
+        Assert.Equal(1u, Take(queues, core, 0));
+        for (uint i = 2; i <= 9; i++)
+        {
+            Assert.True(queues.TryAppendDatagram(0, Entry(core, i), core, mayHold: true));
+        }
+
+        queues.BeginPass(core);
+        Assert.False(queues.IsBacklogged(0));
+
+        // The pool is full of its messages and nothing is backlog: the caller holds the next one, whichever channel's.
+        Assert.False(queues.TryAppendDatagram(0, default, core, mayHold: true));
+        Assert.False(queues.TryAppendDatagram(1, default, core, mayHold: true));
+        Assert.Equal(0, core.Counters.DrainQueueDrops);
+
+        // A take that finds the queue empty counts as a drain too.
+        Assert.False(queues.TryTake(1, out _));
+        Assert.True(queues.TryTake(0, out ReceiveEntry taken));
+        core.ReturnReceive(in taken.Lease);
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 100), core, mayHold: true));
+        queues.BeginPass(core);
+        Assert.False(queues.IsBacklogged(1));
+
+        // Channel 0 was not drained empty in that pass: backlog now, and a message that was held across the pass start
+        // (mayHold false) evicts its oldest.
+        Assert.True(queues.IsBacklogged(0));
+        Assert.Equal(7, queues.BacklogNodes);
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 101), core, mayHold: false));
+        Assert.Equal(1, queues.Drops(0));
+
+        // Drained empty, the channel stops being backlog at once.
+        while (queues.TryTake(0, out taken))
+        {
+            core.ReturnReceive(in taken.Lease);
+        }
+
+        Assert.False(queues.IsBacklogged(0));
+        Assert.Equal(0, queues.BacklogNodes);
+        queues.ReleaseAll(core);
+        Assert.Equal(0, core.ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void ReceiveQueues_Hold_Or_Drop_The_New_Message_When_Nothing_Can_Be_Evicted()
     {
         using SessionHarness h = new(connect: false);
         PeerCore core = h.Client.Core;
 
-        // The whole pool is taken by a channel that is never evicted (more than its reservation: a handled reliable
-        // channel met by a Drain of another channel can do that).
+        // The whole pool is taken by a channel that is never evicted (more than its reservation: a reliable backlog may
+        // take every free node).
         using ReceiveQueues queues = new(new ReceiveQueueLayout(2, 1, 1, 1024, 1, 1024), [ReceiveQueueClass.Datagram, ReceiveQueueClass.Reliable]);
         Assert.True(queues.TryAppend(1, Entry(core, 1)));
         Assert.True(queues.TryAppend(1, Entry(core, 2)));
 
-        Assert.False(queues.AppendEvicting(0, Entry(core, 3), core));
+        // The caller holds it for the rest of the pass: the application may drain the reliable channel in this frame.
+        ReceiveEntry entry = Entry(core, 3);
+        Assert.False(queues.TryAppendDatagram(0, in entry, core, mayHold: true));
+        Assert.Equal(0, queues.Drops(0));
+        Assert.Equal(0, core.Counters.DrainQueueDrops);
+
+        // Held across a pass start and still no room: an unreliable message is not held a second time.
+        queues.BeginPass(core);
+        Assert.True(queues.TryAppendDatagram(0, in entry, core, mayHold: false));
 
         Assert.Equal(1, queues.Drops(0));
         Assert.Equal(0, queues.Drops(1));
@@ -513,42 +852,69 @@ public class DrainBackpressureTests
     }
 
     [Fact]
-    public void ReceiveQueues_Count_What_A_Poll_Has_To_Dispatch()
+    public void ReceiveQueues_Count_What_A_Poll_Has_To_Dispatch_And_Never_Evict_A_Handled_Channel()
     {
         using SessionHarness h = new(connect: false);
         PeerCore core = h.Client.Core;
         byte d = ReceiveQueueClass.Datagram;
         using ReceiveQueues queues = new(new ReceiveQueueLayout(4, 0, 4, 1024, 2, 512), [d, d]);
 
-        Assert.True(queues.AppendEvicting(0, Entry(core, 1), core));
-        Assert.True(queues.AppendEvicting(0, Entry(core, 2), core));
+        Assert.True(queues.TryAppendDatagram(0, Entry(core, 1), core, mayHold: true));
+        Assert.True(queues.TryAppendDatagram(0, Entry(core, 2), core, mayHold: true));
         Assert.Equal(0, queues.QueuedHandled);
 
         queues.SetHandled(0, true);
         queues.SetHandled(0, true);
         Assert.Equal(2, queues.QueuedHandled);
-        Assert.True(queues.AppendEvicting(0, Entry(core, 3), core));
-        Assert.True(queues.AppendEvicting(0, Entry(core, 4), core));
+        Assert.True(queues.TryAppendDatagram(0, Entry(core, 3), core, mayHold: true));
+        Assert.True(queues.TryAppendDatagram(0, Entry(core, 4), core, mayHold: true));
         Assert.Equal(4, queues.QueuedHandled);
 
-        // Evictions of the handled channel — its own, and one forced by the other channel — are not left in the count.
-        Assert.True(queues.AppendEvicting(0, Entry(core, 5), core));
+        // The pool is full of the handled channel's messages. Its next one is held, whatever the caller allows; a message
+        // of the other channel is held, or dropped itself — never at the handled channel's cost. A pass start changes
+        // nothing: a handled channel is no backlog.
+        queues.BeginPass(core);
+        queues.BeginPass(core);
+        Assert.False(queues.IsBacklogged(0));
+        Assert.False(queues.TryAppendDatagram(0, default, core, mayHold: true));
+        Assert.False(queues.TryAppendDatagram(0, default, core, mayHold: false));
+        Assert.False(queues.TryAppendDatagram(1, default, core, mayHold: true));
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 100), core, mayHold: false));
+        Assert.Equal(1, queues.Drops(1));
+        Assert.Equal(0, queues.Drops(0));
         Assert.Equal(4, queues.QueuedHandled);
-        Assert.True(queues.AppendEvicting(1, Entry(core, 100), core));
+
+        // With a backlog of the other channel in the pool, the handled channel takes its room from there.
+        Assert.Equal(1u, Take(queues, core, 0));
+        Assert.Equal(2u, Take(queues, core, 0));
+        Assert.Equal(2, queues.QueuedHandled);
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 101), core, mayHold: true));
+        Assert.True(queues.TryAppendDatagram(1, Entry(core, 102), core, mayHold: true));
+        queues.BeginPass(core);
+        queues.BeginPass(core);
+        Assert.True(queues.IsBacklogged(1));
+        Assert.True(queues.TryAppendDatagram(0, Entry(core, 5), core, mayHold: true));
         Assert.Equal(3, queues.QueuedHandled);
-        Assert.Equal(2, queues.Drops(0));
+        Assert.Equal(2, queues.Drops(1));
+        Assert.Equal(0, queues.Drops(0));
+        Assert.Equal(1, queues.BacklogNodes);
 
         Assert.Equal(3u, Take(queues, core, 0));
         Assert.Equal(2, queues.QueuedHandled);
         queues.SetHandled(0, false);
         Assert.Equal(0, queues.QueuedHandled);
+
+        // A channel that gets a handler stops being backlog: the next Poll dispatches what it has queued.
         queues.SetHandled(1, true);
         Assert.Equal(1, queues.QueuedHandled);
+        Assert.False(queues.IsBacklogged(1));
+        Assert.Equal(0, queues.BacklogNodes);
+        Assert.Equal(0, queues.BacklogBytes);
 
         queues.ReleaseAll(core);
         Assert.Equal(0, queues.QueuedHandled);
         Assert.Equal(0, queues.Used);
-        Assert.Equal(2, queues.Drops(0));
+        Assert.Equal(2, queues.Drops(1));
         Assert.Equal(0, core.ReceiveBytesOutstanding);
     }
 

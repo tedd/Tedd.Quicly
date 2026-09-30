@@ -115,8 +115,9 @@ internal sealed class PeerCounters
     public long DecodeFailures;
 
     /// <summary>
-    /// Messages of unreliable channels dropped from the drain queues to make room for newer ones, or refused because the
-    /// pool held nothing that could be evicted (<see cref="ReceiveQueues.AppendEvicting"/>). Game thread, in <c>Poll</c> and
+    /// Messages of unreliable channels dropped from the backlog of the drain queues to make room for newer ones, or refused
+    /// because the pool held nothing that could be evicted (<see cref="ReceiveQueues.TryAppendDatagram"/>,
+    /// <see cref="ReceiveQueues.BeginPass"/>). Game thread, in <c>Poll</c> and
     /// <c>Drain</c> — deliberately not <see cref="ReceiveRingDrops"/>, which is the transport thread's.
     /// </summary>
     public long DrainQueueDrops;

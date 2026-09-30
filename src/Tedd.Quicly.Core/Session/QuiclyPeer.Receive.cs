@@ -840,9 +840,13 @@ public sealed unsafe partial class QuiclyPeer
 
                             record.WaitsForCredit = true;
                         }
-                        else
+                        else if (!_core.NotePendedStream(id, context.Header.Length))
                         {
-                            _core.NotePendedStream(id);
+                            // The ring of held streams is full, many times over, of streams the peer reset while they
+                            // were held: this one would never be resumed. No sender of this library does that.
+                            NotifyEngineClosed(ref record, id, aborted: true, (ulong)QuiclyErrorCode.LimitExceeded);
+                            RequestLocalClose(QuiclyErrorCode.LimitExceeded);
+                            return ReceiveResult.Consumed(total);
                         }
 
                         return ReceiveResult.PendingAfter(consumed + before);

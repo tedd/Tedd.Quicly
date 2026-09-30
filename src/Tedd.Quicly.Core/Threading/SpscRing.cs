@@ -184,6 +184,30 @@ public sealed unsafe class SpscRing<T> : IDisposable where T : unmanaged
         return true;
     }
 
+    /// <summary>Copies the oldest element without removing it. Consumer thread only.</summary>
+    /// <param name="item">
+    /// Receives a copy of the element. <b>Undefined when the call returns <see langword="false"/></b>, as for
+    /// <see cref="TryDequeue"/>.
+    /// </param>
+    /// <returns><see langword="false"/> when the ring is empty.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryPeek([MaybeNullWhen(false)] out T item)
+    {
+        long head = _idx.Head;
+        if (head == _idx.CachedTail)
+        {
+            _idx.CachedTail = Volatile.Read(ref _idx.Tail);
+            if (head == _idx.CachedTail)
+            {
+                Unsafe.SkipInit(out item);
+                return false;
+            }
+        }
+
+        item = _slots[(int)(head & _mask)];
+        return true;
+    }
+
     /// <summary>Frees the native element buffer. Safe to call more than once; must not race with element access.</summary>
     public void Dispose() => _buffer.Dispose();
 }

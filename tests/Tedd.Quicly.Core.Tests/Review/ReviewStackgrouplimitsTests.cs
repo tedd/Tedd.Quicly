@@ -164,9 +164,11 @@ public class ReviewStackgrouplimitsTests
                 AdvanceNetworkOnly(h, 3_000);
             }
 
-            if (server.Core.PendedStreams.Count == pendedCapacity)
+            if (server.Core.PendedStreams.Count == pendedCapacity || frames == 60)
             {
                 // A live group, held back like the others; the host polls it at the next frame as ever (RunUntil below).
+                // (As fixed, a Poll lets go of the entries beyond what the live streams can account for, so the ring no
+                // longer grows from frame to frame and never fills: the live group comes after 60 frames of churn.)
                 Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStream(Groups, group++, Payload(7_777)), out _, fin: true));
                 AdvanceNetworkOnly(h, 3_000);
                 break;
@@ -178,7 +180,8 @@ public class ReviewStackgrouplimitsTests
             server.Flush();
         }
 
-        Assert.True(frames <= 60, $"precondition: the pended-stream ring never filled (it holds {server.Core.PendedStreams.Count} of {pendedCapacity}; CallbackFaults {faults})");
+        Assert.True(frames <= 60, $"the live group was never sent (the ring holds {server.Core.PendedStreams.Count} of {pendedCapacity}; CallbackFaults {faults})");
+        Assert.True(server.Core.PendedStreams.Count <= pendedCapacity, $"the pended-stream ring grew from frame to frame: {server.Core.PendedStreams.Count} entries");
 
         // The peer stops; the host goes on polling every frame.
         bool done = h.RunUntil(() => received.Contains(7_777) || server.State != PeerState.Connected, 3_000_000);

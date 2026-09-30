@@ -346,8 +346,9 @@ public class ReviewGroup2SwapTests
     }
 
     /// <summary>
-    /// The numbers ADR 0009 and ARCHITECTURE.md give for a client at the default MsQuic grant: a ring of 2 048 ids of 8
-    /// bytes (16 KiB) for a capacity of 1 024, and 1 MiB at the most the option allows.
+    /// The numbers ADR 0009 and ARCHITECTURE.md give for a client that grants 1 024 streams: a ring of 2 048 entries of 12
+    /// bytes (an id and the block the stream waits for; 24 KiB) for a capacity of 1 024, and 1.5 MiB at the most the
+    /// option allows. (Written for 8-byte ids; the entry grew by the block size in the third review round, GR3-2.)
     /// </summary>
     [Fact]
     public void The_Pended_Stream_Ring_Costs_What_The_Documents_Say()
@@ -355,12 +356,12 @@ public class ReviewGroup2SwapTests
         using SessionHarness h = new(table: TestTables.Plumbing);
         PeerCore core = h.Server!.Core;
         core.SetTransportPeerStreams(1024);
-        Assert.Equal(16 * 1024, core.PendedStreams.ByteLength);
+        Assert.Equal(24 * 1024, core.PendedStreams.ByteLength);
         core.SetTransportPeerStreams(4096);
-        Assert.Equal(64 * 1024, core.PendedStreams.ByteLength);
+        Assert.Equal(96 * 1024, core.PendedStreams.ByteLength);
         core.SetTransportPeerStreams(int.MaxValue);
         Assert.Equal(ushort.MaxValue, core.PeerStreamCapacity);
-        Assert.Equal(1024 * 1024, core.PendedStreams.ByteLength);
+        Assert.Equal(1536 * 1024, core.PendedStreams.ByteLength);
     }
 
     /// <summary>

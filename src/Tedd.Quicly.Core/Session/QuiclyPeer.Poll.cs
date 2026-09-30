@@ -881,43 +881,102 @@ public sealed unsafe partial class QuiclyPeer
 
     /// <summary>
     /// Resumes streams whose receive was held back for the receive ring or the receive budget, oldest first, and no more
-    /// of them than the ring has free slots: a resumed stream takes at least one, or is held back again at once, so
-    /// resuming more only sends the rest round — with thousands of streams held after a long hitch, every Poll would
-    /// resume all of them to let a ring's worth through. What is left stays queued, which keeps
-    /// <see cref="HasPendingWork"/> set, and the next Poll goes on.
+    /// of them than the ring has free slots and the budget has room for: a resumed stream takes at least one slot and the
+    /// block of the message it waits with, or is held back again at once, so resuming more only sends the rest round —
+    /// with thousands of streams held after a long hitch, every Poll would resume all of them to let a ring's or a
+    /// budget's worth through. The oldest stream is resumed whenever the ring has a slot, even when its block does not fit
+    /// what the budget has free now (it is held back again and goes to the back), so one stream that cannot go on does
+    /// not keep the ones behind it waiting. What is left stays queued, which keeps <see cref="HasPendingWork"/> set, and
+    /// the next Poll goes on.
     /// </summary>
+    /// <remarks>
+    /// A stream that ended while it was held leaves its entry behind, and more entries than streams can be alive at once
+    /// are all but that many of such streams: the surplus is let go on top of the bounds, so a peer that resets held
+    /// streams cannot make the queue grow from one Poll to the next (<see cref="PeerCore.NotePendedStream"/>).
+    /// </remarks>
     private void ResumePendedStreams()
     {
         PeerCore core = _core;
         ITransport? transport = _transport;
-        SpscRing<TransportStreamId>[]? retired = core.RetiredPendedStreams;
-        SpscRing<TransportStreamId> pended = core.PendedStreams;
+        SpscRing<PendedStream>[]? retired = core.RetiredPendedStreams;
+        SpscRing<PendedStream> pended = core.PendedStreams;
         if (retired is null && pended.IsEmpty)
         {
             return;
         }
 
         SpscRing<ReceiveEntry> ring = core.ReceiveRing;
-        int budget = transport is null ? int.MaxValue : ring.Capacity - ring.Count;
+        PendedResume resume = new()
+        {
+            Slots = transport is null ? int.MaxValue : ring.Capacity - ring.Count,
+            Bytes = transport is null ? long.MaxValue : core.ReceiveBudgetBytes - core.ReceiveBytesOutstanding,
+            Surplus = pended.Count - (core.PeerStreamCapacity + 2),
+        };
+
         if (retired is not null)
         {
-            // Rings the peer's stream capacity outgrew (PeerCore.SetTransportPeerStreams): what was held before the
-            // replacement is older than anything in the current ring.
-            foreach (SpscRing<TransportStreamId> old in retired)
+            // Rings the peer's stream capacity outgrew, or that the peer's resets filled (PeerCore.ReplacePendedStreams):
+            // what was held before the replacement is older than anything in the current ring.
+            foreach (SpscRing<PendedStream> old in retired)
             {
-                while (budget > 0 && old.TryDequeue(out TransportStreamId id))
+                resume.Surplus += old.Count;
+            }
+
+            foreach (SpscRing<PendedStream> old in retired)
+            {
+                if (!ResumeFrom(old, transport, ref resume))
                 {
-                    budget--;
-                    transport?.ResumeStreamReceive(id, 0);
+                    return;
                 }
             }
         }
 
-        while (budget > 0 && pended.TryDequeue(out TransportStreamId id))
+        ResumeFrom(pended, transport, ref resume);
+    }
+
+    /// <summary>Resumes from one ring what <paramref name="resume"/> allows; <see langword="false"/> when it stopped short.</summary>
+    private static bool ResumeFrom(SpscRing<PendedStream> ring, ITransport? transport, ref PendedResume resume)
+    {
+        while (ring.TryPeek(out PendedStream stream))
         {
-            budget--;
-            transport?.ResumeStreamReceive(id, 0);
+            bool fits = resume.Slots > 0 && (!resume.Any || stream.Need <= resume.Bytes);
+            if (!fits && resume.Surplus <= 0)
+            {
+                return false;
+            }
+
+            ring.TryDequeue(out _);
+            if (fits)
+            {
+                resume.Slots--;
+                resume.Bytes -= stream.Need;
+                resume.Any = true;
+            }
+            else
+            {
+                resume.Surplus--;
+            }
+
+            transport?.ResumeStreamReceive(stream.Id, 0);
         }
+
+        return true;
+    }
+
+    /// <summary>What one <see cref="ResumePendedStreams"/> may still resume.</summary>
+    private struct PendedResume
+    {
+        /// <summary>Free slots of the receive ring.</summary>
+        public int Slots;
+
+        /// <summary>Bytes of the receive budget that are free.</summary>
+        public long Bytes;
+
+        /// <summary>Entries beyond what the streams that can be alive at once account for: let go on top of the bounds.</summary>
+        public int Surplus;
+
+        /// <summary>A stream was resumed within the bounds already.</summary>
+        public bool Any;
     }
 
     private void FinishClosed()

@@ -90,9 +90,9 @@ internal sealed unsafe class PeerCore : IDisposable
     private readonly int[] _entryOfToken;
     private readonly ReceiveMailbox?[] _mailboxByIndex;
     private ReceiveMailbox[] _mailboxes = [];
-    private SpscRing<TransportStreamId> _pendedStreams;
+    private SpscRing<PendedStream> _pendedStreams;
     // Rings SetTransportPeerStreams replaced: kept until Dispose, because the game thread may still be reading one.
-    private SpscRing<TransportStreamId>[]? _retiredPendedStreams;
+    private SpscRing<PendedStream>[]? _retiredPendedStreams;
     // Cold, by slot: the shared payload an entry holds one reference on (SendShared), released in ReleasePayload.
     private readonly SharedLeaseTable?[] _sharedTables;
     private readonly SharedLease[] _sharedLeases;
@@ -188,7 +188,7 @@ internal sealed unsafe class PeerCore : IDisposable
         _recvCounters = new NativeArray<ChannelRecvCounters>(Math.Max(1, _channels.Length));
         PeerUnidirectionalStreamLimit = ComputeUnidirectionalLimit(_channels);
         PeerStreamCapacity = PeerUnidirectionalStreamLimit;
-        _pendedStreams = new SpscRing<TransportStreamId>(PeerStreamCapacity + 2);
+        _pendedStreams = new SpscRing<PendedStream>(PeerStreamCapacity + 2);
 
         // What a reliable channel nobody reads may have waiting is what the drain queues keep for it: the nodes the layout
         // reserves per reliable channel, and an equal share of a quarter of the receive budget, counted in the pool's
@@ -657,7 +657,7 @@ internal sealed unsafe class PeerCore : IDisposable
     public SpscRing<ReceiveEntry> ReceiveRing { get; }
 
     /// <summary>Streams whose receive returned Pending, transport thread → game thread (resumed in Poll).</summary>
-    public SpscRing<TransportStreamId> PendedStreams => Volatile.Read(ref _pendedStreams);
+    public SpscRing<PendedStream> PendedStreams => Volatile.Read(ref _pendedStreams);
 
     /// <summary>
     /// The rings <see cref="SetTransportPeerStreams"/> replaced, or null when there is none (any thread; the array is
@@ -665,20 +665,20 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <see cref="QuiclyPeer.Poll"/> resumes from these as well: the replacement does not rest on the transport reporting
     /// its grant before any stream can be held.
     /// </summary>
-    public SpscRing<TransportStreamId>[]? RetiredPendedStreams => Volatile.Read(ref _retiredPendedStreams);
+    public SpscRing<PendedStream>[]? RetiredPendedStreams => Volatile.Read(ref _retiredPendedStreams);
 
     /// <summary>Whether a replaced ring still holds a stream to resume (any thread; part of the pending-work probe).</summary>
     public bool HasRetiredPendedStreams
     {
         get
         {
-            SpscRing<TransportStreamId>[]? retired = Volatile.Read(ref _retiredPendedStreams);
+            SpscRing<PendedStream>[]? retired = Volatile.Read(ref _retiredPendedStreams);
             if (retired is null)
             {
                 return false;
             }
 
-            foreach (SpscRing<TransportStreamId> ring in retired)
+            foreach (SpscRing<PendedStream> ring in retired)
             {
                 if (!ring.IsEmpty)
                 {
@@ -722,17 +722,11 @@ internal sealed unsafe class PeerCore : IDisposable
         }
 
         PeerStreamCapacity = capacity;
-        SpscRing<TransportStreamId> current = _pendedStreams;
-        if (capacity + 2 > current.Capacity)
+        if (capacity + 2 > _pendedStreams.Capacity)
         {
             // The ring that is replaced stays allocated and stays readable: the game thread may be reading it, and streams
             // held before this call are still in it (published before the new ring, so whoever sees the new one sees it).
-            SpscRing<TransportStreamId>[] retired = _retiredPendedStreams ?? [];
-            SpscRing<TransportStreamId>[] grown = new SpscRing<TransportStreamId>[retired.Length + 1];
-            retired.CopyTo(grown, 0);
-            grown[^1] = current;
-            Volatile.Write(ref _retiredPendedStreams, grown);
-            Volatile.Write(ref _pendedStreams, new SpscRing<TransportStreamId>(capacity + 2));
+            ReplacePendedStreams(capacity + 2);
         }
 
         Credit.SetStreamCapacity(capacity + 2);
@@ -1510,17 +1504,82 @@ internal sealed unsafe class PeerCore : IDisposable
     /// Remembers a stream whose receive returned <see cref="ReceiveResult.PendingAfter"/> (transport thread);
     /// <see cref="QuiclyPeer.Poll"/> calls <see cref="ITransport.ResumeStreamReceive"/> for it after draining the ring.
     /// </summary>
+    /// <remarks>
+    /// The ring is sized for every stream the peer can have open (a live stream pends once until it is resumed), but a
+    /// stream that ends while it is held leaves its entry until the game thread's next look, and its end gives the peer the
+    /// stream back at once. A peer that resets the streams this end holds and opens new ones can therefore write more
+    /// entries than it has streams. The ring grows for that, by doubling, up to <see cref="ReceiveCredit.ListGrowth"/>
+    /// times its size, as the credit list does (the rings it replaced stay readable, oldest first). A peer that gets past
+    /// that between two Polls is not one of this library's senders (none resets a stream it started on these channels).
+    /// </remarks>
     /// <param name="id">The stream.</param>
-    public void NotePendedStream(TransportStreamId id)
+    /// <param name="length">Payload length of the message the stream waits with (0 when it waits with none).</param>
+    /// <returns>
+    /// <see langword="false"/> when the stream could not be remembered, so nothing would ever resume it. The caller closes
+    /// the connection.
+    /// </returns>
+    public bool NotePendedStream(TransportStreamId id, int length)
     {
         Counters.StreamReceivePends++;
-        if (!PendedStreams.TryEnqueue(in id))
+        PendedStream pended = new() { Id = id, Need = ReceiveBlockSize(length) };
+        bool listed = _pendedStreams.TryEnqueue(in pended) || TryEnqueuePendedGrowing(in pended);
+        NoteTransportWork();
+        return listed;
+    }
+
+    /// <summary>
+    /// The pended-stream ring is full of entries the game thread has not collected (transport thread): some are of streams
+    /// that ended while they were held. Doubles the ring while it is smaller than <see cref="ReceiveCredit.ListGrowth"/>
+    /// times what the streams that can be open need.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private bool TryEnqueuePendedGrowing(in PendedStream pended)
+    {
+        long limit = (long)SpscRing<PendedStream>.RoundUpCapacity(PeerStreamCapacity + 2) * ReceiveCredit.ListGrowth;
+        SpscRing<PendedStream> current = _pendedStreams;
+        if (current.Capacity >= limit)
         {
-            // Sized to the peer's stream allowance + 2: a stream can pend only once until resumed.
-            Counters.CallbackFaults++;
+            return false;
         }
 
-        NoteTransportWork();
+        ReplacePendedStreams((int)Math.Min(limit, 2L * current.Capacity));
+        return _pendedStreams.TryEnqueue(in pended);
+    }
+
+    /// <summary>
+    /// Puts a larger ring in place of the pended-stream ring (transport thread). The ring that is replaced stays allocated
+    /// until the peer is disposed and stays readable — the game thread may be reading it, and what it holds is older than
+    /// anything the new one will — and it is published before the new one, so whoever sees the new ring sees the old one.
+    /// </summary>
+    private void ReplacePendedStreams(int capacity)
+    {
+        SpscRing<PendedStream>[] retired = _retiredPendedStreams ?? [];
+        SpscRing<PendedStream>[] grown = new SpscRing<PendedStream>[retired.Length + 1];
+        retired.CopyTo(grown, 0);
+        grown[^1] = _pendedStreams;
+        Volatile.Write(ref _retiredPendedStreams, grown);
+        Volatile.Write(ref _pendedStreams, new SpscRing<PendedStream>(capacity));
+    }
+
+    /// <summary>What a message of <paramref name="length"/> bytes takes of the receive budget: the smallest pool block that holds it.</summary>
+    /// <param name="length">Payload bytes (0 or less: none).</param>
+    public int ReceiveBlockSize(int length)
+    {
+        if (length <= 0)
+        {
+            return 0;
+        }
+
+        ReadOnlySpan<SizeClassDefinition> classes = _allocator.SizeClasses;
+        for (int i = 0; i < classes.Length; i++)
+        {
+            if (classes[i].BlockSize >= length)
+            {
+                return classes[i].BlockSize;
+            }
+        }
+
+        return length;
     }
 
     /// <summary>
@@ -2059,7 +2118,7 @@ internal sealed unsafe class PeerCore : IDisposable
 
         if (RetiredPendedStreams is { } retiredPended)
         {
-            foreach (SpscRing<TransportStreamId> ring in retiredPended)
+            foreach (SpscRing<PendedStream> ring in retiredPended)
             {
                 while (ring.TryDequeue(out _))
                 {
@@ -2158,7 +2217,7 @@ internal sealed unsafe class PeerCore : IDisposable
         PendedStreams.Dispose();
         if (_retiredPendedStreams is not null)
         {
-            foreach (SpscRing<TransportStreamId> retired in _retiredPendedStreams)
+            foreach (SpscRing<PendedStream> retired in _retiredPendedStreams)
             {
                 retired.Dispose();
             }
@@ -2189,4 +2248,18 @@ internal sealed unsafe class PeerCore : IDisposable
         /// <summary>Work was published inside the open callback and the host was not told yet.</summary>
         [FieldOffset(CacheLine.Stride + 4)] public bool WorkPending;
     }
+}
+
+/// <summary>A stream held back for the receive ring or the receive budget (<see cref="PeerCore.NotePendedStream"/>).</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct PendedStream
+{
+    /// <summary>The stream.</summary>
+    public TransportStreamId Id;
+
+    /// <summary>
+    /// Block bytes of the message the stream waits with (0 for none): what it will take of the receive budget when it is
+    /// resumed, which <see cref="QuiclyPeer.Poll"/> uses to resume no more streams than the budget can take.
+    /// </summary>
+    public int Need;
 }

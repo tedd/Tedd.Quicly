@@ -333,7 +333,7 @@ public class GroupStreamTests
         PeerCore core = h.Server!.Core;
         int limit = core.PeerUnidirectionalStreamLimit;
         Assert.Equal(limit, core.PeerStreamCapacity);
-        SpscRing<TransportStreamId> first = core.PendedStreams;
+        SpscRing<PendedStream> first = core.PendedStreams;
 
         // A grant at or below the session's own limit changes nothing.
         core.SetTransportPeerStreams(0);
@@ -350,7 +350,7 @@ public class GroupStreamTests
         Assert.False(first.TryDequeue(out _));
 
         // The capacity never shrinks: a transport attached later with a smaller grant keeps what is there.
-        SpscRing<TransportStreamId> second = core.PendedStreams;
+        SpscRing<PendedStream> second = core.PendedStreams;
         core.SetTransportPeerStreams(50);
         Assert.Equal(200, core.PeerStreamCapacity);
         Assert.Same(second, core.PendedStreams);
@@ -360,6 +360,68 @@ public class GroupStreamTests
         h.Server.RegisterHandler(11, Handlers.Collect(got));
         Assert.True(h.Client.SendCopy(new SendHeader(11), [1, 2, 3]).IsAdmitted);
         Assert.True(h.RunUntil(() => got.Count == 1));
+    }
+
+    [Fact]
+    public void A_Peer_That_Resets_Held_Streams_Past_Every_Growth_Of_The_Pended_Ring_Is_Disconnected()
+    {
+        // The receive ring is full and the game thread is late: every group stream the peer opens is held back and listed.
+        // The peer resets them and opens new ones, which the transport allows at once. The list grows for the entries of
+        // the dead streams, up to eight times its size; past that a stream could not be listed, and nothing would ever
+        // resume it, so the connection is closed (LimitExceeded) rather than left with a stream stalled for good.
+        using ServerHarness h = new(table: TestTables.Plumbing, server: o =>
+        {
+            GroupKit.Prompt(o);
+            o.ReceiveRingCapacity = 16;
+        });
+        h.Server!.RegisterHandler(11, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => { });
+        Assert.True(h.Admit());
+        QuiclyPeer server = h.Server!;
+        Assert.True(h.RunUntil(() => server.State == PeerState.Connected));
+        byte[][] fill = new byte[16][];
+        for (int i = 0; i < fill.Length; i++)
+        {
+            fill[i] = [(byte)i, 0, 0, 0];
+        }
+
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStream(11, 1, fill), out _, fin: true));
+        AdvanceNetworkOnly(h, 50_000);
+        Assert.Equal(16, server.Core.ReceiveRing.Count);
+        int capacity = server.Core.PendedStreams.Capacity;
+
+        ulong group = 100;
+        for (int round = 0; round < 40 && !server.Core.IsTransportClosing; round++)
+        {
+            List<TransportStreamId> ids = [];
+            while (ids.Count < server.Core.PeerUnidirectionalStreamLimit - 1
+                && h.Raw.OpenUni(GroupKit.GroupStream(11, group++, [1, 2, 3, 4]), out TransportStreamId id) == TransportStatus.Success)
+            {
+                ids.Add(id);
+            }
+
+            AdvanceNetworkOnly(h, 20_000);
+            foreach (TransportStreamId id in ids)
+            {
+                h.Raw.Transport.AbortStream(id, 0x77, StreamAbortDirection.Send);
+            }
+
+            AdvanceNetworkOnly(h, 20_000);
+        }
+
+        Assert.True(h.RunUntil(() => server.State == PeerState.Closed, 2_000_000), $"the server is {server.State}");
+        Assert.Equal(QuiclyErrorCode.LimitExceeded, server.CloseReason.Code);
+        Assert.True(server.Core.PendedStreams.Capacity == capacity * ReceiveCredit.ListGrowth,
+            $"the list grew to {server.Core.PendedStreams.Capacity} of {capacity * ReceiveCredit.ListGrowth}");
+        Assert.Equal(0, DatagramKit.Statistics(server).CallbackFaults);
+    }
+
+    private static void AdvanceNetworkOnly(ServerHarness h, long micros)
+    {
+        long end = h.Network.NowMicros + micros;
+        while (h.Network.NowMicros < end)
+        {
+            h.Network.AdvanceTo(Math.Min(end, h.Network.NowMicros + 1_000));
+        }
     }
 
     /// <summary>

@@ -1,16 +1,22 @@
 using System.Buffers.Binary;
 using Tedd.Quicly.Core.Channels;
+using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Adversarial review, lens: recheck of the fix commits on fix/stack-review after d567ba5 (b32655c, a184b81: the decode
 /// buffer may take the receive budget past its limit and falls back to a larger size class; CanEverRentDecode no longer
 /// subtracts the block the waiting message holds). A test marked FINDING fails at e8af1f8 for the reason its comment gives.
 /// </summary>
+/// <remarks>
+/// Fixed since (recheck round, RC-1): <c>PeerCore.CanEverRentDecode(raw, heldBlock)</c> counts the pool's blocks of the
+/// classes a decode could use minus the message's own, so the message is dropped and counted again, as at d567ba5 and in
+/// 0.2.1 (a known limit of the default pool, RELEASE-NOTES.md). The description below is what the test found at e8af1f8;
+/// the test now pins the fix, and the tests after it the handler's side and the remedy.
+/// </remarks>
 public class ReviewStackrecheckDecodeTests
 {
     /// <summary>ReliableOrdered with LZ4 (MinCompressSize 16) and MaxMessageSize 256 KiB (the default is 64 KiB; up to 1 MiB is allowed).</summary>
@@ -103,5 +109,85 @@ public class ReviewStackrecheckDecodeTests
             $"two seconds of Poll + Drain + Release every frame: the drained channel gave [{string.Join(",", got)}] (message 1 {(got.Contains(1) ? "arrived" : "never came")}), "
             + $"the handled channel {chat.Count} of 1; ReceiveBytesOutstanding {statistics.ReceiveBytesOutstanding} of 262144, DecodeFailures {statistics.DecodeFailures}, "
             + $"StreamReceivePends {statistics.StreamReceivePends}, the drained channel's Received {DatagramKit.ChannelStats(server, Packed).Received} (chat sent after it arrived: {chatSent})");
+
+        // As fixed: the message that can never be decoded is dropped and counted, and nothing more.
+        Assert.Equal([1], got);
+        Assert.Equal(1, statistics.DecodeFailures);
+    }
+
+    /// <summary>
+    /// The same message on a channel read by a handler: dropped and counted (no block for its decode), and the handler gets
+    /// the message behind it, as every channel of the peer gets its own.
+    /// </summary>
+    [Fact]
+    public void The_Same_Message_To_A_Handler_Is_Dropped_And_Counted_And_The_Peer_Goes_On()
+    {
+        using SessionHarness h = new(table: Table, client: o =>
+        {
+            GroupKit.Prompt(o);
+            OrderedKit.Roomy(o);
+        }, server: GroupKit.Prompt);
+        QuiclyPeer server = h.Server!;
+        List<int> packed = [];
+        List<int> chat = [];
+        server.RegisterHandler(Packed, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => packed.Add(BinaryPrimitives.ReadInt32LittleEndian(payload)));
+        server.RegisterHandler(Chat, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => chat.Add(BinaryPrimitives.ReadInt32LittleEndian(payload)));
+
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(0, 200_000, 100_000)).Status);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(1, 2_000, 0)).Status);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Chat), BitConverter.GetBytes(42)).Status);
+
+        Assert.True(h.RunUntil(() => packed.Contains(1) && chat.Count == 1, 2_000_000),
+            $"the handled channel gave [{string.Join(",", packed)}], chat {chat.Count} of 1, DecodeFailures {DatagramKit.Statistics(server).DecodeFailures}");
+        Assert.Equal([1], packed);
+        Assert.Equal(1, DatagramKit.Statistics(server).DecodeFailures);
+    }
+
+    /// <summary>
+    /// The remedy the release notes give: a pool with a second block of 256 KiB decodes the message, through <c>Drain</c>
+    /// (its decode buffer takes the budget past its limit by that one block) and in order with the message behind it.
+    /// </summary>
+    [Fact]
+    public void A_Pool_With_Two_Blocks_Of_The_Class_Decodes_The_Message()
+    {
+        using SessionHarness h = new(table: Table, client: o =>
+        {
+            GroupKit.Prompt(o);
+            OrderedKit.Roomy(o);
+        }, server: o =>
+        {
+            GroupKit.Prompt(o);
+            SizeClassDefinition[] classes = PeerCore.CreateCompactAllocatorOptions().SizeClasses!;
+            classes[^1] = new SizeClassDefinition(classes[^1].BlockSize, 2);
+            o.AllocatorOptions = new SlabAllocatorOptions { FreeListShards = 2, SizeClasses = classes };
+        });
+        QuiclyPeer server = h.Server!;
+        byte[] large = Payload(0, 200_000, 100_000);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), large).Status);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(1, 2_000, 0)).Status);
+
+        List<int> got = [];
+        bool intact = true;
+        ReceivedMessage[] buffer = new ReceivedMessage[16];
+        Assert.True(h.RunUntil(() =>
+        {
+            int taken;
+            while ((taken = server.Drain(Packed, buffer)) > 0)
+            {
+                for (int i = 0; i < taken; i++)
+                {
+                    int index = BinaryPrimitives.ReadInt32LittleEndian(buffer[i].Payload);
+                    got.Add(index);
+                    intact &= index != 0 || buffer[i].Payload.SequenceEqual(large);
+                }
+
+                server.Release(buffer.AsSpan(0, taken));
+            }
+
+            return got.Count == 2;
+        }, 2_000_000), $"the drained channel gave [{string.Join(",", got)}], DecodeFailures {DatagramKit.Statistics(server).DecodeFailures}");
+        Assert.Equal([0, 1], got);
+        Assert.True(intact);
+        Assert.Equal(0, DatagramKit.Statistics(server).DecodeFailures);
     }
 }

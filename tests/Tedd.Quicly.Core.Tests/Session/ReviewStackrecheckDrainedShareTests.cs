@@ -1,9 +1,8 @@
 using System.Buffers.Binary;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Adversarial review, lens: recheck of 85bbb2e (SC-1: "the reliable channels share half the budget as their Drained
@@ -11,6 +10,12 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// channels in the TABLE — handled channels and channels nobody uses included — not among the channels that are drained.
 /// A test marked FINDING fails at e8af1f8 for the reason its comment gives.
 /// </summary>
+/// <remarks>
+/// Fixed since (recheck round, RC-2): the Drained threshold is half the receive budget counted over the waiting bytes of
+/// the reliable channels no handler reads (<c>ReceiveCredit.IsSharedFull</c>, <c>SharedWaiting</c>), not divided among
+/// the table's channels, so a channel with a handler or with nothing waiting takes nothing of it. The description and the
+/// numbers below are what the test found at e8af1f8; the test now pins the fix.
+/// </remarks>
 public class ReviewStackrecheckDrainedShareTests
 {
     private const ushort Drained = 4;

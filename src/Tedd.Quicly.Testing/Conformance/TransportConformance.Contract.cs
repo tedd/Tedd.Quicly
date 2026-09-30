@@ -363,7 +363,7 @@ public static unsafe partial class TransportConformance
             if (call != 1) return ReceiveResult.Consumed(total);
             var issued = new ManualResetEventSlim();
             var returned = new ManualResetEventSlim();
-            resumer = new Thread(() =>
+            var thread = new Thread(() =>
             {
                 issued.Set();
                 server.ResumeStreamReceive(id, 5);
@@ -373,7 +373,9 @@ public static unsafe partial class TransportConformance
                 IsBackground = true,
                 Name = "conformance-resumer",
             };
-            resumer.Start();
+            thread.Start();
+            // Published once started: the pumping thread joins it (on a real transport this callback runs on another thread).
+            Volatile.Write(ref resumer, thread);
             issued.Wait(TimeSpan.FromSeconds(5));
             // A real transport usually takes the resume while this callback still runs; a simulator (one lock) takes it once the
             // callback has returned. The contract allows both.

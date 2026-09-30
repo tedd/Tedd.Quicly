@@ -40,8 +40,12 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// (<see cref="DeliveryStatus.Failed"/>): the channel stays open and later groups keep flowing. The peer reports a stream's
 /// close exactly once (<see cref="ChannelEngine.OnStreamClosed"/>), and a record's serial rises both when it opens a stream and
 /// when it is released, so a notice or a carrier tag of any earlier stream of that record is recognised as stale.</para>
-/// <para><b>Receive (transport thread).</b> At most <see cref="ChannelDefinition.MaxGroups"/> (default 8) concurrent peer
-/// group streams per channel; further streams are reset <see cref="QuiclyErrorCode.LimitExceeded"/> (PROTOCOL.md §7). Each
+/// <para><b>Receive (transport thread).</b> Every peer group stream the connection's stream limit admits is accepted
+/// (<see cref="PeerCore.PeerUnidirectionalStreamLimit"/>, one receive record each). <see cref="ChannelDefinition.MaxGroups"/>
+/// is a bound on the <em>sender</em> and is not enforced here: a sender counts a stream as closed once its data and FIN are
+/// acknowledged, while this end still holds that stream open for as long as its receive is held back, so a sender that keeps
+/// the limit can have more than <c>MaxGroups</c> streams open here — and resetting them would destroy groups it has already
+/// completed as delivered (PROTOCOL.md §7). Each
 /// accepted stream stages one message at a time into a pooled lease behind a receive-ring reservation and publishes it at its
 /// end, so messages are delivered as they complete. A malformed group is reset
 /// <see cref="QuiclyErrorCode.ProtocolViolation"/> by the peer's parser and the connection survives (PROTOCOL.md §6); a group
@@ -147,7 +151,6 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         _send = new NativeArray<GroupSendState>(Math.Max(count, 1));
         _openGroups = new NativeArray<int>(Math.Max(count, 1));
         int groupSlots = 0;
-        int recvSlots = 0;
         for (int local = 0; local < count; local++)
         {
             ChannelDefinition channel = _channels[local];
@@ -161,19 +164,20 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             send.FillingGroup = -1;
             _openGroups[local] = 0;
 
-            // Both ends hold the same table, so MaxGroups bounds the streams this end may have open on the channel as well
-            // as the peer streams it accepts (PROTOCOL.md §7): a sender that exceeded it would have its own groups reset.
+            // MaxGroups bounds the streams this end keeps open on the channel (PROTOCOL.md §7). It is what the peer's stream
+            // limit is sized from, so a sender that exceeded it would take the stream slots of other channels.
             int maxGroups = Math.Max(channel.MaxGroups, 1);
             _maxGroups[local] = maxGroups;
 
             // Send side: room for groups that are still filling or waiting on top of those holding a stream (a group keeps
-            // its record until its stream shuts down). Receive side: exactly the PROTOCOL.md §7 limit.
+            // its record until its stream shuts down).
             groupSlots += (3 * maxGroups) + 4;
-            recvSlots += maxGroups;
         }
 
+        // Receive side: one record for every stream the peer can have open at all, whatever channel it names — the
+        // channel's own MaxGroups is not the bound there (see OnStreamOpened), the connection's stream limit is.
         _groups = new NativeArray<GroupState>(Math.Max(groupSlots, 1));
-        _recv = new NativeArray<GroupRecv>(Math.Max(recvSlots, 1));
+        _recv = new NativeArray<GroupRecv>(Math.Max(core.PeerUnidirectionalStreamLimit, 1));
         for (int i = _groups.Length - 1; i >= 0; i--)
         {
             ref GroupState group = ref _groups[i];
@@ -1351,9 +1355,14 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             return StreamAccept.Reject(QuiclyErrorCode.UnsupportedChannel);
         }
 
-        // PROTOCOL.md §7: at most MaxGroups concurrent peer group streams per channel; the rest are reset LimitExceeded.
+        // MaxGroups is not checked here. A sender keeps at most MaxGroups streams open per channel, but it counts a stream
+        // as closed once its data and FIN are acknowledged; this end still has that stream open for as long as its receive
+        // is held back (the ring is full, the budget is used up, the host is late with a Poll). A sender that keeps the
+        // limit can therefore have more than MaxGroups streams open here, and resetting one would destroy a group whose
+        // messages it has already completed as delivered. What bounds the streams is the connection's stream limit, and
+        // there is a record for each of them: without one, the transport let the peer past that limit.
         int record = _freeRecv;
-        if (_openGroups[local] >= Math.Max(_channels[local].MaxGroups, 1) || record < 0)
+        if (record < 0)
         {
             return StreamAccept.Reject(QuiclyErrorCode.LimitExceeded);
         }

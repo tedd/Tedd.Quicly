@@ -10,13 +10,15 @@ namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// The group stream's lifecycle and limits (PROTOCOL.md §3.2, §6, §7; docs/design/session-layer.md §7.5): a group that waits
-/// for stream credit and goes out on a new stream, refusals (MsQuic-style asynchronous and synchronous), the receive-side
-/// <see cref="ChannelDefinition.MaxGroups"/> limit, a malformed group, a stalled group, the group interval, back-pressure,
+/// for stream credit and goes out on a new stream, refusals (MsQuic-style asynchronous and synchronous), a receiver that
+/// holds more than <see cref="ChannelDefinition.MaxGroups"/> peer streams open because it fell behind (none is reset; the
+/// connection's stream limit is the bound), a malformed group, a stalled group, the group interval, back-pressure,
 /// expiry, cancellation, close, and a group the peer stops.
 /// </summary>
 public class GroupStreamTests
 {
     private static readonly ChannelTable Table = GroupTables.Main;
+    private static readonly byte[] ResumeToken = [9, 8, 7, 6];
 
     [Fact]
     public void A_Refused_Group_Waits_For_Credit_And_Goes_Out_On_A_New_Stream()
@@ -159,33 +161,196 @@ public class GroupStreamTests
     }
 
     [Fact]
-    public void The_Receive_Limit_Resets_Peer_Group_Streams_Beyond_MaxGroups()
+    public void A_Receiver_That_Falls_Behind_Loses_No_Group()
+    {
+        // The sender keeps MaxGroups (8) by its own count, and it counts a stream as closed once its data and FIN are
+        // acknowledged. A receiver that is late with its Poll still has those streams open, so the sender's ninth stream
+        // arrives while eight are open here. Resetting it (the old receive-side MaxGroups rule) destroyed a group whose
+        // messages the sender had already completed as Delivered: silent loss on a reliable channel.
+        using SessionHarness h = new(table: TestTables.Plumbing, client: GroupKit.Prompt, server: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.ReceiveRingCapacity = 64;
+        });
+        QuiclyPeer server = h.Server!;
+        List<int> got = [];
+        server.RegisterHandler(11, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => got.Add(BitConverter.ToInt32(payload)));
+
+        // A hitch: the server is not polled for 80 ms while the client sends twenty groups of sixteen messages.
+        List<SendToken> tokens = SendGroupsToALateReceiver(h, h.Client, 11, 320);
+        int openWhileBehind = GroupKit.OpenPeerGroups(server, 11);
+        Assert.True(h.RunUntil(() => got.Count == 320, 2_000_000),
+            $"received {got.Count} of 320 messages; the server reset {DatagramKit.Statistics(server).StreamsReset} streams, and the sender "
+            + $"reported {tokens.Count(token => h.Client.GetDeliveryStatus(token) == DeliveryStatus.Delivered)} of them Delivered");
+        Assert.Equal(Enumerable.Range(0, 320), got.Order());
+        Assert.Equal(0, DatagramKit.Statistics(server).StreamsReset);
+        Assert.All(tokens, token => Assert.Equal(DeliveryStatus.Delivered, h.Client.GetDeliveryStatus(token)));
+
+        // The scenario was the one meant: the receiver held more streams of the channel open than its MaxGroups.
+        Assert.True(openWhileBehind > 8, $"only {openWhileBehind} peer streams were open at the receiver while it was behind");
+        Assert.True(h.RunUntil(() => GroupKit.OpenPeerGroups(server, 11) == 0));
+        Assert.Equal(0, DatagramKit.Statistics(server).ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void A_Reconnect_Gives_Back_Every_Receive_Record_Of_A_Peer_That_Was_Past_MaxGroups()
+    {
+        // The client is the receiver here (only a client reconnects). Its connection is lost while it holds more than
+        // MaxGroups peer streams open; the resumed connection starts with every receive record free and takes the same
+        // load again.
+        using SessionHarness h = new(connect: false, table: TestTables.Plumbing, server: GroupKit.Prompt, client: o =>
+        {
+            QuietOptions.Apply(o);
+            o.ReceiveRingCapacity = 64;
+        });
+        h.Admission.Handler = static (in HelloInfo hello, QuiclyPeer _) =>
+            AdmissionResult.Accept(ResumeToken, 4242, epoch: hello.SessionToken.IsEmpty ? 1u : 2u);
+        Assert.True(h.RunUntilConnected());
+        QuiclyPeer client = h.Client;
+        QuiclyPeer oldServer = h.Server!;
+        List<int> got = [];
+        client.RegisterHandler(11, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => got.Add(BitConverter.ToInt32(payload)));
+
+        SendGroupsToALateReceiver(h, oldServer, 11, 320);
+        Assert.True(GroupKit.OpenPeerGroups(client, 11) > 8, "the scenario needs more than MaxGroups peer streams open at the receiver");
+
+        // The link is lost; the client is still not polled, so Reconnect settles the lost connection itself.
+        oldServer.Core.Transport!.Close((ulong)QuiclyErrorCode.NoError, default);
+        for (int step = 0; step < 100 && !client.Core.IsTransportClosed; step++)
+        {
+            h.Network.Advance(1_000);
+        }
+
+        Assert.True(client.Core.IsTransportClosed);
+        client.Reconnect(h.Connector, h.Listener.LocalEndPoint, "test", default);
+        Assert.Equal(0, GroupKit.OpenPeerGroups(client, 11));
+        Assert.Equal(0, DatagramKit.Statistics(client).ReceiveBytesOutstanding);
+        Assert.True(h.RunUntil(() => client.State == PeerState.Connected && h.Server is not null
+            && !ReferenceEquals(h.Server, oldServer) && h.Server.State == PeerState.Connected));
+        oldServer.Dispose();
+        Assert.Equal(2u, client.Epoch);
+
+        // The same load on the resumed connection: nothing of the lost one is in the way.
+        got.Clear();
+        SendGroupsToALateReceiver(h, h.Server!, 11, 320);
+        Assert.True(GroupKit.OpenPeerGroups(client, 11) > 8);
+        Assert.True(h.RunUntil(() => got.Count == 320, 2_000_000), $"received {got.Count} of 320 messages after the reconnect");
+        Assert.Equal(Enumerable.Range(0, 320), got.Order());
+        Assert.True(h.RunUntil(() => GroupKit.OpenPeerGroups(client, 11) == 0));
+        Assert.Equal(0, DatagramKit.Statistics(client).ReceiveBytesOutstanding);
+        Assert.Equal(0, DatagramKit.Statistics(client).StreamsReset);
+    }
+
+    /// <summary>
+    /// Sends <paramref name="count"/> numbered, tracked messages, one group per sixteen, while only the sender is pumped:
+    /// the receiver is late with its Poll for 4 ms per group.
+    /// </summary>
+    private static List<SendToken> SendGroupsToALateReceiver(SimFixture h, QuiclyPeer sender, ushort channel, int count)
+    {
+        List<SendToken> tokens = [];
+        for (int i = 0; i < count; i++)
+        {
+            SendResult result = sender.SendCopy(new SendHeader(channel), DatagramKit.Payload(i, 4), SendOptions.Tracked);
+            Assert.True(result.IsAdmitted);
+            tokens.Add(result.Token);
+            if ((i & 15) == 15)
+            {
+                for (int step = 0; step < 4; step++)
+                {
+                    sender.Poll();
+                    sender.Flush();
+                    h.Network.Advance(1_000);
+                }
+            }
+        }
+
+        return tokens;
+    }
+
+    [Fact]
+    public void Peer_Group_Streams_Beyond_MaxGroups_Are_Accepted()
     {
         using ServerHarness h = new(table: Table);
         Assert.True(h.Admit());
         List<(ReceiveHeader Header, byte[] Payload)> got = [];
         h.Server!.RegisterHandler(9, Handlers.Collect(got));
 
-        // Channel 9 accepts two concurrent peer groups; each stream here holds a message whose payload is incomplete.
+        // Channel 9 has MaxGroups 2: a bound on its sender. Three streams are open here at once, each holding a message
+        // whose payload is incomplete, and none of them is reset.
         Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStreamStart(9, 1, 4, [1]), out TransportStreamId a));
         Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStreamStart(9, 2, 4, [2]), out TransportStreamId b));
-        Assert.True(h.RunUntil(() => GroupKit.OpenPeerGroups(h.Server, 9) == 2));
-        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStreamStart(9, 3, 4, [3]), out TransportStreamId excess));
-        ulong code = 0;
-        Assert.True(h.RunUntil(() => Aborted(h.Raw, excess, out code)));
-        Assert.Equal((ulong)QuiclyErrorCode.LimitExceeded, code);
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStreamStart(9, 3, 4, [3]), out TransportStreamId c));
+        Assert.True(h.RunUntil(() => GroupKit.OpenPeerGroups(h.Server, 9) == 3));
+        h.Run(50_000);
+        Assert.Equal(0, h.Raw.Sink.CountOf(RecordedEventKind.StreamAborted));
+        Assert.Equal(0, h.Statistics().StreamsReset);
         Assert.Equal(PeerState.Connected, h.Server.State);
-        Assert.Equal(2, GroupKit.OpenPeerGroups(h.Server, 9));
 
-        // The accepted groups finish, their slots come back, and a later group is accepted again.
+        // All three finish, their records come back, and a later group is accepted again.
         Assert.Equal(TransportStatus.Success, RawClient.SendStream(h.Raw.Transport, a, [2, 3, 4], TransportSendFlags.Fin));
         Assert.Equal(TransportStatus.Success, RawClient.SendStream(h.Raw.Transport, b, [3, 4, 5], TransportSendFlags.Fin));
-        Assert.True(h.RunUntil(() => got.Count == 2 && GroupKit.OpenPeerGroups(h.Server, 9) == 0));
+        Assert.Equal(TransportStatus.Success, RawClient.SendStream(h.Raw.Transport, c, [4, 5, 6], TransportSendFlags.Fin));
+        Assert.True(h.RunUntil(() => got.Count == 3 && GroupKit.OpenPeerGroups(h.Server, 9) == 0));
         Assert.Equal(new byte[] { 1, 2, 3, 4 }, got[0].Payload);
         Assert.Equal(new byte[] { 2, 3, 4, 5 }, got[1].Payload);
+        Assert.Equal(new byte[] { 3, 4, 5, 6 }, got[2].Payload);
         Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStream(9, 4, [9, 9, 9, 9]), out _, fin: true));
-        Assert.True(h.RunUntil(() => got.Count == 3));
+        Assert.True(h.RunUntil(() => got.Count == 4));
         Assert.Equal(0, h.Statistics().ReceiveBytesOutstanding);
+    }
+
+    [Fact]
+    public void The_Connection_Stream_Limit_Bounds_A_Peer_That_Opens_Every_Stream_On_One_Channel()
+    {
+        // A hostile peer ignores MaxGroups and opens group streams on one channel until the connection's stream limit stops
+        // it. Every one of them has a receive record (the records are sized from that limit, not from the channel), the
+        // limit itself refuses the next stream, and nothing the engine holds grows past it.
+        using ServerHarness h = new(table: Table, server: QuietOptions.Apply);
+        Assert.True(h.Admit());
+        QuiclyPeer server = h.Server!;
+        int limit = server.Core.PeerUnidirectionalStreamLimit;
+        Assert.True(limit > 8, "the table must grant more streams than one channel's MaxGroups");
+        List<(ReceiveHeader Header, byte[] Payload)> got = [];
+        server.RegisterHandler(9, Handlers.Collect(got));
+        server.RegisterHandler(5, Handlers.Collect(got));
+
+        // All but one of the streams on channel 9 (MaxGroups 2), each with a message that is only half there.
+        List<TransportStreamId> streams = [];
+        for (int i = 0; i < limit - 1; i++)
+        {
+            Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStreamStart(9, (ulong)i, 4, [(byte)i]), out TransportStreamId id));
+            streams.Add(id);
+        }
+
+        Assert.True(h.RunUntil(() => GroupKit.OpenPeerGroups(server, 9) == limit - 1));
+
+        // The last stream goes to another channel: the records are shared, so one channel cannot take them all from another.
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStream(5, 1, [7, 7]), out _, fin: true));
+        Assert.True(h.RunUntil(() => got.Count == 1), "a group of another channel found no receive record");
+        Assert.Equal(new byte[] { 7, 7 }, got[0].Payload);
+
+        // Past the limit the transport refuses the stream; the engine never sees it.
+        Assert.True(h.RunUntil(() => GroupKit.OpenPeerGroups(server, 5) == 0));
+        Assert.Equal(TransportStatus.Success, h.Raw.OpenUni(GroupKit.GroupStreamStart(9, 1_000, 4, [1]), out TransportStreamId last));
+        streams.Add(last);
+        Assert.True(h.RunUntil(() => GroupKit.OpenPeerGroups(server, 9) == limit));
+        TransportStatus beyond = h.Raw.OpenUni(GroupKit.GroupStreamStart(9, 1_001, 4, [1]), out _);
+        h.Run(50_000);
+        Assert.True(beyond == TransportStatus.StreamLimitReached || h.Raw.Sink.OfKind(RecordedEventKind.StreamStarted).Any(e => e.Status == TransportStatus.StreamLimitReached),
+            "the connection's stream limit did not refuse a stream beyond it");
+        Assert.Equal(limit, GroupKit.OpenPeerGroups(server, 9));
+        Assert.Equal(0, h.Statistics().StreamsReset);
+        Assert.Equal(PeerState.Connected, server.State);
+
+        // Every stream is completed: all messages arrive and every record and lease comes back.
+        foreach (TransportStreamId id in streams)
+        {
+            Assert.Equal(TransportStatus.Success, RawClient.SendStream(h.Raw.Transport, id, [1, 2, 3], TransportSendFlags.Fin));
+        }
+
+        Assert.True(h.RunUntil(() => got.Count == limit + 1 && GroupKit.OpenPeerGroups(server, 9) == 0));
+        Assert.Equal(0, h.Statistics().ReceiveBytesOutstanding);
+        Assert.Equal(0, h.Statistics().CallbackFaults);
     }
 
     [Fact]

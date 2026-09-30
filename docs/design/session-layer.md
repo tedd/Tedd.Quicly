@@ -101,7 +101,9 @@ NestedContainer, BadLength, ...
 * `KeyTable`: open addressing, linear probing, SoA `ulong[] keys`, `int[] slots`, power-of-two capacity, load ≤ 0.5, `fmix64`,
   backward-shift deletion (no tombstones). `DenseKeyTable`: direct index for `KeySpace.Dense(max)`.
 * Per-key send slot (`KeySendSlot`, 64 B): current version, acked version, lease of current value (ReliableLatest), retry deadline,
-  attempts, entry index in flight, large-value stream id. Per-key receive slot (`KeyRecvSlot`): last accepted sequence,
+  attempts, entry index in flight, large-value stream id. Per-key receive slot (`KeyRecvSlot`): last accepted sequence
+  (as on the wire, for acks and the retirement notice) and the same value extended to 64 bits on the channel's version clock
+  (`LastAcceptedExtended`, what staleness is decided on — PROTOCOL.md §8 "sequence clock"),
   mailbox lease index (int, −1 empty), flags, and a reserved `Reassembly` field that no engine uses — fragments are not
   reassembled per key but per `(channel, key, sequence)` in the datagram engine's own table (§7.8).
 * `Mailboxes`: `int[] mailbox` per key slot + `ulong[] dirty` bitset per channel; transport thread `Interlocked.Exchange` in,
@@ -575,8 +577,16 @@ spaces, a second epoch on one engine); `DatagramSendPathTests` (every send path 
 the transport is done, owned leases and refusals, tracked Delivered/Lost/Expired/Canceled/Disconnected, a transport-canceled
 datagram completing Expired, container members completing in both completion modes, compression round trip and the RawLength
 rules on the wire, admission refusals, send budget); `DatagramZeroAllocationTests` (60 Hz traffic of 64-byte messages over
-unordered, sequenced, coalescing, compressed and tracked channels; a capped scheduler with expiring messages); `SchedulerUnitTests`
-(`TokenBucket` overdraft, `ReceiveKeyTracker`, local completions, the idle packer) and `Framing/PackedContainerWriterResumeTests`.
+unordered, sequenced, coalescing, compressed and tracked channels; a capped scheduler with expiring messages; a keyed and an
+unkeyed 16-bit sequenced channel whose receive clock crosses a wrap in every measured window); `SequencedIdleKeyTests` (the
+sequence clock of §7.1 with hand-written frames: a key idle past half a 16-bit and a 32-bit space, across several wraps, on
+hashed, dense, coalescing and fragmenting channels, and end to end behind 40 000 updates of another key; values of different
+keys in any order, a reordered value of a formerly idle key still dropped, an evicted key next to an idle one; the
+resynchronisation after a gap of more than half the space, its two-second threshold, a duplicate of the newest never
+resynchronising, the channel going on after a false resync and a clock left too far ahead healing; a new epoch forgetting the
+clock); `SchedulerUnitTests`
+(`TokenBucket` overdraft, `ReceiveKeyTracker` on extended sequences, local completions, the idle packer) and
+`Framing/PackedContainerWriterResumeTests`.
 
 Step 3 (ordered delivery, async APIs, sends from other threads) adds: `OrderedTestKit.cs` (`OrderedTables.Main`, `OrderedKit` —
 roomy budgets, payload patterns, engine phase accessors — and `AsyncRefusalTransport`/`AsyncRefusalConnector`, which refuse a stream
@@ -631,7 +641,12 @@ or a counted drop, and the control-stream fallback); `LatestEdgeTests` (the `Flu
 path, every admission refusal, an immediate value, the 30-second version budget, a supersede from the middle of the queue, a
 datagram limit that shrinks below a queued value, a large-value stream refused synchronously and asynchronously, the
 receive-side rejections of a group stream, the ack sweep after the hand-off ring overflows, and the checks the engine makes
-on channels that are not its own); and `LatestZeroAllocationTests` (1 000 keys at 60 Hz, and superseding plus retiring keys).
+on channels that are not its own); `LatestIdleKeyTests` (a key idle for exactly and for more than 2^31 versions of its
+channel, end to end, receiver alone — datagram and large value — and sender alone; an ack of an older version, of the
+previous value before the new one is transmitted, of a superseded version and of a version never handed out completing
+nothing; a stream value overtaken by a newer datagram dropped at its end with its buffer returned once; a retransmission
+after a long quiet still a duplicate; a new epoch and a retired key starting over); and `LatestZeroAllocationTests`
+(1 000 keys at 60 Hz, superseding plus retiring keys, and duplicates dropped and re-acked behind a long ack delay).
 
 ## 7. Engine boundary and implementation waves
 
@@ -766,7 +781,8 @@ containers nor members; the fan-out on the game thread completes their tokens.
 registered in `ChannelEngines.Create`).
 
 * State per channel of the mode (engine-local index): `ChannelSendState` (FIFO head/tail/count/bytes over `Entries.Next`,
-  `NextSequence`) and `ChannelRecvState` (unkeyed sequenced: `LastAccepted`, `HasAccepted`) in native arrays, the resolved default
+  `NextSequence`) and `ChannelRecvState` (sequenced: the sequence clock `NewestSequence` and `LastReceiveMicros`, when it last
+  advanced; unkeyed sequenced also `LastAccepted`, `HasAccepted`, kept for diagnostics) in native arrays, the resolved default
   expiry, the send hints, a `ReceiveKeyTracker` for keyed sequenced and for coalescing channels, a mailbox (`CreateMailbox(dense,
   MaxKeys)`) for coalescing channels. Entry scratch: `Aux0` = admitted length, `Aux1` = queued, handed to the packer, or finished.
 * `Admit`: raw length ≤ `EffectiveMaxMessageSize` (`TooLarge`); a key beyond a dense key space (`KeyTableFull`); `QueueLimitBytes`
@@ -790,20 +806,40 @@ registered in `ChannelEngines.Create`).
   `NextSequence` and has the transport thread clear the receive tables before its next datagram (PROTOCOL.md §4.1). `Tick` and `Flush`
   do nothing: expiry is evaluated when the scheduler reaches an entry.
 * `OnDatagram` (transport thread): fragments ⇒ the `OnFragment` hook (dropped and counted until C2); acceptance — unordered: always
-  (coalescing: the key's slot); sequenced unkeyed: newer than the channel's last (serial, 16 or 32 bits); sequenced keyed:
-  `ReceiveKeyTracker.TryAcceptSequence` (stale ⇒ `Dropped`, a dense key out of range ⇒ `KeyTableFull`); the receive lease
+  (coalescing: the key's slot); sequenced: the sequence is first extended on the channel's **sequence clock** (below), then
+  unkeyed: accepted iff the clock advanced; keyed:
+  `ReceiveKeyTracker.TryAcceptSequence(key, extended)` (stale ⇒ `Dropped`, a dense key out of range ⇒ `KeyTableFull`); the receive lease
   (`OutOfBuffers`, peer `OutOfReceiveBuffers`); the `ReceiveEntry` (sequence, key, `RawLength`, `Compressed`, `StampReceive(now)`,
   `CurrentSenderTick`); coalescing ⇒ `ReceiveMailbox.TryPost(…, out displaced, out replaced)` (`Superseded`), otherwise
   `TryEnqueueReceive` (full ⇒ the newest is dropped: `RingDrops`, peer `ReceiveRingDrops`); `Received`/`Bytes`.
+* **Sequence clock** (`UnreliableSequencedEngine.Observe`, transport thread; PROTOCOL.md §1 and §8). The sender numbers a
+  channel's messages from one counter, so a key's last value may be any number of channel messages old — one parked entity next
+  to a busy one — and comparing two wire sequences of a key in serial arithmetic is wrong as soon as they are half the space
+  apart (the key's next 32 768 values would be dropped). The receiver therefore keeps `ChannelRecvState.NewestSequence`, the
+  newest sequence seen on the channel for any key as a 64-bit number (seeded one span up, 0 = nothing seen), extends every
+  arriving sequence against it (`SerialNumber.Distance` in the channel's width — the one comparison between numbers that are
+  close) and compares per key on the extended value. The clock is observed before anything can refuse the message (no key slot,
+  no buffer, a full ring): it follows the sender's counter, not what was kept. A reassembled message is judged when it
+  completes, with the completing fragment's stamp; the partial-against-partial comparison of §7.8 stays serial, because
+  partials live for 2 × RTT + 100 ms. **Resynchronisation:** a sequence *behind* the clock arriving more than
+  `ResyncQuietMicros` (2 s) after the clock last advanced is read as a forward jump of half the space or more — a blackout, or
+  sends that expired unsent — and moves the clock (`PeerStatistics.SequenceResyncs`); without it an unkeyed channel and every
+  recently updated key would stay blocked until the sender's counter came round. It uses the callback's existing clock stamp:
+  no timer, no extra clock read (ADR 0008 invariant 9, like the reassembly expiry). The state is zeroed with the rest of the
+  channel's receive state at an epoch reset and on reconnect. Cost per message on a keyed channel: one read-modify-write of the
+  channel's `ChannelRecvState` line and one 64-bit compare; +4 B per key slot.
 * `ReceiveKeyTracker`: the channel's key table (a hashed `KeyTable(MaxKeys, 64)` that grows, or a `DenseKeyTable`), the last accepted
-  sequence per slot and, for hashed tables, a least-recently-updated list: a full table evicts the key updated longest ago (stale
-  values do not refresh a key), and an evicted key re-accepts any sequence when it returns (the PROTOCOL.md §7 replay window). The
+  sequence per slot — the 64-bit extended one, compared with a plain `>` — and, for hashed tables, a least-recently-updated list:
+  a full table evicts the key updated longest ago (stale
+  values do not refresh a key), and an evicted key re-accepts any sequence when it returns (the PROTOCOL.md §7 replay window; a
+  tracked key that idled past half the space is in the same position for its next value, no wider). The
   per-slot arrays grow with the slots in use.
 
 **Statistics.** `PeerStatistics.DatagramsSent`, `DatagramBytesSent`, `ContainersSent` and `MessagesPacked` (application datagrams:
 messages sent alone and containers; control datagrams are not included); per channel the send counters `Sent`, `BytesSent`,
 `Expired`, `QueueFull`, `TooLarge`, `SendKeyTableFull` and the receive counters `Received`, `BytesReceived`, `Dropped`,
-`ReceiveSuperseded`, `RingDrops`, `ReceiveKeyTableFull`, `OutOfBuffers`.
+`ReceiveSuperseded`, `RingDrops`, `ReceiveKeyTableFull`, `OutOfBuffers`. Per peer, `SequenceResyncs` counts the
+resynchronisations of the sequence clock (normally zero).
 
 ### 7.2 Reliable ordered delivery (as built: wave C1, step 3)
 
@@ -1091,8 +1127,15 @@ state of the peer's group streams. Every per-key array grows with the slots in u
   back). The peer completes every live value `Disconnected` before the hook runs, so the re-queue of PROTOCOL.md §4.1 applies
   to whatever is still live when `OnEpochReset(resumed: true)` runs — on an in-place resume that is nothing, and the
   application resends; the re-queue matters for a host that drives a new epoch without losing the values.
-* **Receive** (transport thread). Only a version newer than the key's last accepted one is accepted (serial arithmetic, 32
-  bits), into the key's mailbox — ReliableLatest always coalesces, so it uses **no receive-ring entry and no reservation**
+* **Receive** (transport thread). Only a version newer than the key's last accepted one is accepted — newer on the channel's
+  **version clock** (`LatestRecvKeys.Newest`, `ExtendVersion`; PROTOCOL.md §8): every arriving version, datagram or stream,
+  accepted or not, is extended to 64 bits against the newest version seen on the channel for any key and compared with the
+  key's `LastAcceptedExtended`, so a key may idle while other keys take the channel's counter past 2^31. There is no time
+  resynchronisation here (a retransmission is legitimately behind the clock after any quiet). A large value is judged at its
+  stream's `Start` and **again at its `End`**: a newer datagram version of the key accepted in between would otherwise be
+  overwritten in the mailbox by the older stream value, and its pending ack replaced by the older version; the overtaken
+  value is dropped (`Dropped`), its staging lease returned, and the newer version re-acked. An accepted value goes into the
+  key's mailbox — ReliableLatest always coalesces, so it uses **no receive-ring entry and no reservation**
   (PROTOCOL.md §7, ADR 0008 invariant 6) and the `TryReserveReceive`/`PublishReserved` protocol does not apply. Without a ring
   publication to raise the peer's work signal, the engine raises it itself (`NoteTransportWork`, so once per transport callback
   however many values, acks, rejects and notices it published): for a value or key retirement posted into a mailbox, an ack
@@ -1132,10 +1175,17 @@ state of the peer's group streams. Every per-key array grows with the slots in u
   receive-budget sizing rule of §7.2.
 * **Acks the peer sent.** `OnControl` validates that every entry names a ReliableLatest channel of this engine (otherwise the
   message is a violation on the control stream and a counted drop as a datagram) and hands the entries to the game thread
-  through an SPSC ring, drained before every send-side decision (`Admit`, `FlushChannel`, `Flush`, `Tick`). An ack is
-  cumulative per key: one covering the current version completes the value `Delivered` and frees the key; a `LatestReject`
-  re-arms the timer (back off, then retry). An ack is evidence only for a version that really left this host, so an entry
-  above the highest version ever **transmitted** for that key is ignored: nothing the peer can have received names it.
+  through an SPSC ring, drained before every send-side decision (`Admit`, `FlushChannel`, `Flush`, `Tick`). A `LatestReject`
+  re-arms the timer (back off, then retry). An ack completes the key's value `Delivered` and frees the key only when it names
+  **exactly the version of the key's most recent transmission** (`LatestSendKeys.SentVersion`, stored unconditionally at every
+  transmission; 0 = nothing transmitted in this epoch) **and that version is the key's current one**. The receiver acks the
+  highest version it accepted for the key, which is never above the last one transmitted, so equality loses nothing; and
+  because no serial comparison is made, nothing the peer can send turns an old ack into a new one — the re-ack of an old
+  version by a receiver that dropped the new one, a late duplicate of the previous value's ack arriving before the new value's
+  first transmission (`Admit` drains notices first), an ack of a superseded version or of a closed epoch all complete nothing.
+  With the earlier cumulative rule ("covers every v' ≤ v in serial arithmetic") the first two reported `Delivered` for a value
+  that never arrived once the key had idled for more than 2^31 versions. `KeySendSlot.AckedVersion` records the last such ack
+  and is diagnostic only.
 * **Key retirement.** `RetireKey(channel, key)` completes the key's live value `Canceled`, stops its retries, aborts its
   stream, frees the send slot and sends `KeyRetired` (0x17) on the control stream. A received `KeyRetired` posts a message
   with `ReceiveFlags.KeyRetired` (empty payload, the last accepted version) into the key's mailbox and marks the receive slot
@@ -1147,13 +1197,16 @@ state of the peer's group streams. Every per-key array grows with the slots in u
   key is still never evicted, PROTOCOL.md §7).
 * **Epoch reset.** A resumed session (`OnEpochReset(resumed: true)`) restarts the channel counter (PROTOCOL.md §1: counters
   are scoped to the epoch) and re-queues every live key at its current *value* under a fresh version — the free full-state
-  resync of §4.1 — and asks the transport thread to forget its receive keys before the next value, so the lower versions are
+  resync of §4.1 — and asks the transport thread to forget its receive keys, and the version clock they were measured on
+  (one `LatestRecvKeys.Clear()`, so the two always share a lifetime), before the next value, so the lower versions are
   accepted again. That request is consumed at **every** receive entry point (`OnDatagram`, `OnStreamOpened` and a stream
   message's `Start`), because the first value of a key in the new epoch may well be a large one that never touches the
   datagram path: a reset consumed only there would have such a value dropped as "not newer" against the *previous* epoch's
-  version and re-acked, and that re-ack looks cumulative on the sender, which would complete a value `Delivered` the peer
-  never received (PROTOCOL.md §4.3, §5). The acks this end still owed are dropped with the epoch, together with the peer's
-  acks not yet applied and every key's highest-transmitted version, so no ack of a closed epoch can be sent or believed.
+  version and re-acked (PROTOCOL.md §4.3, §5). The acks this end still owed are dropped with the epoch, together with the peer's
+  acks not yet applied and every key's last-transmitted version, so no ack of a closed epoch can be sent or believed.
+  Known residual: a group stream that started in the previous epoch and delivers its `End` after the reset was consumed
+  feeds an old-epoch version into the new clock and names a key slot of the cleared table; the affected key's new-epoch
+  values then read as stale until the counter passes it, and the sender reports them `Failed`, never `Delivered`.
 * **Statistics.** Per channel: `Sent`/`BytesSent` per transmission, `Retries` (retransmissions), `SendSuperseded`,
   `Received`/`BytesReceived`, `Dropped` (stale or duplicate), `ReceiveSuperseded` (mailbox replacements), `RingDrops`,
   `ReceiveKeyTableFull`, `ReceiveTooLarge`, `OutOfBuffers`, and the engine's `QueuedMessages`/`QueuedBytes`/

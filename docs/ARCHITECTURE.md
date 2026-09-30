@@ -241,7 +241,7 @@ Channels are declared once in a `ChannelTable` (both sides must agree; the hands
 | Mode | Contract | Implementation |
 |---|---|---|
 | `UnreliableUnordered` | may be lost, may arrive in any order | QUIC DATAGRAM |
-| `UnreliableSequenced` | may be lost; only messages newer than the last accepted one per key are delivered | DATAGRAM + 16/32-bit serial sequence (per-channel counter, compared per key) |
+| `UnreliableSequenced` | may be lost; only messages newer than the last accepted one per key are delivered | DATAGRAM + 16/32-bit sequence (per-channel counter; ordered per key on the channel's extended sequence, so a key may idle for any number of channel messages — PROTOCOL §8) |
 | `ReliableOrdered` | every message, in order, per channel; optional request/response correlation | one persistent unidirectional QUIC stream per channel per direction; length-prefixed frames |
 | `ReliableUnordered` | every message; no message waits for another's retransmission | one unidirectional stream per *flush group*; groups are independent |
 | `ReliableLatest` | intermediate versions may be discarded; the latest version is eventually delivered while the epoch lives | versioned DATAGRAMs + application acks + loss-driven/timed retries (large values: per-key stream that aborts the previous one) |
@@ -279,7 +279,8 @@ Keys can be retired (`RetireKey`) so per-key state is freed on both sides; seque
 so a reused key is never mistaken for its previous holder.
 
 Completion points: **BufferReleased** (always), **Delivered** (transport ack for datagrams/streams when the
-transport reports it; `LatestAck` for ReliableLatest; transfer complete for Bulk), and — the only
+transport reports it; for ReliableLatest a `LatestAck` naming exactly the version last transmitted for the key;
+transfer complete for Bulk), and — the only
 application-level acknowledgement in v1 — the **response** on a `RequestResponse` channel.
 
 ## 6. Public API (Core)

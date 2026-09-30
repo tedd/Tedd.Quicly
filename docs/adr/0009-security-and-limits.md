@@ -22,7 +22,17 @@
 * **Remote-chosen identifiers are capped and have an eviction rule** (keys, groups, streams, reassemblies,
   transfers, requests); the rule is written per limit in PROTOCOL §7, and every violation is a counter.
 * **Retransmission cannot be weaponised**: ReliableLatest has per-version and per-peer retry budgets;
-  acks are coalesced and cumulative; Pong is rate-limited; control message rate is capped.
+  acks are coalesced per key (the highest accepted version); Pong is rate-limited; control message rate is capped.
+* **Sequence numbers give the peer nothing it did not have** (PROTOCOL §8 "sequence clock"). Only the
+  authenticated peer can produce datagrams (QUIC's AEAD and packet numbers exclude third-party replay and
+  duplication), and it could always send any sequence it liked. A tracked key that was updated recently is
+  judged exactly: nothing at or below its value is accepted. A tracked key that idled past half the range accepts
+  its next value whatever the wire sequence — the position an evicted or new key is already in (§7), no wider. A
+  sequence far ahead moves the channel's clock by less than half a range and only makes that peer's own later
+  values stale; the time-based resynchronisation of `UnreliableSequenced` is equivalent to sending a fresh higher
+  sequence. State is fixed-size, work is O(1) per message, nothing allocates. A `ReliableLatest` ack completes a
+  value only when it names exactly the version last transmitted for the key, so no ack the peer can forge or
+  replay reports a value `Delivered` that was not the one on the wire.
 * **0-RTT is never used for QUICLY frames**; servers default to no TLS resumption.
 * **Both endpoints enforce the same limits** — a client parses hostile servers too.
 * **HTTP/3 co-hosting is opt-in** with a per-ALPN MsQuic configuration and HTTP-specific limits; static

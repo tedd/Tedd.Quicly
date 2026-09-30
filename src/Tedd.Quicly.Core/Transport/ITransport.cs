@@ -40,8 +40,11 @@ public unsafe interface ITransport : IDisposable
     /// <see cref="TransportStatus.StreamLimitReached"/> and nothing follows for the stream) or asynchronously (the call returns
     /// <see cref="TransportStatus.Success"/>; then <see cref="ITransportSink.OnStreamStarted"/> reports
     /// <see cref="TransportStatus.StreamLimitReached"/>, every send accepted together with the start completes canceled, and
-    /// <see cref="ITransportSink.OnStreamShutdownComplete"/> follows, in that order). MsQuic and the simulator always refuse
-    /// asynchronously.</para>
+    /// <see cref="ITransportSink.OnStreamShutdownComplete"/> follows, in that order). MsQuic and the simulator always refuse a
+    /// StartStream asynchronously. A transport whose StartStream is itself a send that carries the start — the WebTransport
+    /// carrier starts a stream by sending its preamble on the inner transport — can also answer with the combined case of
+    /// <see cref="SendStream"/>: <see cref="TransportStatus.StreamLimitReached"/> after the start's report (and possibly the
+    /// shutdown) was delivered. The synchronous answer is final either way.</para>
     /// <para>A refused stream never starts: <see cref="StartStream"/>, and a send carrying <see cref="TransportSendFlags.Start"/>,
     /// return <see cref="TransportStatus.InvalidState"/> on it, also after <see cref="ITransportSink.OnStreamsAvailable"/>, and
     /// the peer never hears of it. Release it with <see cref="CloseStream"/> (after its
@@ -63,7 +66,9 @@ public unsafe interface ITransport : IDisposable
     /// follows, because the send was never accepted. A caller must treat a synchronous
     /// <see cref="TransportStatus.StreamLimitReached"/> as final even when refusal callbacks for the same stream have arrived
     /// or arrive: it releases the stream once and waits for <see cref="ITransportSink.OnStreamsAvailable"/> before it tries
-    /// again on a new stream.
+    /// again on a new stream. The shutdown may never be reported: a caller that releases the stream before it arrives
+    /// (<see cref="CloseStream"/>, as it should on the synchronous answer) suppresses it, so the report of the refused start
+    /// can be the only callback — state keyed to the stream must not wait for its shutdown.
     /// </para>
     /// </remarks>
     TransportStatus SendStream(TransportStreamId id, TransportSegment* segments, int count, ulong context, TransportSendFlags flags);
@@ -132,9 +137,11 @@ public interface ITransportSink
     /// <see cref="TransportStatus.StreamLimitReached"/> means the peer's stream limit refused the start: the stream never
     /// starts, sends accepted with the start complete canceled and <see cref="OnStreamShutdownComplete"/> follows; release it
     /// with <see cref="ITransport.CloseStream"/> and open a new stream to retry (see <see cref="ITransport.StartStream"/>).
-    /// This report can also arrive for a stream whose <see cref="ITransport.SendStream"/> call returns (or returned)
-    /// <see cref="TransportStatus.StreamLimitReached"/> synchronously: a send carrying the start can lose a race against the
-    /// refusal, and then no send completion follows (see <see cref="ITransport.SendStream"/>). The synchronous answer is final.
+    /// This report can also arrive for a stream whose <see cref="ITransport.SendStream"/> call (or a carrier's
+    /// <see cref="ITransport.StartStream"/>) returns or returned <see cref="TransportStatus.StreamLimitReached"/> synchronously:
+    /// a send carrying the start can lose a race against the refusal, and then no send completion follows, and the shutdown
+    /// only if the caller has not released the stream yet (see <see cref="ITransport.SendStream"/>). The synchronous answer is
+    /// final.
     /// </remarks>
     void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status);
 

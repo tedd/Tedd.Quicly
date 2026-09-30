@@ -61,16 +61,32 @@ public class ReviewStackstartraceConformanceTests
     }
 
     /// <summary>
-    /// FINDING (doc): both scenarios accept the combined case from StartStream as well, which ITransport.StartStream forbids
+    /// FINDING (doc): both scenarios accept the combined case from StartStream as well, which ITransport.StartStream forbade
     /// ("the call returns StreamLimitReached and nothing follows for the stream"; "MsQuic and the simulator always refuse
     /// asynchronously"). The WebTransport carrier does produce it: its StartStream is a SendStream(Start) of the preamble on
     /// the inner MsQuic transport (QueuePreamble), so it inherits the race. Either the StartStream contract names the
-    /// combined case or the scenarios must reject it; today the two disagree.
+    /// combined case or the scenarios must reject it; the two disagreed.
+    /// <para>
+    /// As fixed: the contract names it (ITransport.StartStream: a transport whose StartStream is a send carrying the start
+    /// has the combined case of SendStream), so the scenario and the contract agree that it is accepted — and both still
+    /// reject a shutdown without the start's report from StartStream.
+    /// </para>
     /// </summary>
-    [Fact]
-    public void RefusedStreamNeverStarts_Rejects_A_Combined_Case_From_StartStream()
+    [Theory]
+    [InlineData(Lie.StartedOnly)]
+    [InlineData(Lie.StartedAndShutdown)]
+    public void RefusedStreamNeverStarts_Accepts_The_Combined_Case_From_StartStream_That_ITransport_Documents(Lie shape)
     {
-        using var harness = new LyingHarness(new SimulatedTransportHarness()) { StartShape = Lie.StartedAndShutdown };
+        using var harness = new LyingHarness(new SimulatedTransportHarness()) { StartShape = shape };
+        TransportConformance.RefusedStreamNeverStartsAndIsRetriedOnANewStream(harness);
+        Assert.True(harness.Lies > 0, "the lie was never told");
+    }
+
+    /// <summary>GUARD, the other half of the fix of the finding above: a shutdown without the start's report from StartStream is rejected.</summary>
+    [Fact]
+    public void RefusedStreamNeverStarts_Rejects_A_Shutdown_Without_The_Starts_Report_From_StartStream()
+    {
+        using var harness = new LyingHarness(new SimulatedTransportHarness()) { StartShape = Lie.ShutdownOnly };
         Exception? thrown = Record.Exception(() => TransportConformance.RefusedStreamNeverStartsAndIsRetriedOnANewStream(harness));
         Assert.True(harness.Lies > 0, "the lie was never told");
         Assert.IsType<ConformanceException>(thrown);

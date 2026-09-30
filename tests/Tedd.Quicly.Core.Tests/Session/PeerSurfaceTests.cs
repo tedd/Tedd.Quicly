@@ -126,9 +126,12 @@ public class PeerSurfaceTests
             MaxReceiveDatagram = 1_100,
             HeartbeatTimeout = TimeSpan.FromSeconds(3),
             FailFastOnCallbackException = false,
+            DropWhenBlocked = false,
         };
 
+        Assert.True(new PeerOptions().DropWhenBlocked);
         PeerOptions copy = original.Clone();
+        Assert.False(copy.DropWhenBlocked);
         Assert.NotSame(original, copy);
         Assert.Same(clock, copy.Clock);
         Assert.Same(signal, copy.WorkSignal);

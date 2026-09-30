@@ -244,7 +244,7 @@ public struct PeerStatistics
     /// <summary>
     /// Datagrams among <see cref="DatagramsSent"/> the transport dropped before transmission while the connection was not
     /// closing: it could not send them at once and they carried <c>CancelOnBlocked</c>
-    /// (PROTOCOL.md §4.5), or they no longer fitted after the path's datagram limit shrank. Each
+    /// (<see cref="PeerOptions.DropWhenBlocked"/>), or they no longer fitted after the path's datagram limit shrank. Each
     /// message of such a datagram completes <see cref="Threading.DeliveryStatus.Expired"/> and is counted in its channel's
     /// <see cref="ChannelStatistics.TransportCanceled"/>. Datagrams the transport cancelled because the connection was
     /// closing are not counted — that includes a genuine blocked drop whose completion was still waiting when the close
@@ -335,7 +335,7 @@ public struct ChannelStatistics
     /// <summary>
     /// Messages among <see cref="Sent"/> whose datagram the transport dropped before transmission while the connection was
     /// not closing: it could not send the datagram at once and the datagram carried <c>CancelOnBlocked</c>
-    /// (PROTOCOL.md §4.5), or the datagram no longer fitted after the path's datagram limit shrank.
+    /// (<see cref="PeerOptions.DropWhenBlocked"/>), or the datagram no longer fitted after the path's datagram limit shrank.
     /// Counted in the unit of <see cref="Sent"/>: every member of a dropped packed container counts on its own channel, a
     /// fragment counts as one (the rest of its message still travels and the receiver gives the partial up), and so does a
     /// ReliableLatest transmission (which is retransmitted). The send completes

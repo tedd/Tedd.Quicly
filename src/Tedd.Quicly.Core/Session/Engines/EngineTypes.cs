@@ -121,8 +121,8 @@ internal struct FlushContext
     public long BytesSubmitted;
 
     /// <summary>
-    /// Unreliable datagrams may carry <see cref="TransportSendFlags.CancelOnBlocked"/> in this pass (PROTOCOL.md §4.5
-    /// <c>DropWhenBlocked</c>): true only when the transport reports that it honours the flag.
+    /// Unreliable datagrams may carry <see cref="TransportSendFlags.CancelOnBlocked"/> in this pass (PROTOCOL.md §4.5):
+    /// true only when <see cref="PeerOptions.DropWhenBlocked"/> is on and the transport reports that it honours the flag.
     /// </summary>
     public bool CancelBlockedDatagrams;
 }

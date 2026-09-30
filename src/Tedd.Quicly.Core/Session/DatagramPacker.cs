@@ -27,7 +27,7 @@ internal enum DatagramHints : byte
 
     /// <summary>
     /// The message is unreliable, so its datagram may be dropped when the transport cannot send it at once
-    /// (<c>DropWhenBlocked</c>). A container gets <see cref="TransportSendFlags.CancelOnBlocked"/> only when every member is
+    /// (<see cref="PeerOptions.DropWhenBlocked"/>). A container gets <see cref="TransportSendFlags.CancelOnBlocked"/> only when every member is
     /// unreliable and the pass allows the flag (<see cref="FlushContext.CancelBlockedDatagrams"/>).
     /// </summary>
     Unreliable = 2,

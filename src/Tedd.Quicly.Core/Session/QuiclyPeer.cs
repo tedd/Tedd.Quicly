@@ -66,6 +66,8 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     private readonly bool _requestTable;
     private uint _lastEpoch;
     private readonly bool _failFast;
+    // PeerOptions.DropWhenBlocked: unreliable datagrams may carry CancelOnBlocked (when the transport honours it).
+    private readonly bool _dropWhenBlocked;
     private readonly bool _needsDatagrams;
     private ITransport? _transport;
     private IPEndPoint? _remoteEndPoint;
@@ -104,6 +106,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         _requestTable = options.RequestChannelTable;
         _lastEpoch = options.LastEpoch;
         _failFast = options.FailFastOnCallbackException;
+        _dropWhenBlocked = options.DropWhenBlocked;
         _workSignal = options.WorkSignal;
         foreach (ChannelDefinition channel in table.All)
         {

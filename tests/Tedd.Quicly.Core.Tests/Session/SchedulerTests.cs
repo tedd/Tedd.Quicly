@@ -400,6 +400,40 @@ public class SchedulerTests
     }
 
     [Fact]
+    public void DropWhenBlocked_Off_Queues_Instead_Of_Canceling()
+    {
+        // The transport honours CancelOnBlocked (no capability override here); the option alone keeps the flag off, so the
+        // datagram that meets the busy link waits in the transport's queue and is delivered.
+        FlagRecordingConnector? recorder = null;
+        using SessionHarness h = new(link: new LinkOptions { BandwidthBitsPerSecond = 1_000_000 }, table: Table,
+            client: o =>
+            {
+                DatagramKit.Quiet(o);
+                o.DropWhenBlocked = false;
+            },
+            server: DatagramKit.Quiet, connector: c => recorder = new FlagRecordingConnector(c));
+        Assert.True(h.Client.Core.CancelOnBlockedHonoured);
+        h.Run(10_000);
+        FlagRecordingTransport transport = recorder!.Transport!;
+        transport.Datagrams.Clear();
+        SendToken first = h.Client.SendCopy(new SendHeader(2), new byte[1_000], SendOptions.Tracked).Token;
+        h.Client.Flush();
+        SendToken second = h.Client.SendCopy(new SendHeader(2), new byte[1_000], SendOptions.Tracked).Token;
+        h.Client.Flush();
+        h.Client.SendCopy(new SendHeader(7), [1]);
+        h.Client.SendCopy(new SendHeader(3, 1), [2]);
+        h.Client.Flush();
+        Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(second) != DeliveryStatus.Pending));
+        Assert.Equal(DeliveryStatus.Delivered, h.Client.GetDeliveryStatus(first));
+        Assert.Equal(DeliveryStatus.Delivered, h.Client.GetDeliveryStatus(second));
+        Assert.Equal(3, transport.Datagrams.Count);
+        Assert.DoesNotContain(transport.Datagrams, d => (d.Flags & TransportSendFlags.CancelOnBlocked) != 0);
+        Assert.True(h.RunUntil(() => DatagramKit.Statistics(h.Client).SendEntriesInUse == 0));
+        Assert.Equal(0, DatagramKit.ChannelStats(h.Client, 2).TransportCanceled);
+        Assert.Equal(0, DatagramKit.Statistics(h.Client).DatagramsCanceled);
+    }
+
+    [Fact]
     public void A_Datagram_The_Transport_Refuses_Fails_Its_Messages_And_Is_Not_Counted()
     {
         FlagRecordingConnector? recorder = null;

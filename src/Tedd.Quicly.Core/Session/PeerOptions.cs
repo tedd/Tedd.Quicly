@@ -273,6 +273,28 @@ public sealed class PeerOptions
     public long MaxSendBytesPerSecond { get; set; }
 
     /// <summary>
+    /// Whether unreliable datagrams are sent with the transport's cancel-on-blocked flag (PROTOCOL.md §4.5), so a datagram
+    /// the transport cannot send at once is dropped instead of queueing behind congestion, where it would go out late.
+    /// Default <see langword="true"/>. It takes effect only on a transport that honours the flag
+    /// (<see cref="Transport.TransportCapabilities.CancelOnBlocked"/>); ReliableLatest datagrams and control datagrams never
+    /// carry it, and a packed container carries it only when every member is unreliable.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A dropped datagram's messages complete <see cref="Threading.DeliveryStatus.Expired"/> and are counted in
+    /// <see cref="ChannelStatistics.TransportCanceled"/> and <see cref="PeerStatistics.DatagramsCanceled"/>. When those
+    /// counters explain messages that go missing — typically bursts after a stall, on any link including loopback — set this
+    /// to <see langword="false"/>: blocked datagrams then wait in the transport's queue and are sent when it can send again.
+    /// </para>
+    /// <para>
+    /// The price of <see langword="false"/> is staleness: a channel's expiry is evaluated only while the scheduler holds a
+    /// message, so a datagram that waits inside the transport is sent however old it has become, and a sustained overload
+    /// grows the transport's queue instead of shedding load. Read once, when the peer is created.
+    /// </para>
+    /// </remarks>
+    public bool DropWhenBlocked { get; set; } = true;
+
+    /// <summary>
     /// Bulk traffic's share of the estimated bandwidth (PROTOCOL.md §4.5): the rate at which the bulk engine hands
     /// stream bytes to the transport, so real-time traffic keeps flowing. The estimate is the transport's congestion
     /// window divided by its RTT, or <see cref="MaxSendBytesPerSecond"/> when the transport reports no window. A derived

@@ -19,9 +19,9 @@ the end that receives is the end to upgrade.
   part of a quarter of `ReceiveBudgetBytes`), and past that only **its own streams** are held back, by ordinary
   QUIC flow control. A channel the application drains may have its share of half the budget waiting, so what
   channels nobody reads, channels drained and then abandoned, and unread datagram backlog pin together leaves a
-  quarter of the budget (short of one message per reliable channel) to the channels that are read. Every other channel keeps working, nothing is lost,
-  and the held streams go on when the application drains the channel or registers a handler for it. PROTOCOL.md §7,
-  "Channels nobody drains".
+  quarter of the budget (short of one message per reliable channel) to the channels that are read. Every other
+  channel keeps working, nothing is lost, and the held streams go on when the application drains the channel or
+  registers a handler for it. PROTOCOL.md §7, "Channels nobody drains".
 * **A handler, or a `Drain`, called from inside another handler could deliver a `ReliableOrdered` channel out of
   order.** A `Drain` of another channel from inside a handler queued the older messages it met for "the next
   `Poll`" while the running `Poll` went on dispatching newer ones; a handler registered from inside a handler over

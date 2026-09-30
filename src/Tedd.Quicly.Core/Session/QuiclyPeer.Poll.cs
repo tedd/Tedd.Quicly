@@ -213,7 +213,8 @@ public sealed unsafe partial class QuiclyPeer
     /// no buffer, and neither does one that would exceed <see cref="PeerOptions.DecodedBytesPerSecond"/>. On a reliable
     /// channel such a message is not dropped: it stays queued, the channel gives nothing newer in this call (its order
     /// holds), and the call returns what it has — possibly fewer messages than the span holds, or none. Release them and
-    /// drain again; a Drain that finds everything released always gets the next message's buffer. (A message that could
+    /// drain again; a Drain that finds everything released gets the next message's buffer (unless a shared pool has no
+    /// block of any size that fits within the budget). (A message that could
     /// never be decoded is dropped and counted in <see cref="PeerStatistics.DecodeFailures"/>, as are compressed messages
     /// of unreliable channels that find no buffer or no decode budget.)
     /// </para>
@@ -796,7 +797,7 @@ public sealed unsafe partial class QuiclyPeer
     /// now, or <see cref="PeerOptions.DecodedBytesPerSecond"/> has no room for it yet, and the caller leaves the message
     /// where it is (its channel's receive credit then holds its sender back). The buffer may take the receive budget past
     /// its limit by itself (<see cref="PeerCore.TryRentDecode"/>): the budget can be full of the very messages that wait,
-    /// and the first message of a Drain that finds everything released always gets one. A message that could never be
+    /// and the first message of a Drain that finds everything released gets one. A message that could never be
     /// decoded (no block of its raw size within the budget, a raw size above the decode budget's burst, or no raw size at
     /// all) gets <see langword="true"/> without a buffer, and <see cref="TryDecode"/> drops and counts it.
     /// </remarks>

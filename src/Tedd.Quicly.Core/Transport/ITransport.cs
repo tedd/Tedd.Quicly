@@ -55,6 +55,16 @@ public unsafe interface ITransport : IDisposable
     /// With <see cref="TransportSendFlags.Start"/> on a stream that was not started yet, the start behaves as
     /// <see cref="StartStream"/>: when it is refused for the peer's stream limit asynchronously, the send is accepted and
     /// completes canceled; when synchronously, the call returns <see cref="TransportStatus.StreamLimitReached"/>.
+    /// <para>
+    /// One narrow case combines the two: a transport that starts the stream and queues the send as two steps (MsQuic) can have
+    /// the start refused and reported between them. The call then returns <see cref="TransportStatus.StreamLimitReached"/>
+    /// although <see cref="ITransportSink.OnStreamStarted"/> (<see cref="TransportStatus.StreamLimitReached"/>) and
+    /// <see cref="ITransportSink.OnStreamShutdownComplete"/> were already delivered for the stream, and no send completion
+    /// follows, because the send was never accepted. A caller must treat a synchronous
+    /// <see cref="TransportStatus.StreamLimitReached"/> as final even when refusal callbacks for the same stream have arrived
+    /// or arrive: it releases the stream once and waits for <see cref="ITransportSink.OnStreamsAvailable"/> before it tries
+    /// again on a new stream.
+    /// </para>
     /// </remarks>
     TransportStatus SendStream(TransportStreamId id, TransportSegment* segments, int count, ulong context, TransportSendFlags flags);
 
@@ -122,6 +132,9 @@ public interface ITransportSink
     /// <see cref="TransportStatus.StreamLimitReached"/> means the peer's stream limit refused the start: the stream never
     /// starts, sends accepted with the start complete canceled and <see cref="OnStreamShutdownComplete"/> follows; release it
     /// with <see cref="ITransport.CloseStream"/> and open a new stream to retry (see <see cref="ITransport.StartStream"/>).
+    /// This report can also arrive for a stream whose <see cref="ITransport.SendStream"/> call returns (or returned)
+    /// <see cref="TransportStatus.StreamLimitReached"/> synchronously: a send carrying the start can lose a race against the
+    /// refusal, and then no send completion follows (see <see cref="ITransport.SendStream"/>). The synchronous answer is final.
     /// </remarks>
     void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status);
 

@@ -112,7 +112,12 @@ public struct PeerStatistics
     /// <summary>Transport callbacks that threw (each one closes the connection with <c>InternalError</c>).</summary>
     public long CallbackFaults;
 
-    /// <summary>Compressed messages dropped because decoding failed or exceeded the decode budget.</summary>
+    /// <summary>
+    /// Compressed messages dropped because decoding failed, exceeded the decode budget
+    /// (<see cref="PeerOptions.DecodedBytesPerSecond"/>), or found no buffer for the decoded payload within the receive
+    /// budget. The last does not apply to <see cref="QuiclyPeer.Drain"/> on a ReliableOrdered or ReliableUnordered
+    /// channel: there the message waits for the next Drain.
+    /// </summary>
     public long DecodeFailures;
 
     /// <summary>

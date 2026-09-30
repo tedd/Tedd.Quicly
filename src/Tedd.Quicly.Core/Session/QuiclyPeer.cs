@@ -121,9 +121,11 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         // The class of a channel comes from its definition, not from the engines: they (and their mailboxes) do not exist yet.
         ReadOnlySpan<ChannelDefinition> channels = _core.Channels;
         byte[] queueClasses = new byte[channels.Length];
+        _decodeWaits = new bool[channels.Length];
         for (int i = 0; i < channels.Length; i++)
         {
             queueClasses[i] = ReceiveQueueClass.Of(channels[i]);
+            _decodeWaits[i] = queueClasses[i] == ReceiveQueueClass.Reliable && channels[i].Compression != ChannelCompression.None;
         }
 
         ReceiveQueueLayout layout = ReceiveQueueLayout.Compute(channels, options.ReceiveRingCapacity, options.ReceiveBudgetBytes);

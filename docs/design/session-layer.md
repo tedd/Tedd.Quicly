@@ -322,6 +322,14 @@ is back in `Filling` and still owned by the caller.
    channel, or by registering the handler over a backlog — and without it a ReliableOrdered channel was delivered out of
    order (0, 2, 1). The message cannot starve behind the queue: a Poll takes nothing from the ring while a queue of a
    channel with a handler is not empty or `maxItems` is used up.
+   `Drain` decodes too, and its caller cannot release a payload before the call returns, so a batch can need more decode
+   buffers than the receive budget has. `TryDecode` drops what it cannot decode, and a dropped message does not fill the
+   span, so the loop went on dropping: one `Drain` with a span of sixteen returned 3 of 40 queued messages of a reliable
+   channel and dropped 37. On a reliable channel that compresses (`_decodeWaits`) Drain now rents the decode buffer before
+   it takes the message (`ReceiveQueues.TryPeek`, `TryRentForDecode`); without one the message stays in the queue or the
+   held slot — or, taken from the ring, goes to the held slot — and the call returns what it has. A message that can never
+   be decoded (no block of its raw size within the budget next to the block it arrived in) is still dropped and counted,
+   as is one over the decode rate; the dispatch to a handler, which needs one buffer at a time, is unchanged.
 5. `ResumePendedStreams()`.
 6. Closed: engines' `OnPeerClosed`, requests still in the `ThreadSafeSend` front dropped (leases returned), every receive lease
    released, waiting `SendAsync` calls completed `NotConnected` and `FlushAsync` calls completed, the Closed event raised last;

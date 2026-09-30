@@ -104,12 +104,10 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
     // Per counted stream, what its transmission is counted with once the start is known to have succeeded — the key and
     // the value it carries (slot and version), its payload and wire bytes, whether it is a retry — and what a refusal
-    // needs: the stream-credit generation read before the stream was opened, and whether the refusal has been seen (its
-    // shutdown then must not unblock the channel).
+    // needs: the stream-credit generation read before the stream was opened (a refusal gives the slot back at once).
     private int[] _countedKeySlots = [];
     private int[] _countedCredit = [];
     private bool[] _countedRetry = [];
-    private bool[] _countedRefused = [];
     private bool[] _countedStarted = [];
     private int[] _countedValues = [];
     private uint[] _countedVersions = [];
@@ -177,7 +175,6 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         _countedKeySlots = new int[_streamCapacity];
         _countedCredit = new int[_streamCapacity];
         _countedRetry = new bool[_streamCapacity];
-        _countedRefused = new bool[_streamCapacity];
         _countedStarted = new bool[_streamCapacity];
         _countedValues = new int[_streamCapacity];
         _countedVersions = new uint[_streamCapacity];
@@ -1029,11 +1026,20 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         uint version = entries.Sequences[value];
         uint serial = (send.StreamSerial + 1) & PeerCore.EngineStreamSerialMask;
         ulong context = PeerCore.MakeEngineStreamContext(ChannelMode.ReliableLatest, _denseOf[local], serial);
-        if (_core.OpenStream(StreamKind.Unidirectional, context, (ushort)(channel.Priority * 257), out TransportStreamId stream) != TransportStatus.Success)
+        TransportStatus opened = _core.OpenStream(StreamKind.Unidirectional, context, (ushort)(channel.Priority * 257), out TransportStreamId stream);
+        if (opened != TransportStatus.Success)
         {
             _core.DiscardEntry(transmission);
-            _streamBlocked[local] = true;
-            send.CreditGeneration = credit;
+            if (opened == TransportStatus.StreamLimitReached)
+            {
+                _streamBlocked[local] = true;
+                send.CreditGeneration = credit;
+            }
+
+            // Any other failure is not the peer's stream credit — OutOfMemory is a stream table that is full for the moment
+            // (this end's own streams hold their share, or closed streams' slots are still being cleaned up) — so nothing
+            // from the peer would end the wait: the value keeps its place and the next pass tries again, as the group,
+            // ordered and bulk engines do.
             return Transmit.Waits;
         }
 
@@ -1084,7 +1090,6 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         _countedKeySlots[counted] = keySlot;
         _countedCredit[counted] = credit;
         _countedRetry[counted] = retry;
-        _countedRefused[counted] = false;
         _countedStarted[counted] = false;
         _countedValues[counted] = value;
         _countedVersions[counted] = version;
@@ -1116,8 +1121,8 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
     /// <summary>
     /// Gives back the per-channel stream slot of <paramref name="stream"/>, if this engine counted one for it (game thread,
-    /// from the shutdown notice). A stream that was never counted — a start the transport reported and then refused, or
-    /// another engine's stream broadcast to us — changes nothing.
+    /// from the shutdown notice). A stream that was never counted — a start the peer's limit refused (its refusal gave its
+    /// slot back already, <see cref="OnLargeStreamRefused"/>), or another engine's stream broadcast to us — changes nothing.
     /// </summary>
     /// <param name="stream">The stream that shut down.</param>
     private void ReleaseCountedStream(TransportStreamId stream)
@@ -1138,14 +1143,8 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
                     _openStreams[local]--;
                 }
 
-                // A stream that really was open gave its slot at the peer back with this shutdown. One whose start the
-                // peer's limit refused never had a slot there: the channel keeps waiting for the credit generation to change.
-                if (!_countedRefused[index])
-                {
-                    _streamBlocked[local] = false;
-                }
-
-                _countedRefused[index] = false;
+                // A stream that really was open gave its slot at the peer back with this shutdown.
+                _streamBlocked[local] = false;
                 return;
             }
         }
@@ -1157,21 +1156,27 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     /// counted — a transmission is counted when its start is known (<see cref="OnLargeStreamStarted"/>) — so there is
     /// nothing to take back: the channel's large values wait for stream credit (PROTOCOL.md §3.2: they wait, they never
     /// fail), exactly as after a refusal the call itself reports, and its other values go on. The canceled completion
-    /// that follows puts the value back in its queue; the stream's shutdown gives back its per-channel slot and leaves
-    /// the channel's large values waiting.
+    /// that follows puts the value back in its queue. The refused stream never had a slot at the peer, so its per-channel
+    /// slot is given back here, not by its shutdown: that may never be reported (the transport thread does not record a
+    /// refused stream, <see cref="OnStreamStarted"/>). The channel's large values keep waiting for credit.
     /// </summary>
     private void OnLargeStreamRefused(int local, TransportStreamId stream)
     {
         for (int index = 0; index < _countedStreams.Length; index++)
         {
-            if (_countedStreams[index] != stream || _countedRefused[index] || _countedStarted[index])
+            if (_countedStreams[index] != stream || _countedStarted[index])
             {
                 continue;
             }
 
-            _countedRefused[index] = true;
             _streamBlocked[local] = true;
             _send[local].CreditGeneration = _countedCredit[index];
+            _countedStreams[index] = default;
+            if (_openStreams[local] > 0)
+            {
+                _openStreams[local]--;
+            }
+
             return;
         }
     }
@@ -1186,7 +1191,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     {
         for (int index = 0; index < _countedStreams.Length; index++)
         {
-            if (_countedStreams[index] != stream || _countedRefused[index] || _countedStarted[index])
+            if (_countedStreams[index] != stream || _countedStarted[index])
             {
                 continue;
             }
@@ -1633,7 +1638,6 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         }
 
         Array.Clear(_countedStreams);
-        Array.Clear(_countedRefused);
         ResetReceiveForReconnect();
     }
 

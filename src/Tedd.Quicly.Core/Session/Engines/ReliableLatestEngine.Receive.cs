@@ -61,8 +61,8 @@ internal sealed unsafe partial class ReliableLatestEngine
 
         /// <summary>
         /// The peer's stream limit refused the start of a large-value stream this engine opened. The send that carried the
-        /// start completes canceled and the stream shuts down afterwards; the value never reached the peer and waits for
-        /// stream credit.
+        /// start completes canceled; the value never reached the peer and waits for stream credit. The stream never had a
+        /// slot at the peer, so this notice gives back its per-channel slot (no <see cref="StreamClosed"/> follows).
         /// </summary>
         StreamRefused = 3,
 
@@ -94,8 +94,9 @@ internal sealed unsafe partial class ReliableLatestEngine
         _streamCapacity = Math.Max(streams, 1);
         _streams = new NativeArray<LatestRecvStream>(_streamCapacity);
 
-        // One entry per stream this engine may hold open plus one per channel: a start the peer refused is recorded here too
-        // until its shutdown arrives, and it must never crowd out the record of a stream that is really carrying a value.
+        // One entry per stream this engine may hold open plus one per channel. A start the peer refused is not recorded (its
+        // refusal gives its slot back, OnStreamStarted), so it can never crowd out the record of a stream that is really
+        // carrying a value.
         _txStreams = new TransportStreamId[_streamCapacity + count];
         _txLocals = new int[_streamCapacity + count];
         _streamFree = new int[_streamCapacity];
@@ -110,8 +111,8 @@ internal sealed unsafe partial class ReliableLatestEngine
         _ackQueue = new SpscRing<AckRequest>((int)Math.Min(ackSlots, MaxAckRingSlots));
         _rejectQueue = new SpscRing<RejectRequest>(256);
         _notices = new SpscRing<LatestNotice>(1024);
-        // A stream the engine opened raises its start (or its refusal) and its shutdown: two notices, and its record in
-        // _txStreams is free again only after the second.
+        // A stream the engine opened raises its start and its shutdown (two notices, and its record in _txStreams is free
+        // again only after the second), or only its refusal.
         _streamNotices = new SpscRing<LatestNotice>((2 * _txStreams.Length) + 8);
         _heldAck.Local = -1;
         // A value is staged whole, so it can never be larger than the receive budget or the pool's largest block (§7.2).
@@ -847,8 +848,9 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// thread; the peer routes it here by the context's mode), and tells the game thread how the start went: the
     /// transmission the stream carries is counted only once it is known to have started. A start the peer's stream limit
     /// refused is followed by the canceled completion of its send, which puts the value back in its queue; the refusal
-    /// makes the channel's large values wait for stream credit (MsQuic and the simulator refuse a start only here, never
-    /// in the call that made it).
+    /// makes the channel's large values wait for stream credit and gives the stream's per-channel slot back, so a refused
+    /// stream is not recorded (see below). The refusal comes here after the send that carried the start was accepted, or
+    /// — when the refusal raced it — before that send answered <see cref="TransportStatus.StreamLimitReached"/> itself.
     /// </remarks>
     public override void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status)
     {
@@ -871,7 +873,14 @@ internal sealed unsafe partial class ReliableLatestEngine
         }
         else if (status == TransportStatus.StreamLimitReached)
         {
+            // Not recorded: the refusal gives the stream's per-channel slot back by itself (OnLargeStreamRefused), so its
+            // shutdown carries nothing the game thread waits for — and it may never come. When the send that carried the
+            // start answers StreamLimitReached itself (the refusal raced it, ITransport.SendStream), the caller closes the
+            // stream at once, and a transport reports no shutdown for a stream its owner closed first: a record would stay
+            // taken for the rest of the connection, and enough of them would leave no record for a stream that is really
+            // open, whose shutdown would then never give its slot back.
             PostStream(new LatestNotice { Local = local, Kind = NoticeKind.StreamRefused, Stream = id });
+            return;
         }
 
         for (int index = 0; index < _txStreams.Length; index++)

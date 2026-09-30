@@ -618,14 +618,16 @@ receiver-local; nothing on the wire changes and either end may run it alone.
   each hold is counted per channel (`BacklogHolds`).
 * A reliable channel **with a handler** has no such limit (its messages leave the ring at every Poll). A channel
   the application **drains** is not held to the share either: a Drain that leaves the channel's queue empty (an
-  empty Drain counts) marks it as read, and its limits are then the ring depth in messages and **an equal share
-  of half the byte budget** among the reliable channels of the table (a message is started while less than that
-  waits, and always on an empty channel). It returns to its share at the first Poll that finds messages queued
-  for it which no Drain took during the whole Poll interval before, and it keeps what it accepted until then —
-  which is why the drained channels share half the budget and do not get all of it: channels drained and then
-  abandoned keep at most that half between them (plus one message each), and the other half is what is left for
-  the channels that are read. So a host that drains a reliable channel once per frame is limited as a handler is,
-  short of that share, and a host that stops draining it is confined within two Poll intervals. A message larger than the
+  empty Drain counts) marks it as read, and its limits are then the ring depth in messages and **half the byte
+  budget, shared with the other reliable channels no handler reads** (a message is started while less than that
+  waits in them, this channel's own messages included, and always on an empty channel; a channel with a handler,
+  or with nothing waiting, takes nothing of it, and a channel nobody reads starts no message that does not fit in
+  what is left of it). It returns to its share at the first Poll that finds messages queued for it which no
+  Drain took during the whole Poll interval before, and it keeps what it accepted until then — which is why the
+  drained channels share half the budget and do not get all of it: channels drained and then abandoned, and the
+  channels nobody reads, keep at most that half between them (plus one message each), and the other half is what
+  is left for the channels that are read. So a host that drains a reliable channel once per frame is limited as a
+  handler is, short of that half, and a host that stops draining it is confined within two Poll intervals. A message larger than the
   share of a channel that was never drained arrives after the application's first Drain of it. What the credit
   cannot change is the order inside one stream: on a `ReliableOrdered` channel everything behind an unread
   message waits with it, a response to this end's own request included.
@@ -668,7 +670,10 @@ receiver-local; nothing on the wire changes and either end may run it alone.
   very compressed messages that wait), so the first message of a Drain that finds everything released, and a
   message dispatched to a handler, get one — unless payloads the application still holds (drained and not yet
   released, or retained) took the budget past its limit already; then a Drain waits and a handler's message is
-  dropped and counted.
+  dropped and counted. A message that can never get one is dropped and counted by both: a raw size that needs a
+  block larger than the budget, and a message whose own block is the pool's last block its decode could use (with
+  the default per-peer pool, whose largest class is one block of 256 KiB, a message above 64 KiB both compressed
+  and raw, on a channel whose `MaxMessageSize` was raised above the 64 KiB default).
 
 The **stream idle mid-message** rule is per receiving stream and applies to every stream mode: a stream that has
 delivered a message's frame header but not the rest of its payload for 30 s (`PeerOptions.StreamIdleTimeout`) is
@@ -696,8 +701,10 @@ sender that ignores `MaxGroups` gains nothing but the slots of its own other cha
 stream table must have room for what it admits as well: a stream it had to refuse for want of a slot would
 never reach the session and would be lost in the same way. The MsQuic transport therefore sizes its table from
 the streams it grants, whatever `MaxStreams` says, and keeps a quarter of it for this end's own streams; while
-slots of closed streams still wait for their native close it grows, up to twice that size, and only a peer that
-churns streams faster than that can have one refused (`RefusedPeerStreamCount`).
+slots of closed streams still wait for their native close it grows, up to twice that size. Past that a peer
+stream is refused (`RefusedPeerStreamCount`) and what it carried can be lost below the session: a peer that churns
+streams faster than the thread pool closes them reaches it, and so can an honest peer's group streams when the
+receiving process's thread pool is starved for seconds.
 
 This is a receiver-side rule, so it takes effect when the *receiving* end runs it, whatever the sender runs. A
 receiver built before it reset the excess streams, and still loses groups when it falls behind, however new its

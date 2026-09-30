@@ -447,15 +447,25 @@ allocated in native memory in chunks that double from 64.
     the end of `DispatchReceived`): a handler that throws on the last message of its backlog leaves the dispatch loop
     before the limit is lifted, and nothing else would come back to it.
     `Drained` — a `Drain` left the channel's queue empty (`SettleCreditAfterDrain`): the ring's capacity in messages and
-    `B/2/Qr` lease bytes as a threshold (a message is started while less than that waits, and always on an empty channel). A
+    `B/2` lease bytes as a threshold, counted over every accounted channel that is not `Handled` (a message is started
+    while less than that waits in them, this channel's own messages included, and always on an empty channel). A
     pass start demotes a `Drained` channel that still has messages queued which no take emptied during the whole pass
     before (`DemoteUndrainedChannels`, `ReceiveQueues.LeftUndrained`; one compare while no channel is in that state). A
     narrower limit takes nothing back: the channel keeps what it accepted and accepts nothing more until the application
-    has taken it down to the new limit — which is the reason for `B/2/Qr`: what the drained channels hold at the moment the
-    application stops coming for them stays, at most `B/2` between them (plus a message each), and the other half of the
+    has taken it down to the new limit — which is the reason the `B/2` is shared: what the drained channels hold at the
+    moment the application stops coming for them stays, and they are then `Unread` channels that hold more than their
+    share. So an `Unread` channel also starts no message whose block does not fit in what the channels that are not
+    `Handled` leave of `B/2`, and all of them together hold at most `B/2` (plus a message each); the other half of the
     budget is what the channels that are read then have. (The first version gave each drained channel `B/2`, and two
-    channels abandoned that way held all of it: third review round, SC-1.) A host that drains once per frame never meets
-    the share, and meets its drained limit only with more than `B/2/Qr` of one channel's messages between two drains.
+    channels abandoned that way held all of it: third review round, SC-1. The second divided `B/2` by `Qr`, every
+    reliable channel of the table: handled and idle channels, which hold nothing of it, cut a drained channel's intake
+    per frame — a burst of 400 × 1 000 B next to seven idle handled channels took 37 frames instead of 5: recheck round,
+    RC-2.) The transport thread sums the channels' waiting bytes from its own copies (`IsSharedFull`, one pass over the
+    accounted channels for a message of a limited channel, only with more than one accounted channel) and refreshes every
+    copy only when they say the half is full; the game thread sums the live counters where it decides a resume
+    (`SharedWaiting`). What another channel gives back of the half marks it changed (`NoteReturned`), so a stream held
+    for the half is looked at again. A host that drains once per frame never meets the share, and meets its drained
+    limit only with more than `B/2` of its non-handled channels' messages between two drains.
   * **Resuming.** A stream held back for credit is *not* retried by every Poll (that would resume and re-pend every stream of
     an unread channel each frame). The transport thread lists it (`NotePended`, an SPSC ring sized for every stream the peer
     may open); the game thread collects the list into its own (`Resume`: the end of `Drain`, every Poll, `RegisterHandler`)
@@ -532,9 +542,15 @@ allocated in native memory in chunks that double from 64.
     within the budget: the budget and the class can both be full of the very compressed messages that wait, and a Drain
     held to them waited for good (S1: two Drained LZ4 channels after a hitch, every Drain 0 for ever). The same rental serves
     the dispatch to a handler, which no longer loses a burst's compressed messages to a full budget (S3). A message that can
-    never be decoded (its decoded block is larger than the whole budget, or its raw size above the decode rate's burst) is
-    still dropped and counted; `TryDecode` rents before it charges the rate, so such a drop costs the messages behind it
-    nothing. Over the rate, a handler's message is dropped (holding it would close the ring to every channel).
+    never be decoded (its decoded block is larger than the whole budget, the pool has no block for it within the budget but
+    the one the message holds itself, or its raw size is above the decode rate's burst) is still dropped and counted;
+    `TryDecode` rents before it charges the rate, so such a drop costs the messages behind it nothing. The second case is
+    `PeerCore.CanEverRentDecode(raw, heldBlock)`, which counts the blocks of the classes a decode could use minus the
+    message's own: the default private pool's largest class is one block of 256 KiB, so a message above 64 KiB both
+    compressed and raw holds the only block its decode could use. After the S1 fix that check asked about the budget alone,
+    and such a message waited at the head of its channel for good with the whole budget, every other channel of the peer
+    stalled behind it (recheck round, RC-1); 0.2.1 dropped it, and so does this. Over the rate, a handler's message is
+    dropped (holding it would close the ring to every channel).
 * **`QueuedHandled`.** The number of queued messages whose channel has a handler — what the next Poll dispatches from the queues
   and what the work probe reads — is kept by `ReceiveQueues` itself (`SetHandled` from `RegisterHandler`/`UnregisterHandler`,
   adjusted in `TryAppend`/`Take`), not by the peer, so that every way an entry leaves the queues keeps it exact: a count that

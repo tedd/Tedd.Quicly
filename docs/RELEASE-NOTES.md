@@ -17,9 +17,10 @@ the end that receives is the end to upgrade.
   per-channel **receive credit**: a channel nobody reads may have its share waiting for the application (its
   reserved part of the queue pool — 256 messages each with two reliable channels at default options — and the same
   part of a quarter of `ReceiveBudgetBytes`), and past that only **its own streams** are held back, by ordinary
-  QUIC flow control. A channel the application drains may have its share of half the budget waiting, so what
-  channels nobody reads, channels drained and then abandoned, and unread datagram backlog pin together leaves a
-  quarter of the budget (short of one message per reliable channel) to the channels that are read. Every other
+  QUIC flow control. A channel the application drains may have half the budget waiting, shared with the other
+  reliable channels no handler reads, so what channels nobody reads, channels drained and then abandoned, and
+  unread datagram backlog pin together leaves a quarter of the budget (short of one message per reliable channel)
+  to the channels that are read. Every other
   channel keeps working, nothing is lost, and the held streams go on when the application drains the channel or
   registers a handler for it. PROTOCOL.md §7, "Channels nobody drains".
 * **A handler, or a `Drain`, called from inside another handler could deliver a `ReliableOrdered` channel out of
@@ -33,9 +34,10 @@ the end that receives is the end to upgrade.
   was dropped (`DecodeFailures`) after the sender had been told `Delivered` — through a handler (256 of 1 200
   messages of 20 000 bytes to a late receiver in the test that found it), and through `Drain`, which also went on
   to drop the rest of the queue once the batch did not fit. A decode buffer may now take the receive budget past
-  its limit by itself (the transport takes nothing new until it is back within it), so a handler's message and
-  the first message of a `Drain` have one unless the application still holds decoded payloads that took the
-  budget over already. On `ReliableOrdered` / `ReliableUnordered` channels `Drain` leaves a message it has no
+  its limit by itself (the transport takes nothing new until it is back within it), and a used-up size class is
+  replaced by a larger one within the budget, so a handler's message and the first message of a `Drain` have one
+  unless the application still holds decoded payloads that took the budget over already, or the message's own
+  block is the pool's last block its decode could use (see "Known limits"). On `ReliableOrdered` / `ReliableUnordered` channels `Drain` leaves a message it has no
   buffer or no decode budget (`DecodedBytesPerSecond`) for queued, gives nothing newer of that channel in the same
   call — the channel's order holds — and returns what it has. A message dropped for want of a buffer no longer
   uses up the decode budget of the ones behind it.
@@ -88,15 +90,16 @@ the end that receives is the end to upgrade.
   is full, as before; with it, that channel alone answers `QueueFull`.
 * **How a reliable channel without a handler is limited depends on whether it is read.** A channel the
   application drains — a `Drain` left its queue empty since the `Poll` before last, and an empty `Drain` counts —
-  may have as many messages waiting as the receive ring holds and **an equal share of half of
-  `ReceiveBudgetBytes`** among the table's reliable channels (64 KiB each with two of them at the default; a
-  message is started while less than that waits, and one message is always accepted on an empty channel). Before
-  this release it shared the whole budget with every other channel. A host that receives more than its share on
-  one drained channel between two drains now has the rest wait at the sender for a frame: raise
-  `ReceiveBudgetBytes`, or register a handler (a handler's channel is limited as before). A channel that is *not* read is held to the share above, strictly:
-  a message whose buffer block is larger than the share (with default options: a message above 16 KiB when the
-  table has two to four reliable channels, above 4 KiB with five to sixteen) is not started until the application
-  drains the channel for the first time. A host that lets a whole `Poll` interval pass without draining a
+  may have as many messages waiting as the receive ring holds and **half of `ReceiveBudgetBytes`, shared with the
+  other reliable channels no handler reads** (128 KiB at the default when they have nothing waiting; a message is
+  started while less than that waits in them, and one message is always accepted on an empty channel; channels
+  with a handler take nothing of it). Before this release it shared the whole budget with every other channel. A
+  host that receives more than that on its drained channels between two drains now has the rest wait at the
+  sender for a frame: raise `ReceiveBudgetBytes`, or register a handler (a handler's channel is limited as
+  before). A channel that is *not* read is held to the share above, strictly: a message whose buffer block is
+  larger than the share (with default options: a message above 16 KiB when the table has two to four reliable
+  channels, above 4 KiB with five to sixteen), or than what the channels no handler reads leave of the half, is
+  not started until the application drains the channel for the first time. A host that lets a whole `Poll` interval pass without draining a
   reliable channel that has messages queued, or never empties it (a fixed-size buffer it fills without calling
   again), is treated as not reading it until a `Drain` empties the queue again. Nothing is lost either way — the
   rest waits at the sender — but to keep the throughput, drain until `Drain` returns 0, once per `Poll`.
@@ -121,8 +124,7 @@ the end that receives is the end to upgrade.
   option is the table's size when that is enough. It still limits this end's own streams: `OpenStream` answers
   `OutOfMemory` once they hold everything the table has beyond the peer's grants. While slots of closed streams
   wait for the thread pool's cleanup work item the table grows, up to twice its size; past that a peer stream is
-  refused (`RefusedPeerStreamCount`, and the diagnostic sink), which only a peer that churns streams faster than a
-  starved thread pool closes them reaches.
+  refused (`RefusedPeerStreamCount`, and the diagnostic sink): see "Known limits".
 * `WebTransportOptions.MaxStreams` is no longer a limit (the carrier's table follows the streams in use), and the
   carrier shows the session no more peer streams than it reported it would admit.
 * A large `ReliableLatest` channel and a `Bulk` channel still reset streams beyond their limit on the receiver.
@@ -158,13 +160,28 @@ the end that receives is the end to upgrade.
   in its send table and send budget, which all its channels share; when they are full its sends on every channel
   are refused (`OutOfBuffers`), datagrams included. `ChannelOptions.QueueLimitBytes` bounds one channel's part.
 * **Channels that were drained and are then abandoned keep what they accepted**, up to half the receive budget
-  together (and one message each on top of their share), until they are drained again.
+  together with the channels nobody reads (and one message each on top of it), until they are drained again.
+* **A compressed message above 64 KiB both compressed and raw is dropped with the default per-peer pool**
+  (`DecodeFailures`), on reliable channels too, after the sender was told `Delivered`, through a handler and
+  through `Drain` alike: its compressed form takes the pool's only 256 KiB block, which is the only block its
+  decode could use. It needs a channel whose `MaxMessageSize` was raised above the 64 KiB default, and 0.2.1
+  dropped it as well. Give such a peer a pool with two blocks of 256 KiB (`PeerOptions.AllocatorOptions`), or a
+  shared allocator (`PeerOptions.Allocator`, as a server has); more generally a compressed message whose own block
+  is the pool's last block that its decode could use is dropped.
+* **An MsQuic receiver whose thread pool is starved for seconds can refuse peer streams, and lose what they
+  carried.** Slots of closed streams come back when the thread pool's cleanup work item has closed them, and the
+  stream table grows for them only up to twice its size (so a peer's churn cannot grow it without bound). Group
+  streams close all the time, so an honest sender's groups can reach that cap too; each refused stream counts in
+  `MsQuicTransport.RefusedPeerStreamCount` and is said through the diagnostic sink. The default table (2 048
+  slots, so 4 096 at the cap) leaves a wide margin; a larger `MsQuicTransportOptions.MaxStreams` raises the cap
+  with it. Keep the thread pool from being starved for that long.
 * On a `ReliableOrdered` channel everything behind an unread message waits with it (the stream is ordered),
   including a response to this end's own request on that channel.
 * A compressed message dispatched to a **handler** is still dropped (`DecodeFailures`) when it exceeds
   `DecodedBytesPerSecond` (8 MiB/s by default, and a burst of the same), on reliable channels too — a burst of
-  compressed messages that decode to more than that loses the rest — and when the application still holds decoded
-  payloads (retained, or drained and not released) that took the receive budget past its limit. Raise
+  compressed messages that decode to more than that loses the rest — when the application still holds decoded
+  payloads (retained, or drained and not released) that took the receive budget past its limit, and when the pool
+  has no free block of the decode's size class or a larger one within the budget. Raise
   `DecodedBytesPerSecond` for a channel that receives more, or read it with `Drain`, which waits instead.
 * **A Bulk sender that cancels more than three times `BulkTransfersPerDirection` transfers (six at the default)
   while the receiver's host is late** has its next transfer refused (`LimitExceeded`, the transfer ends `Failed`)

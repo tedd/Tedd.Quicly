@@ -232,7 +232,7 @@ is chosen:
   waiting (strictly: a message whose block does not fit is not started), and then holds back that channel's own
   streams (QUIC flow control stops their sender; `ChannelStatistics.BacklogHolds`). The ring and the other
   channels are not affected. A channel with a handler keeps the ring and the budget as its only limits; one that
-  is drained every frame, the ring and its share of half the budget. What remains: an unread `ReliableUnordered` channel ends
+  is drained every frame, the ring and half the budget, shared with the other reliable channels no handler reads. What remains: an unread `ReliableUnordered` channel ends
   up holding the connection's free stream slots, and unread channels that hold the transport's connection
   flow-control window between them (16 MiB by default) stop its streams, so read every reliable channel that can
   receive that much.

@@ -47,7 +47,10 @@
   so a stream the peer was allowed to open always finds a slot, and the local streams cannot take the slots of
   the granted ones; while slots of closed streams wait for their native close (the thread pool's cleanup work
   item) the table grows, but only to twice that size — a peer that churns streams faster than a starved pool
-  closes them has a stream refused past that (counted) rather than growing the table without bound; slots are
+  closes them has a stream refused past that (counted) rather than growing the table without bound. The cap is
+  not only a hostile peer's: an honest peer's group streams close all the time, so on a receiver whose thread pool
+  is starved for seconds they can reach it too, and a refused stream's data can be lost (the closes cannot run
+  inline instead, on the MsQuic worker whose callbacks they wait for); slots are
   created as streams use them, and the WebTransport carrier's mirror of the table
   grows the same way (slot records on first use, preamble storage in chunks of 256 slots). A peer that
   opens every stream it may on a single channel holds one half-received message per stream — a ring reservation
@@ -81,11 +84,14 @@
   together they can pin half the queue pool and a quarter of the budget — the byte share is strict, a message
   whose buffer block does not fit in it is not started — which leaves the other half of each to the traffic that
   is read. A channel with a handler is not held to the share (the ring and the budget bound it, as before). A
-  channel the application drains every frame is bounded by the ring and by its equal share of half the budget
-  among the reliable channels, because it keeps what it accepted when the application stops draining it and falls
-  back to the share (within two Poll intervals): the peer chooses the burst, the application chooses when it
-  stops, and half the budget is what all such channels together can then hold (plus a message each; the first
-  version gave each of them half, and two abandoned channels held the whole budget). The lists of held-back
+  channel the application drains every frame is bounded by the ring and by half the budget, counted over every
+  reliable channel no handler reads, because it keeps what it accepted when the application stops draining it and
+  falls back to the share (within two Poll intervals): the peer chooses the burst, the application chooses when it
+  stops, and half the budget is what all such channels together, with the channels nobody reads, can then hold
+  (plus a message each; the first version gave each of them half, and two abandoned channels held the whole
+  budget; the second divided the half among every reliable channel of the table, handled and idle ones included,
+  which cut what a drained channel took per frame for nothing). A channel nobody reads starts no message that does
+  not fit in what those channels leave of that half, next to its strict share. The lists of held-back
   streams are bounded too — the credit list, and the ring of streams held for the receive ring or the budget: a
   peer that resets held streams and opens new ones leaves an entry per stream until the receiver's next Poll;
   each list grows to eight times the streams the peer may have open and then the connection is closed

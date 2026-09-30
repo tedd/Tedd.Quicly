@@ -206,12 +206,25 @@ public sealed unsafe partial class QuiclyPeer
         return written;
     }
 
-    /// <summary>Returns the payloads of drained messages to the pool (game thread). Each message must be released exactly once.</summary>
+    /// <summary>
+    /// Returns the payloads of drained messages to the pool (game thread). Each message must be released exactly once.
+    /// </summary>
+    /// <remarks>
+    /// Still valid after <see cref="Dispose"/>, and required then for a peer over a shared allocator
+    /// (<see cref="PeerOptions.Allocator"/>; every peer of a server): the blocks go back to the shared pool, which outlives
+    /// the peer. For a peer with its own private pool the call is a no-op once the peer is disposed (the pool is freed with
+    /// the peer). Release before the shared allocator itself is disposed; a release after that is a no-op.
+    /// </remarks>
     /// <param name="messages">Messages from <see cref="Drain"/>.</param>
     public void Release(ReadOnlySpan<ReceivedMessage> messages)
     {
         if (_disposed)
         {
+            for (int i = 0; i < messages.Length; i++)
+            {
+                _core.ReturnReceiveAfterDispose(in messages[i].Lease);
+            }
+
             return;
         }
 
@@ -221,19 +234,34 @@ public sealed unsafe partial class QuiclyPeer
         }
     }
 
-    /// <summary>Returns a retained payload to the pool (game thread). Must be called exactly once per lease.</summary>
+    /// <summary>
+    /// Returns a retained payload, or the payload of a response from <see cref="SendRequestAsync"/>, to the pool (game
+    /// thread). Must be called exactly once per lease.
+    /// </summary>
+    /// <remarks>
+    /// Still valid after <see cref="Dispose"/>, and required then for a peer over a shared allocator
+    /// (<see cref="PeerOptions.Allocator"/>; every peer of a server, which disposes a peer right after its
+    /// <c>PeerClosed</c> event): the block goes back to the shared pool, which outlives the peer. For a peer with its own
+    /// private pool the call is a no-op once the peer is disposed (the pool is freed with the peer, and the lease's
+    /// payload with it). Release before the shared allocator itself is disposed; a release after that is a no-op.
+    /// </remarks>
     /// <param name="lease">A lease from <see cref="Retain"/>.</param>
     public void Release(in ReceiveLease lease)
     {
-        if (!_disposed)
+        if (_disposed)
         {
-            _core.ReturnReceive(in lease.Lease);
+            _core.ReturnReceiveAfterDispose(in lease.Lease);
+            return;
         }
+
+        _core.ReturnReceive(in lease.Lease);
     }
 
     /// <summary>
     /// Keeps the payload of the message being handled beyond its handler. Only valid inside a <see cref="MessageHandler"/>
-    /// for the header it was given; release the lease with <see cref="Release(in ReceiveLease)"/>.
+    /// for the header it was given; release the lease with <see cref="Release(in ReceiveLease)"/> — exactly once, and also
+    /// when the peer was disposed meanwhile (a peer over a shared <see cref="PeerOptions.Allocator"/> returns the block to
+    /// that pool then; see <see cref="Dispose"/>).
     /// </summary>
     /// <param name="header">The header passed to the handler.</param>
     /// <returns>The lease.</returns>

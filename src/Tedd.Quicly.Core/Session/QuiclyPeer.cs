@@ -225,8 +225,8 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     /// <summary>
     /// True once <see cref="Dispose"/> has been called: every member that changes the peer then throws
     /// <see cref="ObjectDisposedException"/>, and <see cref="Release(in ReceiveLease)"/>, <see cref="GetStatistics"/> and
-    /// <see cref="Capabilities"/> answer as documented for a disposed peer. Lets a host skip a peer it disposed from a
-    /// handler without catching.
+    /// <see cref="Capabilities"/> answer as documented for a disposed peer (<c>Release</c> still returns a block to a
+    /// shared <see cref="PeerOptions.Allocator"/>). Lets a host skip a peer it disposed from a handler without catching.
     /// </summary>
     public bool IsDisposed => _disposed;
 
@@ -459,8 +459,17 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
     /// <summary>
     /// Closes the transport if it is still open (error code 0, no linger) and releases the peer. Native memory is freed as
     /// soon as the transport has reported its close and no <see cref="Poll"/>/<see cref="Flush"/> is running (so disposing
-    /// from a handler is safe). Release retained leases first; afterwards <see cref="Release(in ReceiveLease)"/> is a no-op.
+    /// from a handler is safe).
     /// </summary>
+    /// <remarks>
+    /// The peer does not track the payloads the application holds (a lease from <see cref="Retain"/>, a message from
+    /// <see cref="Drain"/>, a response from <see cref="SendRequestAsync"/>) and does not return them here. Over a private
+    /// pool (no <see cref="PeerOptions.Allocator"/>) they are freed with the peer: their payload is invalid once the
+    /// peer's memory is freed, and a later <see cref="Release(in ReceiveLease)"/> is a no-op, so release them first. Over
+    /// a shared pool (<see cref="PeerOptions.Allocator"/>; every peer of a server) they stay rented and valid, and each
+    /// must still be released exactly once — <see cref="Release(in ReceiveLease)"/> and
+    /// <see cref="Release(ReadOnlySpan{ReceivedMessage})"/> return the block to the shared pool on a disposed peer too.
+    /// </remarks>
     public void Dispose()
     {
         if (_disposed)

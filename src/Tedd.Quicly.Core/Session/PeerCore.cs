@@ -1117,6 +1117,37 @@ internal sealed unsafe class PeerCore : IDisposable
         _allocator.Return(in lease);
     }
 
+    /// <summary>
+    /// Returns a receive lease the application still held when its peer was disposed
+    /// (<see cref="QuiclyPeer.Release(in ReceiveLease)"/> after <see cref="QuiclyPeer.Dispose"/>; any thread, before or
+    /// after the peer's native memory was freed).
+    /// </summary>
+    /// <remarks>
+    /// A peer over its own private allocator has nothing to return to: the pool is freed with the peer (possibly on the
+    /// transport thread, and <see cref="SlabAllocator.Dispose"/> must not race a <see cref="SlabAllocator.Return"/>), so the
+    /// call does nothing, as it always did. A peer over a shared allocator (<see cref="PeerOptions.Allocator"/>: every
+    /// server peer) must return the block, or the pool that outlives the peer loses it for good. Only two managed fields
+    /// and the shared allocator are touched, never the peer's native tables, and the receive budget is left alone: the
+    /// peer's accounting ended with it. A shared allocator that was disposed meanwhile makes the call a no-op.
+    /// </remarks>
+    /// <param name="lease">The lease.</param>
+    public void ReturnReceiveAfterDispose(in BufferLease lease)
+    {
+        if (lease.IsEmpty || _ownsAllocator || _allocator.IsDisposed)
+        {
+            return;
+        }
+
+        try
+        {
+            _allocator.Return(in lease);
+        }
+        catch (ObjectDisposedException)
+        {
+            // The owner of the shared allocator disposed it between the check and the return: the block went with it.
+        }
+    }
+
     /// <summary>Native address of a lease's first byte.</summary>
     /// <param name="lease">A non-empty lease.</param>
     public byte* GetPointer(in BufferLease lease) => _allocator.GetPointer(in lease);

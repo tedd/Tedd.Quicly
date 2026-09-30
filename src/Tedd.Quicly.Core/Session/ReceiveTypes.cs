@@ -55,6 +55,8 @@ public delegate void MessageHandler(QuiclyPeer peer, in ReceiveHeader header, Re
 /// <summary>
 /// A message taken with <see cref="QuiclyPeer.Drain"/>. Its payload stays valid until the message is passed to
 /// <see cref="QuiclyPeer.Release(ReadOnlySpan{ReceivedMessage})"/>; every drained message must be released exactly once.
+/// On a peer with its own private pool the payload also ends when the peer's memory is freed after
+/// <see cref="QuiclyPeer.Dispose"/>; on a peer over a shared pool it must be released even after the peer was disposed.
 /// </summary>
 public readonly unsafe struct ReceivedMessage
 {
@@ -78,6 +80,9 @@ public readonly unsafe struct ReceivedMessage
 /// <summary>
 /// A payload kept beyond its handler (<see cref="QuiclyPeer.Retain"/>). Valid until
 /// <see cref="QuiclyPeer.Release(in ReceiveLease)"/>; must be released exactly once, on the game thread.
+/// On a peer with its own private pool the payload also ends when the peer's memory is freed after
+/// <see cref="QuiclyPeer.Dispose"/>; on a peer over a shared pool (<see cref="PeerOptions.Allocator"/>, every peer of a
+/// server) it stays valid and must be released even after the peer was disposed, or the shared pool loses the block.
 /// </summary>
 public readonly unsafe struct ReceiveLease
 {

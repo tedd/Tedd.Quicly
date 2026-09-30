@@ -154,8 +154,29 @@ transport's `OnClosed` no callback runs.
 lifetime word: close seen (the `Sink` sets it in the `finally` of `OnClosed`; `Dispose` sets it for a peer that never got a
 transport), dispose requested (`Dispose`, which also closes and disposes the transport) and no game-thread call in progress (a bit
 held from the outermost `Poll`/`Flush` entry to its exit, handler re-entry included). `Dispose` may therefore run inside a
-`StateChanged` or receive handler: the memory stays valid until that `Poll` returns. After `Dispose`, `Release` is a no-op,
-statistics and `Capabilities` read as default, and callbacks that still arrive are ignored (`IsFreed`).
+`StateChanged` or receive handler: the memory stays valid until that `Poll` returns. After `Dispose`, statistics and
+`Capabilities` read as default, and callbacks that still arrive are ignored (`IsFreed`).
+
+**A lease can outlive its peer.** The peer does not track the payloads the application holds (a lease from `Retain`, a message
+from `Drain`, a response from `SendRequestAsync`), so `Dispose` cannot return them — and must not: the application may still be
+reading the block, and re-renting it would put one player's data into another's buffer. What `Release` does after `Dispose`
+depends on who owns the pool (`PeerCore.ReturnReceiveAfterDispose`):
+
+* a **private** allocator (no `PeerOptions.Allocator`) is freed with the peer, possibly on the transport thread, and
+  `SlabAllocator.Dispose` must not race a `Return`: `Release` is a no-op, and the lease's payload pointer is dead once the
+  peer's memory was freed;
+* a **shared** allocator (`PeerOptions.Allocator`; every peer of a `QuiclyServer`, which disposes a peer right after its
+  `PeerClosed` handlers return) outlives the peer: `Release` returns the block to it — before or after the peer's memory was
+  freed, since only two managed fields of the core and the allocator itself are touched, and `SlabAllocator.Return` is
+  thread-safe. The receive budget is not adjusted; the peer's accounting ended with it. Before this rule a late release was
+  dropped and the shared pool lost the block for good, one per player that left while a payload was still held.
+
+A release after the shared allocator itself was disposed is a no-op (`SlabAllocator.IsDisposed`, and an
+`ObjectDisposedException` from a `Return` that lost the race is swallowed); a `Return` that is *in flight* while the allocator
+is disposed is still unsafe, so an application releases every lease before it disposes the server or a supplied allocator. A
+lease must still be released exactly once: a second release after `Dispose` used to be harmless and now corrupts the shared
+free list in a Release build, exactly as a double release on a live peer does (`SlabAllocatorOptions.ValidateLeases` throws
+instead).
 
 ### 4.1 Send path (game thread)
 

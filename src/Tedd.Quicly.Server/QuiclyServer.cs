@@ -35,7 +35,11 @@ namespace Tedd.Quicly.Server;
 /// <para><b>Ownership.</b> The server owns the listener (stopped by <see cref="StopAsync"/>, disposed by
 /// <see cref="DisposeAsync"/>), every peer it accepts (disposed right after <see cref="PeerClosed"/>: close peers with
 /// <see cref="QuiclyPeer.Close(CloseReason)"/>, never dispose them), and the shared buffer pool it created
-/// (<see cref="Allocator"/>, disposed once every peer freed its memory). Release shared leases before disposing the server.</para>
+/// (<see cref="Allocator"/>, disposed once every peer freed its memory). Release shared leases before disposing the server.
+/// A received payload the application still holds when its peer closes — retained with <see cref="QuiclyPeer.Retain"/>,
+/// taken with <see cref="QuiclyPeer.Drain"/>, or a response — stays rented from that pool and valid after the server
+/// disposed the peer: release it on that peer as usual (<see cref="QuiclyPeer.Release(in ReceiveLease)"/> returns the block
+/// to the pool on a disposed peer), exactly once, and before the server itself is disposed.</para>
 /// </remarks>
 public sealed partial class QuiclyServer : IAsyncDisposable
 {
@@ -231,7 +235,9 @@ public sealed partial class QuiclyServer : IAsyncDisposable
 
     /// <summary>
     /// An admitted peer closed (raised from <see cref="PollAll"/>, or from <see cref="StopAsync"/>). The peer is disposed and
-    /// its slot released right after the handlers return. Its session may still be resumed within the grace period
+    /// its slot released right after the handlers return; received payloads the application still holds from it stay valid
+    /// (they are rented from the server's <see cref="Allocator"/>) and are released on the disposed peer when the
+    /// application is done with them, each exactly once. Its session may still be resumed within the grace period
     /// (<see cref="SessionEnded"/> says when it cannot); a resumed session arrives as a new peer through
     /// <see cref="PeerAdmitted"/> with a higher <see cref="QuiclyPeer.Epoch"/> and the same <see cref="QuiclyPeer.SessionId"/>.
     /// When a resume replaces a connection that was still open, <see cref="PeerAdmitted"/> of the new peer can come first: the

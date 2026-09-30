@@ -692,6 +692,26 @@ internal sealed class ReceiveQueues : IDisposable
         return taken;
     }
 
+    /// <summary>
+    /// A copy of the oldest message of <paramref name="channelIndex"/>, which stays queued (<see cref="QuiclyPeer.Drain"/>
+    /// looks at a compressed message of a reliable channel before it takes it: it needs a buffer to decode it into).
+    /// </summary>
+    /// <param name="channelIndex">Dense channel index.</param>
+    /// <param name="entry">The message; its lease still belongs to the queue.</param>
+    /// <returns><see langword="false"/> when the queue is empty.</returns>
+    public bool TryPeek(int channelIndex, out ReceiveEntry entry)
+    {
+        int node = _head[channelIndex];
+        if (node < 0)
+        {
+            entry = default;
+            return false;
+        }
+
+        entry = _nodes[node];
+        return true;
+    }
+
     private bool Take(int channelIndex, out ReceiveEntry entry)
     {
         int node = _head[channelIndex];

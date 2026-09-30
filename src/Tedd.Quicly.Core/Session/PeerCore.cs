@@ -1128,6 +1128,27 @@ internal sealed unsafe class PeerCore : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Whether <see cref="TryRentReceive"/> can succeed for <paramref name="length"/> bytes at all while the caller holds
+    /// <paramref name="held"/> bytes of the budget itself: the pool has a block that holds them, and that block fits in
+    /// what is left of the receive budget. When it cannot, waiting for a buffer is pointless.
+    /// </summary>
+    /// <param name="length">Bytes needed.</param>
+    /// <param name="held">Budget bytes the caller keeps until the rent succeeded (a compressed message's own block).</param>
+    public bool CanEverRentReceive(int length, int held)
+    {
+        ReadOnlySpan<SizeClassDefinition> classes = _allocator.SizeClasses;
+        for (int i = 0; i < classes.Length; i++)
+        {
+            if (classes[i].BlockSize >= length)
+            {
+                return classes[i].BlockSize <= _receiveBudget - held;
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>Returns a receive lease (any thread; normally the game thread). Empty leases are ignored.</summary>
     /// <param name="lease">The lease.</param>
     public void ReturnReceive(in BufferLease lease)

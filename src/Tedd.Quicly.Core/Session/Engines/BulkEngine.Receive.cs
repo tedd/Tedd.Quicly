@@ -97,7 +97,7 @@ internal sealed unsafe partial class BulkEngine
         // final progress, and a sender whose transfer was canceled gets its slot back from the stream's close alone — on
         // this end's transport thread, whether or not its game thread is polling. So a sender that keeps the limit can
         // start transfers while earlier ones still wait to be reported; the live limit is _recvLive. Past
-        // ReceiveRecordsPerTransfer - 1 transfers per slot ended during one hitch of this end's host, the next is refused
+        // (ReceiveRecordsPerTransfer - 1) × transfers ended during one hitch of this end's host, the next is refused
         // (LimitExceeded) until the host polls again.
         int records = transfers * ReceiveRecordsPerTransfer;
         _recv = new NativeArray<BulkRecv>(records);

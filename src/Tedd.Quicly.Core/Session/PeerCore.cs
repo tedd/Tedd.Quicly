@@ -701,7 +701,8 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>
     /// Makes room for the streams the transport admits by itself (transport thread, <see cref="ITransportSink.OnConnected"/>).
     /// A QUIC transport grants the peer an initial number of unidirectional streams in its own configuration — an MsQuic
-    /// client 1 024 by default — and never takes them back, whatever the session asks for after admission. When that is more
+    /// client whatever <c>ClientPeerUnidiStreamCount</c> says (0 by default, 1 024 in 0.2.1) — and never takes them back,
+    /// whatever the session asks for after admission. When that is more
     /// than the session's limit, the streams a late receiver holds open can outnumber what the session was built for; a
     /// stream without a record would have to be reset, and its sender has long completed its messages as delivered.
     /// </summary>
@@ -1258,29 +1259,47 @@ internal sealed unsafe class PeerCore : IDisposable
     /// what fills it — so a decode held to the budget could wait for buffers that only its own channel's messages can free,
     /// for ever. A decode that finds the budget already over its limit (an earlier decoded payload the application still
     /// holds) fails, so the budget is exceeded by at most one decode buffer at a time, and the transport thread takes
-    /// nothing new until it is back within it.
+    /// nothing new until it is back within it. For the same reason a used-up size class is not the end: a block of a
+    /// larger class within the budget is taken instead (the default private pool has blocks for the whole budget in
+    /// every class, so the waiting messages can never hold all of them and the budget's worth of a larger class too).
     /// </summary>
     /// <param name="length">Bytes needed (the message's raw length).</param>
     /// <param name="lease">The lease, or empty.</param>
     /// <returns><see langword="false"/> when the budget is over its limit already or the pool has no block.</returns>
     public bool TryRentDecode(int length, out BufferLease lease)
     {
-        if (Volatile.Read(ref _receiveBytes) > _receiveBudget || !_allocator.TryRent(length, out lease))
+        lease = BufferLease.Empty;
+        if (Volatile.Read(ref _receiveBytes) > _receiveBudget)
         {
-            lease = BufferLease.Empty;
             return false;
         }
 
-        if (lease.Length > _receiveBudget)
+        // The smallest class that holds the payload, or a larger one within the budget when that class is used up: the
+        // messages that wait to be decoded may hold every block of the class their decoded payloads need.
+        ReadOnlySpan<SizeClassDefinition> classes = _allocator.SizeClasses;
+        for (int i = 0; i < classes.Length; i++)
         {
-            // Larger than the whole budget: never, not even past it (CanEverRentDecode).
-            _allocator.Return(in lease);
-            lease = BufferLease.Empty;
-            return false;
+            int block = classes[i].BlockSize;
+            if (block < length)
+            {
+                continue;
+            }
+
+            if (block > _receiveBudget)
+            {
+                // Larger than the whole budget: never, not even past it (CanEverRentDecode).
+                return false;
+            }
+
+            if (_allocator.TryRent(block, out lease))
+            {
+                Interlocked.Add(ref _receiveBytes, lease.Length);
+                return true;
+            }
         }
 
-        Interlocked.Add(ref _receiveBytes, lease.Length);
-        return true;
+        lease = BufferLease.Empty;
+        return false;
     }
 
     /// <summary>

@@ -192,12 +192,22 @@ public sealed unsafe partial class QuiclyPeer
         }
     }
 
-    /// <summary>Re-arms the work signal (start of every <see cref="Poll"/>, where the host consumes what was published).</summary>
+    /// <summary>
+    /// Re-arms the work signal (game thread, start of every <see cref="Poll"/>, where the host consumes what was
+    /// published).
+    /// </summary>
+    /// <remarks>
+    /// The clear is an <see cref="Interlocked.Exchange(ref int, int)"/>, not a plain store: a store may still sit in this
+    /// core's store buffer while the Poll reads the completion ring and the thread-safe send front, and a publisher whose
+    /// <see cref="NoteWork"/> exchange then reads the old 1 stays silent about work the Poll has already looked past. The
+    /// full fence orders the clear before every read the Poll makes, so a publication is either seen by this Poll or finds
+    /// the edge armed. A Poll that was not signalled pays only the read: a publisher that finds 0 raises the signal itself.
+    /// </remarks>
     private void ClearWorkSignal()
     {
-        if (_workSignal is not null)
+        if (_workSignal is not null && Volatile.Read(ref _workSignalled) != 0)
         {
-            Volatile.Write(ref _workSignalled, 0);
+            Interlocked.Exchange(ref _workSignalled, 0);
         }
     }
 }

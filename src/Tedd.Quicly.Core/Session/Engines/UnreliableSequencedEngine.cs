@@ -24,19 +24,45 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// <para><b>Resynchronisation.</b> What remains is the clock's own limit: if at least half the sequence space of
 /// consecutive channel messages fails to arrive (a blackout, or messages expiring or being canceled unsent, which burn
 /// numbers), the next arrival reads as <em>behind</em> the clock. The wire value cannot tell "late by x" from "ahead by
-/// span − x"; time can, because QUIC never retransmits a datagram, so a late one arrives near its successors. A sequence
-/// behind the clock arriving more than <see cref="ResyncQuietMicros"/> after the clock last advanced is therefore taken
-/// for a forward jump: the clock moves to it (counted in <see cref="PeerStatistics.SequenceResyncs"/>) and it is judged
-/// like any newer value. The decision uses the receive callback's existing clock stamp — no timer and no extra clock read
-/// (ADR 0008 invariant 9; the reassembly expiry is the precedent).</para>
+/// span − x"; two things together can. <em>Distance:</em> a late message is a few numbers behind the newest one, while a
+/// jump of J reads as span − J behind, which is small only when almost a whole span was lost. <em>Time:</em> a late
+/// datagram normally arrives near its successors. A sequence that is more than the reorder window behind the clock
+/// (<see cref="ResyncWindow16"/>, <see cref="ResyncWindow32"/>) and arrives more than <see cref="ResyncQuietMicros"/>
+/// after the clock last advanced is therefore taken for a forward jump: the clock moves to it (counted in
+/// <see cref="PeerStatistics.SequenceResyncs"/>) and it is judged like any newer value. The decision uses the receive
+/// callback's existing clock stamp — no timer and no extra clock read (ADR 0008 invariant 9; the reassembly expiry is the
+/// precedent).</para>
+/// <para><b>Why time alone is not enough.</b> QUIC never retransmits a datagram, but this library's own sender can make
+/// one seconds late relative to its successors: a datagram without the cancel-on-blocked flag (a container that also
+/// carries a ReliableLatest value, or any datagram with <see cref="PeerOptions.DropWhenBlocked"/> off) waits in the
+/// transport's queue for as long as the link is busy, and a later datagram with the priority flag (an Immediate or
+/// high-priority member) overtakes it (PROTOCOL.md §4.5). Such a straggler arrives after a quiet period, behind the
+/// clock by the few messages that overtook it; without the window it would be read as a jump, delivered after its
+/// successors, and leave the clock almost a span ahead. Inside the window it is judged as what it is: late.</para>
+/// <para><b>What the window costs, and what it leaves.</b> A real jump that lands within the window of a whole span
+/// (more than 64 512 consecutive messages lost on a 16-bit channel) is not resynchronised: the arrivals read as late
+/// until the sender's counter has passed the clock, at most one window of messages — a small fraction of what the
+/// blackout itself lost. A straggler <em>more</em> than the window behind its channel's newest sequence that arrives
+/// after the quiet period is still read as a jump; that needs more than a window of later messages of the channel to
+/// have overtaken it, followed by two seconds of silence on the channel.</para>
 /// </remarks>
 internal sealed class UnreliableSequencedEngine : DatagramEngine
 {
     /// <summary>
     /// How long a channel's sequence clock must have stood still before a sequence behind it is read as a forward jump
-    /// rather than a late message: two seconds, far beyond any reordering of datagrams that are never retransmitted.
+    /// rather than a late message: two seconds, far beyond the reordering of a path. It is not beyond what the sender's
+    /// own transport queue can add (see the class remarks), which is why the distance is tested as well.
     /// </summary>
     internal const long ResyncQuietMicros = 2_000_000;
+
+    /// <summary>
+    /// Reorder window of a 16-bit channel: a sequence at most this far behind the clock is always a late message, however
+    /// long the clock stood still. A jump reads as this close only when more than 65 536 − 1 024 messages were lost.
+    /// </summary>
+    internal const int ResyncWindow16 = 1_024;
+
+    /// <summary>Reorder window of a 32-bit channel (see <see cref="ResyncWindow16"/>).</summary>
+    internal const int ResyncWindow32 = 65_536;
 
     private const ulong Span16 = 0x1_0000UL;
     private const ulong Span32 = 0x1_0000_0000UL;
@@ -87,7 +113,8 @@ internal sealed class UnreliableSequencedEngine : DatagramEngine
 
     /// <summary>
     /// Extends <paramref name="sequence"/> against the channel's sequence clock and advances the clock when the sequence is
-    /// ahead of it — or behind it after the clock stood still for more than <see cref="ResyncQuietMicros"/>, which is read
+    /// ahead of it — or more than the reorder window behind it after the clock stood still for more than
+    /// <see cref="ResyncQuietMicros"/>, which is read
     /// as a forward jump of at least half the sequence space (transport thread).
     /// </summary>
     /// <param name="state">The channel's receive state.</param>
@@ -114,11 +141,12 @@ internal sealed class UnreliableSequencedEngine : DatagramEngine
             {
                 extended = newest + (ulong)distance;
             }
-            else if (distance < 0 && nowMicros - state.LastReceiveMicros > ResyncQuietMicros)
+            else if (distance < -(sixteenBit ? ResyncWindow16 : ResyncWindow32) && nowMicros - state.LastReceiveMicros > ResyncQuietMicros)
             {
-                // Behind the newest, yet the newest has not advanced for longer than any datagram can be late: the sender's
-                // counter is at least half the space ahead. Step forward by span − |distance| (in [span / 2, span − 1]); the
-                // low bits become the arriving sequence. A duplicate of the newest (distance 0) never gets here.
+                // Further behind the newest than a straggler is, and the newest has not advanced for two seconds: the
+                // sender's counter is at least half the space ahead. Step forward by span − |distance| (in
+                // [span / 2, span − window − 1]); the low bits become the arriving sequence. A duplicate of the newest
+                // (distance 0) and a sequence inside the reorder window never get here.
                 extended = newest + span - (ulong)(-(long)distance);
                 PeerCounters.SequenceResyncs++;
             }

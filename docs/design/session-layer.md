@@ -308,15 +308,76 @@ is back in `Filling` and still owned by the caller.
    table info / table request, transport closed; then pong samples (matched against the last eight pings; unmatched are counted) and
    stream-ping requests.
 3. `RunTimers(now)`; raise queued `StateChanged` events, holding back the change to Closed.
-4. Dispatch while Connected or Closing (and Closed not yet raised): drain-queued messages of channels that now have a handler, the
-   held entry, then the ring — a channel with a handler is dispatched, others go to `ReceiveQueues` (a node pool of the ring's
-   capacity; when it is full one entry is held and the ring is left alone) — then the mailboxes of channels with handlers.
+4. Dispatch while Connected or Closing (and Closed not yet raised): drain-queued messages of channels that now have a handler
+   (`ReceiveQueues.QueuedHandled`), the held entry, then the ring — a channel with a handler is dispatched, others go to
+   `ReceiveQueues` ("Channels without a handler" below: an unreliable channel evicts, a reliable one is held when the pool is
+   full and the ring is then left alone) — then the mailboxes of channels with handlers, **also while an entry is held**: the
+   mailboxes do not pass through the ring, and stopping them would silence every coalescing and ReliableLatest handler for as
+   long as one reliable channel is not drained, while the transport thread keeps acknowledging those values to the sender.
    Compressed messages are decoded with `Lz4Block.DecompressExact` into a second lease (decoded-bytes budget; a failure drops and
    counts `DecodeFailures`). The lease is released after the handler unless `Retain` was called; handler exceptions propagate.
 5. `ResumePendedStreams()`.
 6. Closed: engines' `OnPeerClosed`, requests still in the `ThreadSafeSend` front dropped (leases returned), every receive lease
    released, waiting `SendAsync` calls completed `NotConnected` and `FlushAsync` calls completed, the Closed event raised last;
    afterwards Poll/Flush do nothing and no handler or event runs.
+
+**Channels without a handler (`ReceiveQueues`, game thread only).** The receive ring is a FIFO shared by every ring channel and
+cannot be skipped, so a message Poll cannot dispatch has to leave it: it goes to its channel's queue, a linked list in one fixed
+node pool, and waits for `Drain`. (`Drain(X)` does the same with the messages of other channels it meets, handled or not; the
+next Poll dispatches the handled ones first.) What bounds the queues, and what happens at the bound, is decided per channel from
+its definition (`ReceiveQueueClass.Of`; the engines and their mailboxes do not exist yet when the queues are built):
+
+| Class | Channels | When the message does not fit |
+|---|---|---|
+| `Datagram` | UnreliableUnordered / UnreliableSequenced without `CoalesceOnReceive` | evict the oldest queued unreliable message, count it (`AppendEvicting`); never held |
+| `Reliable` | ReliableOrdered, ReliableUnordered | never dropped: `TryAppend` fails, the peer holds the entry (`_held`) and stops taking from the ring |
+| `Other` | everything else — a coalescing channel, ReliableLatest and Bulk never enter the ring, so only a replaced engine (`PeerOptions.EngineFactory`) gets here | as `Reliable` |
+
+Sizes (`ReceiveQueueLayout.Compute`, integer division; `Qr` reliable channels, `Qu` datagram-class channels, `B` the receive
+budget): `Capacity = max(min(ring, 1 024), 2·Qr)`; `ReliableNodes = max(1, (Capacity/2)/Qr)` reserved per reliable channel (0
+without one); `DatagramNodes = Capacity − Qr·ReliableNodes` (at least half the pool); `DatagramBytes = max(1, B/4)`;
+`NodeFair = max(1, DatagramNodes/Qu)` and `ByteFair = max(1, DatagramBytes/Qu)`. With the defaults (ring 4 096, B 256 KiB) and
+two reliable and four unreliable ring channels that is a pool of 1 024, 256 nodes reserved per reliable channel, 512 nodes and
+64 KiB for the unreliable channels together, and fair shares of 128 nodes and 16 KiB.
+
+* **Datagram class.** `AppendEvicting` makes room while the class is at `DatagramNodes`, the pool has no free node, or the
+  class's queued block bytes plus the new block exceed `DatagramBytes` (bytes are the leases' lengths — block sizes, which is
+  what the receive budget is charged; a node cap alone would let 170 full-size datagrams pin the whole default budget). The
+  victim is the appending channel itself when it is at or over its fair share of the resource under pressure — one flooded
+  channel evicts its own oldest in O(1) — and otherwise the datagram channel with the most queued (a scan over the datagram
+  channels only, whose result is kept as a hint and reused while that channel stays strictly over its share). Nothing is
+  partitioned: a channel alone may use the whole class, and the fair share only decides who loses, so a channel that is drained
+  diligently is not evicted while another one is the hog. An empty class always takes one message of any size. Drop-**oldest**
+  for both modes — a consumer that comes back gets the freshest messages in order, and on UnreliableSequenced the transport
+  thread has already moved the key's sequence on, so the older queued values are the stale ones (the ring keeps drop-newest:
+  nothing can be evicted from it). Counted in `ChannelStatistics.DrainQueueDrops` (`ReceiveQueues._drops`, the victim's
+  channel) and `PeerStatistics.DrainQueueDrops` — not in `RingDrops`, which the transport thread owns (ADR 0008 invariants 4
+  and 13); `Received` still counts a message that is evicted later. When the pool is full of entries that cannot be evicted and
+  no datagram channel has anything queued, the new message itself is dropped and counted the same way. A datagram-class entry
+  is therefore never held: an unreliable channel nobody drains costs its own oldest messages and nothing else — not the ring,
+  not the mailboxes, not more than a quarter of the budget, and not a busy host.
+* **Reliable class: the limit that remains.** A reliable message may not be dropped, and nothing tells the transport thread how
+  much room a channel's queue has, so an undrained reliable channel still fills the pool (it may use every free node; only the
+  datagram class is capped), its next message is held, and Poll and Drain stop taking from the ring. The ring then fills and its
+  own rules hit **every** ring channel: streams are pended (`TryReserveReceive` fails, the parser un-reads, QUIC flow control
+  holds the sender — of every stream channel, not only the undrained one), datagrams are dropped newest-first (`RingDrops`),
+  responses wait in the ring so requests time out, and `HasPendingWork` stays set (the held entry, the non-empty ring and the
+  re-pended streams), so a signal-driven host keeps polling. It ends when the application drains the channel or registers a
+  handler. The reservation guarantees only that the *unreliable* channels cannot cause this: they never occupy the
+  `Qr·ReliableNodes` nodes. Confining the back-pressure to the undrained channel's own streams needs a per-channel credit the
+  transport thread checks before it reserves a ring slot (designed as "D1b", not built); until then an application must
+  register a handler for, or drain, every reliable channel the other end sends on. Other holds that remain: `Drain(X)` meeting
+  more messages of a *handled* reliable channel than there are free nodes (cleared by the next Poll, which dispatches the queue
+  first), and `UnregisterHandler` on a reliable channel with a backlog.
+* **`QueuedHandled`.** The number of queued messages whose channel has a handler — what the next Poll dispatches from the queues
+  and what the work probe reads — is kept by `ReceiveQueues` itself (`SetHandled` from `RegisterHandler`/`UnregisterHandler`,
+  adjusted in `TryAppend`/`TryTake`), not by the peer: an eviction removes entries of a handled channel too (a `Drain` of
+  another channel queues them between two Polls), and a counter the peer kept on the side would stay positive for good — a
+  permanent `HasPendingWork`.
+* Tests: `DrainBackpressureTests` (a handled channel, the mailboxes, a `Drain` of another channel, a diligent Drain-style
+  channel, the byte bound, the work probe after evictions, the reserved nodes, the reliable limit, the queue and layout units),
+  `SessionZeroAllocationTests.Evicting_From_An_Undrained_Channel_Does_Not_Allocate`; the held-slot paths are exercised with a
+  reliable channel in `RequestResponseTests` (`HeldBehindHarness`), `SessionEdgeTests` and `ReceivePlumbingTests`.
 
 ### 4.5 Control protocol
 
@@ -383,7 +444,10 @@ is back in `Filling` and still owned by the caller.
   handshake is unchanged; a plain-read "exchange only when clear" shortcut was rejected because the read could pass the ring store
   (x86 store-load reordering) and lose a wake-up. Outside a callback `NoteTransportWork` is `NoteWork`.
 * **`HasPendingWork`** answers whether anything is really waiting: the signal word, the completion ring and the local completions,
-  the receive ring, the per-channel drain queues and the held entry, the mailbox dirty bitsets (`Mailboxes.HasDirty`),
+  the receive ring, the per-channel drain queues of channels that have a handler (`ReceiveQueues.QueuedHandled`; a message
+  queued for a channel without one is the application's to drain, not Poll's work) and the held entry (only ever a reliable
+  channel's message, §4.4 "Channels without a handler" — an undrained unreliable channel no longer keeps the probe set), the
+  mailbox dirty bitsets (`Mailboxes.HasDirty`),
   `PendedStreams`, the pong and stream-ping rings, the `ThreadSafeSend` front, a state transition that has not been raised, a due
   deadline (`NextDeadlineMicros` passed), and — while `Connected` — the engines' pass work: the ReliableLatest engine's
   (`ReliableLatestEngine.HasUnsentControl`: acks and rejects owed, notices to apply) and the Bulk engine's
@@ -1779,7 +1843,10 @@ Two features that ride on engines that already exist: fragmentation is the secon
   caller can see a response even though only two checks exist. Two tests pin it with both of those structures really in
   use: the drain queues full, a plain message held and the response waiting in the ring behind it, then `Drain` (queue →
   held → ring) and, separately, `Poll` with a newly registered handler (handler-queue loop → held → ring) must hand over
-  only the plain messages while the response completes its request.
+  only the plain messages while the response completes its request. The messages that fill the pool and the held slot are
+  a *reliable* channel's (a second ordered channel without a handler): only a message that may not be dropped is ever
+  held (§4.4 "Channels without a handler"). The same scenario is the remaining cost of an undrained reliable channel —
+  while it lasts, the response waits in the ring and the request runs into its timeout.
 * **Statistics.** `RequestsSent`, `RequestsTimedOut`, `ResponsesUnmatched`; a request and its response also count as
   ordinary messages of their channel.
 

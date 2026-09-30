@@ -559,7 +559,7 @@ logging.
 
 | Limit | Default | On violation |
 |---|---|---|
-| per-peer receive byte budget (pooled leases + reassembly + stream staging) | 256 KiB | datagram channels: drop newest + count; stream channels: stop consuming (transport back-pressure), resume from Poll |
+| per-peer receive byte budget (pooled leases + reassembly + stream staging) | 256 KiB | datagram channels: drop newest + count; stream channels: stop consuming (transport back-pressure), resume from Poll. At most a quarter of it can be pinned by unreliable messages nobody drains (next-to-last row) |
 | keys per channel per peer (`MaxKeys`) | 4 096 | UnreliableSequenced: evict least-recently-updated key (evicted keys re-accept any sequence; replay window documented — a key still in the table that has idled for more than half the sequence range is in the same position for its next value, no wider: every wire value then extends above what the key holds, §8); ReliableLatest: reject with `LatestReject(4)`, never evict |
 | concurrent peer streams per channel (`MaxGroups`) | 8 (ReliableUnordered), 4 (large ReliableLatest), 2 (Bulk) | further streams are reset `LimitExceeded` |
 | stream idle mid-message | 30 s | stream reset `Timeout` |
@@ -568,7 +568,29 @@ logging.
 | control messages per second | 2 000 (per peer, configurable; size it from the channel table, because acks scale with keyed `ReliableLatest` traffic and one ack datagram carries about 170 keys) | connection close `LimitExceeded` |
 | decoded (decompressed) bytes per second per peer | 8 MiB/s | further compressed messages dropped + counted |
 | bulk transfers per direction per peer | 2 transfers, and an outbound range-request table of one more than that (3), so a further range can be asked for while both transfers run | `BulkReject` |
-| receive ring depth per peer | 4 096 entries | see byte budget row; latest/coalescing channels use per-key mailboxes instead of ring entries |
+| drain backlog of channels without a handler | a pool of min(ring depth, 1 024) messages (at least 2 per reliable channel); with a `ReliableOrdered` / `ReliableUnordered` channel in the table half of it is reserved for those, split evenly. The unreliable channels together may queue the rest and pin ¼ of the byte budget (64 KiB, counted in buffer block sizes) | `UnreliableUnordered` / `UnreliableSequenced` (not coalescing): **drop oldest** + count (`DrainQueueDrops`) — the oldest queued message of the same channel when it is at or over its even share, otherwise of the unreliable channel with the longest queue; never affects another channel. `ReliableOrdered` / `ReliableUnordered`: nothing is dropped; once the pool is full the next message is held and the receiver stops taking from the ring until the application drains the channel or registers a handler (see below) |
+| receive ring depth per peer | 4 096 entries | see byte budget row (a full ring drops datagrams newest-first, where the drain backlog above drops oldest-first: nothing can be evicted from the ring); latest/coalescing channels use per-key mailboxes instead of ring entries |
+
+**Channels nobody drains.** A message of a channel that has no handler waits for `Drain` in a per-channel
+queue, and the two kinds of channel behave differently when the application never comes for it. This is
+receiver-local; nothing on the wire changes and either end may run it alone.
+
+* An *unreliable* ring channel keeps the bounded backlog of the table and loses its **oldest** messages,
+  counted per channel and per peer (`DrainQueueDrops`; `Received` still counts them). A consumer that comes back
+  gets the freshest messages in order — on `UnreliableSequenced` the older queued values are the stale ones.
+  Such a channel never stops another channel, never holds the ring, and keeps no host busy. Note that this
+  backlog is smaller than the whole byte budget: a Drain-style consumer that lets more than ¼ of the budget (or
+  the unreliable share of the pool) accumulate between two drains loses the oldest part; raise
+  `ReceiveBudgetBytes` / `ReceiveRingCapacity` for such a channel, or give it a handler.
+* A *reliable* channel is never dropped, so an undrained one still ends in back-pressure: when the pool is full
+  its next message is held, the receiver takes nothing more out of the ring, and the ring's own rules apply to
+  **every** channel — stream channels stop consuming (the sender sees ordinary QUIC flow control, and its
+  sends on those channels back up), datagrams of ring channels are dropped newest-first (`ReceiveRingDrops`),
+  responses of request/response channels wait (requests time out), and the peer keeps reporting pending work.
+  Coalescing and `ReliableLatest` channels are still dispatched (their mailboxes do not pass through the ring).
+  It ends when the application drains that channel or registers a handler for it. An application MUST register
+  a handler for, or drain, every reliable channel the other end sends on. (Per-channel receive credit, which
+  would confine the back-pressure to the undrained channel's own streams, is designed but not built.)
 
 The **stream idle mid-message** rule is per receiving stream and applies to every stream mode: a stream that has
 delivered a message's frame header but not the rest of its payload for 30 s (`PeerOptions.StreamIdleTimeout`) is

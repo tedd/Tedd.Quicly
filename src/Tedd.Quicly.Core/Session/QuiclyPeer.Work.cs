@@ -40,6 +40,14 @@ public sealed unsafe partial class QuiclyPeer
     /// progress work may wait out <see cref="PeerOptions.AckDelay"/> or the bulk progress window in it. A Flush-only
     /// deadline that has not passed is not work: use <see cref="NextFlushDeadlineMicros"/> for that, which a
     /// <see cref="Poll"/> brings forward to the engine work above.
+    /// <para>
+    /// Messages queued for a channel without a handler are not work — they wait for the application's
+    /// <see cref="Drain"/> — so an unreliable channel nobody drains leaves the probe clear (its backlog is bounded and
+    /// evicts; see <see cref="Poll"/>). A <em>reliable</em> channel without a handler that is not drained is different:
+    /// once the queue pool is full its next message is held and the ring behind it is not emptied, and the probe stays
+    /// set for as long as that lasts, because there is work that no <see cref="Poll"/> can consume. A host that polls
+    /// while the probe is set then polls every pass; the cure is to drain that channel or register a handler for it.
+    /// </para>
     /// </remarks>
     public bool HasPendingWork
     {

@@ -100,7 +100,7 @@ public sealed unsafe partial class QuiclyPeer
             || !_pongs.IsEmpty
             || !_streamPings.IsEmpty
             || _transitionCount != 0
-            || _queuedWithHandler != 0
+            || _queues.QueuedHandled != 0
             || _hasHeld
             || _hasHeldForeign
             || _front is { IsEmpty: false }

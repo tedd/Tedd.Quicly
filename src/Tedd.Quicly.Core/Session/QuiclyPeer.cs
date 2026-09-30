@@ -117,7 +117,16 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         _core = new PeerCore(this, role, table, options);
         _handlers = new MessageHandler?[_core.ChannelCount];
         // Built here, never inside Poll: the drain queues are native memory sized once (ARCHITECTURE.md §3).
-        _queues = new ReceiveQueues(ReceiveQueues.NodesFor(options.ReceiveRingCapacity), _core.ChannelCount);
+        // The class of a channel comes from its definition, not from the engines: they (and their mailboxes) do not exist yet.
+        ReadOnlySpan<ChannelDefinition> channels = _core.Channels;
+        byte[] queueClasses = new byte[channels.Length];
+        for (int i = 0; i < channels.Length; i++)
+        {
+            queueClasses[i] = ReceiveQueueClass.Of(channels[i]);
+        }
+
+        ReceiveQueueLayout layout = ReceiveQueueLayout.Compute(channels, options.ReceiveRingCapacity, options.ReceiveBudgetBytes);
+        _queues = new ReceiveQueues(in layout, queueClasses);
         InitializeSendSide(options);
         long now = _clock.NowMicros;
         _controlBucket.Initialize(options.ControlMessagesPerSecond, options.ControlMessagesPerSecond, now);
@@ -328,6 +337,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.StaleCompletions = Volatile.Read(ref c.StaleCompletions);
         statistics.ReceiveRingDrops = Volatile.Read(ref c.ReceiveRingDrops);
         statistics.OutOfReceiveBuffers = Volatile.Read(ref c.OutOfReceiveBuffers);
+        statistics.DrainQueueDrops = c.DrainQueueDrops;
         statistics.CallbackFaults = Volatile.Read(ref c.CallbackFaults);
         statistics.DecodeFailures = c.DecodeFailures;
         statistics.BulkProgressOverClaims = c.BulkProgressOverClaims;
@@ -396,6 +406,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.ReceiveKeyTableFull = Volatile.Read(ref recv.KeyTableFull);
         statistics.ReceiveTooLarge = Volatile.Read(ref recv.TooLarge);
         statistics.OutOfBuffers = Volatile.Read(ref recv.OutOfBuffers);
+        statistics.DrainQueueDrops = _queues.Drops(index);
         _core.GetEngine(index).AddStatistics(index, ref statistics);
         return true;
     }

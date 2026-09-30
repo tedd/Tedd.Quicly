@@ -98,7 +98,12 @@ public struct PeerStatistics
     /// <summary>Transport completions whose context no longer matched a live send (ignored, ADR 0008 invariant 2).</summary>
     public long StaleCompletions;
 
-    /// <summary>Complete messages dropped because the receive ring was full.</summary>
+    /// <summary>
+    /// Complete messages dropped on arrival because the receive ring was full: the game thread did not take messages out
+    /// fast enough, or a reliable channel without a handler is not drained and holds the ring (see
+    /// <see cref="QuiclyPeer.Poll"/>). An unreliable channel nobody drains does not cause this; its own backlog is
+    /// bounded and counted in <see cref="DrainQueueDrops"/>.
+    /// </summary>
     public long ReceiveRingDrops;
 
     /// <summary>Messages dropped because the receive budget or pool was exhausted.</summary>
@@ -158,7 +163,12 @@ public struct PeerStatistics
     /// <summary>Bytes of <see cref="StreamSends"/> (preambles, frame headers and payloads).</summary>
     public long StreamBytesSent;
 
-    /// <summary>Stream receives held back by back-pressure (receive ring full or receive budget used up) and resumed from Poll.</summary>
+    /// <summary>
+    /// Stream receives held back by back-pressure (receive ring full or receive budget used up) and resumed from Poll. A
+    /// value that keeps rising while the peer is polled every tick means the ring is not being emptied: a reliable channel
+    /// has no handler and is not drained (see <see cref="QuiclyPeer.Poll"/>), and every Poll resumes the streams only for
+    /// them to be held back again.
+    /// </summary>
     public long StreamReceivePends;
 
     /// <summary>
@@ -251,6 +261,21 @@ public struct PeerStatistics
     /// started.
     /// </summary>
     public long DatagramsCanceled;
+
+    /// <summary>
+    /// Received messages of unreliable channels dropped from the drain queues: the sum of
+    /// <see cref="ChannelStatistics.DrainQueueDrops"/> over the channels. A message of an UnreliableUnordered or
+    /// UnreliableSequenced channel (without <c>CoalesceOnReceive</c>) that has no handler waits for
+    /// <see cref="QuiclyPeer.Drain"/> in a bounded backlog — together these channels queue at most the part of the queue
+    /// pool that is not reserved for reliable channels (the pool is <see cref="ReceiveRingCapacity"/> messages, at most
+    /// 1 024; half of it is reserved when the table has a ReliableOrdered or ReliableUnordered channel) and pin at most a
+    /// quarter of <see cref="PeerOptions.ReceiveBudgetBytes"/> — and when a new message does not fit, the oldest queued
+    /// one is dropped: of the same channel when that channel is at or over its fair share, otherwise of the unreliable
+    /// channel with the longest queue. Non-zero means a channel receives traffic that nobody drains, or that is drained
+    /// too slowly: register a handler, drain every tick, or raise <see cref="PeerOptions.ReceiveBudgetBytes"/> /
+    /// <see cref="PeerOptions.ReceiveRingCapacity"/>. Game thread; a total since the peer was created.
+    /// </summary>
+    public long DrainQueueDrops;
 }
 
 /// <summary>Per-channel statistics (<see cref="QuiclyPeer.GetChannelStatistics"/>). Fixed layout, no references.</summary>
@@ -292,7 +317,11 @@ public struct ChannelStatistics
     /// <summary>Sends rejected with <see cref="SendStatus.KeyTableFull"/>.</summary>
     public long SendKeyTableFull;
 
-    /// <summary>Messages accepted.</summary>
+    /// <summary>
+    /// Messages accepted: complete, valid and handed to the game thread's side (the receive ring or a mailbox). A message
+    /// counted here can still be dropped before the application sees it — <see cref="DrainQueueDrops"/> on an unreliable
+    /// channel nobody drains, <see cref="ReceiveSuperseded"/> on a coalescing one — so it is not a delivery count.
+    /// </summary>
     public long Received;
 
     /// <summary>Payload bytes accepted.</summary>
@@ -360,4 +389,15 @@ public struct ChannelStatistics
     /// transport that reports no datagram send states.
     /// </summary>
     public long TransportLost;
+
+    /// <summary>
+    /// Received messages of this channel dropped from its drain queue (an unreliable channel without
+    /// <c>CoalesceOnReceive</c>; always 0 for the other modes): the channel had no handler — or its messages were met by a
+    /// <see cref="QuiclyPeer.Drain"/> of another channel before the next <see cref="QuiclyPeer.Poll"/> — and the bounded
+    /// backlog of the unreliable channels was full, so the oldest queued message made room for a newer one (see
+    /// <see cref="PeerStatistics.DrainQueueDrops"/> for the limits and for which channel loses). The dropped messages are
+    /// still counted in <see cref="Received"/>. Distinct from <see cref="RingDrops"/>, which counts messages dropped on
+    /// arrival because the receive ring itself was full. Survives a reconnect.
+    /// </summary>
+    public long DrainQueueDrops;
 }

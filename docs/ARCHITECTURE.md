@@ -448,7 +448,7 @@ logs a warning per connection). Session/auth token rules, admission timeouts, re
 | drain queues | peer | min(receive ring, 1 024) × 68 B (68 KiB) | per-channel queues for `Drain` consumers: a 64 B node plus its link, native, built with the peer |
 | segment arena | peer | 1 024 × 16 B | per-submission gather arrays for stream sends |
 | channel state | peer × channel | 2 × 64 B | send + receive halves |
-| group records | peer × group channel | `(3 × max(MaxGroups, 1) + 4) × 64 B` send + `max(MaxGroups, 1) × 64 B` receive | `ReliableUnordered`: one record per live group (filling, waiting, or holding a stream) and one per accepted peer stream; the engine's notice ring adds `4 × its send records + 8` × 12 B |
+| group records | peer × group channel (send), peer (receive) | `(3 × max(MaxGroups, 1) + 4) × 64 B` send per channel + `PeerUnidiStreamCount × 64 B` receive per peer | `ReliableUnordered`: one send record per live group (filling, waiting, or holding a stream); one receive record for every stream the peer can have open on the connection, because a receiver that is behind holds more than a channel's `MaxGroups` of them (PROTOCOL.md §7) — 0.6 KiB for a table with one group channel and one ordered channel, 256 KiB at the 4 096-stream cap; the engine's notice ring adds `4 × its send records + 8` × 12 B |
 | bulk transfers | peer (both directions) | `BulkTransfersPerDirection` × 128 B send + × 192 B receive | `Bulk`: one record per transfer in each direction (2 + 2 by default = 640 B), plus the engine's rings — stream notices `(4 × transfers + 8) × 24 B`, peer control messages 64 × 48 B, and two `transfers + 8` slot rings of 4 B — about 4 KiB per peer in total. A transfer that **compresses** also rents one `BulkChunkBytes` scratch block (64 KiB, lazily, per peer); the staging of a received compressed chunk comes from the receive budget, not from here |
 | key slots | peer × keyed channel | `MaxKeys` × 64 B (+ mailbox) | dense or hashed |
 | reassembly table | peer × fragmenting channel | `MaxReassemblies` × 64 B (1 KiB at the default of 16) | one record per partial message; its buffer comes from the receive byte budget (at most `MaxReassemblies` × `MaxMessageSize`, so 16 × 8 800 = 138 KiB per channel with the defaults — size `ReceiveBudgetBytes` for it, or lower `MaxReassemblies`) |
@@ -462,7 +462,7 @@ from the shared slab reserve, not additional per-peer allocations. `ServerOption
 it — 1 000 peers at the defaults would be ~550 MiB of tables alone, so a server with many peers lowers
 `ReceiveRingCapacity`, `SendTableCapacity` and the byte budgets (the defaults target tens to a few hundred peers
 per process). `MaxGroups` is the one channel option that can dominate this: at its default of 8 a group channel costs about
-1.8 KiB of send records, 0.5 KiB of receive records and 1.4 KiB of notice ring, but a channel raised to `MaxGroups = 1024` costs
+1.8 KiB of send records, 0.5 KiB of the peer's receive records and 1.4 KiB of notice ring, but a channel raised to `MaxGroups = 1024` costs
 about **192 KiB** of send records (3 076 of them), 64 KiB of receive records and ~144 KiB of ring — roughly 400 KiB for that one
 channel, per peer — so raise it only for a channel that really needs that many groups in flight at once. The numbers are
 published from the benchmark in `docs/benchmarks/memory.md`.

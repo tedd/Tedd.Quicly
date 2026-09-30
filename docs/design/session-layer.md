@@ -1040,7 +1040,8 @@ live groups, the group being filled, queued/in-flight counts and bytes, the grou
 groups holding a stream), a `GroupState` per group (its message FIFO over `Entries.Next`, its byte count, its group id, its
 stream with serial and credit generation, its carriers outstanding, its phase) taken from a free list of
 `Σ (3 × max(MaxGroups, 1) + 4)` records, and a `GroupRecv` per accepted peer stream (staging lease, message header fields) from a
-free list of `Σ max(MaxGroups, 1)` records. The peer's files are untouched; the only new shared seam is the churn bound
+free list of `PeerCore.PeerUnidirectionalStreamLimit` records — one for every stream the peer can have open at all, because a
+receiver that is behind holds more than a channel's `MaxGroups` of them (see "Receive" below). The peer's files are untouched; the only new shared seam is the churn bound
 (`PeerOptions.GroupMinInterval` → `PeerCore.GroupMinIntervalMicros`).
 
 * **Groups.** The messages a channel admits between two scheduler passes form one group (PROTOCOL.md §3.2). `Admit` appends to
@@ -1081,17 +1082,27 @@ free list of `Σ max(MaxGroups, 1)` records. The peer's files are untouched; the
   transport that reported the refusal afterwards would make this engine fail a group the peer never even saw. Together with the
   deferred-`CloseStream` rule of §4.3 (the transport must not close a stream inline from a callback or a pass) these are the two
   things a new transport has to get right for the stream engines.
-* **`MaxGroups` bounds both directions.** Both ends hold the same table, so the sender keeps at most `max(MaxGroups, 1)` streams
-  open per channel: exceeding it would have the receiver reset its own live groups. The slot (like the peer's stream credit)
-  returns only when the stream **shuts down**, not when its last carrier completes — the receiver frees its group slot at that
-  same event, so this end can never open the stream that would push the peer past the limit. A group therefore keeps its record
-  until its stream is gone; `OnPeerClosed` hands the slots back itself, since nothing shuts a stream down after the connection
-  is.
+* **`MaxGroups` bounds the sender.** The sender keeps at most `max(MaxGroups, 1)` streams open per channel; the peer's stream
+  limit is sized from that number, so exceeding it would take the stream slots of other channels. The slot returns when the
+  stream **shuts down**, not when its last carrier completes, and a group keeps its record until its stream is gone;
+  `OnPeerClosed` hands the slots back itself, since nothing shuts a stream down after the connection is. **The shutdown is not
+  the moment the receiver is done with the stream.** A stream shuts down for its sender when its data and FIN are acknowledged,
+  and acknowledgement is the transport's: the receiving peer reads the stream later, when its ring has room, its budget allows
+  and its host polls (the conformance scenario `SenderShutdownDoesNotWaitForTheReceiverToConsume` pins this for the simulator,
+  MsQuic and the WebTransport carrier). So this end *can* open the stream that takes the peer past `MaxGroups` open streams of
+  the channel, and it does whenever the peer is late — which is why the receive side does not enforce `MaxGroups` (below). An
+  earlier version of this section said the two ends free their slots at the same event; they do not, and the receive-side reset
+  that rested on it destroyed groups whose messages were already `Delivered`.
 * **Completions.** A carrier's completion completes both stages of every member `Delivered` (PROTOCOL.md §4.3),
   `Disconnected` while the connection closes, and re-queues them after a refusal. Anything else fails **that group**
   (`Failed`), and so does a stream the peer stops (STOP_SENDING) or one that fails to start: its queued messages complete
   `Failed`, its record is released and the channel keeps admitting and sending — groups are independent, so nothing here closes
-  a channel (unlike §7.2). `TryCancel` unlinks a message that is still queued in its group. Local-stream events reach the game
+  a channel (unlike §7.2). A stop can only fail what the group has not sent yet. Messages whose carrier completed are `Delivered`
+  and their payloads are released, and a STOP_SENDING that arrives after that changes nothing: once the stream has shut down the
+  transport has no stream left to report it on (the slot is closed), and before that the notice finds no queued message to fail.
+  The sender therefore cannot see, let alone count, a group the receiver discarded after acknowledging it — the receiver's
+  `StreamsReset` is the only counter of it — and that is the reason a receiver must never reset the stream of a sender that kept
+  its limits (the receive rule below). `TryCancel` unlinks a message that is still queued in its group. Local-stream events reach the game
   thread through an SPSC ring of notices keyed by group slot and serial, drained before every decision that depends on them.
   A record is returned to the free list **exactly once**: the release is idempotent, and it bumps the record's serial as it frees
   it, so no notice and no carrier tag of the stream that record just had can match its next occupant (the serial also rises on
@@ -1101,9 +1112,14 @@ free list of `Σ max(MaxGroups, 1)` records. The peer's files are untouched; the
   record, so even a stale carrier could only ever touch its own channel's counters. The channel's list of live groups is doubly
   linked, so a finished group leaves it in one step: a pass that finishes many groups of a channel with a large `MaxGroups` costs
   no walk per release.
-* **Receive** (transport thread). `OnStreamOpened` accepts at most `MaxGroups` concurrent peer streams per channel and resets
-  the rest with `LimitExceeded` (PROTOCOL.md §7); each accepted stream gets a `GroupRecv` record whose index is the stream's
-  cookie. `Start` reserves a receive-ring slot and rents a lease of the frame's `Length` (either failing ⇒ `Pend`), `Chunk`
+* **Receive** (transport thread). `OnStreamOpened` accepts every peer stream the connection's stream limit admits and gives it
+  a `GroupRecv` record whose index is the stream's cookie; there is a record for each stream the peer can have open
+  (`PeerUnidirectionalStreamLimit`), whatever channel it names, so one channel cannot take another's. The channel's `MaxGroups` is
+  deliberately not checked (PROTOCOL.md §7): a receiver that is behind has more than `MaxGroups` streams of a conforming sender
+  open, the sender has completed their messages `Delivered` and released the payloads, and a reset would lose them without
+  anyone being told. A peer that ignores `MaxGroups` is bounded by the same stream limit a conforming one is, and holds no more
+  half-received messages (ring reservations, staging leases) than it could by spreading them over its channels. Without a free
+  record the transport let the peer past its limit, and that stream is reset `LimitExceeded`. `Start` reserves a receive-ring slot and rents a lease of the frame's `Length` (either failing ⇒ `Pend`), `Chunk`
   copies, `End` publishes — so a group's messages are delivered as they complete, not at its FIN. A message within
   `MaxMessageSize` but above `min(ReceiveBudgetBytes, largest pool block)` resets **its** stream with `LimitExceeded` (the
   §7.2 sizing rule applies, but a group never closes the connection for it). A malformed group is reset
@@ -1119,7 +1135,9 @@ free list of `Σ max(MaxGroups, 1)` records. The peer's files are untouched; the
   `LoseNextStreamPackets`; 3 000 messages of 4 B … 64 KiB byte-exact under 5 % datagram loss, 3 % stream loss, reordering,
   jitter and a bandwidth cap; a group's messages delivered while its stream is still open; one flush of a hundred messages as
   one group in four stream sends; the `GroupMaxBytes` seal; keys, LZ4 and empty payloads), `GroupStreamTests` (a refused group
-  waiting for credit and going out on a new stream, asynchronous and synchronous refusals, the receive-side `MaxGroups` reset,
+  waiting for credit and going out on a new stream, asynchronous and synchronous refusals, a receiver that is late with its
+  Poll losing no group although more than `MaxGroups` streams are open at it, streams beyond `MaxGroups` accepted, a peer that
+  opens every stream the connection allows on one channel, a reconnect with more than `MaxGroups` receive records in use,
   a malformed group reset while other groups keep flowing, the mid-message idle timeout, the churn bound with and without an
   interval, a message the receiver could never buffer resetting only its group, a group the peer stops, the queue limit, the
   size limit, cancellation, expiry before the stream opens, close, and a full receive ring holding a group back) and

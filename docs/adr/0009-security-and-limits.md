@@ -21,6 +21,19 @@
   Decompression runs on the game thread with a per-peer decoded-bytes budget.
 * **Remote-chosen identifiers are capped and have an eviction rule** (keys, groups, streams, reassemblies,
   transfers, requests); the rule is written per limit in PROTOCOL §7, and every violation is a counter.
+  The cap on a `ReliableUnordered` channel's group streams is the connection's unidirectional stream limit, not
+  the channel's `MaxGroups` (amended 2026-09-30). `MaxGroups` was enforced by the receiver with a reset, on the
+  belief that both ends free a stream's slot at the same event. They do not: a stream is over for its sender
+  when its data and FIN are acknowledged, and the receiver holds it open until it has read it, so a receiver
+  that was behind reset streams of a sender that had kept the limit — after the sender had completed their
+  messages `Delivered`. The stream limit is enforced by the transport, which returns a slot only when the
+  receiver has closed a stream; it is Σ max(`MaxGroups`, 1) over the stream channels and at most 4 096, and the
+  engine keeps one 64-byte receive record per slot (0.6 KiB for a table with one group channel and one ordered
+  channel, 256 KiB per peer at the cap). A peer that opens every one of them on a single channel holds exactly
+  as many half-received messages — ring reservations and staging leases, the latter inside the receive byte
+  budget — as it could before by using each channel's share, and the stream idle rule still resets the ones it
+  leaves unfinished; the records are per connection, so it takes none from another channel. What it does take
+  is the stream slots of its own other channels.
 * **Retransmission cannot be weaponised**: ReliableLatest has per-version and per-peer retry budgets;
   acks are coalesced per key (the highest accepted version); Pong is rate-limited; control message rate is capped.
 * **Sequence numbers give the peer nothing it did not have** (PROTOCOL §8 "sequence clock"). Only the

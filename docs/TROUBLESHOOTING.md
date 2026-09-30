@@ -47,3 +47,13 @@ only fail to be admitted (`SendStatus`, and the channel's `QueueFull` / `TooLarg
 `Disconnected` with the connection. A `ReliableLatest` value is delivered unless a newer value of its key
 replaced it (`SendSuperseded`, `ReceiveSuperseded`) — and a tracked value completes `Delivered` only when the
 receiver acknowledged exactly the version that was last transmitted (PROTOCOL.md §4.4).
+
+The exception is a `ReliableUnordered` group whose stream the **receiver** reset, which its
+`PeerStatistics.StreamsReset` counts. A group's messages complete `Delivered` on the sender when the transport
+has acknowledged them, so a reset that comes after that is not reported to the sender. A receiver resets a
+group that is malformed, one that carries a message it could never buffer (`ReceiveTooLarge`), and one that
+stops in the middle of a message (`StreamIdleTimeouts`). A receiver built before the PROTOCOL.md §7 rule
+"`MaxGroups` is a sender's bound" also reset whole groups when it fell behind its sender — a late `Poll`, a full
+receive ring — and more than `MaxGroups` streams of the channel were open at it. If `StreamsReset` rises on a
+receiver while its peer's `ReliableUnordered` messages go missing, update the receiving end; the sender's
+version does not matter.

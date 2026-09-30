@@ -182,8 +182,10 @@ public sealed unsafe partial class MsQuicTransport : ITransport, IMsQuicConnecti
     public long SinkExceptionCount => Interlocked.Read(ref _sinkExceptions);
 
     /// <summary>
-    /// Peer streams refused because the stream table was full. Stays 0: the table is sized for every stream the peer was
-    /// granted (<see cref="MsQuicTransportOptions.StreamTableFor"/>), and MsQuic admits no other.
+    /// Peer streams refused because the stream table was full. Stays 0 in practice: the table is sized for every stream the
+    /// peer was granted (<see cref="MsQuicTransportOptions.StreamTableFor"/>), MsQuic admits no other, and when slots of
+    /// closed streams still wait for the thread pool's cleanup work item the table grows, up to twice that size. A stream is
+    /// refused only past that: a peer that resets streams faster than a starved thread pool closes them.
     /// </summary>
     public long RefusedPeerStreamCount => Interlocked.Read(ref _refusedPeerStreams);
 

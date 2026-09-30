@@ -94,6 +94,12 @@ public sealed unsafe partial class MsQuicTransport
     private int _freeSlotCount;
     private int _slotHighWater;
     private int _maxStreams;
+
+    // Under _tableLock: the most streams the peer may have open in each direction (the largest grant made so far; QUIC
+    // never takes granted credit back), and the slots this end's own streams hold.
+    private int _grantedPeerUnidi;
+    private int _grantedPeerBidi;
+    private int _localSlots;
     private int _deferredHead = -1;
 
     /// <summary>
@@ -103,8 +109,49 @@ public sealed unsafe partial class MsQuicTransport
     /// </summary>
     private bool _tableClosed;
 
-    /// <summary>Capacity of the stream table (<see cref="MsQuicTransportOptions.MaxStreams"/>).</summary>
-    public int MaxStreams => _maxStreams;
+    /// <summary>
+    /// Capacity of the stream table: <see cref="MsQuicTransportOptions.MaxStreams"/>, or more when the streams the peer was
+    /// granted need it (<see cref="MakeRoomForPeerStreams"/>).
+    /// </summary>
+    public int MaxStreams
+    {
+        get
+        {
+            lock (_tableLock)
+                return _maxStreams;
+        }
+    }
+
+    /// <summary>
+    /// Sizes the stream table for what the peer may open: <paramref name="bidirectional"/> and
+    /// <paramref name="unidirectional"/> streams at once (the connection's settings at first, then every
+    /// <see cref="UpdatePeerStreamLimits"/>). MsQuic admits a stream the peer has credit for, and a stream that found no
+    /// slot could only be refused below the session, with whatever it carried lost — so the table always has room for the
+    /// grants, next to a quarter of it for this end's own streams (<see cref="MsQuicTransportOptions.StreamTableFor"/>).
+    /// <see cref="MsQuicTransportOptions.MaxStreams"/> is the size the table has when that is enough. Says so once,
+    /// through the diagnostic sink, when it is not.
+    /// </summary>
+    private void MakeRoomForPeerStreams(int bidirectional, int unidirectional)
+    {
+        int peer;
+        int before;
+        int after;
+        lock (_tableLock)
+        {
+            _grantedPeerBidi = Math.Max(_grantedPeerBidi, bidirectional);
+            _grantedPeerUnidi = Math.Max(_grantedPeerUnidi, unidirectional);
+            peer = _grantedPeerBidi + _grantedPeerUnidi;
+            before = _maxStreams;
+            after = Math.Max(before, MsQuicTransportOptions.StreamTableFor(peer));
+            _maxStreams = after;
+        }
+
+        if (after != before && Interlocked.Exchange(ref _streamTableRaised, 1) == 0)
+        {
+            Diagnose(TransportDiagnosticLevel.Information,
+                $"The peer may have {peer} streams open, more than a stream table of {before} slots (MsQuicTransportOptions.MaxStreams) has room for next to the local streams: the table was raised to {after} slots.", null);
+        }
+    }
 
     /// <summary>Stream slots in use: open streams plus released streams whose native close the cleanup work item has not run yet.</summary>
     public int OpenStreamCount
@@ -141,7 +188,7 @@ public sealed unsafe partial class MsQuicTransport
         int state = Volatile.Read(ref _state);
         if (state is not (StateConnecting or StateConnected) || _connection.IsClosed) return TransportStatus.InvalidState;
         if (kind is not (StreamKind.Unidirectional or StreamKind.Bidirectional)) return TransportStatus.NotSupported;
-        StreamSlot? slot = AllocateSlot(out TransportStatus refused);
+        StreamSlot? slot = AllocateSlot(local: true, out TransportStatus refused);
         if (slot is null) return refused;
         slot.Local = true;
         slot.Kind = kind;
@@ -461,7 +508,13 @@ public sealed unsafe partial class MsQuicTransport
 
     // ------------------------------------------------------------------ slot table
 
-    private StreamSlot? AllocateSlot(out TransportStatus failure)
+    /// <summary>
+    /// Takes a slot for a stream. A local stream is refused (<see cref="TransportStatus.OutOfMemory"/>) once this end's
+    /// streams hold their whole share of the table — what the peer was granted is not theirs to take. A peer stream is
+    /// never refused for room: MsQuic admitted it, so it is within the grants the table was sized for; when its slot is
+    /// still held by streams whose native close has not run yet, the table grows.
+    /// </summary>
+    private StreamSlot? AllocateSlot(bool local, out TransportStatus failure)
     {
         lock (_tableLock)
         {
@@ -471,11 +524,21 @@ public sealed unsafe partial class MsQuicTransport
                 failure = TransportStatus.InvalidState;
                 return null;
             }
+            if (local)
+            {
+                if (_localSlots >= _maxStreams - (_grantedPeerBidi + _grantedPeerUnidi))
+                {
+                    failure = TransportStatus.OutOfMemory;
+                    return null;
+                }
+                _localSlots++;
+            }
             if (_freeSlotCount > 0) return _slots[_freeSlots[--_freeSlotCount]];
             if (_slotHighWater == _maxStreams)
             {
-                failure = TransportStatus.OutOfMemory;
-                return null;
+                // Every slot is in use although neither side is over what it may hold: slots of closed streams are given
+                // back by the cleanup work item, a moment after MsQuic returned their credit to the peer.
+                _maxStreams += Math.Max(16, _maxStreams / 8);
             }
             if (_slotHighWater == _slots.Length)
             {
@@ -493,6 +556,7 @@ public sealed unsafe partial class MsQuicTransport
     /// <summary>Resets a slot whose native stream is closed (or was never opened), bumps its generation and returns it to the free list.</summary>
     private void FreeSlot(StreamSlot slot)
     {
+        bool local = slot.Local;
         slot.Stream = null;
         slot.Local = false;
         slot.Kind = default;
@@ -517,7 +581,10 @@ public sealed unsafe partial class MsQuicTransport
         slot.Generation = slot.Generation == uint.MaxValue ? 1 : slot.Generation + 1;
         Interlocked.And(ref slot.Guard, ~GuardClosing);
         lock (_tableLock)
+        {
+            if (local) _localSlots--;
             _freeSlots[_freeSlotCount++] = slot.Index;
+        }
     }
 
     /// <summary>Pins a live slot for an API call (see <see cref="StreamSlot.Guard"/>); null for unknown, stale, closed or closing ids.</summary>
@@ -684,9 +751,10 @@ public sealed unsafe partial class MsQuicTransport
     bool IMsQuicConnectionEvents.PeerStreamStarted(MsQuicConnection connection, MsQuicStream stream, QUIC_STREAM_OPEN_FLAGS flags)
     {
         if (Volatile.Read(ref _closedDelivered) != 0) return false;
-        StreamSlot? slot = AllocateSlot(out TransportStatus failure);
+        StreamSlot? slot = AllocateSlot(local: false, out TransportStatus failure);
         if (slot is null)
         {
+            // The table is closed (the connection is shutting down). Room is never the reason: see AllocateSlot.
             if (failure == TransportStatus.OutOfMemory)
             {
                 Interlocked.Increment(ref _refusedPeerStreams);

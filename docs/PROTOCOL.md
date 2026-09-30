@@ -565,7 +565,7 @@ logging.
 |---|---|---|
 | per-peer receive byte budget (pooled leases + reassembly + stream staging) | 256 KiB | datagram channels: drop newest + count; stream channels: stop consuming (transport back-pressure), resume from Poll. At most a quarter of it can be pinned by unreliable messages nobody drains (next-to-last row) |
 | keys per channel per peer (`MaxKeys`) | 4 096 | UnreliableSequenced: evict least-recently-updated key (evicted keys re-accept any sequence; replay window documented — a key still in the table that has idled for more than half the sequence range is in the same position for its next value, no wider: every wire value then extends above what the key holds, §8); ReliableLatest: reject with `LatestReject(4)`, never evict |
-| concurrent peer streams per channel (`MaxGroups`) | 8 (ReliableUnordered), 4 (large ReliableLatest), 2 (Bulk) | further streams are reset `LimitExceeded` |
+| streams a sender keeps open per channel (`MaxGroups`) | 8 (ReliableUnordered), 4 (large ReliableLatest), 2 (Bulk) | the sender's further group, value or transfer waits for one of its streams to shut down. A receiver resets further streams `LimitExceeded` on large ReliableLatest and Bulk channels; on a ReliableUnordered channel it accepts every stream the connection's stream limit admits (see below) |
 | stream idle mid-message | 30 s | stream reset `Timeout` |
 | concurrent reassemblies per channel (`MaxReassemblies`) | 16 | evict oldest; reassembly expiry 2 × RTT + 100 ms; on a channel whose sequence carries ordering (`UnreliableSequenced`), a newer sequence for the same key abandons the older partial |
 | fragmented message size | ≤ 8 × (maxDatagram − header), the §2.1 `FragCount` cap, and ≤ `MaxMessageSize` | drop before any buffer is chosen |
@@ -620,6 +620,40 @@ peer that starts one message and stops can pin the whole per-peer receive byte b
 connection, and the connection-level heartbeat does not notice because the peer stays live on other channels.
 Progress on the stream (any accepted frame event) restarts the 30 s, and a stream between messages is never
 watched.
+
+**`MaxGroups` is a sender's bound, and a ReliableUnordered receiver does not enforce it.** A sender counts a
+group stream as closed when its data and FIN are acknowledged, and only then opens the next one past the limit.
+The receiver can still have that stream open: acknowledgement is the transport's, and the receiving peer reads
+the stream later — when its receive ring has room, its byte budget allows, or its host gets round to `Poll`. A
+receiver that is behind therefore sees more than `MaxGroups` streams of a channel open although the sender kept
+the limit. It MUST NOT reset them: the sender has already completed those messages `Delivered`, has released
+their payloads and cannot send them again, so a reset there is a silent loss on a reliable channel. What bounds
+the streams is what the transport admits: the unidirectional stream limit the session asks for after admission
+(Σ max(`MaxGroups`, 1) over the stream-capable channels, at most 4 096), or the transport's own initial grant
+when that is larger — a QUIC stack announces one in its transport parameters and never takes it back, and an
+MsQuic client grants its server 1 024 that way by default. A slot returns only when the receiver has closed a
+stream, and the receiver keeps one receive record for every stream it can be sent, whatever channel uses it. A
+sender that ignores `MaxGroups` gains nothing but the slots of its own other channels. The transport's own
+stream table must have room for what it admits as well: a stream it had to refuse for want of a slot would
+never reach the session and would be lost in the same way. The MsQuic transport therefore sizes its table from
+the streams it grants, whatever `MaxStreams` says, and keeps a quarter of it for this end's own streams.
+
+This is a receiver-side rule, so it takes effect when the *receiving* end runs it, whatever the sender runs. A
+receiver built before it reset the excess streams, and still loses groups when it falls behind, however new its
+peer is; it counts them in `StreamsReset`. The reset remains the rule for large
+ReliableLatest values and Bulk transfers. There it is not silent, and a sender that keeps the limit does not
+reach it through a late receiver: a value is `Delivered` only when the receiver acknowledged it, and its receive
+path holds no stream open while the host is late with its `Poll`; a Bulk stream can be held (a chunk waits when
+the receive budget is used up), but the sender's transfer slot is given back only by the receiver's final
+`BulkProgress`, which its game thread sends, so the sender does not open the next stream past the limit before
+the receiver has let the last one go.
+
+One consequence is not solved by it: the stream limit is shared by all channels of a connection. A
+ReliableUnordered channel whose receiver never reads it while its sender keeps sending ends up holding every
+slot, and from then on a group, a large value or a transfer that needs a *new* stream waits — on any channel —
+until that channel is read (a large value waits for stream credit like a group does; its thirty-second version
+budget still ends it, with `Failed`, if the wait lasts that long). Streams that are already open (every
+ReliableOrdered channel that has sent anything) and all datagram channels are not affected.
 
 Decompression runs on the game thread inside `Poll` (never on a transport thread); compressed messages are
 staged compressed in a pooled lease. Every limit is configurable per channel or per peer, and every violation

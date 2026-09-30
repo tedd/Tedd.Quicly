@@ -62,6 +62,10 @@ public sealed unsafe partial class QuiclyPeer
             Volatile.Write(ref _remoteEndPoint, info.RemoteEndPoint);
         }
 
+        // First: no stream of this connection exists yet, so the per-stream receive state can still be sized for what the
+        // transport admits by itself.
+        _core.SetTransportPeerStreams(info.Capabilities.PeerUnidirectionalStreams);
+
         // MsQuic can report CONNECTED before its first DATAGRAM_STATE_CHANGED. A negative snapshot is provisional,
         // and must not overwrite an explicit capability callback that preceded this snapshot.
         if (!_core.DatagramCapabilityKnown)
@@ -918,7 +922,7 @@ public sealed unsafe partial class QuiclyPeer
         if (record.Tag == StreamTag.Engine)
         {
             record.Tag = StreamTag.Discard;
-            _core.GetEngine(record.ChannelIndex).OnStreamClosed(id, aborted, code);
+            _core.GetEngine(record.ChannelIndex).OnPeerStreamClosed(id, record.Cookie, aborted, code);
         }
         else
         {

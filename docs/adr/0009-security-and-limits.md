@@ -21,6 +21,33 @@
   Decompression runs on the game thread with a per-peer decoded-bytes budget.
 * **Remote-chosen identifiers are capped and have an eviction rule** (keys, groups, streams, reassemblies,
   transfers, requests); the rule is written per limit in PROTOCOL §7, and every violation is a counter.
+  The cap on a `ReliableUnordered` channel's group streams is the connection's unidirectional stream limit, not
+  the channel's `MaxGroups` (amended 2026-09-30). `MaxGroups` was enforced by the receiver with a reset, on the
+  belief that both ends free a stream's slot at the same event. They do not: a stream is over for its sender
+  when its data and FIN are acknowledged, and the receiver holds it open until it has read it, so a receiver
+  that was behind reset streams of a sender that had kept the limit — after the sender had completed their
+  messages `Delivered`. The bound is what the transport admits, and a slot returns only when the receiver has
+  closed a stream: the limit the session asks for after admission (Σ max(`MaxGroups`, 1) over the stream
+  channels, at most 4 096), or the transport's own initial grant when that is more
+  (`TransportCapabilities.PeerUnidirectionalStreams`; an MsQuic client grants 1 024 in its transport parameters
+  by default, and QUIC never takes granted credit back). The session keeps its per-stream receive state for the
+  larger of the two (`PeerCore.PeerStreamCapacity`): one 64-byte record of the group engine and 8 bytes of the
+  pended-stream ring per stream. **Both numbers are this end's own configuration — its channel table and its
+  transport options — so a peer cannot make the state larger than the host chose.** On a server peer the grant is
+  0 and the state is the table's sum: 0.6 KiB of records for one group channel and one ordered channel. On a
+  client peer at the default grant it is 64 KiB of records and a 16 KiB ring; at the most the option allows
+  (65 535) it would be 4 MiB and 1 MiB. The transport's stream table follows the same two numbers: it is
+  `MaxStreams` slots (default 2 048) or as many as the grants need next to a quarter for this end's own streams,
+  so a stream the peer was allowed to open always finds a slot, and the local streams cannot take the slots of
+  the granted ones; slots are created as streams use them, and the WebTransport carrier's mirror of the table
+  grows the same way (slot records on first use, preamble storage in chunks of 256 slots). A peer that
+  opens every stream it may on a single channel holds one half-received message per stream — a ring reservation
+  and a staging lease, the lease inside the receive byte budget. That is more than the per-channel cap allowed
+  it on that one channel, and the same total it could always hold across the group and ordered channels; the
+  shares of ReliableLatest and Bulk channels, whose receive paths reserve no ring slot, are now usable for it
+  too. The stream idle rule still resets the streams it leaves unfinished, the records are per connection, so
+  it takes none from another peer or another channel, and what it does take is the stream slots of its own
+  other channels.
 * **A channel the application does not read is bounded per class** (PROTOCOL §7 "Channels nobody drains", added
   2026-09-30). A peer chooses which channels it sends on, so it must not be able to stall a receiver through a
   channel the application happens not to drain. What unreliable ring channels still have queued when a Poll begins,

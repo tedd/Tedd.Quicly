@@ -785,12 +785,44 @@ public sealed unsafe partial class QuiclyPeer
         a.Channel == b.Channel && a.Key == b.Key && a.Sequence == b.Sequence && a.Length == b.Length
         && a.ReceivedMicros == b.ReceivedMicros && a.RequestId == b.RequestId;
 
+    /// <summary>
+    /// Resumes streams whose receive was held back for the receive ring or the receive budget, oldest first, and no more
+    /// of them than the ring has free slots: a resumed stream takes at least one, or is held back again at once, so
+    /// resuming more only sends the rest round — with thousands of streams held after a long hitch, every Poll would
+    /// resume all of them to let a ring's worth through. What is left stays queued, which keeps
+    /// <see cref="HasPendingWork"/> set, and the next Poll goes on.
+    /// </summary>
     private void ResumePendedStreams()
     {
-        SpscRing<TransportStreamId> pended = _core.PendedStreams;
-        while (pended.TryDequeue(out TransportStreamId id))
+        PeerCore core = _core;
+        ITransport? transport = _transport;
+        SpscRing<TransportStreamId>[]? retired = core.RetiredPendedStreams;
+        SpscRing<TransportStreamId> pended = core.PendedStreams;
+        if (retired is null && pended.IsEmpty)
         {
-            _transport?.ResumeStreamReceive(id, 0);
+            return;
+        }
+
+        SpscRing<ReceiveEntry> ring = core.ReceiveRing;
+        int budget = transport is null ? int.MaxValue : ring.Capacity - ring.Count;
+        if (retired is not null)
+        {
+            // Rings the peer's stream capacity outgrew (PeerCore.SetTransportPeerStreams): what was held before the
+            // replacement is older than anything in the current ring.
+            foreach (SpscRing<TransportStreamId> old in retired)
+            {
+                while (budget > 0 && old.TryDequeue(out TransportStreamId id))
+                {
+                    budget--;
+                    transport?.ResumeStreamReceive(id, 0);
+                }
+            }
+        }
+
+        while (budget > 0 && pended.TryDequeue(out TransportStreamId id))
+        {
+            budget--;
+            transport?.ResumeStreamReceive(id, 0);
         }
     }
 

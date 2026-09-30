@@ -27,6 +27,11 @@ internal sealed unsafe partial class ReliableLatestEngine
     private SpscRing<AckRequest> _ackQueue = null!;
     private SpscRing<RejectRequest> _rejectQueue = null!;
     private SpscRing<LatestNotice> _notices = null!;
+
+    // The starts, refusals and shutdowns of the large-value streams this engine opened, in a ring of their own: sized for
+    // every stream the engine can have open, so that a burst of acks can never cost one of them. A lost shutdown would
+    // leave its per-channel stream slot taken for the rest of the connection.
+    private SpscRing<LatestNotice> _streamNotices = null!;
     private AckRequest _heldAck;
     private RejectRequest _heldReject;
     private int _sweepLocal = -1;
@@ -53,6 +58,19 @@ internal sealed unsafe partial class ReliableLatestEngine
 
         /// <summary>A large-value stream this engine opened has shut down; its per-channel slot is free again.</summary>
         StreamClosed = 2,
+
+        /// <summary>
+        /// The peer's stream limit refused the start of a large-value stream this engine opened. The send that carried the
+        /// start completes canceled and the stream shuts down afterwards; the value never reached the peer and waits for
+        /// stream credit.
+        /// </summary>
+        StreamRefused = 3,
+
+        /// <summary>
+        /// The start of a large-value stream this engine opened succeeded: the transmission it carries is now one that left
+        /// this host, and is counted as one (<see cref="ReliableLatestEngine.OnLargeStreamStarted"/>).
+        /// </summary>
+        StreamStarted = 4,
     }
 
     /// <summary>Builds the receive-side state (engine construction, game thread).</summary>
@@ -92,6 +110,9 @@ internal sealed unsafe partial class ReliableLatestEngine
         _ackQueue = new SpscRing<AckRequest>((int)Math.Min(ackSlots, MaxAckRingSlots));
         _rejectQueue = new SpscRing<RejectRequest>(256);
         _notices = new SpscRing<LatestNotice>(1024);
+        // A stream the engine opened raises its start (or its refusal) and its shutdown: two notices, and its record in
+        // _txStreams is free again only after the second.
+        _streamNotices = new SpscRing<LatestNotice>((2 * _txStreams.Length) + 8);
         _heldAck.Local = -1;
         // A value is staged whole, so it can never be larger than the receive budget or the pool's largest block (§7.2).
         _maxStage = Math.Min(core.ReceiveBudgetBytes, core.Allocator.MaxBlockSize);
@@ -169,6 +190,7 @@ internal sealed unsafe partial class ReliableLatestEngine
         _ackQueue?.Dispose();
         _rejectQueue?.Dispose();
         _notices?.Dispose();
+        _streamNotices?.Dispose();
     }
 
     // ------------------------------------------------------------------ control messages (transport thread)
@@ -268,6 +290,21 @@ internal sealed unsafe partial class ReliableLatestEngine
         if (!_notices.TryEnqueue(in notice))
         {
             // The game thread has not drained them yet; a lost ack is covered by the sender's timer (PROTOCOL.md §4.4).
+            _core.Counters.CallbackFaults++;
+            return;
+        }
+
+        _core.NoteTransportWork();
+    }
+
+    /// <summary>
+    /// Hands the start, the refusal or the shutdown of a stream this engine opened to the game thread (transport thread).
+    /// The ring holds two notices per stream the engine can have recorded, so it does not fill.
+    /// </summary>
+    private void PostStream(in LatestNotice notice)
+    {
+        if (!_streamNotices.TryEnqueue(in notice))
+        {
             _core.Counters.CallbackFaults++;
             return;
         }
@@ -798,7 +835,7 @@ internal sealed unsafe partial class ReliableLatestEngine
             if (_txStreams[index] == id)
             {
                 _txStreams[index] = default;
-                Post(new LatestNotice { Local = _txLocals[index], Kind = NoticeKind.StreamClosed, Stream = id });
+                PostStream(new LatestNotice { Local = _txLocals[index], Kind = NoticeKind.StreamClosed, Stream = id });
                 return;
             }
         }
@@ -807,8 +844,11 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// <inheritdoc/>
     /// <remarks>
     /// Records a large-value stream this engine opened so that <see cref="OnStreamClosed"/> can recognise it (transport
-    /// thread; the peer routes it here by the context's mode). A start the peer's stream limit refused is followed by the
-    /// canceled completion of its send, which is what schedules the retransmission.
+    /// thread; the peer routes it here by the context's mode), and tells the game thread how the start went: the
+    /// transmission the stream carries is counted only once it is known to have started. A start the peer's stream limit
+    /// refused is followed by the canceled completion of its send, which puts the value back in its queue; the refusal
+    /// makes the channel's large values wait for stream credit (MsQuic and the simulator refuse a start only here, never
+    /// in the call that made it).
     /// </remarks>
     public override void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status)
     {
@@ -823,6 +863,15 @@ internal sealed unsafe partial class ReliableLatestEngine
         if (local < 0)
         {
             return;
+        }
+
+        if (status == TransportStatus.Success)
+        {
+            PostStream(new LatestNotice { Local = local, Kind = NoticeKind.StreamStarted, Stream = id });
+        }
+        else if (status == TransportStatus.StreamLimitReached)
+        {
+            PostStream(new LatestNotice { Local = local, Kind = NoticeKind.StreamRefused, Stream = id });
         }
 
         for (int index = 0; index < _txStreams.Length; index++)
@@ -867,6 +916,10 @@ internal sealed unsafe partial class ReliableLatestEngine
         {
         }
 
+        while (_streamNotices.TryDequeue(out _))
+        {
+        }
+
         // Pending acks name versions of the epoch that ended.
         for (int local = 0; local < _channels.Length; local++)
         {
@@ -897,7 +950,11 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// </summary>
     private void DropNoticesOfClosedEpoch()
     {
-        while (_notices.TryDequeue(out LatestNotice notice))
+        while (_notices.TryDequeue(out _))
+        {
+        }
+
+        while (_streamNotices.TryDequeue(out LatestNotice notice))
         {
             if (notice.Kind == NoticeKind.StreamClosed)
             {
@@ -909,19 +966,32 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// <summary>Applies the LatestAck and LatestReject entries the transport thread handed over (game thread).</summary>
     private void DrainNotices()
     {
-        SpscRing<LatestNotice> ring = _notices;
-        while (ring.TryDequeue(out LatestNotice notice))
+        // The streams first: a stream's start is posted before anything the peer can answer it with, so the ack of a
+        // large value is applied after its transmission was counted.
+        SpscRing<LatestNotice> streams = _streamNotices;
+        while (streams.TryDequeue(out LatestNotice stream))
         {
-            int local = notice.Local;
-            if (notice.Kind == NoticeKind.StreamClosed)
+            if (stream.Kind == NoticeKind.StreamClosed)
             {
                 // A large-value stream of ours shut down, so its per-channel slot is free again (the receiver freed its own
                 // at the same point) and a value waiting for credit may go out. The slot is looked up by the stream's own id,
                 // so a start that was reported and then refused — one this engine never counted — releases nothing.
-                ReleaseCountedStream(notice.Stream);
-                continue;
+                ReleaseCountedStream(stream.Stream);
             }
+            else if (stream.Kind == NoticeKind.StreamRefused)
+            {
+                OnLargeStreamRefused(stream.Local, stream.Stream);
+            }
+            else
+            {
+                OnLargeStreamStarted(stream.Local, stream.Stream);
+            }
+        }
 
+        SpscRing<LatestNotice> ring = _notices;
+        while (ring.TryDequeue(out LatestNotice notice))
+        {
+            int local = notice.Local;
             LatestSendKeys keys = _sendKeys[local];
             if (!keys.TryGet(notice.Key, out int keySlot))
             {
@@ -980,7 +1050,7 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// (<see cref="QuiclyPeer.CanSkipFlush"/>) flushes for it. Game thread; from another thread the answer is advisory (the
     /// held entries and the sweep cursor are the game thread's own).
     /// </summary>
-    internal bool HasUnsentControl => !_notices.IsEmpty || HasPendingAcks();
+    internal bool HasUnsentControl => !_notices.IsEmpty || !_streamNotices.IsEmpty || HasPendingAcks();
 
     private bool HasPendingAcks()
     {

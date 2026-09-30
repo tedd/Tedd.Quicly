@@ -26,9 +26,8 @@ public enum WebTransportOriginPolicy
 /// limits and the size of the carrier's own tables. Copied when a connector or listener is created.
 /// </summary>
 /// <remarks>
-/// <see cref="MaxStreams"/> must be at least the <see cref="MsQuicTransportOptions.MaxStreams"/> of the transport the
-/// carrier runs over, because the carrier mirrors the inner transport's stream slots;
-/// <see cref="WebTransportConnector"/> and <see cref="WebTransportListener"/> keep the two in step for you.
+/// The carrier mirrors the inner transport's stream slots. The mirror grows with the slots the inner transport uses, so
+/// <see cref="MaxStreams"/> does not have to match the inner transport's table any more.
 /// </remarks>
 public sealed class WebTransportOptions
 {
@@ -76,9 +75,15 @@ public sealed class WebTransportOptions
     public IList<string> AllowedOrigins { get; set; } = new List<string>();
 
     /// <summary>
-    /// Capacity of the carrier's stream table; must be at least the inner transport's. Default 1 024.
+    /// Size the carrier's mirror of the inner transport's stream table may start with (it starts with at most 64 slot
+    /// references). Default 2 048, the inner transport's default.
     /// </summary>
-    public int MaxStreams { get; set; } = 1024;
+    /// <remarks>
+    /// Not a limit: the mirror grows when the inner transport uses a higher slot — its own table grows with the streams
+    /// it grants — so no peer stream is dropped because the two sizes differ. A slot's record is created when a stream
+    /// first uses it, and the per-slot preamble storage in chunks of 256 slots when a local stream first needs one.
+    /// </remarks>
+    public int MaxStreams { get; set; } = 2048;
 
     /// <summary>
     /// Datagram sends the carrier can have outstanding towards a final <see cref="Core.Transport.DatagramSendState"/>.

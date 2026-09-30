@@ -153,6 +153,16 @@ public struct TransportCapabilities
     /// with an MsQuic library older than 2.4).
     /// </summary>
     public bool CancelOnBlocked;
+
+    /// <summary>
+    /// Unidirectional streams this transport lets the peer have open from the start, before the session asks for anything
+    /// with <see cref="ITransport.UpdatePeerStreamLimits"/>: the grant of the transport's own configuration (for QUIC, the
+    /// initial <c>max_streams_uni</c>). QUIC never takes granted credit back, so it stays in force when the session later asks
+    /// for fewer, and the peer may have up to the larger of the two open. The session sizes its per-stream receive state for
+    /// that many. 0 when the transport grants nothing before it is asked to. It is this end's own configuration: the peer
+    /// cannot influence it.
+    /// </summary>
+    public int PeerUnidirectionalStreams;
 }
 
 /// <summary>Snapshot of transport-level statistics. Fixed layout, no references.</summary>

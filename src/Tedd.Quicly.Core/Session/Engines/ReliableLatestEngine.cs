@@ -102,13 +102,32 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     private TransportStreamId[] _countedStreams = [];
     private int[] _countedLocals = [];
 
-    // Per counted stream, what undoes its transmission if the peer's stream limit refuses the start: the key it carries,
-    // the stream-credit generation read before it was opened, whether it was counted as a retry, and whether the refusal
-    // has been seen (its shutdown then must not unblock the channel).
+    // Per counted stream, what its transmission is counted with once the start is known to have succeeded — the key and
+    // the value it carries (slot and version), its payload and wire bytes, whether it is a retry — and what a refusal
+    // needs: the stream-credit generation read before the stream was opened, and whether the refusal has been seen (its
+    // shutdown then must not unblock the channel).
     private int[] _countedKeySlots = [];
     private int[] _countedCredit = [];
     private bool[] _countedRetry = [];
     private bool[] _countedRefused = [];
+    private bool[] _countedStarted = [];
+    private int[] _countedValues = [];
+    private uint[] _countedVersions = [];
+    private long[] _countedPayload = [];
+    private long[] _countedBytes = [];
+
+    /// <summary>What <see cref="TryTransmit"/> did with a value.</summary>
+    private enum Transmit
+    {
+        /// <summary>The value was handed to the transport (or finished): it leaves its queue.</summary>
+        Done,
+
+        /// <summary>The value waits for a stream (credit, the channel's MaxGroups): it keeps its place, the values behind it go on.</summary>
+        Waits,
+
+        /// <summary>The pass is over for the channel (no entry, no datagrams, the send cap).</summary>
+        Stop,
+    }
 
     /// <summary>Where a value entry is and what it still owes.</summary>
     [Flags]
@@ -159,6 +178,11 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         _countedCredit = new int[_streamCapacity];
         _countedRetry = new bool[_streamCapacity];
         _countedRefused = new bool[_streamCapacity];
+        _countedStarted = new bool[_streamCapacity];
+        _countedValues = new int[_streamCapacity];
+        _countedVersions = new uint[_streamCapacity];
+        _countedPayload = new long[_streamCapacity];
+        _countedBytes = new long[_streamCapacity];
         for (int local = 0; local < count; local++)
         {
             ChannelDefinition channel = _channels[local];
@@ -246,7 +270,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     public override SendStatus Admit(ref SendRequest request)
     {
         // The notice ring is almost always empty: check it inline and call the drain only when a notice is waiting.
-        if (!_notices.IsEmpty)
+        if (!_notices.IsEmpty || !_streamNotices.IsEmpty)
         {
             DrainNotices();
         }
@@ -664,7 +688,15 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
                     // The value goes back into the retry queue and its timer is re-armed rather than cleared: a retry the
                     // per-peer byte budget holds back must stay visible here, or its 30-second version budget would never
                     // be checked again (PROTOCOL.md §4.4).
-                    EnqueueRetry(local, ref send, value);
+                    if ((FlagsOf(_core.Entries[value].Aux1) & ValueFlags.Transmitted) != 0)
+                    {
+                        EnqueueRetry(local, ref send, value);
+                    }
+                    else
+                    {
+                        EnqueueFreshFront(ref send, value); // still waiting for its first transmission (a stream start)
+                    }
+
                     ArmRetry(local, ref send, ref key, nowMicros);
                     if (key.RetryDeadline < earliest)
                     {
@@ -720,20 +752,19 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
     /// <summary>
     /// Hands the channel's fresh values (or its due retries) to the transport in admission order, stopping when the pass's
-    /// budget, the retry budget, the datagram limit or the peer's stream credit runs out.
+    /// budget, the retry budget or the datagram limit runs out. A large value that waits for a stream — the peer's stream
+    /// credit, the channel's MaxGroups — keeps its place and is passed over: the values behind it that fit a datagram need
+    /// no stream and do not wait for one (PROTOCOL.md §7).
     /// </summary>
     private void DrainQueue(int local, ref LatestSendState send, ref FlushContext flush, bool retries)
     {
         SendEntryTable entries = _core.Entries;
+        NativeArray<int> links = entries.Next;
         ref ChannelSendCounters counters = ref _core.SendCounters(_denseOf[local]);
-        while (true)
+        int previous = -1;
+        int value = retries ? send.RetryHead : send.PendingHead;
+        while (value >= 0)
         {
-            int value = retries ? send.RetryHead : send.PendingHead;
-            if (value < 0)
-            {
-                return;
-            }
-
             // A finished value is unlinked where it is finished (MarkValueFinished), so a queue only holds live values.
             ref SendEntry entry = ref entries[value];
             if (flush.BudgetBytes <= 0)
@@ -749,30 +780,92 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
                 return;
             }
 
-            if (!TryTransmit(local, value, ref send, ref counters, ref flush, retries))
+            int next = links[value];
+            Transmit result = TryTransmit(local, value, ref send, ref counters, ref flush, retries, out bool onStream);
+            if (result == Transmit.Stop)
             {
                 return;
             }
 
-            if (retries && _retryRate > 0)
+            if (result == Transmit.Waits)
             {
+                previous = value;
+                value = next;
+                continue;
+            }
+
+            if (retries && _retryRate > 0 && !onStream)
+            {
+                // A large value's bytes are charged when its stream is known to have started (OnLargeStreamStarted): a
+                // start the peer's stream limit refuses put nothing on the wire.
                 _retryBucket.Consume(bytes);
             }
 
-            if ((retries ? send.RetryHead : send.PendingHead) == value)
+            // Still linked unless the transmission itself finished the value (its budget ran out), which unlinked it.
+            if ((FlagsOf(entries[value].Aux1) & (retries ? ValueFlags.Retrying : ValueFlags.Queued)) != 0)
             {
-                // Still the head unless the transmission itself finished the value (its budget ran out).
-                Dequeue(ref send, retries, value);
+                Remove(ref send, retries, previous, value);
             }
+
+            value = next;
         }
     }
 
     /// <summary>
-    /// Sends one transmission of a value: a datagram through the packer, or a one-message group stream when the value does
-    /// not fit the current datagram limit (PROTOCOL.md §3.2). Returns <see langword="false"/> when the pass must stop for
-    /// this channel (no entry, no datagrams, no stream credit, budget exhausted).
+    /// Takes a value off one queue where <see cref="DrainQueue"/> stands: <paramref name="previous"/> is the value the walk
+    /// passed over just before it, or -1 when it is the head.
     /// </summary>
-    private bool TryTransmit(int local, int value, ref LatestSendState send, ref ChannelSendCounters counters, ref FlushContext flush, bool retry)
+    private void Remove(ref LatestSendState send, bool retries, int previous, int value)
+    {
+        if (previous < 0)
+        {
+            Dequeue(ref send, retries, value);
+            return;
+        }
+
+        SendEntryTable entries = _core.Entries;
+        NativeArray<int> links = entries.Next;
+        links[previous] = links[value];
+        ref SendEntry entry = ref entries[value];
+        ValueFlags flags = FlagsOf(entry.Aux1);
+        if (retries)
+        {
+            if (send.RetryTail == value)
+            {
+                send.RetryTail = previous;
+            }
+
+            entry.Aux1 = WithFlags(entry.Aux1, flags & ~ValueFlags.Retrying);
+            return;
+        }
+
+        if (send.PendingTail == value)
+        {
+            send.PendingTail = previous;
+        }
+
+        if ((flags & ValueFlags.Queued) != 0)
+        {
+            send.PendingCount--;
+            send.PendingBytes -= entry.Aux0;
+        }
+
+        entry.Aux1 = WithFlags(entry.Aux1, flags & ~ValueFlags.Queued);
+    }
+
+    /// <summary>
+    /// Sends one transmission of a value: a datagram through the packer, or a one-message group stream when the value does
+    /// not fit the current datagram limit (PROTOCOL.md §3.2). <see cref="Transmit.Stop"/> ends the pass for this channel
+    /// (no entry, no datagrams, budget exhausted); <see cref="Transmit.Waits"/> means only this value has to wait — it
+    /// needs a stream and there is none to be had now.
+    /// </summary>
+    /// <remarks>
+    /// A datagram transmission is counted here. A stream transmission (<paramref name="onStream"/>) is counted when its
+    /// start is known to have succeeded (<see cref="OnLargeStreamStarted"/>): MsQuic and the simulator accept the send that
+    /// carries a start and refuse the start afterwards, and a refused start is not a transmission — it spends none of the
+    /// version's attempts, none of the retry budget, and is not in <c>Sent</c>.
+    /// </remarks>
+    private Transmit TryTransmit(int local, int value, ref LatestSendState send, ref ChannelSendCounters counters, ref FlushContext flush, bool retry, out bool onStream)
     {
         SendEntryTable entries = _core.Entries;
         LatestSendKeys keys = _sendKeys[local];
@@ -786,7 +879,8 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             send.LiveKeys--;
             AbortLargeStream(ref key);
             MarkValueFinished(local, value, DeliveryStatus.Failed, superseded: false);
-            return true;
+            onStream = false;
+            return Transmit.Done;
         }
 
         ChannelDefinition channel = _channels[local];
@@ -794,52 +888,88 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         // The pass's own snapshot of the datagram limit — the one the packer was started with (§7.1) — decides datagram or
         // group stream, so the packer can never answer TooLarge for a value this pass already measured.
         bool large = !flush.DatagramsEnabled || size > flush.MaxDatagramPayload;
-        if (!_core.TryAllocateEntry(channel.Id, SendEntryFlags.None, out int transmission))
+        onStream = large;
+        if (large && LargeValuesWait(local, channel, ref send))
         {
-            return false;
+            return Transmit.Waits;
         }
 
-        bool sent = large
-            ? TrySendLarge(local, value, transmission, keySlot, ref key, ref flush, retry)
-            : TrySendDatagram(local, value, transmission, ref flush);
-        if (!sent)
+        if (!_core.TryAllocateEntry(channel.Id, SendEntryFlags.None, out int transmission))
         {
-            return false;
+            return Transmit.Stop;
+        }
+
+        if (large)
+        {
+            Transmit started = TrySendLarge(local, value, transmission, keySlot, ref key, ref flush, retry);
+            if (started != Transmit.Done)
+            {
+                return started;
+            }
+        }
+        else if (!TrySendDatagram(local, value, transmission, ref flush))
+        {
+            return Transmit.Stop;
         }
 
         long now = flush.NowMicros;
         ref SendEntry valueEntry = ref entries[value];
-        long aux = valueEntry.Aux1;
-        ValueFlags valueFlags = FlagsOf(aux);
-        if ((valueFlags & ValueFlags.Transmitted) == 0)
-        {
-            aux = WithFlags(aux, valueFlags | ValueFlags.Transmitted);
-            send.InFlightCount++;
-            send.InFlightBytes += valueEntry.Aux0;
-        }
-
-        valueEntry.Aux1 = WithOutstanding(aux, OutstandingOf(aux) + 1);
+        valueEntry.Aux1 = WithOutstanding(valueEntry.Aux1, OutstandingOf(valueEntry.Aux1) + 1);
 
         // PROTOCOL.md §4.3: only a version that really left this host can be acknowledged, so the version of the key's most
         // recent transmission is what an incoming ack must name (DrainNotices). A queue holds only a key's live value —
         // whatever finishes or replaces one unlinks it (MarkValueFinished), and an epoch reset re-stamps value and key
-        // together (Requeue) — so this is always the key's current version.
+        // together (Requeue) — so this is always the key's current version. (A stream whose start is then refused carried
+        // nothing to the peer, so no ack can name it.)
         uint transmitted = entries.Sequences[value];
         System.Diagnostics.Debug.Assert(transmitted == key.CurrentVersion, "a queue holds only the key's live value");
         keys.SentVersion(keySlot) = transmitted;
 
-        key.Attempts++;
         key.LastSentMicros = now;
-        ArmRetry(local, ref send, ref key, now);
+        if (!large)
+        {
+            CountTransmission(ref send, ref key, ref valueEntry, ref counters, retry);
+        }
+
+        // The timer is armed for a stream whose start is not known yet as well, as if its attempt were counted already: it
+        // is what wakes a sleeping host for a value that waits for stream credit (the transport's credit report raises no
+        // work signal).
+        ArmRetry(local, ref send, ref key, now, pendingAttempts: large ? 1 : 0);
+        return Transmit.Done;
+    }
+
+    /// <summary>
+    /// Counts one transmission that left this host: the version's attempt, the channel's <c>Sent</c> and <c>BytesSent</c>
+    /// (and <c>Retries</c>), and the value as in flight. For a datagram that is when the packer took it; for a large
+    /// value, when its stream's start succeeded.
+    /// </summary>
+    private static void CountTransmission(ref LatestSendState send, ref KeySendSlot key, ref SendEntry valueEntry, ref ChannelSendCounters counters, bool retry)
+    {
+        long aux = valueEntry.Aux1;
+        ValueFlags valueFlags = FlagsOf(aux);
+        if ((valueFlags & ValueFlags.Transmitted) == 0)
+        {
+            valueEntry.Aux1 = WithFlags(aux, valueFlags | ValueFlags.Transmitted);
+            send.InFlightCount++;
+            send.InFlightBytes += valueEntry.Aux0;
+        }
+
+        key.Attempts++;
         counters.Sent++;
         counters.Bytes += valueEntry.Payload.Length;
         if (retry)
         {
             counters.Retries++;
         }
-
-        return true;
     }
+
+    /// <summary>
+    /// Whether a large value of the channel has to wait without trying: the peer's stream limit refused a start and no
+    /// stream credit has arrived since, or the channel has as many streams open as its MaxGroups allows.
+    /// </summary>
+    private bool LargeValuesWait(int local, ChannelDefinition channel, ref LatestSendState send) =>
+        (_streamBlocked[local] && _core.StreamCreditGeneration == send.CreditGeneration)
+        || _openStreams[local] >= Math.Max(channel.MaxGroups, 1);
 
     private bool TrySendDatagram(int local, int value, int transmission, ref FlushContext flush)
     {
@@ -871,36 +1001,29 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     /// <summary>
     /// Sends a large value as one group stream (PROTOCOL.md §3.2, §8 item 8): preamble <c>ChannelId, GroupId = version</c>,
     /// one frame <c>Length, Sequence = version, Key, RawLength</c>, FIN. The header and the value's payload are the entry's
-    /// own adjacent segment pair, so nothing is copied.
+    /// own adjacent segment pair, so nothing is copied. The caller has checked <see cref="LargeValuesWait"/>.
     /// </summary>
-    private bool TrySendLarge(int local, int value, int transmission, int keySlot, ref KeySendSlot key, ref FlushContext flush, bool retry)
+    /// <returns>
+    /// <see cref="Transmit.Done"/> when the stream's send was accepted (its start may still be refused,
+    /// <see cref="OnLargeStreamRefused"/>); <see cref="Transmit.Waits"/> when there is no stream to be had now;
+    /// <see cref="Transmit.Stop"/> when the transport refused the send for another reason.
+    /// </returns>
+    private Transmit TrySendLarge(int local, int value, int transmission, int keySlot, ref KeySendSlot key, ref FlushContext flush, bool retry)
     {
         ChannelDefinition channel = _channels[local];
         SendEntryTable entries = _core.Entries;
         ref LatestSendState send = ref _send[local];
         int credit = _core.StreamCreditGeneration;
-        if (_streamBlocked[local] && credit == send.CreditGeneration)
-        {
-            _core.DiscardEntry(transmission);
-            return false;
-        }
 
-        // Both peers read the same channel table, so the channel's concurrent-stream cap binds the sender too: opening one
-        // more than MaxGroups would make the receiver reset a live stream of ours (PROTOCOL.md §7). The value waits instead.
-        if (_openStreams[local] >= Math.Max(channel.MaxGroups, 1))
-        {
-            _core.DiscardEntry(transmission);
-            return false;
-        }
-
-        // The slot is counted against this stream's id, so only that id's own shutdown can give it back: a transport that
-        // reports a start it then refused cannot release a slot the refused stream never took, and the sender can never
-        // exceed the channel's cap because of one.
+        // Both peers read the same channel table, so the channel's concurrent-stream cap binds the sender too (the caller
+        // checked it, PROTOCOL.md §7). The slot is counted against this stream's id, so only that id's own shutdown can
+        // give it back: a transport that reports a start it then refused cannot release a slot the refused stream never
+        // took, and the sender can never exceed the channel's cap because of one.
         int counted = FreeCountedStream();
         if (counted < 0)
         {
             _core.DiscardEntry(transmission);
-            return false;
+            return Transmit.Waits;
         }
 
         uint version = entries.Sequences[value];
@@ -911,7 +1034,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             _core.DiscardEntry(transmission);
             _streamBlocked[local] = true;
             send.CreditGeneration = credit;
-            return false;
+            return Transmit.Waits;
         }
 
         send.StreamSerial = serial;
@@ -946,9 +1069,10 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             {
                 _streamBlocked[local] = true;
                 send.CreditGeneration = credit;
+                return Transmit.Waits;
             }
 
-            return false;
+            return Transmit.Stop;
         }
 
         _streamBlocked[local] = false;
@@ -961,14 +1085,19 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         _countedCredit[counted] = credit;
         _countedRetry[counted] = retry;
         _countedRefused[counted] = false;
-        _openStreams[local]++;
+        _countedStarted[counted] = false;
+        _countedValues[counted] = value;
+        _countedVersions[counted] = version;
+        _countedPayload[counted] = header.Length;
         long bytes = written + header.Length;
+        _countedBytes[counted] = bytes;
+        _openStreams[local]++;
         flush.BudgetBytes -= bytes;
         flush.BytesSubmitted += bytes;
         PeerCounters counters = _core.Counters;
         counters.StreamSends++;
         counters.StreamBytesSent += bytes;
-        return true;
+        return Transmit.Done;
     }
 
     /// <summary>A free slot of the counted-stream table, or -1 when every stream this engine may open is already counted.</summary>
@@ -1024,45 +1153,69 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
     /// <summary>
     /// The peer's stream limit refused the start of a large value's stream (game thread, from the transport thread's
-    /// notice). MsQuic and the simulator report that after the send that carried the start was accepted, so the
-    /// transmission was counted like one that left: it is taken back here — the value's attempt, the channel's
-    /// <c>Sent</c> — and the channel waits for stream credit (PROTOCOL.md §3.2: it waits, it never fails), exactly as after
-    /// a refusal the call itself reports. Without this every pass would open a stream, have it refused and spend one of
-    /// the version's transmissions, and a value would end <see cref="DeliveryStatus.Failed"/> within a few milliseconds
-    /// of a receiver that is merely late. The canceled completion that follows re-queues the value; the stream's shutdown
-    /// gives back its per-channel slot and leaves the channel blocked.
+    /// notice). MsQuic and the simulator report that after the send that carried the start was accepted. Nothing of it was
+    /// counted — a transmission is counted when its start is known (<see cref="OnLargeStreamStarted"/>) — so there is
+    /// nothing to take back: the channel's large values wait for stream credit (PROTOCOL.md §3.2: they wait, they never
+    /// fail), exactly as after a refusal the call itself reports, and its other values go on. The canceled completion
+    /// that follows puts the value back in its queue; the stream's shutdown gives back its per-channel slot and leaves
+    /// the channel's large values waiting.
     /// </summary>
     private void OnLargeStreamRefused(int local, TransportStreamId stream)
     {
         for (int index = 0; index < _countedStreams.Length; index++)
         {
-            if (_countedStreams[index] != stream || _countedRefused[index])
+            if (_countedStreams[index] != stream || _countedRefused[index] || _countedStarted[index])
             {
                 continue;
             }
 
             _countedRefused[index] = true;
-            ref LatestSendState send = ref _send[local];
             _streamBlocked[local] = true;
-            send.CreditGeneration = _countedCredit[index];
-            LatestSendKeys keys = _sendKeys[local];
-            ref KeySendSlot key = ref keys[_countedKeySlots[index]];
-            if ((key.Flags & KeySendFlags.LargeValue) == 0 || key.LargeValueStream != stream || key.InFlightEntry < 0)
+            _send[local].CreditGeneration = _countedCredit[index];
+            return;
+        }
+    }
+
+    /// <summary>
+    /// The start of a large value's stream succeeded (game thread, from the transport thread's notice): the transmission
+    /// left this host, and is counted now — the channel's <c>Sent</c>, <c>BytesSent</c> and <c>Retries</c>, the aggregate
+    /// retry budget when it was a retry, and, while the value it carried is still the key's live value, the version's
+    /// attempt and the value as in flight.
+    /// </summary>
+    private void OnLargeStreamStarted(int local, TransportStreamId stream)
+    {
+        for (int index = 0; index < _countedStreams.Length; index++)
+        {
+            if (_countedStreams[index] != stream || _countedRefused[index] || _countedStarted[index])
             {
-                return; // the value was replaced or finished meanwhile: nothing of this transmission is left to take back
+                continue;
             }
 
-            if (key.Attempts > 0)
-            {
-                key.Attempts--;
-            }
-
+            _countedStarted[index] = true;
+            bool retry = _countedRetry[index];
             ref ChannelSendCounters counters = ref _core.SendCounters(_denseOf[local]);
-            counters.Sent--;
-            counters.Bytes -= _core.Entries[key.InFlightEntry].Payload.Length;
-            if (_countedRetry[index])
+            if (retry && _retryRate > 0)
             {
-                counters.Retries--;
+                _retryBucket.Consume(_countedBytes[index]);
+            }
+
+            SendEntryTable entries = _core.Entries;
+            int value = _countedValues[index];
+            ref KeySendSlot key = ref _sendKeys[local][_countedKeySlots[index]];
+            if ((key.Flags & KeySendFlags.LargeValue) != 0 && key.LargeValueStream == stream && key.InFlightEntry == value
+                && entries.GetState(value) != SendEntryState.Free && IsValueEntry(entries[value].Aux1) && entries.Sequences[value] == _countedVersions[index])
+            {
+                CountTransmission(ref _send[local], ref key, ref entries[value], ref counters, retry);
+                return;
+            }
+
+            // The value was replaced, acknowledged or given up meanwhile (its stream is being aborted): the transmission
+            // still left this host once.
+            counters.Sent++;
+            counters.Bytes += _countedPayload[index];
+            if (retry)
+            {
+                counters.Retries++;
             }
 
             return;
@@ -1086,12 +1239,12 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     }
 
     /// <summary>Arms the timer backstop of PROTOCOL.md §4.4: <c>clamp(1.5 × RTT, MinRetry, MaxRetry)</c>, doubled per attempt.</summary>
-    private void ArmRetry(int local, ref LatestSendState send, ref KeySendSlot key, long now)
+    private void ArmRetry(int local, ref LatestSendState send, ref KeySendSlot key, long now, int pendingAttempts = 0)
     {
         long rtt = _core.ApplicationRttMicros;
         long interval = rtt > 0 ? rtt + (rtt >> 1) : MinRetryMicros;
         interval = Math.Clamp(interval, MinRetryMicros, MaxRetryMicros);
-        int doublings = Math.Min((int)key.Attempts, 8);
+        int doublings = Math.Min((int)key.Attempts + pendingAttempts, 8);
         for (int i = 0; i < doublings && interval < MaxRetryMicros; i++)
         {
             interval = Math.Min(interval * 2, MaxRetryMicros);
@@ -1273,10 +1426,46 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         }
 
         ref LatestSendState send = ref _send[local];
-        EnqueueRetry(local, ref send, value);
+        if ((flags & ValueFlags.Transmitted) != 0)
+        {
+            EnqueueRetry(local, ref send, value);
+        }
+        else
+        {
+            // Nothing of the value has left this host: its only transmission was a stream whose start the peer's stream
+            // limit refused. It is still waiting for its first transmission, which is not a retry.
+            EnqueueFreshFront(ref send, value);
+        }
 
-        // The timer stays armed while the retry waits for its turn, so the version budget keeps being checked.
+        // The timer stays armed while the value waits for its turn, so the version budget keeps being checked.
         ArmRetry(local, ref send, ref keys[keySlot], _core.CurrentPassMicros);
+    }
+
+    /// <summary>
+    /// Puts a value back at the head of the fresh queue: it was taken off for a transmission that never left this host, so
+    /// it keeps the place it had. The retry budget neither gates nor pays for its next transmission, and <c>Retries</c>
+    /// does not count it.
+    /// </summary>
+    private void EnqueueFreshFront(ref LatestSendState send, int value)
+    {
+        SendEntryTable entries = _core.Entries;
+        ref SendEntry entry = ref entries[value];
+        ValueFlags flags = FlagsOf(entry.Aux1);
+        if ((flags & (ValueFlags.Queued | ValueFlags.Retrying | ValueFlags.Finish)) != 0)
+        {
+            return;
+        }
+
+        entry.Aux1 = WithFlags(entry.Aux1, flags | ValueFlags.Queued);
+        entries.Next[value] = send.PendingHead;
+        if (send.PendingHead < 0)
+        {
+            send.PendingTail = value;
+        }
+
+        send.PendingHead = value;
+        send.PendingCount++;
+        send.PendingBytes += entry.Aux0;
     }
 
     /// <inheritdoc/>
@@ -1492,8 +1681,11 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
             ref KeySendSlot slot = ref keys[keySlot];
             int value = slot.InFlightEntry;
             slot.InFlightEntry = -1;
-            slot.Flags = KeySendFlags.None;
+
+            // Before the flags go: the abort looks at LargeValue to know there is a stream to abort. Without it a retired
+            // key's large value would still complete on its stream.
             AbortLargeStream(ref slot);
+            slot.Flags = KeySendFlags.None;
             keys.Disarm(keySlot);
             if (value >= 0)
             {

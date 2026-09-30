@@ -227,7 +227,7 @@ public class LatestEdgeTests
     }
 
     [Fact]
-    public void A_Large_Value_Whose_Start_Is_Refused_Asynchronously_Is_Retransmitted()
+    public void A_Large_Value_Whose_Start_Is_Refused_Asynchronously_Goes_Out_Again_As_Its_First_Transmission()
     {
         AsyncRefusalConnector connector = null!;
         using SessionHarness h = new(link: new LinkOptions { DelayMicros = 2_000 }, table: Table,
@@ -255,7 +255,13 @@ public class LatestEdgeTests
         Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(result.Token) == DeliveryStatus.Delivered, 10_000_000),
             $"status {h.Client.GetDeliveryStatus(result.Token)}");
         Assert.True(LatestKit.Matches(received[^1].Payload, 7, 8_000));
-        Assert.True(DatagramKit.ChannelStats(h.Client, 2).Retries >= 1, "the refused start should have been retransmitted");
+
+        // The refused start put nothing on the wire, so the stream that carried the value is its first transmission: one
+        // Sent, and no retransmission (this test asserted Retries >= 1 while a refused start was counted as a transmission).
+        ChannelStatistics statistics = DatagramKit.ChannelStats(h.Client, 2);
+        Assert.Equal(1, transport.Refused);
+        Assert.Equal(1, statistics.Sent);
+        Assert.Equal(0, statistics.Retries);
     }
 
     [Fact]

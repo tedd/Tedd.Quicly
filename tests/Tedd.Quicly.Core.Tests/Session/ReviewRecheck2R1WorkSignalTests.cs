@@ -1,10 +1,9 @@
 using System.Buffers.Binary;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Core.Transport;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (recheck 2, round 1) of 3a18b6d: <see cref="QuiclyPeer.HasPendingWork"/> re-arms the work signal when it finds

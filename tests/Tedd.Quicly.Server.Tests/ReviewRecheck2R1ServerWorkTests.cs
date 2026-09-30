@@ -1,7 +1,7 @@
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
 
-namespace Tedd.Quicly.Server.Tests.Review;
+namespace Tedd.Quicly.Server.Tests;
 
 /// <summary>
 /// Review (recheck 2, round 1) of 3a18b6d at the server: <c>QuiclyServer.PollSlot</c> asks

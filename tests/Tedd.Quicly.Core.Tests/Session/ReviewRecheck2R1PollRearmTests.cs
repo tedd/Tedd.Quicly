@@ -1,10 +1,9 @@
 using System.Reflection;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Core.Transport;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (recheck 2, round 1), the interleaving {publish, Poll's ClearWorkSignal}. Poll re-arms the work signal with
@@ -24,6 +23,11 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// passes in Release as well (checked on a scratch copy).
 /// </para>
 /// </summary>
+/// <remarks>
+/// Fixed since: <c>ClearWorkSignal</c> clears the word with <c>Interlocked.Exchange</c> when it is set, a full fence before
+/// the first read of the Poll, so a publication is seen by that Poll or finds the edge armed. The description above is
+/// what the test found before the fix; it guards the fix only in a Release build.
+/// </remarks>
 public class ReviewRecheck2R1PollRearmTests
 {
     private static readonly ChannelTable Table = ChannelTable.Create()

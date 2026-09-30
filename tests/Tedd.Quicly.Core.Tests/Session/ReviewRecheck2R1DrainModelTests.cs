@@ -2,9 +2,8 @@ using System.Buffers.Binary;
 using System.Reflection;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (recheck 2, round 1) of 4c06333: the drain-queue rule as it stands, driven by randomised hosts over a small

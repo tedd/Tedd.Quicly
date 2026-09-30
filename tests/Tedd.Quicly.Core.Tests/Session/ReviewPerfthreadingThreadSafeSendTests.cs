@@ -1,9 +1,8 @@
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (perf-threading lens) of fix/localhost-drops: the expiry bitmap (<c>PeerCore.StampExpiry</c> /

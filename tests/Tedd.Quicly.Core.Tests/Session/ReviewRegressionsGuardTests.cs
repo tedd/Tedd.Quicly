@@ -1,9 +1,8 @@
 using System.Runtime.InteropServices;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (regressions lens): contracts that were checked and hold, and that had no test of their own. These pass.

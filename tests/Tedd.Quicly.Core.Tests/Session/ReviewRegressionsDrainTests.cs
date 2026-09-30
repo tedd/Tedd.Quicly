@@ -2,9 +2,8 @@ using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (regressions lens) of the drain-queue change (D1a): what a host that did everything right on main — it polls
@@ -12,6 +11,12 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// ring and the receive budget (asserted as a precondition: no ring drop, no out-of-buffers), and the application takes
 /// everything out in the same frame.
 /// </summary>
+/// <remarks>
+/// Fixed since: eviction applies only to a backlog that was left undrained across a Poll, a channel with a handler is never
+/// evicted, and a message that finds the pool full without such a backlog is held as on main (<c>ReceiveQueues.BeginPass</c>,
+/// <c>TryAppendDatagram</c>); SequenceResyncs moved behind the fields of the previous release. The descriptions and the
+/// numbers in the comments below are what the tests found on the branch before the fix; the tests now pin the fix.
+/// </remarks>
 public class ReviewRegressionsDrainTests
 {
     private const int Batch = 32;

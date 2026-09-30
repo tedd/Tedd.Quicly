@@ -1,9 +1,8 @@
 using System.Buffers.Binary;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (perf-threading lens) of fix/localhost-drops, the drain-queue eviction (<c>ReceiveQueues.AppendEvicting</c> /
@@ -17,6 +16,11 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// The test the branch added for this (<c>A_Diligent_Drain_Channel_Is_Not_Evicted_By_A_Flooded_One</c>) sends exactly the
 /// even share (8 of 8) per round, so it cannot see it.
 /// </summary>
+/// <remarks>
+/// Fixed since: only a backlog that was left undrained across a Poll is limited and evicted (<c>ReceiveQueues.BeginPass</c>,
+/// <c>TryAppendDatagram</c>), a channel that is drained every frame is outside those limits, and among backlogged channels the
+/// victim is the one furthest over its share. The description above is what the tests found; they now pin the fix.
+/// </remarks>
 public class ReviewPerfthreadingFairnessTests
 {
     /// <summary>2, 3, 6 unordered · 8 keyed sequenced · 10 ordered · 11 reliable unordered: four unreliable ring channels, two reliable.</summary>

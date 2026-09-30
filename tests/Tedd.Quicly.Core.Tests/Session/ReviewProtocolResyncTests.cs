@@ -1,9 +1,8 @@
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (protocol lens): the two-second resynchronisation of the UnreliableSequenced sequence clock (PROTOCOL.md §8)
@@ -12,6 +11,10 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// transport's queue, and with <see cref="PeerOptions.DropWhenBlocked"/> off (or a transport that does not honour
 /// cancel-on-blocked) those wait "however old they have become" (PROTOCOL.md §4.5).
 /// </summary>
+/// <remarks>
+/// Fixed since: a sequence inside the reorder window (1 024 on a 16-bit channel, 65 536 on a 32-bit one) is a late message
+/// however long the channel was quiet (<c>UnreliableSequencedEngine.ResyncWindow16</c>). The tests now pin the fix.
+/// </remarks>
 public class ReviewProtocolResyncTests
 {
     /// <summary>3 = sequenced keyed (32-bit), 6 = sequenced unkeyed (16-bit); expiry off on both.</summary>

@@ -1,9 +1,8 @@
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (protocol lens): the same false resynchronisation as <see cref="ReviewProtocolResyncTests"/>, with every option
@@ -12,6 +11,10 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// waits in the transport's queue for as long as the link is busy; a later container that holds an Immediate (priority)
 /// member overtakes it. The sequenced value it carries is then more than two seconds later than its successor.
 /// </summary>
+/// <remarks>
+/// Fixed since: a sequence inside the reorder window (1 024 on a 16-bit channel, 65 536 on a 32-bit one) is a late message
+/// however long the channel was quiet (<c>UnreliableSequencedEngine.ResyncWindow16</c>). The tests now pin the fix.
+/// </remarks>
 public class ReviewProtocolResyncDefaultTests
 {
     /// <summary>2 sequenced keyed (default expiry) · 3 sequenced unkeyed (default expiry) · 4 ReliableLatest.</summary>

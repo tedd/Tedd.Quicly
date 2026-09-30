@@ -1,9 +1,8 @@
 using System.Buffers.Binary;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (perf-threading lens) of fix/localhost-drops: the pending-work probe after the drain-queue change. The branch
@@ -12,6 +11,10 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// values wait in a mailbox — a coalescing channel, or ReliableLatest — still reports work for as long as nobody drains
 /// it, although no Poll can consume it: a host that polls while the probe is set never sleeps.
 /// </summary>
+/// <remarks>
+/// Fixed since: the probe counts a mailbox only while its channel has a handler. The description above is what the tests
+/// found; they now pin the fix.
+/// </remarks>
 public class ReviewPerfthreadingWorkProbeTests
 {
     /// <summary>2 unordered · 9 keyed sequenced, coalescing (a mailbox) · 12 ReliableLatest (always a mailbox).</summary>

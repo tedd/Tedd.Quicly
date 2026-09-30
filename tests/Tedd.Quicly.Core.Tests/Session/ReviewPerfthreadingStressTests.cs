@@ -3,11 +3,10 @@ using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Core.Transport;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (perf-threading lens) of fix/localhost-drops: randomised runs over a lossy, reordering, jittering link that mix

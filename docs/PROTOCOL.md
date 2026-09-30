@@ -580,17 +580,24 @@ queue, and the two kinds of channel behave differently when the application neve
 receiver-local; nothing on the wire changes and either end may run it alone.
 
 * An *unreliable* ring channel that the application **drains every frame** — completely, once per Poll, before
-  or after it — loses nothing the receive ring and the byte budget took: a burst waits in the queue pool, then in
-  one held message and the ring, until the Drain. The same holds for a channel **with a handler** whose messages
-  a Drain of another channel met: they are never dropped, and the next Poll dispatches them.
+  or after it — loses nothing the receive ring and the byte budget took, however many channels it reads that
+  way: a burst waits in the queue pool, then in one held message and the ring, until the Drain (a message held
+  when a Poll begins is held again while its channel was drained since the Poll before). The Poll in which the
+  session is established counts as drained for every channel — a client library may run it before the
+  application has the peer — so what arrived with the handshake is not backlog at the application's first
+  Poll. The same holds for a channel **with a handler** whose messages a Drain of another channel met: they are
+  never dropped, and the next Poll dispatches them.
 * What an unreliable ring channel without a handler still has queued when the *next* Poll begins, without having
   been drained empty in between, is its **backlog**. The backlog of all such channels together is bounded by the
   table row above: the Poll cuts it to the limit, and from then on a message that does not fit drops the
   **oldest** queued one, counted per channel and per peer (`DrainQueueDrops`; `Received` still counts them). A
   consumer that comes back gets the freshest messages in order — on `UnreliableSequenced` the older queued values
-  are the stale ones. A channel nobody drains therefore keeps the ring closed for one Poll interval at most (the
-  message held for a Drain that did not come), pins more than ¼ of the byte budget for one Poll interval at
-  most, and keeps no host busy. It stops being backlog when a Drain empties it or it gets a handler. Note what
+  are the stale ones. A channel stops being backlog only when a Drain finds or leaves its queue empty, or it
+  gets a handler — not when other channels evicted everything it had queued. A channel nobody drains therefore
+  keeps the ring closed once, for one Poll interval (the message held for a Drain that did not come), and not
+  again before it has been drained; several such channels do so once each. It pins more than ¼ of the byte
+  budget for one Poll interval at most, and keeps no host busy. (A channel that was drained and then no longer
+  is, and the first Poll of a session, extend both to two intervals.) Note what
   this means for a host that polls several times between two drains, or that drains with a buffer it fills
   without calling again: what survives a Poll is backlog, so such a host keeps at most the limits above of a
   burst. Drain completely after every Poll, or give the channel a handler. A larger `ReceiveBudgetBytes` raises

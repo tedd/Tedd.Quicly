@@ -219,11 +219,14 @@ is chosen:
   after `Dispose` returns the block to that pool (ADR 0004).
   **A channel without a handler must be drained**, and what it costs when it is not depends on its mode
   (PROTOCOL.md §7, docs/design/session-layer.md §4.4). An unreliable channel that is drained completely
-  once per Poll (before or after it) loses nothing the ring and the budget took. What such a channel still has
+  once per Poll (before or after it) loses nothing the ring and the budget took — with any number of such
+  channels, and including what arrived with the handshake, because the Poll in which the peer became Connected
+  (run by `QuiclyClient.ConnectAsync` for a client) counts as drained. What such a channel still has
   queued when the next Poll begins is its backlog, and that is bounded — the backlogs together occupy at most
   the part of the drain-queue pool not reserved for reliable channels and pin at most a quarter of the receive
   budget — and drops its **oldest** messages beyond it (`DrainQueueDrops`, per channel and per peer); a channel
-  nobody drains disturbs the other channels for one Poll interval at most. A reliable channel is never
+  nobody drains closes the ring to the other channels once, for one Poll interval, and not again until it has
+  been drained. A reliable channel is never
   dropped, so an undrained one fills the pool and then holds the receive ring: every stream channel is
   back-pressured and datagrams of ring channels are dropped on arrival until it is drained or gets a handler
   (coalescing and `ReliableLatest` handlers keep running). Drain, or register a handler for, every reliable
@@ -314,8 +317,8 @@ public sealed class QuiclyPeer : IDisposable
     public TimeSpan NextDeadline { get; }
     public long NextDeadlineMicros { get; }            // = min(poll, flush), for a host with one loop
     public long NextPollDeadlineMicros { get; }         // the peer's own timers: ping, heartbeat, admission, close linger, stream idle
-    public long NextFlushDeadlineMicros { get; }        // engine work only a Flush can serve (retries, expiry, send-cap refill)
-    public bool HasPendingWork { get; }                 // anything waiting for Poll: rings, mailboxes, transitions, a due timer
+    public long NextFlushDeadlineMicros { get; }        // engine work only a Flush can serve (retries, owed acks, send-cap refill); expiry has no deadline of its own, a held-back message is dropped by the first pass after it expired
+    public bool HasPendingWork { get; }                 // anything waiting for Poll: rings, drain queues and mailboxes of channels that have a handler, transitions, a due timer; answering false re-arms the work signal
     public bool IsDisposed { get; }
 
     public BufferLease RentBuffer(int size);
@@ -356,7 +359,8 @@ public enum SendStatus { Admitted, QueueFull, TooLarge, OutOfBuffers, ChannelClo
 public enum DeliveryStatus { Pending, Delivered, Superseded, Failed, Canceled, Expired, Lost, Disconnected, Sent }
 
 // PeerOptions.WorkSignal: told once per Poll that the peer has game-thread work, so a host wakes instead of polling idle peers.
-// Non-blocking, allocation-free, must not re-enter the peer; HasPendingWork is the level behind this edge.
+// Non-blocking, allocation-free, must not re-enter the peer; HasPendingWork is the level behind this edge. The edge is
+// re-armed by Poll and by a HasPendingWork that answers false, so a host may wake, ask the probe and sleep again.
 public interface IPeerWorkSignal { void OnWork(QuiclyPeer peer); }
 
 // PeerOptions also exposes Clone() (an independent copy sharing the clock, pool and signal) and Validate() (the same checks the

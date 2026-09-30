@@ -131,7 +131,7 @@ options, authToken)` (client) and `QuiclyPeer.CreateServerPeer(transport, in inf
 | `QuiclyPeer.Control.cs` | game thread: handshake (client Hello, server checks + `IPeerAdmission` + HelloAck, `CompleteAdmission`, channel-table answer), `Close`, close linger, ping schedule + `PingClock`, heartbeat, admission timeout, the `StateChanged` queue |
 | `QuiclyPeer.Receive.cs` | transport thread: the `Sink`, datagram / container / control-datagram receive, the stream table driver (control stream parsing, preamble → engine, parser events → engine, back-pressure un-read), stream error rules, Pong from the transport thread |
 | `QuiclyPeer.Completion.cs` | `WaitAsync`/`Wait`/`GetDeliveryStatus`/`TryCancel`, completion-ring drain and routing |
-| `QuiclyPeer.Work.cs` | `HasPendingWork` and the `PeerOptions.WorkSignal` edge (`NoteWork`, re-armed by `Poll`; §4.7) |
+| `QuiclyPeer.Work.cs` | `HasPendingWork` and the `PeerOptions.WorkSignal` edge (`NoteWork`, re-armed by `Poll` and by a probe that answers `false`; §4.7) |
 | `QuiclyPeer.Shared.cs` | `SendShared` over a reference-counted `SharedLease` (§4.1) |
 | `QuiclyPeer.Reconnect.cs` | `Reconnect` and the two resets it drives (§4.8) |
 | `PeerCore.cs` | the engine-facing façade (§7) |
@@ -329,7 +329,7 @@ its definition (`ReceiveQueueClass.Of`; the engines and their mailboxes do not e
 
 | Class | Channels | When the message does not fit |
 |---|---|---|
-| `Datagram` | UnreliableUnordered / UnreliableSequenced without `CoalesceOnReceive` | `TryAppendDatagram`: a *backlog* (below) evicts its oldest message, counted; a channel that is drained, or has a handler, takes room from a backlog and is otherwise held — for one Poll interval at most when it has no handler |
+| `Datagram` | UnreliableUnordered / UnreliableSequenced without `CoalesceOnReceive` | `TryAppendDatagram`: a *backlog* (below) evicts its oldest message, counted; a channel that is drained, or has a handler, takes room from a backlog and is otherwise held — until its Drain while the application drains it, and for one Poll interval, once, when nobody does |
 | `Reliable` | ReliableOrdered, ReliableUnordered | never dropped: `TryAppend` fails, the peer holds the entry (`_held`) and stops taking from the ring |
 | `Other` | everything else — a coalescing channel, ReliableLatest and Bulk never enter the ring, so only a replaced engine (`PeerOptions.EngineFactory`) gets here | as `Reliable` |
 
@@ -365,20 +365,39 @@ with a ring larger than 1 024 (68 bytes a node, per peer).
     the ring, charged to the budget, when the pass began, and are on their way to the Drain that follows. They are queued while
     a node is free — any node, including the reserved ones. With the pool full, the oldest message of a backlog makes room;
     with no backlog the message is **held**, exactly as before the bound existed, and the rest of the burst waits in the ring:
-    `Drain` takes the queue, the held message and the ring in that order, so nothing the ring and the budget took is lost. If
-    the Drain does not come, the next pass start makes the channel backlogged; the held message is then queued by evicting the
-    channel's own oldest (`mayHold: false` — a message held across a pass start is queued or dropped, never held again, and
-    the retry does not wait for room in Poll's `maxItems`), and the ring is open again.
+    `Drain` takes the queue, the held message and the ring in that order, so nothing the ring and the budget took is lost. A
+    message that is still held when the next pass starts is retried with `mayHold: false` (the retry does not wait for room
+    in Poll's `maxItems`), and what happens then depends on whether the application is draining the channel
+    (`DrainedSinceLastPass`: a take found or left its queue empty in the pass that ended, or in this one). If it is, the
+    message is **held again** — a host that polls and then drains several channels in turn reaches this channel's Drain
+    after the Poll, and dropping the message here lost one from the middle of a burst on every channel but the first (the
+    second review's finding). If it is not, the pass start has just made the channel backlogged and the message is queued by
+    evicting the channel's own oldest; a channel with nothing queued (the pool is full of messages that cannot be evicted)
+    drops it, counted. So a hold of a channel nobody drains ends at the second pass start at the latest, and the ring is
+    open again.
+  * **A backlog ends only by a drain.** `TryTake` clears the mark when it finds or leaves the queue empty, and `SetHandled`
+    when the channel gets a handler. `BeginPass` does not clear it for a channel whose queue is empty because *other*
+    channels evicted it: such a channel would be "new" again, its next burst would fill the pool by evicting the others'
+    backlog and be held, and two channels nobody drains would take turns at closing the ring in every Poll interval (the
+    second review measured the ring closed in 8 of 8 frames). With the mark kept, its burst evicts and is never held.
+  * **The first pass of a session counts as drained.** The first `BeginPass` after the queues were created or released
+    (`_sessionStart`) is in the Poll in which the peer became Connected, and nobody could drain before it:
+    `QuiclyClient.ConnectAsync` runs that Poll itself and only then returns the peer. It stamps every datagram channel as
+    emptied in that pass, so the welcome burst a server sends with its admission is not backlog when the application's first
+    frame begins with a Poll (before this, 42 of 60 full-size messages survived that Poll at default options).
   * **A channel with a handler** reaches the queues only when a `Drain` of another channel meets its messages. It is never
     evicted and never dropped (on the first version it was, so a host that mixed the styles had no lossless order of Poll and
     Drain): it is queued while a node is free, takes room from a backlog when there is one, and is otherwise held. That hold
     cannot become a stall: the next Poll dispatches the channel's queue, then the held message, then the ring, all to the
     handler, in arrival order (a Poll whose `maxItems` runs out dispatches less, as for any handled channel).
 
-  So an unreliable channel nobody drains holds the ring for one Poll interval at most — the interval after the pass in which a
-  burst first filled the pool — and from then on costs its own oldest messages and nothing else: not the ring, not the
-  mailboxes, not more than a quarter of the budget beyond one interval, and not a busy host. What the rule does **not** cover
-  is a host that polls several times between two drains, or drains with a span it fills without calling again: what is left
+  So an unreliable channel nobody drains holds the ring once, for one Poll interval — the interval after the pass in which a
+  burst first filled the pool — and from then on, until it is drained, costs its own oldest messages and nothing else: not
+  the ring, not the mailboxes, not more than a quarter of the budget beyond one interval, and not a busy host. Several such
+  channels hold it once each. A channel that was drained and then abandoned, and a channel at the start of a session, get
+  one interval more (they count as drained in the pass before). What the rule does **not** cover
+  is a host that polls several times between two drains — a server that calls `PollAll` at network rate and drains at
+  simulation rate — or drains with a span it fills without calling again: what is left
   queued across a Poll is backlog and is cut to the limits above. Drop-**oldest** for both modes — a consumer that comes
   back gets the freshest messages in order, and on UnreliableSequenced the transport thread has already moved the key's
   sequence on, so the older queued values are the stale ones (the ring keeps drop-newest: nothing can be evicted from it).
@@ -460,7 +479,8 @@ with a ring larger than 1 024 (68 bytes a node, per peer).
   thread instead of polling idle peers. It is an **edge with set-once semantics**: one `Interlocked.Exchange` on a word guards the
   call and `Poll` re-arms it at entry, so a burst of a thousand messages costs one host call — and work that Poll does not consume (a
   message of a channel without a handler, engine work that needs a `Flush`) raises no second call, because `HasPendingWork` is the
-  level. Raised from the transport thread by `Signal(bit)` (every handshake, close and table signal), `TryEnqueueReceive`,
+  level. The probe re-arms it as well, when it answers `false` (below): the host it sends back to sleep will not poll.
+  Raised from the transport thread by `Signal(bit)` (every handshake, close and table signal), `TryEnqueueReceive`,
   `PublishReserved`, a coalescing mailbox post (the datagram engine's and the ReliableLatest engine's: a value, whether it came
   in a datagram or on a group stream, and a key retirement), `PushCompletion`, `NotePendedStream`, the pong / stream-ping rings,
   the ReliableLatest engine's pass work (an ack or reject it owes, a LatestAck / LatestReject / stream notice to apply —
@@ -479,11 +499,12 @@ with a ring larger than 1 024 (68 bytes a node, per peer).
 * **`HasPendingWork`** answers whether anything is really waiting: the signal word, the completion ring and the local completions,
   the receive ring, the per-channel drain queues of channels that have a handler (`ReceiveQueues.QueuedHandled`; a message
   queued for a channel without one is the application's to drain, not Poll's work) and the held entry (a reliable
-  channel's message for as long as nobody drains it; an unreliable channel's for one Poll interval at most, §4.4 "Channels
-  without a handler" — an undrained unreliable channel does not keep the probe set), the mailbox dirty bitsets
+  channel's message for as long as nobody drains it; an unreliable channel's until its Drain, or for one Poll interval when
+  nobody drains it, §4.4 "Channels without a handler" — an undrained unreliable channel does not keep the probe set), the
+  mailbox dirty bitsets
   (`Mailboxes.HasDirty`) of channels that have a handler (as with the queues: a value waiting in the mailbox of a channel
   without one is for `Drain`, and counting it kept a host that polls while there is work — and `QuiclyServer.PollAll` —
-  polling for good; the arrival still raises the edge, and `RegisterHandler` turns the level on by itself),
+  polling for good; the arrival raises the edge when it is armed, and `RegisterHandler` turns the level on by itself),
   `PendedStreams`, the pong and stream-ping rings, the `ThreadSafeSend` front, a state transition that has not been raised, a due
   deadline (`NextDeadlineMicros` passed), and — while `Connected` — the engines' pass work: the ReliableLatest engine's
   (`ReliableLatestEngine.HasUnsentControl`: acks and rejects owed, notices to apply) and the Bulk engine's
@@ -491,10 +512,16 @@ with a ring larger than 1 024 (68 bytes a node, per peer).
   last served the send lists, a cancel asked for, progress owed for bytes accepted or for a retired receive). `false` once the
   session is closed or the peer disposed. The rings, the bitsets and the signal word are read with acquire semantics; the game
   thread's own bookkeeping is read plainly, so a foreign caller gets an advisory answer — which is why a host wakes on the edge and
-  decides on this probe from its game thread. Every publication that raises the edge is in the level, so a host that woke never
-  finds the probe clear with the edge still set (it would then skip the `Poll` that re-arms it and sleep through the next
-  publication; `QuiclyServer.PollAll` instead keeps such a slot marked and probes it on every call until the peer's next poll
-  deadline, which is what a Bulk peer did before 2026-09-19). The pass work stays in the level until a `Flush` consumes it (owed
+  decides on this probe from its game thread. **A probe that answers `false` re-arms the edge.** Not every publication that
+  raises the edge is in the level — a mailbox value of a channel without a handler is not, and a `Drain` can take work out of
+  the ring before the host asks — so a host that woke can find the probe clear with the edge consumed; it then skips the
+  `Poll` that would re-arm it, and every later publication would be silent (the second review's finding: a message for a
+  handler arrived without a wake-up). The getter therefore ends with: if the level is clear and `_workSignalled` is set,
+  `Interlocked.Exchange(ref _workSignalled, 0)` and read the level once more. The exchange is a full fence, which makes this
+  the same re-arm-then-probe handshake as Poll's: a publication before the fence is seen by the second read, one after it
+  finds the edge armed and calls the host. A probe that answers `true` does not touch the edge (the host polls, and a burst
+  keeps costing one call); an idle probe costs one extra volatile read. `QuiclyServer.PollAll` still keeps a slot whose probe
+  was clear marked and probes it on every call until the peer's next poll deadline, as before. The pass work stays in the level until a `Flush` consumes it (owed
   acks can wait out `AckDelay` there, owed bulk progress its 100 ms window); `QuiclyServer.PollAll` therefore keeps a peer marked
   after its Poll only for what a Poll serves (`HasPendingPollWork`: the queues, and the *poll* deadline only), and the flush
   deadline that Poll brought forward (below) gets the pass work served.

@@ -25,8 +25,9 @@ Message type is not a header field; a channel *is* a type.
 * What a channel costs the receiver when the application neither handles nor drains it follows from the mode's
   contract (PROTOCOL section 7, added 2026-09-30): `UnreliableUnordered` / `UnreliableSequenced` keep a bounded
   backlog — what is still queued when the next Poll begins — and drop their own oldest messages, counted, without
-  touching another channel beyond one Poll interval (a channel that *is* drained every frame loses nothing the
-  ring and the budget took); coalescing channels and
+  touching another channel beyond one Poll interval, once, until the channel is drained again (a channel that *is*
+  drained every frame loses nothing the ring and the budget took, whatever the number of such channels and
+  including what arrived with the handshake); coalescing channels and
   `ReliableLatest` keep one value per key; `ReliableOrdered` / `ReliableUnordered` may not drop, so an undrained
   one ends in back-pressure — which today reaches every stream channel and the receive ring, not only the
   undrained channel — until it is drained or gets a handler; `Bulk` never waits in a queue (its data goes to the

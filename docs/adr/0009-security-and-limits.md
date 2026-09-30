@@ -31,9 +31,12 @@
   longest queue, O(their number), and remembers the answer; each Poll with something queued walks them once). The
   cap is deliberately not applied to a channel the application *is* draining — that would cut bursts the ring and
   the budget had already accepted — so the first burst on an undrained channel is queued whole and may hold the
-  ring until the next Poll; from that Poll on the channel is backlog and never holds again. A peer can therefore
-  close the ring through an unread unreliable channel for one Poll interval, not longer, and pin more than the
-  quarter of the budget for one Poll interval, not longer. Reliable channels cannot be evicted; an undrained one
+  ring until the next Poll; from that Poll on the channel is backlog and never holds again — the mark is cleared
+  only by the application's own Drain (or a handler), not by other channels evicting its queue to nothing, or two
+  unread channels could take turns at closing the ring. A peer can therefore close the ring through the unread
+  unreliable channels of a table for one Poll interval per channel in total (two for a channel the application
+  stopped draining, and at the start of a session, whose first Poll counts as drained), not longer, and pin more
+  than the quarter of the budget for as long, not longer. Reliable channels cannot be evicted; an undrained one
   still back-pressures the whole ring (a known limit, to be confined to its own streams by per-channel receive
   credit), so a host must handle or drain every reliable channel in its table.
 * **Retransmission cannot be weaponised**: ReliableLatest has per-version and per-peer retry budgets;

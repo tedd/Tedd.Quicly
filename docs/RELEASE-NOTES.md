@@ -55,22 +55,38 @@ either end can be upgraded alone (what an old end still does wrong is listed und
   that newest sequence last advanced (`PeerStatistics.SequenceResyncs`, normally 0). 0.2.0 kept dropping until
   the sender's counter came round.
 * **Draining: an unreliable channel read with `Drain` must be drained completely once per `Poll`.** Do that —
-  call `Drain` until it returns 0, every frame, before or after the `Poll` — and nothing changes: a burst of any
-  size the receive ring and `ReceiveBudgetBytes` take is delivered, as on 0.2.0. What is new is what happens to
+  call `Drain` until it returns 0, every frame, before or after the `Poll`, for each channel you read this way —
+  and nothing changes: a burst of any size the receive ring and `ReceiveBudgetBytes` take is delivered, as on
+  0.2.0. That holds for any number of drained channels, and for what the server sends with its admission: the
+  `Poll` in which the peer becomes Connected (`QuiclyClient.ConnectAsync` runs it for you) counts as drained, so
+  the first frame of `Poll` and `Drain` after `ConnectAsync` gets everything. What is new is what happens to
   messages that are *still queued when the next `Poll` begins*: they are backlog, and the backlog of the
   unreliable channels is bounded. With every option at its default it keeps 512 messages when the channel table
   has a `ReliableOrdered`/`ReliableUnordered` channel (1 024 otherwise) and 64 KiB counted in buffer blocks — 1 024
   messages of up to 64 bytes, 256 of 65 to 256 bytes, 42 of 257 to 1 536 bytes — and drops the **oldest** beyond
   that, counted in `DrainQueueDrops`. So a host that polls several times between two drains, or drains with a
   fixed span without calling again, now loses the older part of a large burst where 0.2.0 kept it (and stalled
-  the peer when nobody came). Raise `ReceiveBudgetBytes` for a larger byte bound; `ReceiveRingCapacity` does not
-  raise the 1 024-message bound. A channel with a handler never loses a message here, also when a `Drain` of
-  another channel runs before the `Poll`.
+  the peer when nobody came). **This includes the common server loop that polls at network rate and drains at
+  simulation rate** — `PollAll` every few milliseconds, `Drain` once per tick: only what the last `Poll` before
+  the `Drain` queued is outside the bound, so with every option at its default such a host keeps, of everything
+  the earlier `Poll`s of the tick queued, the newest 42 full-size datagrams (64 KiB, all its undrained channels
+  together), where 0.2.0 kept whatever the ring and the budget held. Drain after
+  every `Poll`, register a handler, or raise `ReceiveBudgetBytes` for a larger byte bound; `ReceiveRingCapacity`
+  does not raise the 1 024-message bound. A backlog ends when a `Drain` finds or leaves the channel's queue
+  empty. A channel with a handler never loses a message here, also when a `Drain` of another channel runs before
+  the `Poll`.
 * **`HasPendingWork` / `HasPendingPollWork` no longer report a value that waits in the mailbox of a channel
   without a handler** (a coalescing channel, `ReliableLatest`). No `Poll` can consume it, and reporting it kept a
-  host that polls while there is work polling for good. The work signal (`IPeerWorkSignal`) is still raised when
-  the value arrives; a host that reads such a channel with `Drain` drains on its own tick or on the signal, not on
-  the probe.
+  host that polls while there is work polling for good. A host that reads such a channel with `Drain` drains on
+  its own tick or on the work signal (`IPeerWorkSignal`), not on the probe.
+* **`HasPendingWork` re-arms the work signal when it answers `false`.** The signal is an edge: it is raised for
+  the first work published and then stays silent until it is re-armed. On 0.2.0 only a `Poll` re-armed it. Now a
+  `HasPendingWork` that finds nothing re-arms it too, so a host that wakes on the signal, asks the probe and goes
+  back to sleep without polling is woken by the next publication — without this, a value arriving for a
+  `Drain`-style mailbox channel (which the probe no longer reports) would have silenced the signal until the
+  host's next `Poll`. A probe that answers `true` leaves the edge alone, so a burst still costs one `OnWork`
+  call. The only visible difference: a host that asks the probe while idle can get one `OnWork` per probe
+  interval instead of one per `Poll`.
 * **`Release` after `Dispose` is no longer a no-op on a shared allocator.** Every lease must be released exactly
   once, also after its peer is gone; a second release of the same lease corrupts the pool in a Release build (it
   throws with `ValidateLeases`), as it always did on a live peer. Release before the shared allocator itself is
@@ -106,7 +122,9 @@ either end can be upgraded alone (what an old end still does wrong is listed und
   handler, or drain it. (A per-channel receive credit that confines the back-pressure to that channel is designed
   and being built.)
 * An unreliable channel nobody drains keeps the receive ring closed for one `Poll` interval the first time a
-  burst fills the queue pool; after that it only loses its own oldest messages.
+  burst fills the queue pool; after that it only loses its own oldest messages, and it is not held again until
+  it has been drained. Several such channels do this once each. A channel that was drained and then no longer is
+  can keep the ring closed for two intervals.
 * `UnreliableSequenced`: a datagram that more than 1 024 later messages of its channel overtook in the sender's
   transport queue (65 536 on a 32-bit channel), arriving after the channel stayed quiet for 2 s, is delivered out
   of order once. It needs a link congested for seconds and datagrams sent without cancel-on-blocked.

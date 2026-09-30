@@ -28,9 +28,12 @@ internal enum CreditState : byte
     /// The application drains the channel: <see cref="QuiclyPeer.Drain"/> emptied its queue since the Poll before last.
     /// Its limits are the ring's and the budget's: <see cref="ReceiveCredit.DrainedCountLimit"/> messages (the ring's
     /// capacity, so that the drain queues always have a node for what was accepted) and, once something waits,
-    /// <see cref="ReceiveCredit.DrainedByteLimit"/> bytes of buffer blocks — half the receive budget, because a channel
-    /// keeps what it accepted when the application stops draining it, and the other half is then what is left for the
-    /// channels that are read. One message is always accepted on an empty channel, whatever its size.
+    /// <see cref="ReceiveCredit.DrainedByteLimit"/> bytes of buffer blocks — an equal share of half the receive budget
+    /// among the reliable channels (<see cref="ReceiveCredit.DrainedByteLimitFor"/>), because a channel keeps what it
+    /// accepted when the application stops draining it: the channels drained and then abandoned together keep at most that
+    /// half, plus one message each, and the other half is what is left for the channels that are read. The limit is a
+    /// threshold: a message is started while less than it waits, and one message is always accepted on an empty channel,
+    /// whatever its size.
     /// </summary>
     Drained = 2,
 }
@@ -54,10 +57,10 @@ internal enum CreditState : byte
 /// what the unread channels of a peer pin of the receive budget, for as long as nobody comes for it, is at most the
 /// quarter <see cref="ByteLimitFor"/> divides among them. A channel with a handler has no limit: its messages leave the
 /// ring at every <see cref="QuiclyPeer.Poll"/>, so the ring's own back-pressure is all it needs. A channel the
-/// application drains is limited by the ring's capacity and by half the receive budget: what it takes in a frame is
-/// what a handler would have been given, short of the half that stays for the other channels if the application stops
-/// coming for it. Both are still counted, so that the count is right the moment the handler is removed or the
-/// application stops draining.
+/// application drains is limited by the ring's capacity and by its equal share of half the receive budget: what it takes
+/// in a frame is what a handler would have been given up to that share, and the drained channels together never keep more
+/// than that half (plus a message each) if the application stops coming for them. Both are still counted, so that the
+/// count is right the moment the handler is removed or the application stops draining.
 /// </para>
 /// <para>
 /// Threads (ADR 0008 invariants 4 and 5). The transport thread owns what it took (<see cref="Taken"/>, with a private copy
@@ -194,6 +197,18 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     /// <returns>The limit, at least 1.</returns>
     public static int ByteLimitFor(long receiveBudget, int reliableChannels) =>
         reliableChannels == 0 ? 1 : (int)Math.Clamp(receiveBudget / 4 / reliableChannels, 1, int.MaxValue - 1);
+
+    /// <summary>
+    /// Lease bytes a channel the application drains may have waiting before a further message is held back: the reliable
+    /// channels share half of the receive budget. A channel keeps what it accepted when the application stops draining it,
+    /// so the channels that were drained and then abandoned together pin at most that half (plus the one message each may
+    /// start on top of its threshold), and the other half stays for the traffic that is read.
+    /// </summary>
+    /// <param name="receiveBudget">The receive budget (<see cref="PeerOptions.ReceiveBudgetBytes"/>).</param>
+    /// <param name="reliableChannels">ReliableOrdered and ReliableUnordered channels in the table.</param>
+    /// <returns>The limit, at least 1.</returns>
+    public static int DrainedByteLimitFor(long receiveBudget, int reliableChannels) =>
+        reliableChannels == 0 ? 1 : (int)Math.Clamp(receiveBudget / 2 / reliableChannels, 1, int.MaxValue - 1);
 
     // ------------------------------------------------------------------ construction (engine Initialize)
 

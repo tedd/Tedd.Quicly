@@ -208,7 +208,7 @@ internal sealed unsafe class PeerCore : IDisposable
             queueLayout.ReliableNodes,
             ReceiveCredit.ByteLimitFor(options.ReceiveBudgetBytes, reliableChannels),
             ReceiveRing.Capacity,
-            (int)Math.Clamp(options.ReceiveBudgetBytes / 2, 1, int.MaxValue - 1),
+            ReceiveCredit.DrainedByteLimitFor(options.ReceiveBudgetBytes, reliableChannels),
             blockSizes);
         Streams = new StreamTable();
         SessionMaxMessageSize = role == PeerRole.Server ? options.MaxMessageSize : 0;

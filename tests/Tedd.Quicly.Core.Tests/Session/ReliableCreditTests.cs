@@ -621,19 +621,23 @@ public class ReliableCreditTests
     }
 
     [Fact]
-    public void A_Channel_The_Application_Drains_Takes_One_Message_Of_Any_Size_And_Half_The_Budget()
+    public void A_Channel_The_Application_Drains_Takes_One_Message_Of_Any_Size_And_Its_Share_Of_Half_The_Budget()
     {
         using SessionHarness h = new(table: Table, client: o => { GroupKit.Prompt(o); OrderedKit.Roomy(o); }, server: GroupKit.Prompt);
         QuiclyPeer server = h.Server!;
         ReceiveCredit credit = server.Core.Credit;
-        Assert.Equal(128 * 1024, credit.DrainedByteLimit);
+
+        // The reliable channels share half the 256 KiB budget: channels drained and then abandoned keep no more together.
+        Assert.Equal(128 * 1024 / CountReliable(server), credit.DrainedByteLimit);
 
         // The consumer's first frame: nothing to take, and from then on the channel is one the application reads.
         Assert.Empty(DrainAll(server, Ordered));
         Assert.Equal(CreditState.Drained, credit.State(server.Core.ChannelIndexOf(Ordered)));
 
-        // Messages of 60 000 bytes take a 64 KiB block each: two of them are half the budget, and the third waits. Only
-        // the sender and the network run meanwhile (the receiving host is late), so the channel stays one that is drained.
+        // Messages of 60 000 bytes take a 64 KiB block each: as many as the share holds are accepted (a message is started
+        // while less than the share waits), and the next waits. Only the sender and the network run meanwhile (the
+        // receiving host is late), so the channel stays one that is drained.
+        int accepted = (credit.DrainedByteLimit + 65_535) / 65_536;
         for (int i = 0; i < 5; i++)
         {
             Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Ordered), Payload(i, 60_000)).Status);
@@ -645,9 +649,20 @@ public class ReliableCreditTests
             }
         }
 
-        Assert.Equal(2, Waiting(server, Ordered));
+        Assert.Equal(accepted, Waiting(server, Ordered));
         Assert.Equal(1, Channel(server, Ordered).BacklogHolds);
         Assert.Equal(Enumerable.Range(0, 5), DrainUntil(h, server, Ordered, 5));
+    }
+
+    private static int CountReliable(QuiclyPeer peer)
+    {
+        int count = 0;
+        foreach (ChannelDefinition channel in peer.Core.Channels)
+        {
+            count += channel.Mode is ChannelMode.ReliableOrdered or ChannelMode.ReliableUnordered ? 1 : 0;
+        }
+
+        return count;
     }
 
     // ------------------------------------------------------------------ what is not counted, and what is given back

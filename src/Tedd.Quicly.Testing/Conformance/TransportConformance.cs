@@ -32,6 +32,7 @@ public static unsafe partial class TransportConformance
         (nameof(StreamDataIntegrityWithArbitraryConsumption), StreamDataIntegrityWithArbitraryConsumption),
         (nameof(PartialConsumptionIsIndicatedAgain), PartialConsumptionIsIndicatedAgain),
         (nameof(PeerStreamLimitThenUpdatePeerStreamLimits), PeerStreamLimitThenUpdatePeerStreamLimits),
+        (nameof(SenderShutdownDoesNotWaitForTheReceiverToConsume), SenderShutdownDoesNotWaitForTheReceiverToConsume),
         (nameof(AbortStreamPropagatesCodesInBothDirections), AbortStreamPropagatesCodesInBothDirections),
         (nameof(CloseReportsLocalAndPeerWithCode), CloseReportsLocalAndPeerWithCode),
         (nameof(NoCallbacksAfterOnClosed), NoCallbacksAfterOnClosed),
@@ -416,6 +417,71 @@ public static unsafe partial class TransportConformance
         IReadOnlyList<RecordedEvent> receives = s.ServerSink.OfKind(RecordedEventKind.StreamReceived);
         s.Require(receives[1].Data.AsSpan().SequenceEqual(data.ToArray(10, 90)), "the second indication did not carry the unconsumed remainder.");
         s.Require(receives[^1].Fin && receives[^1].Data.AsSpan().SequenceEqual(data.ToArray(15, 85)), "the indication after the resume did not carry the rest with FIN.");
+        s.CloseAndWait();
+    }
+
+    /// <summary>
+    /// A sender's stream shuts down once its data and FIN are acknowledged, whether or not the receiving sink has consumed
+    /// them: a receiver may hold a stream back (<c>Consumed(0)</c>) for as long as it likes, and its peer has long seen
+    /// <see cref="ITransportSink.OnStreamShutdownComplete"/> for it. The stream still counts against the receiver's stream
+    /// limit until the receiver has consumed it and closed it: a further stream is refused until then.
+    /// </summary>
+    /// <remarks>
+    /// The stream engines rest on both halves. A sender that bounds its own open streams by its shutdown events therefore does
+    /// not bound the streams its peer holds open, and only the stream limit does (PROTOCOL.md §7, <c>MaxGroups</c>).
+    /// </remarks>
+    public static void SenderShutdownDoesNotWaitForTheReceiverToConsume(ITransportTestHarness harness)
+    {
+        using var s = new Session(harness, new ConformancePairOptions { ServerPeerUnidiStreams = 1 });
+        int calls = 0;
+        int hold = 1;
+        s.ServerSink.ReceiveHandler = (_, segments, _, _) =>
+        {
+            Interlocked.Increment(ref calls);
+            int total = 0;
+            foreach (TransportSegment segment in segments) total += (int)segment.Length;
+            return Volatile.Read(ref hold) != 0 ? ReceiveResult.Consumed(0) : ReceiveResult.Consumed(total);
+        };
+        s.WaitConnected();
+        NativeBuffer data = s.Rent(100, seed: 12);
+        NativeSegments segments = s.RentSegments(1);
+        segments.Set(0, data.Segment(0, 100));
+        s.Require(s.Client.OpenStream(StreamKind.Unidirectional, 1, 32767, out TransportStreamId held) == TransportStatus.Success, "OpenStream failed.");
+        s.Require(s.Client.SendStream(held, segments.At(0), 1, 1, TransportSendFlags.Start | TransportSendFlags.Fin) == TransportStatus.Success, "SendStream failed.");
+        s.Wait(() => Volatile.Read(ref calls) >= 1, "the indication at the receiver");
+
+        // The receiver has consumed nothing, and the sender's stream is over all the same.
+        s.Wait(() => CountStream(s.ClientSink, RecordedEventKind.StreamShutdownComplete, held) == 1,
+            "the sender's OnStreamShutdownComplete while the receiver holds the stream back");
+        s.Require(CountStream(s.ServerSink, RecordedEventKind.StreamShutdownComplete, default) == 0, "the receiver's stream shut down although nothing was consumed.");
+
+        // The receiver's slot is still taken: the limit of one refuses a second stream.
+        s.Require(s.Client.OpenStream(StreamKind.Unidirectional, 2, 32767, out TransportStreamId refused) == TransportStatus.Success, "OpenStream must succeed without peer credit.");
+        TransportStatus start = s.Client.StartStream(refused);
+        if (start == TransportStatus.Success)
+        {
+            s.Wait(() => CountStream(s.ClientSink, RecordedEventKind.StreamStarted, refused) > 0, "OnStreamStarted for a start while the peer holds the only slot");
+            RecordedEvent started = Single(s, s.ClientSink, e => e.Kind == RecordedEventKind.StreamStarted && e.StreamId == refused, "OnStreamStarted of the refused stream");
+            s.Require(started.Status == TransportStatus.StreamLimitReached, $"a start while the peer holds the only slot reported {started.Status}, expected StreamLimitReached.");
+        }
+        else
+        {
+            s.Require(start == TransportStatus.StreamLimitReached, $"StartStream while the peer holds the only slot returned {start}, expected StreamLimitReached.");
+            s.Client.CloseStream(refused);
+        }
+
+        // The receiver consumes and closes the stream; only now does the slot come back.
+        int before = s.ClientSink.Count;
+        Volatile.Write(ref hold, 0);
+        TransportStreamId peer = s.ServerSink.OfKind(RecordedEventKind.PeerStreamStarted)[0].StreamId;
+        s.Server.ResumeStreamReceive(peer, 0);
+        s.Wait(() => CountStream(s.ServerSink, RecordedEventKind.StreamShutdownComplete, peer) == 1, "the receiver's shutdown after it consumed the stream");
+        s.Wait(() => HasStreamsAvailableAfter(s.ClientSink, before), "OnStreamsAvailable once the receiver closed the stream it held");
+        s.Require(s.Client.OpenStream(StreamKind.Unidirectional, 3, 32767, out TransportStreamId fresh) == TransportStatus.Success, "OpenStream after the slot came back failed.");
+        s.Require(s.Client.StartStream(fresh) == TransportStatus.Success, "StartStream after the slot came back failed.");
+        s.Wait(() => CountStream(s.ClientSink, RecordedEventKind.StreamStarted, fresh) == 1, "OnStreamStarted of the new stream");
+        RecordedEvent freshStarted = Single(s, s.ClientSink, e => e.Kind == RecordedEventKind.StreamStarted && e.StreamId == fresh, "OnStreamStarted of the new stream");
+        s.Require(freshStarted.Status == TransportStatus.Success, $"the stream opened after the slot came back started with {freshStarted.Status}.");
         s.CloseAndWait();
     }
 

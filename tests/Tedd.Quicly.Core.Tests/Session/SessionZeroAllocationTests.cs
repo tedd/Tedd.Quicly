@@ -94,4 +94,37 @@ public class SessionZeroAllocationTests
         });
         Assert.True(drained >= 11_000, $"{drained} messages");
     }
+
+    [Fact]
+    public void Evicting_From_An_Undrained_Channel_Does_Not_Allocate()
+    {
+        // Channel 2 has no handler and is never drained: once its backlog is at the limit (it is, long before the warm-up
+        // ends), every Poll evicts the oldest queued message for the new one. Channel 3 is under its share and drained every
+        // round, so its append takes the victim-scan path instead of the appender's own.
+        using SessionHarness h = TestEngines.Create(out _, out _, both: o => o.ReceiveRingCapacity = 64);
+        SimulatedNetwork network = h.Network;
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        ReceivedMessage[] buffer = new ReceivedMessage[8];
+        byte[] payload = new byte[32];
+        int drained = 0;
+        AllocationAssert.NoAllocations(() =>
+        {
+            client.SendCopy(new SendHeader(2), payload);
+            client.SendCopy(new SendHeader(2), payload);
+            client.SendCopy(new SendHeader(3), payload);
+            network.Advance(1_000);
+            client.Poll();
+            server.Poll();
+            int n = server.Drain(3, buffer);
+            server.Release(buffer.AsSpan(0, n));
+            drained += n;
+        });
+        Assert.True(drained >= 11_000, $"{drained} messages");
+        server.GetStatistics(out PeerStatistics statistics);
+        Assert.True(statistics.DrainQueueDrops >= 20_000, $"{statistics.DrainQueueDrops} evictions");
+        Assert.Equal(0, statistics.ReceiveRingDrops);
+        Assert.True(server.GetChannelStatistics(3, out ChannelStatistics drainedChannel));
+        Assert.Equal(0, drainedChannel.DrainQueueDrops);
+    }
 }

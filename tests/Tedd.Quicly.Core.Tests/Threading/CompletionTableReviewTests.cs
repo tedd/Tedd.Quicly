@@ -170,59 +170,85 @@ public class CompletionTableReviewFollowUpTests
     /// <see cref="CompletionTable.Available"/> counts the slot as soon as the place is claimed, so
     /// <see cref="CompletionTable.TryAllocate"/> must wait out the publish rather than report exhaustion.
     /// </summary>
+    /// <remarks>
+    /// The owner spins on TryAllocate while the transport thread releases the slot: that is the window. The transport
+    /// thread takes each token through a hand-off that spins and then blocks, and an owner that has spun for far longer
+    /// than a release takes while both threads run waits for the release instead (<see cref="HandOff"/>), so that on a
+    /// machine with no core to spare a hand-off costs a thread wake-up rather than a scheduler quantum.
+    /// </remarks>
     [Fact]
     public void TryAllocate_Succeeds_Whenever_Available_Is_Positive_While_A_Release_Is_Being_Published()
     {
         const int iterations = 200_000;
+        const long stop = long.MinValue;
+        long spinTicks = Stopwatch.Frequency / 20_000;
         var table = new CompletionTable(1);
-        long published = 0;
-        bool stop = false;
+        using var published = new HandOff();
+        using var released = new HandOff();
         int spuriousExhaustion = 0;
+        Exception? transportFailure = null;
 
         var transport = new Thread(() =>
         {
-            SpinWait spinner = default;
-            while (!Volatile.Read(ref stop))
+            try
             {
-                long packed = Interlocked.Exchange(ref published, 0);
-                if (packed == 0)
+                long packed;
+                while ((packed = published.Take()) != stop)
                 {
-                    spinner.SpinOnce(sleep1Threshold: -1);
-                    continue;
+                    SendToken token = Unpack(packed);
+                    table.Complete(token, Buffer, DeliveryStatus.Pending);
+                    table.Complete(token, Remote, DeliveryStatus.Delivered); // releases the slot from this thread
+                    released.Put(1);
                 }
-
-                spinner.Reset();
-                SendToken token = Unpack(packed);
-                table.Complete(token, Buffer, DeliveryStatus.Pending);
-                table.Complete(token, Remote, DeliveryStatus.Delivered); // releases the slot from this thread
+            }
+            catch (Exception e)
+            {
+                transportFailure = e;
             }
         })
         { IsBackground = true, Name = "transport" };
         transport.Start();
 
-        for (int i = 0; i < iterations; i++)
+        try
         {
-            SendToken token;
-            while (true)
+            for (int i = 0; i < iterations; i++)
             {
-                // Once Available says the slot is back, the release has been claimed and TryAllocate must succeed.
-                bool expectSuccess = table.Available != 0;
-                if (table.TryAllocate(out token))
-                    break;
-                if (expectSuccess)
-                    spuriousExhaustion++;
-                Thread.SpinWait(1);
+                SendToken token;
+                long spinUntil = Stopwatch.GetTimestamp() + spinTicks;
+                for (int attempt = 1; ; attempt++)
+                {
+                    // Once Available says the slot is back, the release has been claimed and TryAllocate must succeed.
+                    bool expectSuccess = table.Available != 0;
+                    if (table.TryAllocate(out token))
+                        break;
+                    if (expectSuccess)
+                        spuriousExhaustion++;
+                    if ((attempt & 15) != 0 || Stopwatch.GetTimestamp() < spinUntil)
+                    {
+                        Thread.SpinWait(1);
+                        continue;
+                    }
+
+                    // The transport thread has no core: wait for its release (a hand-off it made earlier may still be
+                    // there, in which case this returns at once and the owner spins once more).
+                    released.Take();
+                    spinUntil = Stopwatch.GetTimestamp() + spinTicks;
+                }
+
+                published.Put(Pack(token));
             }
 
-            Volatile.Write(ref published, Pack(token));
+            // Drain the last release so the table is whole again.
+            while (table.Available != 1)
+                released.Take();
+        }
+        finally
+        {
+            published.Put(stop);
+            transport.Join();
         }
 
-        // Drain the last release so the table is whole again.
-        while (table.Available != 1)
-            Thread.SpinWait(1);
-        Volatile.Write(ref stop, true);
-        transport.Join();
-
+        Assert.True(transportFailure is null, $"The transport thread failed: {transportFailure}");
         Assert.Equal(0, spuriousExhaustion);
         Assert.True(table.TryAllocate(out _));
         Assert.Equal(0, table.Available);

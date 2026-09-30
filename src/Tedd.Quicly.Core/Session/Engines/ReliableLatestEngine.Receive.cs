@@ -53,6 +53,13 @@ internal sealed unsafe partial class ReliableLatestEngine
 
         /// <summary>A large-value stream this engine opened has shut down; its per-channel slot is free again.</summary>
         StreamClosed = 2,
+
+        /// <summary>
+        /// The peer's stream limit refused the start of a large-value stream this engine opened. The send that carried the
+        /// start completes canceled and the stream shuts down afterwards; the value never reached the peer and waits for
+        /// stream credit.
+        /// </summary>
+        StreamRefused = 3,
     }
 
     /// <summary>Builds the receive-side state (engine construction, game thread).</summary>
@@ -808,7 +815,9 @@ internal sealed unsafe partial class ReliableLatestEngine
     /// <remarks>
     /// Records a large-value stream this engine opened so that <see cref="OnStreamClosed"/> can recognise it (transport
     /// thread; the peer routes it here by the context's mode). A start the peer's stream limit refused is followed by the
-    /// canceled completion of its send, which is what schedules the retransmission.
+    /// canceled completion of its send, which puts the value back in the queue; the refusal itself is handed to the game
+    /// thread first, so that the value then waits for stream credit instead of spending one of its transmissions on every
+    /// pass (MsQuic and the simulator refuse a start only here, never in the call that made it).
     /// </remarks>
     public override void OnStreamStarted(TransportStreamId id, ulong context, TransportStatus status)
     {
@@ -823,6 +832,11 @@ internal sealed unsafe partial class ReliableLatestEngine
         if (local < 0)
         {
             return;
+        }
+
+        if (status == TransportStatus.StreamLimitReached)
+        {
+            Post(new LatestNotice { Local = local, Kind = NoticeKind.StreamRefused, Stream = id });
         }
 
         for (int index = 0; index < _txStreams.Length; index++)
@@ -919,6 +933,12 @@ internal sealed unsafe partial class ReliableLatestEngine
                 // at the same point) and a value waiting for credit may go out. The slot is looked up by the stream's own id,
                 // so a start that was reported and then refused — one this engine never counted — releases nothing.
                 ReleaseCountedStream(notice.Stream);
+                continue;
+            }
+
+            if (notice.Kind == NoticeKind.StreamRefused)
+            {
+                OnLargeStreamRefused(local, notice.Stream);
                 continue;
             }
 

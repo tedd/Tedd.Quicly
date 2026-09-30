@@ -102,6 +102,14 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     private TransportStreamId[] _countedStreams = [];
     private int[] _countedLocals = [];
 
+    // Per counted stream, what undoes its transmission if the peer's stream limit refuses the start: the key it carries,
+    // the stream-credit generation read before it was opened, whether it was counted as a retry, and whether the refusal
+    // has been seen (its shutdown then must not unblock the channel).
+    private int[] _countedKeySlots = [];
+    private int[] _countedCredit = [];
+    private bool[] _countedRetry = [];
+    private bool[] _countedRefused = [];
+
     /// <summary>Where a value entry is and what it still owes.</summary>
     [Flags]
     private enum ValueFlags : byte
@@ -147,6 +155,10 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         // shutdown notice.
         _countedStreams = new TransportStreamId[_streamCapacity];
         _countedLocals = new int[_streamCapacity];
+        _countedKeySlots = new int[_streamCapacity];
+        _countedCredit = new int[_streamCapacity];
+        _countedRetry = new bool[_streamCapacity];
+        _countedRefused = new bool[_streamCapacity];
         for (int local = 0; local < count; local++)
         {
             ChannelDefinition channel = _channels[local];
@@ -788,7 +800,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         }
 
         bool sent = large
-            ? TrySendLarge(local, value, transmission, keySlot, ref key, ref flush)
+            ? TrySendLarge(local, value, transmission, keySlot, ref key, ref flush, retry)
             : TrySendDatagram(local, value, transmission, ref flush);
         if (!sent)
         {
@@ -861,7 +873,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
     /// one frame <c>Length, Sequence = version, Key, RawLength</c>, FIN. The header and the value's payload are the entry's
     /// own adjacent segment pair, so nothing is copied.
     /// </summary>
-    private bool TrySendLarge(int local, int value, int transmission, int keySlot, ref KeySendSlot key, ref FlushContext flush)
+    private bool TrySendLarge(int local, int value, int transmission, int keySlot, ref KeySendSlot key, ref FlushContext flush, bool retry)
     {
         ChannelDefinition channel = _channels[local];
         SendEntryTable entries = _core.Entries;
@@ -945,6 +957,10 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         // shutdown, so counting the send would let us open one more stream than it still holds.
         _countedStreams[counted] = stream;
         _countedLocals[counted] = local;
+        _countedKeySlots[counted] = keySlot;
+        _countedCredit[counted] = credit;
+        _countedRetry[counted] = retry;
+        _countedRefused[counted] = false;
         _openStreams[local]++;
         long bytes = written + header.Length;
         flush.BudgetBytes -= bytes;
@@ -993,9 +1009,63 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
                     _openStreams[local]--;
                 }
 
-                _streamBlocked[local] = false;
+                // A stream that really was open gave its slot at the peer back with this shutdown. One whose start the
+                // peer's limit refused never had a slot there: the channel keeps waiting for the credit generation to change.
+                if (!_countedRefused[index])
+                {
+                    _streamBlocked[local] = false;
+                }
+
+                _countedRefused[index] = false;
                 return;
             }
+        }
+    }
+
+    /// <summary>
+    /// The peer's stream limit refused the start of a large value's stream (game thread, from the transport thread's
+    /// notice). MsQuic and the simulator report that after the send that carried the start was accepted, so the
+    /// transmission was counted like one that left: it is taken back here — the value's attempt, the channel's
+    /// <c>Sent</c> — and the channel waits for stream credit (PROTOCOL.md §3.2: it waits, it never fails), exactly as after
+    /// a refusal the call itself reports. Without this every pass would open a stream, have it refused and spend one of
+    /// the version's transmissions, and a value would end <see cref="DeliveryStatus.Failed"/> within a few milliseconds
+    /// of a receiver that is merely late. The canceled completion that follows re-queues the value; the stream's shutdown
+    /// gives back its per-channel slot and leaves the channel blocked.
+    /// </summary>
+    private void OnLargeStreamRefused(int local, TransportStreamId stream)
+    {
+        for (int index = 0; index < _countedStreams.Length; index++)
+        {
+            if (_countedStreams[index] != stream || _countedRefused[index])
+            {
+                continue;
+            }
+
+            _countedRefused[index] = true;
+            ref LatestSendState send = ref _send[local];
+            _streamBlocked[local] = true;
+            send.CreditGeneration = _countedCredit[index];
+            LatestSendKeys keys = _sendKeys[local];
+            ref KeySendSlot key = ref keys[_countedKeySlots[index]];
+            if ((key.Flags & KeySendFlags.LargeValue) == 0 || key.LargeValueStream != stream || key.InFlightEntry < 0)
+            {
+                return; // the value was replaced or finished meanwhile: nothing of this transmission is left to take back
+            }
+
+            if (key.Attempts > 0)
+            {
+                key.Attempts--;
+            }
+
+            ref ChannelSendCounters counters = ref _core.SendCounters(_denseOf[local]);
+            counters.Sent--;
+            counters.Bytes -= _core.Entries[key.InFlightEntry].Payload.Length;
+            if (_countedRetry[index])
+            {
+                counters.Retries--;
+            }
+
+            return;
         }
     }
 
@@ -1374,6 +1444,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
         }
 
         Array.Clear(_countedStreams);
+        Array.Clear(_countedRefused);
         ResetReceiveForReconnect();
     }
 

@@ -36,10 +36,17 @@ namespace Tedd.Quicly.Transport.MsQuic;
 /// <see cref="TransportStatus.InvalidState"/>): release it with <see cref="CloseStream"/> and open a new stream to retry after
 /// <see cref="ITransportSink.OnStreamsAvailable"/>.</para>
 /// <para><b>Receive.</b> <see cref="ITransportSink.OnStreamReceived"/> sees MsQuic's receive buffers reinterpreted in place.
-/// Consuming everything completes the receive. <see cref="ReceiveResult.PendingAfter"/> returns <c>QUIC_STATUS_PENDING</c>;
-/// <see cref="ResumeStreamReceive"/> later calls <c>StreamReceiveComplete(consumed + resumed)</c> and, when bytes remain,
-/// <c>StreamReceiveSetEnabled(TRUE)</c> (MsQuic pauses a stream after any partial completion; measured on msquic 2.5.10,
-/// see <c>docs/benchmarks/msquic-transport.md</c>). A resume that arrives while the receive callback is still running is
+/// Consuming everything completes the receive. <see cref="ReceiveResult.PendingAfter"/> is answered to MsQuic as a partial
+/// consumption of the bytes the sink took, which MsQuic completes itself when the callback returns and after which it
+/// pauses the stream (measured on msquic 2.5.10, see <c>docs/benchmarks/msquic-transport.md</c>);
+/// <see cref="ResumeStreamReceive"/> later calls <c>StreamReceiveSetEnabled(TRUE)</c>, which MsQuic always queues to the
+/// connection's worker, and the bytes the resume credits are skipped at the head of the next indication. No receive is
+/// left pending for another thread to complete: MsQuic drops a completion of zero bytes that reaches it before the
+/// receive callback has returned, and the stream would never be indicated again (the same table, R4). Two holds cannot be
+/// partial: of an indication the sink consumed whole one byte is kept back and skipped later, and an indication that
+/// carries only the FIN stays pending and is indicated again by the re-enable alone. A FIN the sink saw on the indication
+/// it held is not shown to it a second time: once the bytes before it are the sink's, the peer's send shutdown follows
+/// (as on the simulator). A resume that arrives while the receive callback is still running is
 /// applied when it returns. A partial <see cref="ReceiveResult.Consumed"/> of at least one byte re-enables receives
 /// inline, so MsQuic indicates the remainder again right away, together with anything that arrived since; consuming
 /// nothing of a non-empty indication without <c>Pending</c> counts as <c>PendingAfter(0)</c> (see <see cref="ReceiveResult"/>).</para>

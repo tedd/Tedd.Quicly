@@ -23,7 +23,10 @@ public readonly struct MsQuicReceiveResult
     /// <summary>The handler consumed <paramref name="bytes"/> bytes synchronously.</summary>
     public static MsQuicReceiveResult Consumed(ulong bytes) => new(bytes, false);
 
-    /// <summary>The handler will call <see cref="MsQuicStream.ReceiveComplete"/> later (backpressure).</summary>
+    /// <summary>
+    /// The handler will call <see cref="MsQuicStream.ReceiveComplete"/> later (backpressure). See the remarks there: a
+    /// completion of zero bytes must not race this callback's return.
+    /// </summary>
     public static MsQuicReceiveResult Pending => new(0, true);
 }
 

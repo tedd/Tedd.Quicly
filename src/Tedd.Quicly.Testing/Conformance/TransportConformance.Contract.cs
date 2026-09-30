@@ -396,6 +396,172 @@ public static unsafe partial class TransportConformance
         s.CloseAndWait();
     }
 
+    /// <summary>
+    /// ReceiveResult: a stream held with <see cref="ReceiveResult.PendingAfter"/> is indicated again after every
+    /// <see cref="ITransport.ResumeStreamReceive"/>, however the resume is timed against the receive callback that held the
+    /// stream — also when it credits no bytes, which is how a session resumes a stream it could not take a message from.
+    /// </summary>
+    /// <remarks>
+    /// Three streams. The server holds the first one two thousand times with <c>PendingAfter(0)</c> while another thread
+    /// resumes it as soon as each hold is announced — before the callback has returned, as it returns, or after: every one
+    /// of those indications starts at offset 0, and the stream then arrives whole. The second one is consumed as it is
+    /// indicated and held at the same time (<c>PendingAfter(all)</c>): nothing more happens on it until the resume, and then
+    /// the rest and the end arrive with no byte indicated twice. The third one's FIN arrives alone and is held: the peer's
+    /// send shutdown is reported after the resume, not before.
+    /// </remarks>
+    public static void HeldStreamIsIndicatedAgainAfterEveryResume(ITransportTestHarness harness)
+    {
+        const int Holds = 2000;
+        const int Length = 100;
+        using var s = new Session(harness);
+        ITransport server = s.Server;
+        var gate = new object();
+        var taken = new MemoryStream();
+        TransportStreamId announced = default;
+        int phase = 1;
+        int signal = 0;
+        int stop = 0;
+        int holds = 0;
+        int calls = 0;
+        int errors = 0;
+        int finHeld = 0;
+        s.ServerSink.ReceiveHandler = (id, segments, offset, fin) =>
+        {
+            int total = 0;
+            foreach (TransportSegment segment in segments) total += (int)segment.Length;
+            lock (gate)
+            {
+                calls++;
+                // Whatever the stream, the sink is never shown a byte twice and never skips one.
+                bool held = phase == 1 && holds < Holds;
+                if (offset != (ulong)taken.Length) errors++;
+                if (held)
+                {
+                    holds++;
+                    announced = id;
+                    Volatile.Write(ref signal, 1);
+                    return ReceiveResult.PendingAfter(0);
+                }
+
+                foreach (TransportSegment segment in segments) taken.Write(segment.AsSpan());
+                if (phase == 2 && calls == 1)
+                {
+                    announced = id;
+                    return ReceiveResult.PendingAfter(total);
+                }
+
+                if (phase == 3 && total == 0 && fin && finHeld == 0)
+                {
+                    finHeld = 1;
+                    announced = id;
+                    return ReceiveResult.PendingAfter(0);
+                }
+
+                return ReceiveResult.Consumed(total);
+            }
+        };
+        var resumer = new Thread(() =>
+        {
+            var random = new Random(7);
+            while (Volatile.Read(ref stop) == 0)
+            {
+                if (Interlocked.Exchange(ref signal, 0) == 0)
+                {
+                    Thread.Yield();
+                    continue;
+                }
+
+                // A varying moment after the hold was announced: the callback that holds the stream may still be running,
+                // may be returning, or may have returned.
+                int spins = random.Next(0, 60);
+                for (int i = 0; i < spins; i++) Thread.SpinWait(1);
+                TransportStreamId id;
+                lock (gate) id = announced;
+                server.ResumeStreamReceive(id, 0);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "conformance-resumer",
+        };
+        int Read(ref int value)
+        {
+            lock (gate) return value;
+        }
+        void Begin(int next)
+        {
+            lock (gate)
+            {
+                phase = next;
+                calls = 0;
+                taken.SetLength(0);
+            }
+        }
+        byte[] Taken()
+        {
+            lock (gate) return taken.ToArray();
+        }
+
+        s.WaitConnected();
+        NativeSegments segments = s.RentSegments(3);
+        try
+        {
+            resumer.Start();
+
+            // 1. Held and resumed with zero bytes, again and again, by a thread that races the callback.
+            NativeBuffer first = s.Rent(Length, seed: 31);
+            segments.Set(0, first.Segment(0, Length));
+            s.Require(s.Client.OpenStream(StreamKind.Unidirectional, 1, 32767, out TransportStreamId one) == TransportStatus.Success, "OpenStream failed.");
+            s.Require(s.Client.SendStream(one, segments.At(0), 1, 1, TransportSendFlags.Start | TransportSendFlags.Fin) == TransportStatus.Success, "SendStream failed.");
+            bool ended = s.Harness.Pump(() => s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 1 || Read(ref errors) != 0, s.Harness.DefaultTimeout);
+            s.Require(ended, $"a stream that was held and resumed with zero bytes was indicated {Read(ref holds)} times and then never again.");
+            s.Require(Read(ref errors) == 0, "an indication of the held stream did not start where the sink had stopped consuming.");
+            s.Require(Read(ref holds) == Holds, $"the stream was held {Read(ref holds)} times, expected {Holds}.");
+            s.Require(Taken().AsSpan().SequenceEqual(first.ToArray(0, Length)), "the held stream did not arrive whole after its last resume.");
+        }
+        finally
+        {
+            Volatile.Write(ref stop, 1);
+        }
+
+        s.Require(resumer.Join(TimeSpan.FromSeconds(10)), "the resuming thread did not finish.");
+
+        // 2. Consumed whole and held: nothing more until the resume, then the end of the stream, and no byte twice.
+        Begin(2);
+        NativeBuffer second = s.Rent(Length, seed: 32);
+        segments.Set(1, second.Segment(0, Length));
+        s.Require(s.Client.OpenStream(StreamKind.Unidirectional, 2, 32767, out TransportStreamId two) == TransportStatus.Success, "OpenStream failed.");
+        s.Require(s.Client.SendStream(two, segments.At(1), 1, 2, TransportSendFlags.Start | TransportSendFlags.Fin) == TransportStatus.Success, "SendStream failed.");
+        s.Wait(() => Read(ref calls) >= 1, "the second stream's first indication");
+        s.Settle(TimeSpan.FromMilliseconds(100));
+        s.Require(Read(ref calls) == 1, $"a stream held with PendingAfter(all) was indicated {Read(ref calls)} times before it was resumed.");
+        s.Require(s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 1, "a stream held with PendingAfter(all) reported its end before it was resumed.");
+        TransportStreamId held;
+        lock (gate) held = announced;
+        server.ResumeStreamReceive(held, 0);
+        s.Wait(() => s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 2, "the end of the stream that was consumed whole and held, after its resume");
+        s.Require(Read(ref errors) == 0, "after a hold with PendingAfter(all) an indication did not start where the sink had stopped consuming.");
+        s.Require(Taken().AsSpan().SequenceEqual(second.ToArray(0, Length)), "the stream that was consumed whole and held did not arrive exactly once.");
+
+        // 3. The FIN arrives alone and is held.
+        Begin(3);
+        NativeBuffer third = s.Rent(Length, seed: 33);
+        segments.Set(2, third.Segment(0, Length));
+        s.Require(s.Client.OpenStream(StreamKind.Unidirectional, 3, 32767, out TransportStreamId three) == TransportStatus.Success, "OpenStream failed.");
+        s.Require(s.Client.SendStream(three, segments.At(2), 1, 3, TransportSendFlags.Start) == TransportStatus.Success, "SendStream failed.");
+        s.Wait(() => Taken().Length == Length, "the third stream's data");
+        s.Require(s.Client.SendStream(three, null, 0, 4, TransportSendFlags.Fin) == TransportStatus.Success, "SendStream of the FIN alone failed.");
+        s.Wait(() => Read(ref finHeld) == 1, "the indication that carries only the FIN");
+        s.Settle(TimeSpan.FromMilliseconds(100));
+        s.Require(s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 2, "a held FIN was reported as the peer's send shutdown before the stream was resumed.");
+        lock (gate) held = announced;
+        server.ResumeStreamReceive(held, 0);
+        s.Wait(() => s.ServerSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) == 3, "the peer's send shutdown after the held FIN was resumed");
+        s.Require(Read(ref errors) == 0, "after a held FIN an indication did not start at the end of the stream.");
+        s.Require(Taken().AsSpan().SequenceEqual(third.ToArray(0, Length)), "the third stream's data did not arrive exactly once.");
+        s.CloseAndWait();
+    }
+
     // ------------------------------------------------------------------ refused connections and the ways a connection ends
 
     /// <summary>

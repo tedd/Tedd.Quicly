@@ -173,6 +173,13 @@ public sealed unsafe class MsQuicStream : IDisposable
     }
 
     /// <summary>Completes a receive that returned <see cref="MsQuicReceiveResult.Pending"/>, consuming <paramref name="bufferLength"/> bytes.</summary>
+    /// <remarks>
+    /// Do not complete with zero bytes from another thread: if the call reaches MsQuic before the receive callback that
+    /// returns <c>Pending</c> has returned to it, MsQuic (2.5) only adds the length to the stream's completion counter and
+    /// completes the receive after the callback only if that counter is not zero. A zero-byte completion is then dropped,
+    /// and the receive stays pending for good. Return a partial count from the callback instead (MsQuic pauses the stream)
+    /// and call <see cref="ReceiveSetEnabled"/> to go on, as <c>MsQuicTransport</c> does.
+    /// </remarks>
     public void ReceiveComplete(ulong bufferLength)
     {
         QUIC_HANDLE* handle = _handle;

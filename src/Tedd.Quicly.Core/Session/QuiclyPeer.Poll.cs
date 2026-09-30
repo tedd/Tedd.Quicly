@@ -455,6 +455,16 @@ public sealed unsafe partial class QuiclyPeer
         MessageHandler? handler = index >= 0 ? _handlers[index] : null;
         if (handler is not null)
         {
+            if (_queues.QueuedHandled != 0 && _queues.Count(index) != 0)
+            {
+                // Older messages of this channel wait in its queue: a handler of this very Poll drained another channel
+                // and met them, or registered this handler over a backlog, after the queues were dispatched. This one
+                // goes behind them, and the next Poll dispatches the queue first — or the channel would be out of order.
+                // It cannot starve there: a Poll takes nothing from the ring before the queues of channels with a
+                // handler are empty (or maxItems is used up), so the queue is always served first.
+                return TryQueue(in entry, mayHold);
+            }
+
             Dispatch(handler, ref entry, now);
             dispatched++;
             return true;

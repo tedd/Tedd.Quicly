@@ -316,6 +316,12 @@ is back in `Filling` and still owned by the caller.
    long as one reliable channel is not drained, while the transport thread keeps acknowledging those values to the sender.
    Compressed messages are decoded with `Lz4Block.DecompressExact` into a second lease (decoded-bytes budget; a failure drops and
    counts `DecodeFailures`). The lease is released after the handler unless `Retain` was called; handler exceptions propagate.
+   A ring message of a channel that has messages *queued* is not dispatched past them: it goes behind the queue
+   (`Route`), and the next Poll dispatches the queue first. The queues are dispatched before the ring, so this only
+   happens when a handler of the running Poll put older messages of the channel there — by calling `Drain` for another
+   channel, or by registering the handler over a backlog — and without it a ReliableOrdered channel was delivered out of
+   order (0, 2, 1). The message cannot starve behind the queue: a Poll takes nothing from the ring while a queue of a
+   channel with a handler is not empty or `maxItems` is used up.
 5. `ResumePendedStreams()`.
 6. Closed: engines' `OnPeerClosed`, requests still in the `ThreadSafeSend` front dropped (leases returned), every receive lease
    released, waiting `SendAsync` calls completed `NotConnected` and `FlushAsync` calls completed, the Closed event raised last;

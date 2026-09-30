@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Tedd.Quicly.Core.Threading;
 
@@ -14,26 +15,25 @@ public class CompletionTableTests
     private const CompletionStage Remote = CompletionStage.RemoteAccepted;
 
     /// <summary>
-    /// Pre-allocated awaiter: registers one cached continuation on a pending ValueTask and spins until it runs.
-    /// Lets tests drive the IValueTaskSource path without an async state machine.
+    /// Pre-allocated awaiter: registers one cached continuation on a pending ValueTask and waits until it has run, spinning
+    /// first and then blocked (<see cref="HandOff"/>), so that waiting for a thread that has no core costs a wake-up rather
+    /// than a scheduler quantum. Lets tests drive the IValueTaskSource path without an async state machine, and allocates
+    /// nothing on the waiting thread.
     /// </summary>
-    private sealed class SpinAwaiter
+    private sealed class HandOffAwaiter
     {
+        private readonly HandOff _ran = new();
         private readonly Action _continuation;
-        private volatile bool _signaled;
 
-        public SpinAwaiter() => _continuation = () => _signaled = true;
+        public HandOffAwaiter() => _continuation = () => _ran.Put(1);
 
         public DeliveryStatus Await(ValueTask<DeliveryStatus> task)
         {
             ValueTaskAwaiter<DeliveryStatus> awaiter = task.GetAwaiter();
             if (!awaiter.IsCompleted)
             {
-                _signaled = false;
                 awaiter.UnsafeOnCompleted(_continuation);
-                SpinWait spinner = default;
-                while (!_signaled)
-                    spinner.SpinOnce(sleep1Threshold: -1);
+                _ran.Take();
             }
 
             return awaiter.GetResult();
@@ -43,16 +43,13 @@ public class CompletionTableTests
         public ValueTaskAwaiter<DeliveryStatus> Register(ValueTask<DeliveryStatus> task)
         {
             ValueTaskAwaiter<DeliveryStatus> awaiter = task.GetAwaiter();
-            _signaled = false;
             awaiter.UnsafeOnCompleted(_continuation);
             return awaiter;
         }
 
         public DeliveryStatus Finish(ValueTaskAwaiter<DeliveryStatus> awaiter)
         {
-            SpinWait spinner = default;
-            while (!_signaled)
-                spinner.SpinOnce(sleep1Threshold: -1);
+            _ran.Take();
             return awaiter.GetResult();
         }
     }
@@ -130,7 +127,7 @@ public class CompletionTableTests
     public void Await_Before_Complete_Is_Signalled_With_Status_At_Completion()
     {
         var table = new CompletionTable(1);
-        var awaiter = new SpinAwaiter();
+        var awaiter = new HandOffAwaiter();
         table.TryAllocate(out SendToken token);
 
         ValueTask<DeliveryStatus> remoteWait = table.WaitAsync(token, Remote);
@@ -272,7 +269,7 @@ public class CompletionTableTests
         ValueTask<DeliveryStatus> second = table.WaitAsync(token, Remote);
         Assert.False(second.IsCompleted);
         table.Complete(token, Remote, DeliveryStatus.Delivered);
-        Assert.Equal(DeliveryStatus.Delivered, new SpinAwaiter().Await(second));
+        Assert.Equal(DeliveryStatus.Delivered, new HandOffAwaiter().Await(second));
 
         // Same for the other stage, repeatedly, so both cores go through cancel and reuse.
         for (int i = 0; i < 3; i++)
@@ -287,7 +284,7 @@ public class CompletionTableTests
         ValueTask<DeliveryStatus> bufferSecond = table.WaitAsync(token, Buffer);
         Assert.False(bufferSecond.IsCompleted);
         table.Complete(token, Buffer, DeliveryStatus.Pending);
-        Assert.Equal(DeliveryStatus.Delivered, new SpinAwaiter().Await(bufferSecond));
+        Assert.Equal(DeliveryStatus.Delivered, new HandOffAwaiter().Await(bufferSecond));
         Assert.Equal(1, table.Available);
     }
 
@@ -608,135 +605,245 @@ public class CompletionTableTests
         Assert.NotEqual(completingThread, continuationThread);
     }
 
+    /// <remarks>
+    /// Every mode waits for the send's remote stage before the next one starts, so one token at a time is handed to the
+    /// transport thread (<see cref="HandOff"/>: it spins for the next one and then blocks, so that on a machine with no
+    /// core to spare a hand-off costs a wake-up rather than a scheduler quantum).
+    /// </remarks>
     [Fact]
     public void Stress_Transport_Thread_Completes_While_Owner_Awaits()
     {
         const int iterations = 20_000;
+        const long stop = -1;
         var table = new CompletionTable(64);
-        var awaiter = new SpinAwaiter();
-        var handoff = new MpscRing<long>(256);
+        var awaiter = new HandOffAwaiter();
+        using var handoff = new HandOff();
         var random = new Random(12345);
         int failures = 0;
+        Exception? transportFailure = null;
 
         var transport = new Thread(() =>
         {
             var localRandom = new Random(777);
-            long packed;
-            SpinWait spinner = default;
-            while (true)
+            try
             {
-                if (!handoff.TryDequeue(out packed))
+                long packed;
+                while ((packed = handoff.Take()) != stop)
                 {
-                    spinner.SpinOnce(sleep1Threshold: -1);
-                    continue;
+                    var token = new SendToken((int)(packed & 0xFFFF_FFFF), (uint)(packed >> 32));
+                    if ((localRandom.Next() & 1) == 0)
+                        Thread.SpinWait(localRandom.Next(0, 200));
+                    table.Complete(token, Buffer, DeliveryStatus.Pending);
+                    if ((localRandom.Next() & 1) == 0)
+                        Thread.SpinWait(localRandom.Next(0, 200));
+                    table.Complete(token, Remote, DeliveryStatus.Delivered);
                 }
-
-                spinner.Reset();
-                if (packed == -1)
-                    return;
-
-                var token = new SendToken((int)(packed & 0xFFFF_FFFF), (uint)(packed >> 32));
-                if ((localRandom.Next() & 1) == 0)
-                    Thread.SpinWait(localRandom.Next(0, 200));
-                table.Complete(token, Buffer, DeliveryStatus.Pending);
-                if ((localRandom.Next() & 1) == 0)
-                    Thread.SpinWait(localRandom.Next(0, 200));
-                table.Complete(token, Remote, DeliveryStatus.Delivered);
+            }
+            catch (Exception e)
+            {
+                transportFailure = e;
             }
         })
         { IsBackground = true, Name = "transport" };
         transport.Start();
 
-        for (int i = 0; i < iterations; i++)
+        try
         {
-            Assert.True(table.TryAllocate(out SendToken token));
-            long packed = ((long)token.Generation << 32) | (uint)token.Slot;
-            int mode = random.Next(4);
-
-            ValueTask<DeliveryStatus> remoteWait = default;
-            ValueTask<DeliveryStatus> bufferWait = default;
-            if (mode is 0 or 1)
-                remoteWait = table.WaitAsync(token, Remote);
-            if (mode == 1)
-                bufferWait = table.WaitAsync(token, Buffer);
-
-            while (!handoff.TryEnqueue(packed))
-                Thread.Yield();
-
-            switch (mode)
+            for (int i = 0; i < iterations; i++)
             {
-                case 0:
-                    if (awaiter.Await(remoteWait) != DeliveryStatus.Delivered)
-                        failures++;
-                    break;
-                case 1:
-                    if (awaiter.Await(bufferWait) is not (DeliveryStatus.Pending or DeliveryStatus.Delivered))
-                        failures++;
-                    if (awaiter.Await(remoteWait) != DeliveryStatus.Delivered)
-                        failures++;
-                    break;
-                case 2:
-                    if (table.Wait(token, Remote, TimeSpan.FromSeconds(10)) != DeliveryStatus.Delivered)
-                        failures++;
-                    break;
-                default:
-                    // Await after completion (probably): either path must yield Delivered.
-                    Thread.SpinWait(random.Next(0, 300));
-                    if (awaiter.Await(table.WaitAsync(token, Remote)) != DeliveryStatus.Delivered)
-                        failures++;
-                    break;
+                Assert.True(table.TryAllocate(out SendToken token));
+                long packed = ((long)token.Generation << 32) | (uint)token.Slot;
+                int mode = random.Next(4);
+
+                ValueTask<DeliveryStatus> remoteWait = default;
+                ValueTask<DeliveryStatus> bufferWait = default;
+                if (mode is 0 or 1)
+                    remoteWait = table.WaitAsync(token, Remote);
+                if (mode == 1)
+                    bufferWait = table.WaitAsync(token, Buffer);
+
+                handoff.Put(packed);
+
+                switch (mode)
+                {
+                    case 0:
+                        if (awaiter.Await(remoteWait) != DeliveryStatus.Delivered)
+                            failures++;
+                        break;
+                    case 1:
+                        if (awaiter.Await(bufferWait) is not (DeliveryStatus.Pending or DeliveryStatus.Delivered))
+                            failures++;
+                        if (awaiter.Await(remoteWait) != DeliveryStatus.Delivered)
+                            failures++;
+                        break;
+                    case 2:
+                        if (table.Wait(token, Remote, TimeSpan.FromSeconds(10)) != DeliveryStatus.Delivered)
+                            failures++;
+                        break;
+                    default:
+                        // Await after completion (probably): either path must yield Delivered.
+                        Thread.SpinWait(random.Next(0, 300));
+                        if (awaiter.Await(table.WaitAsync(token, Remote)) != DeliveryStatus.Delivered)
+                            failures++;
+                        break;
+                }
             }
         }
+        finally
+        {
+            handoff.Put(stop);
+            transport.Join();
+        }
 
-        while (!handoff.TryEnqueue(-1))
-            Thread.Yield();
-        transport.Join();
-
+        Assert.True(transportFailure is null, $"The transport thread failed: {transportFailure}");
         Assert.Equal(0, failures);
         Assert.Equal(64, table.Available);
     }
 
+    /// <summary>
+    /// A cancellation and a completion of the same wait race each other. Whichever wins, the wait ends exactly once
+    /// (delivered or canceled), the completion itself lands, and the slot is free again once its other stage completes.
+    /// </summary>
+    /// <remarks>
+    /// The completing and the cancelling call come from two threads that live for the whole run and are released together
+    /// for every round, once the wait's continuation is attached; each waits a random moment first, so that the two calls
+    /// meet in either order and at every point of each other. A thread that waits longer than a release takes while both
+    /// threads run blocks instead of spinning (<see cref="HandOff"/>). (Two new threads per round rarely raced: the completer,
+    /// started first, won all but a handful of 5 000 rounds, and on a machine with no core to spare the awaiting thread's
+    /// spin lost a scheduler quantum in every round, so the run took many minutes.) The run ends after its rounds or after
+    /// 20 s, and must have seen both outcomes and at least 500 rounds in which the two calls ran at the same time.
+    /// </remarks>
     [Fact]
     public void Stress_Cancel_Races_Completion()
     {
-        const int iterations = 5_000;
+        const int rounds = 20_000;
+        const int requiredOverlaps = 500;
+        const long stop = -1;
+        long start = Stopwatch.GetTimestamp();
+        long deadline = start + (20 * Stopwatch.Frequency);
         var table = new CompletionTable(4);
-        var awaiter = new SpinAwaiter();
-        int canceledWaits = 0;
-        int completedWaits = 0;
+        using var completeGo = new HandOff();
+        using var cancelGo = new HandOff();
+        using var completeDone = new HandOff();
+        using var cancelDone = new HandOff();
+        SendToken token = default;
+        CancellationTokenSource? cts = null;
+        long clock = 0;
+        long completeStart = 0;
+        long completeEnd = 0;
+        long cancelStart = 0;
+        long cancelEnd = 0;
+        int continuations = 0;
+        Exception? failure = null;
+        Action continuation = () => Interlocked.Increment(ref continuations);
 
-        for (int i = 0; i < iterations; i++)
+        var completer = new Thread(() => Serve(completeGo, completeDone, 1, () =>
         {
-            Assert.True(table.TryAllocate(out SendToken token));
-            using var cts = new CancellationTokenSource();
-            ValueTask<DeliveryStatus> wait = table.WaitAsync(token, Remote, cts.Token);
+            completeStart = Interlocked.Increment(ref clock);
+            table.Complete(token, Remote, DeliveryStatus.Delivered);
+            completeEnd = Interlocked.Increment(ref clock);
+        }))
+        { IsBackground = true, Name = "completer" };
+        var canceller = new Thread(() => Serve(cancelGo, cancelDone, 2, () =>
+        {
+            cancelStart = Interlocked.Increment(ref clock);
+            cts!.Cancel();
+            cancelEnd = Interlocked.Increment(ref clock);
+        }))
+        { IsBackground = true, Name = "canceller" };
 
-            var completer = new Thread(() => table.Complete(token, Remote, DeliveryStatus.Delivered));
-            var canceller = new Thread(cts.Cancel);
-            completer.Start();
-            canceller.Start();
-
-            try
+        int completedWaits = 0;
+        int canceledWaits = 0;
+        int overlaps = 0;
+        int round = 0;
+        completer.Start();
+        canceller.Start();
+        try
+        {
+            for (; round < rounds && ((round & 255) != 0 || Stopwatch.GetTimestamp() < deadline); round++)
             {
-                Assert.Equal(DeliveryStatus.Delivered, awaiter.Await(wait));
-                completedWaits++;
-            }
-            catch (OperationCanceledException)
-            {
-                canceledWaits++;
-            }
+                Assert.True(table.TryAllocate(out token));
+                cts = new CancellationTokenSource();
+                // Without a captured context the continuation runs inline on the thread that ends the wait. Nothing awaits
+                // here, so no parallelization limit is bypassed.
+#pragma warning disable xUnit1030
+                ConfiguredValueTaskAwaitable<DeliveryStatus>.ConfiguredValueTaskAwaiter awaiter =
+                    table.WaitAsync(token, Remote, cts.Token).ConfigureAwait(false).GetAwaiter();
+#pragma warning restore xUnit1030
+                continuations = 0;
+                awaiter.UnsafeOnCompleted(continuation);
 
-            completer.Join();
-            canceller.Join();
+                completeGo.Put(1);
+                cancelGo.Put(1);
+                completeDone.Take();
+                cancelDone.Take();
+                if (failure is not null)
+                    Assert.Fail($"Round {round}: {failure}");
 
-            // Whatever happened to the wait, the completion itself always landed.
-            Assert.Equal(DeliveryStatus.Delivered, table.GetStatus(token));
-            Assert.True(table.IsCompleted(token, Remote));
-            table.Complete(token, Buffer, DeliveryStatus.Pending);
-            Assert.Equal(4, table.Available);
+                // The two calls ran at the same time when each started before the other ended.
+                if (completeStart < cancelEnd && cancelStart < completeEnd)
+                    overlaps++;
+
+                // The wait ended exactly once, on whichever thread ended it.
+                Assert.Equal(1, Volatile.Read(ref continuations));
+                try
+                {
+                    Assert.Equal(DeliveryStatus.Delivered, awaiter.GetResult());
+                    completedWaits++;
+                }
+                catch (OperationCanceledException)
+                {
+                    canceledWaits++;
+                }
+
+                // Whatever happened to the wait, the completion itself always landed.
+                Assert.Equal(DeliveryStatus.Delivered, table.GetStatus(token));
+                Assert.True(table.IsCompleted(token, Remote));
+                table.Complete(token, Buffer, DeliveryStatus.Pending);
+                Assert.Equal(4, table.Available);
+                cts.Dispose();
+            }
+        }
+        finally
+        {
+            completeGo.Put(stop);
+            cancelGo.Put(stop);
+            completer.Join(HandOff.Timeout);
+            canceller.Join(HandOff.Timeout);
         }
 
-        Assert.Equal(iterations, canceledWaits + completedWaits);
+        string run = $"{round:N0} rounds in {Stopwatch.GetElapsedTime(start).TotalSeconds:F1} s: {completedWaits:N0} delivered, "
+            + $"{canceledWaits:N0} canceled, the two calls at the same time in {overlaps:N0}";
+        TestContext.Current.TestOutputHelper?.WriteLine(run);
+        Assert.Equal(round, canceledWaits + completedWaits);
+        Assert.True(overlaps >= requiredOverlaps && completedWaits > 0 && canceledWaits > 0, $"The run did not exercise the race ({run}).");
+
+        // One call per round, a random few hundred nanoseconds after the round was released.
+        void Serve(HandOff go, HandOff done, int seed, Action call)
+        {
+            var random = new Random(seed);
+            try
+            {
+                while (go.Take() != stop)
+                {
+                    Thread.SpinWait(random.Next(0, 64));
+                    try
+                    {
+                        call();
+                    }
+                    catch (Exception e)
+                    {
+                        Interlocked.CompareExchange(ref failure, e, null);
+                    }
+
+                    done.Put(1);
+                }
+            }
+            catch (TimeoutException e)
+            {
+                Interlocked.CompareExchange(ref failure, e, null);
+            }
+        }
     }
 
     [Fact]
@@ -776,49 +883,53 @@ public class CompletionTableTests
         SynchronizationContext.SetSynchronizationContext(null);
         try
         {
+            const long stop = -1;
             var table = new CompletionTable(8);
-            var awaiter = new SpinAwaiter();
-            var remoteAwaiter = new SpinAwaiter();
-            long pendingToken = 0;
-            bool stop = false;
+            var awaiter = new HandOffAwaiter();
+            var remoteAwaiter = new HandOffAwaiter();
+            using var published = new HandOff();
 
+            // The token goes to the transport thread through a hand-off that spins and then blocks, as do the waits for
+            // the two continuations: on a machine with no core to spare a hand-off costs a wake-up, not a scheduler
+            // quantum. Neither side allocates.
+            Exception? transportFailure = null;
             var transport = new Thread(() =>
             {
-                SpinWait spinner = default;
-                while (!Volatile.Read(ref stop))
+                try
                 {
-                    long packed = Interlocked.Exchange(ref pendingToken, 0);
-                    if (packed == 0)
+                    long packed;
+                    while ((packed = published.Take()) != stop)
                     {
-                        spinner.SpinOnce(sleep1Threshold: -1);
-                        continue;
+                        var token = new SendToken((int)(packed & 0xFFFF_FFFF), (uint)(packed >> 32));
+                        table.Complete(token, Buffer, DeliveryStatus.Pending);
+                        table.Complete(token, Remote, DeliveryStatus.Delivered);
                     }
-
-                    spinner.Reset();
-                    var token = new SendToken((int)(packed & 0xFFFF_FFFF), (uint)(packed >> 32));
-                    table.Complete(token, Buffer, DeliveryStatus.Pending);
-                    table.Complete(token, Remote, DeliveryStatus.Delivered);
+                }
+                catch (Exception e)
+                {
+                    transportFailure = e;
                 }
             })
             { IsBackground = true, Name = "transport" };
             transport.Start();
 
-            // Warm up until tiered compilation has settled (the loop is cross-thread and slow enough that a
-            // fixed iteration count could finish before tier-1 code is installed).
-            long warmupStart = Environment.TickCount64;
-            while (Environment.TickCount64 - warmupStart < 500)
-                RunLoop(table, awaiter, remoteAwaiter, ref pendingToken, 1_000);
-
             try
             {
-                WindowedAllocation.AssertNone(() => RunLoop(table, awaiter, remoteAwaiter, ref pendingToken, 4_000));
+                // Warm up until tiered compilation has settled (the loop is cross-thread and slow enough that a
+                // fixed iteration count could finish before tier-1 code is installed).
+                long warmupStart = Environment.TickCount64;
+                while (Environment.TickCount64 - warmupStart < 500)
+                    RunLoop(table, awaiter, remoteAwaiter, published, 1_000);
+
+                WindowedAllocation.AssertNone(() => RunLoop(table, awaiter, remoteAwaiter, published, 4_000));
             }
             finally
             {
-                Volatile.Write(ref stop, true);
+                published.Put(stop);
                 transport.Join();
             }
 
+            Assert.True(transportFailure is null, $"The transport thread failed: {transportFailure}");
             Assert.Equal(8, table.Available);
         }
         finally
@@ -826,14 +937,14 @@ public class CompletionTableTests
             SynchronizationContext.SetSynchronizationContext(previousContext);
         }
 
-        static void RunLoop(CompletionTable table, SpinAwaiter bufferAwaiter, SpinAwaiter remoteAwaiter, ref long pendingToken, int iterations)
+        static void RunLoop(CompletionTable table, HandOffAwaiter bufferAwaiter, HandOffAwaiter remoteAwaiter, HandOff published, int iterations)
         {
             for (int i = 0; i < iterations; i++)
             {
                 table.TryAllocate(out SendToken token);
                 ValueTaskAwaiter<DeliveryStatus> bufferWait = bufferAwaiter.Register(table.WaitAsync(token, Buffer));
                 ValueTaskAwaiter<DeliveryStatus> remoteWait = remoteAwaiter.Register(table.WaitAsync(token, Remote));
-                Volatile.Write(ref pendingToken, ((long)token.Generation << 32) | (uint)token.Slot);
+                published.Put(((long)token.Generation << 32) | (uint)token.Slot);
                 bufferAwaiter.Finish(bufferWait);
                 remoteAwaiter.Finish(remoteWait);
             }

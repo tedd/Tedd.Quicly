@@ -326,6 +326,7 @@ public sealed unsafe partial class SimulatedTransport : ITransport
         if (_state != TransportState.Connecting)
             return;
         _state = TransportState.Connected;
+        _grantAtConnect = AllowPeerUni;
         if (Peer is not null)
         {
             _peerAllowsBidi = Peer.AllowPeerBidi;
@@ -380,6 +381,9 @@ public sealed unsafe partial class SimulatedTransport : ITransport
         sink.OnClosed(reason, errorCode, transportStatus);
     }
 
+    /// <summary>The unidirectional stream grant in force when this end connected (-1 before that).</summary>
+    private int _grantAtConnect = -1;
+
     private TransportCapabilities BuildCapabilities()
     {
         LinkOptions o = Link.Options;
@@ -392,9 +396,10 @@ public sealed unsafe partial class SimulatedTransport : ITransport
             CancelOnBlocked = true,
             IdealSendBufferSize = o.IdealSendBufferReporting,
 
-            // The link's initial grant: what the peer may open before anyone calls UpdatePeerStreamLimits, which can raise
-            // it and never lower it.
-            PeerUnidirectionalStreams = o.PeerUnidiStreams,
+            // The grant in force when this end connected: the link's, or what UpdatePeerStreamLimits replaced it with
+            // while the connection was still coming up (the values replace the initial ones until then). That is what
+            // the peer may open before anyone calls UpdatePeerStreamLimits on the connection, which can then only raise it.
+            PeerUnidirectionalStreams = _grantAtConnect >= 0 ? _grantAtConnect : AllowPeerUni,
         };
     }
 

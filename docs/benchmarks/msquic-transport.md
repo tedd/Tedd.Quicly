@@ -39,7 +39,7 @@ conformance scenario.
 
 ## 2. Contract decisions that came out of the measurements and the reviews
 
-The shared conformance suite (`src/Tedd.Quicly.Testing/Conformance`, 26 scenarios) runs unchanged against the simulator
+The shared conformance suite (`src/Tedd.Quicly.Testing/Conformance`, 28 scenarios) runs unchanged against the simulator
 (clean link and a 10 ms / 3 ms jitter / 10 % stream-loss link) and against `MsQuicTransport` over loopback. Where MsQuic
 could not do what the simulator documented, the contract was clarified and the simulator aligned, so both behave the same:
 

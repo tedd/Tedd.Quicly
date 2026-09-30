@@ -44,6 +44,8 @@ public static unsafe partial class TransportConformance
         (nameof(DatagramsInFlightAtCloseReachAFinalStateBeforeOnClosed), DatagramsInFlightAtCloseReachAFinalStateBeforeOnClosed),
         (nameof(ResumeRacingTheReceiveCallbackIsApplied), ResumeRacingTheReceiveCallbackIsApplied),
         (nameof(HeldStreamIsIndicatedAgainAfterEveryResume), HeldStreamIsIndicatedAgainAfterEveryResume),
+        (nameof(PeerStreamsFollowOnConnected), PeerStreamsFollowOnConnected),
+        (nameof(PeerUnidirectionalStreamsIsWhatThePeerCanOpen), PeerUnidirectionalStreamsIsWhatThePeerCanOpen),
         (nameof(RefusedConnectionsCloseTheClientOnceAndLeaveTheRefusedTransportClosed), RefusedConnectionsCloseTheClientOnceAndLeaveTheRefusedTransportClosed),
         (nameof(HandshakeFailureClosesBothEndsWithoutConnecting), HandshakeFailureClosesBothEndsWithoutConnecting),
         (nameof(CloseWhileConnecting), CloseWhileConnecting),

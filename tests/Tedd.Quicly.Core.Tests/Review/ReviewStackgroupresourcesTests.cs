@@ -348,6 +348,47 @@ public class ReviewStackgroupresourcesTests
         Assert.Equal(0, statistics.ReceiveBytesOutstanding);
     }
 
+    /// <summary>
+    /// <c>OpenStream</c> answering <see cref="TransportStatus.OutOfMemory"/> is transient by contract: the MsQuic transport
+    /// answers it once this end's own streams hold their share of the table (8702de9: "a quarter of the table is this
+    /// end's own"; slots of closed streams come back "a moment later", from the cleanup work item), and it has nothing to
+    /// do with the peer's stream credit. The group, ordered and bulk engines retry at their next pass. The ReliableLatest
+    /// engine (TrySendLarge) treats any failed open like a refusal by the peer's stream limit: it sets the channel
+    /// blocked and waits for <see cref="PeerCore.StreamCreditGeneration"/> to change, which only a STREAMS_AVAILABLE from
+    /// the peer does. A connection with no other stream traffic never gets one, so one momentarily full table holds the
+    /// channel's large values until the 30-second version budget fails them.
+    /// </summary>
+    [Fact]
+    public void A_Large_Latest_Value_Whose_Stream_Open_Found_The_Table_Full_Once_Goes_Out_When_It_Has_Room()
+    {
+        OpenFailureConnector? wrapper = null;
+        using SessionHarness h = new(table: Mixed, client: GroupKit.Prompt, server: DatagramKit.Quiet,
+            connector: inner => wrapper = new OpenFailureConnector(inner));
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        int? arrived = null;
+        server.RegisterHandler(Latest, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => arrived = BitConverter.ToInt32(payload));
+
+        // The table is full for this one open (this end's streams hold its share, or their slots are still being cleaned
+        // up); it has room again straight after.
+        wrapper!.Transport!.FailLatestOpens = 1;
+        SendResult result = client.SendCopy(new SendHeader(Latest, 3), DatagramKit.Payload(42, 8_000), SendOptions.Tracked);
+        Assert.True(result.IsAdmitted);
+        bool delivered = h.RunUntil(() => arrived == 42, 2_000_000);
+        long waited = 0;
+        if (!delivered)
+        {
+            long start = h.Network.NowMicros;
+            h.RunUntil(() => arrived == 42 || client.GetDeliveryStatus(result.Token) != DeliveryStatus.Pending, 40_000_000);
+            waited = (h.Network.NowMicros - start) / 1_000;
+        }
+
+        Assert.Equal(1, wrapper.Transport.FailedOpens);
+        Assert.True(delivered,
+            $"two seconds after one open found the table full the value had not arrived; it then ended {client.GetDeliveryStatus(result.Token)} "
+            + $"{waited} ms later, arrived: {arrived is not null}");
+    }
+
     private static void AssertExactlyOnce(List<(int Id, SendToken Token, bool FromServer)> tracked, Func<(int Id, SendToken Token, bool FromServer), QuiclyPeer> sender,
         Dictionary<int, int> atClient, Dictionary<int, int> atServer, string when)
     {
@@ -395,5 +436,64 @@ public class ReviewStackgroupresourcesTests
         }
 
         return rented;
+    }
+
+    /// <summary>Answers <see cref="TransportStatus.OutOfMemory"/> to the next ReliableLatest stream opens (a full stream table).</summary>
+    private sealed unsafe class OpenFailureTransport(ITransport inner) : ITransport
+    {
+        public int FailLatestOpens { get; set; }
+
+        public int FailedOpens { get; private set; }
+
+        public TransportCapabilities Capabilities => inner.Capabilities;
+
+        public TransportState State => inner.State;
+
+        public TransportStatus SendDatagram(TransportSegment* segments, int count, ulong context, TransportSendFlags flags) =>
+            inner.SendDatagram(segments, count, context, flags);
+
+        public TransportStatus OpenStream(StreamKind kind, ulong context, ushort priority, out TransportStreamId id)
+        {
+            if (FailLatestOpens > 0 && PeerCore.TryDecodeEngineStreamContext(context, out ChannelMode mode, out _, out _) && mode == ChannelMode.ReliableLatest)
+            {
+                FailLatestOpens--;
+                FailedOpens++;
+                id = TransportStreamId.None;
+                return TransportStatus.OutOfMemory;
+            }
+
+            return inner.OpenStream(kind, context, priority, out id);
+        }
+
+        public TransportStatus StartStream(TransportStreamId id) => inner.StartStream(id);
+
+        public TransportStatus SendStream(TransportStreamId id, TransportSegment* segments, int count, ulong context, TransportSendFlags flags) =>
+            inner.SendStream(id, segments, count, context, flags);
+
+        public void AbortStream(TransportStreamId id, ulong errorCode, StreamAbortDirection direction) => inner.AbortStream(id, errorCode, direction);
+
+        public void SetStreamPriority(TransportStreamId id, ushort priority) => inner.SetStreamPriority(id, priority);
+
+        public long GetQuicStreamId(TransportStreamId id) => inner.GetQuicStreamId(id);
+
+        public void ResumeStreamReceive(TransportStreamId id, int bytesConsumed) => inner.ResumeStreamReceive(id, bytesConsumed);
+
+        public void CloseStream(TransportStreamId id) => inner.CloseStream(id);
+
+        public void UpdatePeerStreamLimits(ushort bidirectional, ushort unidirectional) => inner.UpdatePeerStreamLimits(bidirectional, unidirectional);
+
+        public void Close(ulong errorCode, ReadOnlySpan<byte> reason) => inner.Close(errorCode, reason);
+
+        public void GetStatistics(out TransportStatistics statistics) => inner.GetStatistics(out statistics);
+
+        public void Dispose() => inner.Dispose();
+    }
+
+    private sealed class OpenFailureConnector(ITransportConnector inner) : ITransportConnector
+    {
+        public OpenFailureTransport? Transport { get; private set; }
+
+        public ITransport Connect(System.Net.EndPoint endpoint, string? serverName, ITransportSink sink) =>
+            Transport = new OpenFailureTransport(inner.Connect(endpoint, serverName, sink));
     }
 }

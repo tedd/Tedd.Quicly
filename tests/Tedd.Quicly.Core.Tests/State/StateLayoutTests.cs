@@ -114,7 +114,7 @@ public unsafe class StateLayoutTests
         Assert.Equal(40, (int)((byte*)&r.PendingAcks - b));
         Assert.Equal(44, (int)((byte*)&r.PendingAckVersion - b));
         Assert.Equal(48, (int)((byte*)&r.StagedBytes - b));
-    }
+        Assert.Equal(56, (int)((byte*)&r.NewestSequence - b));    }
 
     [Fact]
     public void Key_Slot_Offsets_Match_The_Documented_Layout()
@@ -142,6 +142,7 @@ public unsafe class StateLayoutTests
         Assert.Equal(24, (int)((byte*)&r.Key - b));
         Assert.Equal(32, (int)((byte*)&r.PendingAckVersion - b));
         Assert.Equal(36, (int)((byte*)&r.Updates - b));
+        Assert.Equal(40, (int)((byte*)&r.LastAcceptedExtended - b));
     }
 
     [Fact]

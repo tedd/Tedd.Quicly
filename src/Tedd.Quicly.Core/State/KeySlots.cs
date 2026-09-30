@@ -57,7 +57,10 @@ public struct KeySendSlot
 
     /// <summary>Version of the most recent value sent (or queued) for the key. Owner: game thread.</summary>
     [FieldOffset(0)] public uint CurrentVersion;
-    /// <summary>Highest version the peer acknowledged. Owner: game thread.</summary>
+    /// <summary>
+    /// The last version the peer acknowledged that was, when the ack arrived, the version most recently transmitted for the
+    /// key. Diagnostic: it decides nothing. Owner: game thread.
+    /// </summary>
     [FieldOffset(4)] public uint AckedVersion;
     /// <summary>Lease holding the current value (kept for retries until acked). Owner: game thread.</summary>
     [FieldOffset(8)] public BufferLease CurrentLease;
@@ -85,7 +88,8 @@ public struct KeySendSlot
 /// <remarks>
 /// Layout: <see cref="LastAccepted"/> (0), <see cref="Mailbox"/> (4), <see cref="Reassembly"/> (8),
 /// <see cref="Flags"/> (12), <see cref="LastUpdateMicros"/> (16), <see cref="Key"/> (24),
-/// <see cref="PendingAckVersion"/> (32), <see cref="Updates"/> (36), reserved (40 … 63).
+/// <see cref="PendingAckVersion"/> (32), <see cref="Updates"/> (36), <see cref="LastAcceptedExtended"/> (40),
+/// reserved (48 … 63).
 /// </remarks>
 [StructLayout(LayoutKind.Explicit, Size = Size)]
 public struct KeyRecvSlot
@@ -93,7 +97,10 @@ public struct KeyRecvSlot
     /// <summary>Size in bytes.</summary>
     public const int Size = 64;
 
-    /// <summary>Last accepted sequence/version for the key. Owner: transport thread.</summary>
+    /// <summary>
+    /// Last accepted sequence/version for the key as it appeared on the wire: what a latest-ack and a KeyRetired notice
+    /// name. Staleness is decided on <see cref="LastAcceptedExtended"/>. Owner: transport thread.
+    /// </summary>
     [FieldOffset(0)] public uint LastAccepted;
     /// <summary>Index of the key's mailbox in the channel's <see cref="Mailboxes"/> (normally the slot itself), or -1. Owner: transport thread.</summary>
     [FieldOffset(4)] public int Mailbox;
@@ -112,4 +119,10 @@ public struct KeyRecvSlot
     [FieldOffset(32)] public uint PendingAckVersion;
     /// <summary>Values accepted for the key (statistics). Owner: transport thread.</summary>
     [FieldOffset(36)] public uint Updates;
+    /// <summary>
+    /// <see cref="LastAccepted"/> extended to 64 bits on the channel's version clock (valid with
+    /// <see cref="KeyRecvFlags.HasAccepted"/>; PROTOCOL.md §8): a value is newer than the key's last one exactly when its
+    /// extended version is greater, however long the key idled. Owner: transport thread.
+    /// </summary>
+    [FieldOffset(40)] public ulong LastAcceptedExtended;
 }

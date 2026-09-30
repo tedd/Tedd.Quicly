@@ -81,10 +81,20 @@ public struct ChannelSendState
 /// callback). Counters live in <see cref="ChannelRecvCounters"/>.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Layout: <see cref="LastAccepted"/> (0), <see cref="HighestSeen"/> (4), <see cref="Stream"/> (8),
 /// <see cref="Reassemblies"/> (16), <see cref="ActiveGroups"/> (20), <see cref="LastReceiveMicros"/> (24),
 /// <see cref="Parser"/> (32), <see cref="Flags"/> (36), <see cref="PendingAcks"/> (40),
-/// <see cref="PendingAckVersion"/> (44), <see cref="StagedBytes"/> (48), reserved (56).
+/// <see cref="PendingAckVersion"/> (44), <see cref="StagedBytes"/> (48), <see cref="NewestSequence"/> (56).
+/// </para>
+/// <para>
+/// <b>The sequence clock</b> (UnreliableSequenced, keyed and unkeyed; PROTOCOL.md §8). A sequenced channel's sender numbers
+/// every message from one counter, so <see cref="NewestSequence"/> — the newest sequence that arrived on the channel, for
+/// any key, extended to 64 bits — says where the sender's counter is. Every arriving sequence is extended against it
+/// (<see cref="Primitives.SerialNumber.Extend(ulong, ushort)"/>) and compared as a 64-bit number, which is what lets a key
+/// idle for longer than half the sequence space. <see cref="LastReceiveMicros"/> is when the clock last advanced. The
+/// whole struct is zeroed at an epoch reset or reconnect, which restarts the clock with the sender's counter.
+/// </para>
 /// </remarks>
 [StructLayout(LayoutKind.Explicit, Size = Size)]
 public struct ChannelRecvState
@@ -92,7 +102,11 @@ public struct ChannelRecvState
     /// <summary>Size in bytes.</summary>
     public const int Size = 64;
 
-    /// <summary>Last accepted sequence for unkeyed sequenced channels. Owner: transport thread.</summary>
+    /// <summary>
+    /// Last accepted sequence for unkeyed sequenced channels (valid with <see cref="ChannelRecvFlags.HasAccepted"/>).
+    /// Diagnostic: acceptance is decided on <see cref="NewestSequence"/>, whose low bits this equals on such a channel.
+    /// Owner: transport thread.
+    /// </summary>
     [FieldOffset(0)] public uint LastAccepted;
     /// <summary>Highest sequence seen (statistics / reorder detection). Owner: transport thread.</summary>
     [FieldOffset(4)] public uint HighestSeen;
@@ -102,7 +116,11 @@ public struct ChannelRecvState
     [FieldOffset(16)] public int Reassemblies;
     /// <summary>Peer group streams currently open on this channel. Owner: transport thread.</summary>
     [FieldOffset(20)] public int ActiveGroups;
-    /// <summary>Clock micros of the last accepted message. Owner: transport thread.</summary>
+    /// <summary>
+    /// Clock micros (the receive callback's stamp) at which <see cref="NewestSequence"/> last advanced, on sequenced
+    /// channels; unused elsewhere. A sequence behind the newest that arrives more than two seconds after this is taken for
+    /// a forward jump of at least half the sequence space (the resynchronisation of PROTOCOL.md §8). Owner: transport thread.
+    /// </summary>
     [FieldOffset(24)] public long LastReceiveMicros;
     /// <summary>Index of the channel's stream-frame parser in the stream table, or -1. Owner: transport thread.</summary>
     [FieldOffset(32)] public int Parser;
@@ -114,6 +132,12 @@ public struct ChannelRecvState
     [FieldOffset(44)] public uint PendingAckVersion;
     /// <summary>Bytes held in staging leases (partial stream messages, reassembly). Owner: transport thread.</summary>
     [FieldOffset(48)] public long StagedBytes;
+    /// <summary>
+    /// The newest sequence seen on a sequenced channel this epoch, for any key, extended to 64 bits and biased by one
+    /// sequence span (2^16 or 2^32) so that 0 means "nothing seen yet". It never decreases within an epoch.
+    /// Owner: transport thread.
+    /// </summary>
+    [FieldOffset(56)] public ulong NewestSequence;
 }
 
 /// <summary>

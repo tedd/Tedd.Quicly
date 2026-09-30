@@ -2,9 +2,8 @@ using System.Buffers.Binary;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (recheck lens) of the pass-and-backlog rule (016038f): "an unreliable channel that nobody drains closes the ring
@@ -14,6 +13,11 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// (ReceiveQueues.BeginPass: count 0), so its next burst is "current" again, fills the pool by evicting the other
 /// channel's whole backlog, and is held. The two take turns, and the ring is closed in every Poll interval.
 /// </summary>
+/// <remarks>
+/// Fixed since: a backlog ends only when the application drains the channel (or registers a handler), not when other
+/// channels evicted its queue to nothing (<c>ReceiveQueues.BeginPass</c>); each undrained channel can therefore hold the
+/// ring once, and not again until it has been drained. The description above is what the test found before the fix.
+/// </remarks>
 public class ReviewRecheckRingHoldTests
 {
     private const int Batch = 32;

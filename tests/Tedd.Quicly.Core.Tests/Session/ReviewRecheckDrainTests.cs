@@ -1,14 +1,18 @@
 using System.Buffers.Binary;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (recheck lens) of the pass-and-backlog rule of the drain queues (016038f): what a host that polls and then
 /// drains every one of its channels completely, every frame, still loses.
 /// </summary>
+/// <remarks>
+/// Fixed since: a message held across a pass start is held again while its channel was drained since the pass before
+/// (<c>ReceiveQueues.TryAppendDatagram</c>); only a channel nobody drained loses it. The descriptions below are what the
+/// tests found before the fix.
+/// </remarks>
 public class ReviewRecheckDrainTests
 {
     private const int Batch = 32;

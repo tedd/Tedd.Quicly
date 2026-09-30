@@ -1,8 +1,7 @@
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Review (recheck lens) of d6df494 (the work probe no longer counts a mailbox value of a channel without a handler).
@@ -12,6 +11,11 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// while the level stays clear, so a host that polls only when the level says so never re-arms the edge: every later
 /// publication of the peer (a message for a handler, a completion, a close) raises no signal.
 /// </summary>
+/// <remarks>
+/// Fixed since: a <see cref="QuiclyPeer.HasPendingWork"/> probe that finds nothing re-arms a consumed edge (and reads the
+/// level again behind the fence), so the host it sends back to sleep is woken by the next publication. The description
+/// above is what the test found before the fix.
+/// </remarks>
 public class ReviewRecheckWorkSignalTests
 {
     /// <summary>2 unordered with a handler; 3 keyed sequenced, coalescing (a mailbox), read with Drain.</summary>

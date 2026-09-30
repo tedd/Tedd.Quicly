@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
 using Tedd.Quicly.Core.Session;
 
-namespace Tedd.Quicly.Client.Tests.Review;
+namespace Tedd.Quicly.Client.Tests;
 
 /// <summary>
 /// Review (recheck lens) of the pass-and-backlog rule of the drain queues (016038f). A pass starts with every Poll that
@@ -10,6 +10,11 @@ namespace Tedd.Quicly.Client.Tests.Review;
 /// a second Poll, and that makes those messages "backlog left undrained across a Poll" before the application had any
 /// chance to drain them.
 /// </summary>
+/// <remarks>
+/// Fixed since: the first pass of a session counts as drained for every channel (<c>ReceiveQueues.BeginPass</c>) — nobody
+/// could drain before the pass in which the peer became Connected, whoever ran it — so what that pass queued is not backlog
+/// when the application's first Poll begins. The description above is what the test found before the fix.
+/// </remarks>
 public class ReviewRecheckConnectTests
 {
     [Theory]

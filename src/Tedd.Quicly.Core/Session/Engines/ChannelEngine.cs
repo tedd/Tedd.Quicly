@@ -233,6 +233,18 @@ internal abstract class ChannelEngine : IDisposable
     public abstract void OnStreamClosed(TransportStreamId id, bool aborted, ulong errorCode);
 
     /// <summary>
+    /// A peer stream this engine accepted ended (transport thread): the <see cref="OnStreamClosed"/> of a stream that has a
+    /// <c>StreamRecord</c>, with the value the engine gave it in <see cref="StreamAccept.Cookie"/>. An engine that keeps a
+    /// record per peer stream overrides this to release it by that value instead of searching for the id; the default is
+    /// <see cref="OnStreamClosed"/>. Exactly one of the two is called for a stream, once.
+    /// </summary>
+    /// <param name="id">The stream.</param>
+    /// <param name="cookie">The engine's per-stream value.</param>
+    /// <param name="aborted">True when the stream was reset or stopped rather than finished.</param>
+    /// <param name="errorCode">The reset code.</param>
+    public virtual void OnPeerStreamClosed(TransportStreamId id, long cookie, bool aborted, ulong errorCode) => OnStreamClosed(id, aborted, errorCode);
+
+    /// <summary>
     /// A stream this engine opened with a context from <see cref="PeerCore.MakeEngineStreamContext"/> finished starting
     /// (transport thread, routed by the context's mode). <paramref name="status"/> is <see cref="TransportStatus.Success"/>, or
     /// why the stream never started: with <see cref="TransportStatus.StreamLimitReached"/> the peer's stream limit refused it,

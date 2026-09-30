@@ -92,7 +92,7 @@ internal sealed unsafe class PeerCore : IDisposable
     private ReceiveMailbox[] _mailboxes = [];
     private SpscRing<TransportStreamId> _pendedStreams;
     // Rings SetTransportPeerStreams replaced: kept until Dispose, because the game thread may still be reading one.
-    private List<SpscRing<TransportStreamId>>? _retiredPendedStreams;
+    private SpscRing<TransportStreamId>[]? _retiredPendedStreams;
     // Cold, by slot: the shared payload an entry holds one reference on (SendShared), released in ReleasePayload.
     private readonly SharedLeaseTable?[] _sharedTables;
     private readonly SharedLease[] _sharedLeases;
@@ -638,6 +638,37 @@ internal sealed unsafe class PeerCore : IDisposable
     public SpscRing<TransportStreamId> PendedStreams => Volatile.Read(ref _pendedStreams);
 
     /// <summary>
+    /// The rings <see cref="SetTransportPeerStreams"/> replaced, or null when there is none (any thread; the array is
+    /// published whole and never changed). A stream that was held when the ring was replaced is still in one of them, so
+    /// <see cref="QuiclyPeer.Poll"/> resumes from these as well: the replacement does not rest on the transport reporting
+    /// its grant before any stream can be held.
+    /// </summary>
+    public SpscRing<TransportStreamId>[]? RetiredPendedStreams => Volatile.Read(ref _retiredPendedStreams);
+
+    /// <summary>Whether a replaced ring still holds a stream to resume (any thread; part of the pending-work probe).</summary>
+    public bool HasRetiredPendedStreams
+    {
+        get
+        {
+            SpscRing<TransportStreamId>[]? retired = Volatile.Read(ref _retiredPendedStreams);
+            if (retired is null)
+            {
+                return false;
+            }
+
+            foreach (SpscRing<TransportStreamId> ring in retired)
+            {
+                if (!ring.IsEmpty)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Unidirectional streams the peer can have open at once on this connection: <see cref="PeerUnidirectionalStreamLimit"/>,
     /// or what the transport granted by itself when that is more (<see cref="SetTransportPeerStreams"/>). Everything the
     /// session keeps per peer stream — <see cref="PendedStreams"/>, the engines' receive records — is sized from it, so a
@@ -672,7 +703,13 @@ internal sealed unsafe class PeerCore : IDisposable
         SpscRing<TransportStreamId> current = _pendedStreams;
         if (capacity + 2 > current.Capacity)
         {
-            (_retiredPendedStreams ??= []).Add(current);
+            // The ring that is replaced stays allocated and stays readable: the game thread may be reading it, and streams
+            // held before this call are still in it (published before the new ring, so whoever sees the new one sees it).
+            SpscRing<TransportStreamId>[] retired = _retiredPendedStreams ?? [];
+            SpscRing<TransportStreamId>[] grown = new SpscRing<TransportStreamId>[retired.Length + 1];
+            retired.CopyTo(grown, 0);
+            grown[^1] = current;
+            Volatile.Write(ref _retiredPendedStreams, grown);
             Volatile.Write(ref _pendedStreams, new SpscRing<TransportStreamId>(capacity + 2));
         }
 
@@ -1871,6 +1908,16 @@ internal sealed unsafe class PeerCore : IDisposable
 
         while (PendedStreams.TryDequeue(out _))
         {
+        }
+
+        if (RetiredPendedStreams is { } retiredPended)
+        {
+            foreach (SpscRing<TransportStreamId> ring in retiredPended)
+            {
+                while (ring.TryDequeue(out _))
+                {
+                }
+            }
         }
 
         _localHead = 0;

@@ -904,7 +904,7 @@ public sealed unsafe partial class QuiclyPeer
         if (record.Tag == StreamTag.Engine)
         {
             record.Tag = StreamTag.Discard;
-            _core.GetEngine(record.ChannelIndex).OnStreamClosed(id, aborted, code);
+            _core.GetEngine(record.ChannelIndex).OnPeerStreamClosed(id, record.Cookie, aborted, code);
         }
         else
         {

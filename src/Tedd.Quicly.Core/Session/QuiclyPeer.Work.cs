@@ -112,6 +112,7 @@ public sealed unsafe partial class QuiclyPeer
             || core.LocalCompletionsQueued != 0
             || !core.ReceiveRing.IsEmpty
             || !core.PendedStreams.IsEmpty
+            || core.HasRetiredPendedStreams
             || !_pongs.IsEmpty
             || !_streamPings.IsEmpty
             || _transitionCount != 0

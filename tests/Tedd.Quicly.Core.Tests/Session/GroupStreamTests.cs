@@ -193,6 +193,46 @@ public class GroupStreamTests
     }
 
     [Fact]
+    public void A_Catch_Up_Resumes_No_More_Streams_Than_The_Ring_Has_Room_For()
+    {
+        // Three hundred one-message groups arrive while the client is late with its Poll: the first sixty-four fill its
+        // receive ring, the streams of the rest are held. Every Poll then empties the ring and lets as many streams go on
+        // as the ring has room for. Resuming all of them each time would hold most of them back again at once, Poll after
+        // Poll: a catch-up that costs the square of the hitch.
+        using SessionHarness h = new(link: new LinkOptions { PeerUnidiStreams = 1024 }, table: TestTables.Plumbing, server: GroupKit.Prompt, client: o =>
+        {
+            QuietOptions.Apply(o);
+            o.ReceiveRingCapacity = 64;
+        });
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        List<int> got = [];
+        client.RegisterHandler(11, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => got.Add(BitConverter.ToInt32(payload)));
+        for (int i = 0; i < 300; i++)
+        {
+            Assert.True(server.SendCopy(new SendHeader(11), DatagramKit.Payload(i, 4)).IsAdmitted);
+            for (int step = 0; step < 3; step++)
+            {
+                server.Poll();
+                server.Flush();
+                h.Network.Advance(1_000);
+            }
+        }
+
+        int held = GroupKit.OpenPeerGroups(client, 11);
+        long heldOnce = DatagramKit.Statistics(client).StreamReceivePends;
+        Assert.True(held > 200, $"only {held} streams were open at the late receiver");
+        Assert.True(heldOnce >= held - 64, $"{heldOnce} streams were held while the receiver was late");
+
+        Assert.True(h.RunUntil(() => got.Count == 300, 2_000_000), $"received {got.Count} of 300 messages");
+        Assert.Equal(Enumerable.Range(0, 300), got.Order());
+        long pends = DatagramKit.Statistics(client).StreamReceivePends;
+        Assert.True(pends <= heldOnce + 32, $"{heldOnce} streams were held while the receiver was late, and {pends - heldOnce} more times while it caught up");
+        Assert.Equal(0, DatagramKit.Statistics(client).StreamsReset);
+        Assert.True(h.RunUntil(() => GroupKit.OpenPeerGroups(client, 11) == 0));
+    }
+
+    [Fact]
     public void A_Reconnect_Gives_Back_Every_Receive_Record_Of_A_Peer_That_Was_Past_MaxGroups()
     {
         // The client is the receiver here (only a client reconnects). Its connection is lost while it holds more than

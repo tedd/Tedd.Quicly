@@ -1569,27 +1569,55 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
     }
 
     /// <inheritdoc/>
-    public override void OnStreamClosed(TransportStreamId id, bool aborted, ulong errorCode)
+    /// <remarks>
+    /// The cookie of a peer group stream is the index of its receive record (<see cref="OnStreamOpened"/>), so the record
+    /// is released without a search: a connection that once held a thousand streams open does not pay for a thousand
+    /// records at every later close.
+    /// </remarks>
+    public override void OnPeerStreamClosed(TransportStreamId id, long cookie, bool aborted, ulong errorCode)
     {
-        // Every engine hears the close of every locally opened stream, so this runs for streams that are not ours at all:
-        // nothing to look for while no peer group stream is open, and otherwise only the records that were ever in use.
+        if ((ulong)cookie < (ulong)_recv.Length)
+        {
+            int record = (int)cookie;
+            ref GroupRecv recv = ref _recv[record];
+            if ((recv.Flags & RecvInUse) != 0 && recv.Stream == id)
+            {
+                ReleaseRecord(ref recv, record);
+                return;
+            }
+        }
+
+        // Not the record the cookie names (no path does this): find it, so that nothing stays held.
         int high = _recvInUse != 0 ? _recvHigh : 0;
         for (int record = 0; record < high; record++)
         {
             ref GroupRecv recv = ref _recv[record];
             if ((recv.Flags & RecvInUse) != 0 && recv.Stream == id)
             {
-                ReleaseReceive(ref recv);
-                _openGroups[recv.Local]--;
-                _recvInUse--;
-                recv.Flags = 0;
-                recv.Stream = default;
-                recv.Next = _freeRecv;
-                _freeRecv = record;
+                ReleaseRecord(ref recv, record);
                 return;
             }
         }
+    }
 
+    private void ReleaseRecord(ref GroupRecv recv, int record)
+    {
+        ReleaseReceive(ref recv);
+        _openGroups[recv.Local]--;
+        _recvInUse--;
+        recv.Flags = 0;
+        recv.Stream = default;
+        recv.Next = _freeRecv;
+        _freeRecv = record;
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Only the streams this end opened arrive here (every engine hears the close of every locally opened stream); a peer
+    /// group stream ends through <see cref="OnPeerStreamClosed"/>. So the receive records are not looked at.
+    /// </remarks>
+    public override void OnStreamClosed(TransportStreamId id, bool aborted, ulong errorCode)
+    {
         if (!id.IsValid)
         {
             return;

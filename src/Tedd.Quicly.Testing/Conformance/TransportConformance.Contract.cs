@@ -23,6 +23,13 @@ public static unsafe partial class TransportConformance
     /// order, and nothing else for the stream). Either way the stream never starts: StartStream and SendStream(Start) on it
     /// return InvalidState, also after OnStreamsAvailable, and the peer never hears of it. CloseStream releases it, and a new
     /// stream started after OnStreamsAvailable delivers its data.
+    /// <para>
+    /// A third outcome is allowed for a send that carries the start (MsQuic has it: the start and the send are two calls,
+    /// and the worker can refuse the start between them): the call returns StreamLimitReached although OnStreamStarted
+    /// (StreamLimitReached) and OnStreamShutdownComplete were already delivered for the stream, and no send completion
+    /// follows, because the send was never accepted. A synchronous StreamLimitReached is final whether or not refusal
+    /// callbacks for the same stream arrive.
+    /// </para>
     /// </summary>
     public static void RefusedStreamNeverStartsAndIsRetriedOnANewStream(ITransportTestHarness harness)
     {
@@ -92,7 +99,12 @@ public static unsafe partial class TransportConformance
         }
         if (returned != TransportStatus.Success)
         {
-            s.Require(actual.Count == 0, $"a start refused synchronously ({returned}) was reported again for {id}: [{string.Join(", ", actual)}].");
+            // A synchronous refusal is final. The one combined case: the worker refused the start before the call queued its
+            // send, so the refusal callbacks may come with it — the start's report and the shutdown, never a send completion.
+            string refusedReport = "StreamStarted " + TransportStatus.StreamLimitReached;
+            bool combined = returned == TransportStatus.StreamLimitReached
+                && (actual.SequenceEqual([refusedReport]) || actual.SequenceEqual([refusedReport, nameof(RecordedEventKind.StreamShutdownComplete)]));
+            s.Require(actual.Count == 0 || combined, $"a start refused synchronously ({returned}) was reported again for {id}: [{string.Join(", ", actual)}].");
             return;
         }
         var expected = new List<string> { "StreamStarted " + TransportStatus.StreamLimitReached };
@@ -106,7 +118,8 @@ public static unsafe partial class TransportConformance
     /// callback (where MsQuic runs it inline): either synchronously (the call returns StreamLimitReached and nothing follows
     /// for the stream) or asynchronously (the call returns Success, exactly one OnStreamStarted carries StreamLimitReached and
     /// a send accepted with the start completes canceled, exactly once). ITransport: "If a send call returns anything but
-    /// Success no completion follows".
+    /// Success no completion follows". The combined case of <see cref="RefusedStreamNeverStartsAndIsRetriedOnANewStream"/>
+    /// is allowed here too: a synchronous refusal after which the start's report and the shutdown of the same stream arrive.
     /// </summary>
     public static void StartRefusedInsideACallbackIsReportedOnce(ITransportTestHarness harness)
     {
@@ -157,9 +170,18 @@ public static unsafe partial class TransportConformance
             return;
         }
         s.Require(returned == TransportStatus.StreamLimitReached, $"{what} returned {returned}, expected StreamLimitReached (or Success with an asynchronous report).");
+        // A synchronous refusal is final; the combined case (the worker refused the start before the send was queued) may
+        // have delivered the start's report and the shutdown, never a send completion.
         int streamEvents = 0;
-        foreach (RecordedEvent e in s.ClientSink.Events) streamEvents += IsStreamEvent(e.Kind) && e.StreamId == id ? 1 : 0;
-        s.Require(streamEvents == 0 && completions == 0, $"{what} returned {returned} synchronously, yet {streamEvents} stream callback(s) and {completions} send completion(s) followed for {id}.");
+        int shutdowns = 0;
+        foreach (RecordedEvent e in s.ClientSink.Events)
+        {
+            if (!IsStreamEvent(e.Kind) || e.StreamId != id) continue;
+            streamEvents++;
+            shutdowns += e.Kind == RecordedEventKind.StreamShutdownComplete ? 1 : 0;
+        }
+        bool combined = started <= 1 && shutdowns <= 1 && streamEvents == started + shutdowns && (started == 0 || status == TransportStatus.StreamLimitReached);
+        s.Require((streamEvents == 0 || combined) && completions == 0, $"{what} returned {returned} synchronously, yet {streamEvents} stream callback(s) and {completions} send completion(s) followed for {id}.");
     }
 
     /// <summary>Starts one stream and sends on another from inside the first datagram callback (MsQuic runs such calls inline).</summary>

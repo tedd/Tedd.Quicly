@@ -781,7 +781,7 @@ internal sealed unsafe partial class BulkEngine : ChannelEngine, IBulkCancelSink
                 AbandonStream(ref send);
                 if (status == TransportStatus.StreamLimitReached)
                 {
-                    send.CreditGeneration = _core.StreamCreditGeneration;
+                    // Retain the generation captured before this start: a concurrent grant must enable its retry.
                     StreamsRefused++;
                 }
                 else

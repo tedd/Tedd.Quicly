@@ -20,8 +20,11 @@ public unsafe class Lz4BlockInPlaceTests
         return buffer.AsSpan(0, n).ToArray();
     }
 
-    /// <summary>The staging block a message gets: room for the compressed bytes, and for the decoded ones plus the margin.</summary>
-    private static int BlockFor(int compressed, int raw) => Math.Max(compressed, raw + Lz4Block.GetInPlaceMargin(compressed));
+    /// <summary>
+    /// The staging block a message gets: room for the compressed bytes and the decoded ones. The margin lives on the decoder's
+    /// stack, unless the compressed block is larger than 504 KiB.
+    /// </summary>
+    private static int BlockFor(int compressed, int raw) => checked((int)Lz4Block.GetInPlaceLength(compressed, raw));
 
     /// <summary>Decodes <paramref name="compressed"/> in place in a block of <paramref name="blockLength"/> bytes; null when refused.</summary>
     private static byte[]? InPlace(byte[] compressed, int raw, int blockLength)
@@ -40,18 +43,29 @@ public unsafe class Lz4BlockInPlaceTests
         Assert.Equal(input, reference);
 
         int block = BlockFor(compressed.Length, input.Length);
+        if (compressed.Length <= 504 * 1024)
+        {
+            Assert.Equal(Math.Max(compressed.Length, input.Length), block); // the margin never grows the block
+        }
+
         byte[]? decoded = InPlace(compressed, input.Length, block);
-        Assert.True(decoded is not null, $"{what}: refused in a block of raw + margin ({block} bytes, C {compressed.Length}, R {input.Length})");
+        Assert.True(decoded is not null, $"{what}: refused in a block of {block} bytes (C {compressed.Length}, R {input.Length})");
         Assert.Equal(input, decoded);
 
-        // Larger blocks decode too.
-        Assert.Equal(input, InPlace(compressed, input.Length, block + 1));
-        Assert.Equal(input, InPlace(compressed, input.Length, block + 4096));
-
-        // One byte short of raw + margin is refused (unless the compressed bytes alone need the larger block).
-        if (input.Length + Lz4Block.GetInPlaceMargin(compressed.Length) - 1 >= compressed.Length)
+        // Larger blocks decode too: every share of the margin between the stack and the block, and none on the stack.
+        int full = input.Length + Lz4Block.GetInPlaceMargin(compressed.Length);
+        foreach (int length in new[] { block + 1, block + 15, block + 16, block + 17, (block + full) / 2, full - 1, full, full + 1, full + 4096 })
         {
-            Assert.Null(InPlace(compressed, input.Length, input.Length + Lz4Block.GetInPlaceMargin(compressed.Length) - 1));
+            if (length >= block)
+            {
+                Assert.Equal(input, InPlace(compressed, input.Length, length));
+            }
+        }
+
+        // One byte short is refused (when the compressed bytes still fit it).
+        if (block - 1 >= compressed.Length)
+        {
+            Assert.Null(InPlace(compressed, input.Length, block - 1));
         }
     }
 
@@ -145,29 +159,52 @@ public unsafe class Lz4BlockInPlaceTests
     [Fact]
     public void Decodes_At_And_Around_Every_Size_Class_Boundary()
     {
-        // The staging block is a pool block: messages whose raw + margin is just at, under and over a class's size.
+        // The staging block is a pool block: messages whose raw size, and whose raw + margin, is just at, under and over a
+        // class's size. A raw size up to the class's size decodes in that class (review RC2R1-1: the margin used to move a
+        // 64 KiB message into a 256 KiB block).
         foreach (int blockSize in new[] { 1536, 4096, 16_384, 65_536, 262_144 })
         {
-            foreach (string kind in new[] { "game", "random", "mixed", "adversarial" })
+            foreach (string kind in new[] { "game", "random", "mixed", "adversarial", "zeroes" })
             {
-                for (int delta = -40; delta <= 2; delta++)
+                foreach (int edge in new[] { blockSize, blockSize - 32 - (blockSize >> 8) })
                 {
-                    int size = blockSize + delta - 32 - (blockSize >> 8);
-                    if (size <= 0)
+                    for (int delta = -40; delta <= 2; delta++)
                     {
-                        continue;
-                    }
+                        int size = edge + delta;
+                        if (size <= 0)
+                        {
+                            continue;
+                        }
 
-                    byte[] input = Make(kind, size, delta + 100);
-                    byte[] compressed = Compress(input);
-                    AssertDecodesInPlace(input, compressed, $"{kind} {size} around {blockSize}");
-                    if (BlockFor(compressed.Length, size) <= blockSize)
-                    {
-                        Assert.Equal(input, InPlace(compressed, size, blockSize));
+                        byte[] input = Make(kind, size, delta + 100);
+                        byte[] compressed = Compress(input);
+                        AssertDecodesInPlace(input, compressed, $"{kind} {size} around {blockSize}");
+                        if (BlockFor(compressed.Length, size) <= blockSize)
+                        {
+                            Assert.Equal(input, InPlace(compressed, size, blockSize));
+                        }
+
+                        if (size <= blockSize && compressed.Length <= blockSize)
+                        {
+                            Assert.True(BlockFor(compressed.Length, size) <= blockSize, $"{kind} {size} needs more than {blockSize}");
+                        }
                     }
                 }
             }
         }
+    }
+
+    [Fact]
+    public void A_Compressed_Block_Above_504_KiB_Keeps_The_Rest_Of_Its_Margin_In_The_Block()
+    {
+        // The stack holds InPlaceTailCapacity bytes of the margin; a larger margin needs the rest of it in the block.
+        byte[] input = Mixed(3 * 1024 * 1024, 11);
+        byte[] compressed = Compress(input);
+        int margin = Lz4Block.GetInPlaceMargin(compressed.Length);
+        Assert.True(margin > Lz4Block.InPlaceTailCapacity, $"C {compressed.Length}: margin {margin}");
+        int block = BlockFor(compressed.Length, input.Length);
+        Assert.Equal(input.Length + margin - Lz4Block.InPlaceTailCapacity, block);
+        AssertDecodesInPlace(input, compressed, "mixed 3 MiB");
     }
 
     [Fact]

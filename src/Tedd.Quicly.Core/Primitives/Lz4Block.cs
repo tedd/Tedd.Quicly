@@ -22,9 +22,9 @@ namespace Tedd.Quicly.Core.Primitives;
 /// <see cref="Decompress"/> is safe against malicious input: every read and write is bounds-checked and malformed
 /// input reports <c>-1</c> instead of throwing. <see cref="DecompressExact"/> additionally requires the decoded
 /// length to equal the destination length, which is what protocol receivers need (PROTOCOL.md §2.1).
-/// <see cref="TryDecompressInPlace"/> decodes a block in the buffer it arrived in, given
-/// <see cref="GetInPlaceMargin"/> bytes beyond the decoded size: a receiver stages a compressed reliable message in a
-/// block that large and needs no second buffer for it.
+/// <see cref="TryDecompressInPlace"/> decodes a block in the buffer it arrived in, if the buffer holds the decoded size
+/// (<see cref="GetInPlaceLength"/>). The in-place margin (<see cref="GetInPlaceMargin"/>) is kept on the stack. A
+/// receiver stages a compressed reliable message in a block that large and needs no second buffer for it.
 /// </para>
 /// <para>
 /// Performance history (table clearing, 8-byte match counting, 16-byte short copies, and the rejected
@@ -471,58 +471,106 @@ public static class Lz4Block
         Decompress(source, destination) == destination.Length;
 
     /// <summary>
-    /// The room an in-place decode needs beyond the decoded length (<see cref="TryDecompressInPlace"/>): a block of
-    /// <c>rawLength + GetInPlaceMargin(compressedLength)</c> bytes decodes any block the compressor wrote in place, with
-    /// the compressed bytes moved to its end. The same margin as the reference implementation's
-    /// <c>LZ4_DECOMPRESS_INPLACE_MARGIN</c>; this decoder writes at most 16 bytes past a copy, which it covers.
+    /// The most source bytes <see cref="TryDecompressInPlace"/> keeps outside the block, in a stack buffer, while it decodes
+    /// (<see cref="GetInPlaceLength"/>). It covers the whole margin of a compressed block of up to 504 KiB.
+    /// </summary>
+    internal const int InPlaceTailCapacity = 2048;
+
+    /// <summary>
+    /// The room an in-place decode needs beyond the decoded length when the whole compressed block sits in the buffer
+    /// (<see cref="TryDecompressInPlace"/>): a span of <c>rawLength + GetInPlaceMargin(compressedLength)</c> bytes, with
+    /// the compressed bytes at its end, decodes any block the compressor wrote. This is the same margin as the reference
+    /// implementation's <c>LZ4_DECOMPRESS_INPLACE_MARGIN</c>. This decoder writes at most 16 bytes past a copy, and the
+    /// margin covers that.
+    /// <see cref="TryDecompressInPlace"/> keeps the last bytes of that span in a stack buffer, so its block needs only
+    /// <see cref="GetInPlaceLength"/> bytes.
     /// </summary>
     /// <param name="compressedLength">The compressed length.</param>
     /// <returns>The margin in bytes.</returns>
     public static int GetInPlaceMargin(int compressedLength) => (compressedLength >> 8) + 32;
 
     /// <summary>
+    /// The smallest block <see cref="TryDecompressInPlace"/> decodes a compressed block of
+    /// <paramref name="compressedLength"/> bytes in, to <paramref name="rawLength"/> bytes. It is the larger of the two
+    /// lengths whenever the margin fits <see cref="InPlaceTailCapacity"/> (any compressed block of up to 504 KiB), so the
+    /// margin never moves a message into a larger pool block than its decoded size needs.
+    /// </summary>
+    /// <param name="compressedLength">The compressed length (positive).</param>
+    /// <param name="rawLength">The decoded length (positive).</param>
+    /// <returns>The block length in bytes, in <see cref="long"/> because <paramref name="rawLength"/> may be a peer's.</returns>
+    internal static long GetInPlaceLength(int compressedLength, int rawLength)
+    {
+        long need = Math.Max(compressedLength, rawLength);
+        if (compressedLength > InPlaceTailCapacity)
+        {
+            // The stack buffer holds at most InPlaceTailCapacity of the margin; the block holds the rest.
+            need = Math.Max(need, (long)rawLength + GetInPlaceMargin(compressedLength) - InPlaceTailCapacity);
+        }
+
+        return need;
+    }
+
+    /// <summary>
     /// Decodes an LZ4 block that occupies the first <paramref name="compressedLength"/> bytes of <paramref name="block"/>
     /// into the first <paramref name="rawLength"/> bytes of the same block, and requires exactly that decoded length
-    /// (PROTOCOL.md §2.1), without a second buffer. Allocation-free and stateless.
+    /// (PROTOCOL.md §2.1), without a second buffer. It does not allocate and keeps no state.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The compressed bytes are first moved to the end of the block (one memmove); the decode then writes from the start
-    /// of the block towards them. Before every write the decoder checks that the bytes it writes, including the slack of a
-    /// 16-byte copy, end at or before the first compressed byte it has not read yet. With the margin of
-    /// <see cref="GetInPlaceMargin"/> the compressor's output never fails that check; a block that does (hostile input, or
-    /// one that needs more room than the block has) is refused, never decoded over its own unread input.
+    /// The decode works on a span of <c>rawLength + GetInPlaceMargin(compressedLength)</c> bytes with the compressed bytes
+    /// at its end. The decode writes from the start of the span towards them. That span is the block followed by a stack
+    /// buffer: when the block is shorter than the span, the last compressed bytes (at most <see cref="InPlaceTailCapacity"/>,
+    /// or all of them when they fit) are copied to the stack buffer first. The rest are moved to the end of the block
+    /// (one memmove). Decoded bytes only ever go to the block, below <paramref name="rawLength"/>.
     /// </para>
     /// <para>
-    /// Never throws and never touches memory outside <paramref name="block"/>, whatever the input. On
-    /// <see langword="false"/> the contents of <paramref name="block"/> are unspecified (the compressed bytes are gone).
+    /// Before every write the decoder checks that the bytes it writes, including the slack of a 16-byte copy, end at or
+    /// before the first compressed byte it has not read yet. With the margin of <see cref="GetInPlaceMargin"/> the
+    /// compressor's output never fails that check. A block that fails it (hostile input, or one that needs more room than
+    /// the block has) is refused. The decoder never writes over input it has not read yet.
+    /// </para>
+    /// <para>
+    /// Never throws and never touches memory outside <paramref name="block"/> and its own stack buffer, whatever the
+    /// input. On <see langword="false"/> the contents of <paramref name="block"/> are unspecified (the compressed bytes
+    /// are gone).
     /// </para>
     /// </remarks>
-    /// <param name="block">The buffer: the compressed block at its start, room for the decoded payload and the margin.</param>
+    /// <param name="block">The buffer: the compressed block at its start, room for the decoded payload.</param>
     /// <param name="compressedLength">Length of the compressed block at the start of <paramref name="block"/>.</param>
     /// <param name="rawLength">The exact decoded length.</param>
     /// <returns>
     /// <see langword="true"/> if the block decoded to exactly <paramref name="rawLength"/> bytes at the start of
-    /// <paramref name="block"/>; <see langword="false"/> if the lengths are out of range, <paramref name="block"/> lacks
-    /// <c>rawLength + GetInPlaceMargin(compressedLength)</c> bytes, or the input is malformed, truncated, decodes to another
-    /// length or would overwrite its own unread bytes.
+    /// <paramref name="block"/>. <see langword="false"/> if the lengths are out of range, <paramref name="block"/> is
+    /// shorter than <see cref="GetInPlaceLength"/>, or the input is malformed, truncated, decodes to another length or
+    /// would overwrite its own unread bytes.
     /// </returns>
+    [SkipLocalsInit]
     internal static bool TryDecompressInPlace(Span<byte> block, int compressedLength, int rawLength)
     {
         int blockLength = block.Length;
-        if (compressedLength <= 0 || rawLength <= 0 || compressedLength > blockLength
-            || rawLength > blockLength - GetInPlaceMargin(compressedLength))
+        if (compressedLength <= 0 || rawLength <= 0 || GetInPlaceLength(compressedLength, rawLength) > blockLength)
         {
             return false;
         }
 
-        // The source moves to the end of the block; Span.CopyTo is a memmove, so the overlap is fine.
-        int s = blockLength - compressedLength;
-        block.Slice(0, compressedLength).CopyTo(block.Slice(s));
+        // The span the decode works on is the block followed by a tail of `tailLength` bytes on the stack, together
+        // rawLength + margin long, or the block plus the whole source when the source is that short. GetInPlaceLength
+        // makes sure the tail fits its buffer.
+        long shortBy = (long)rawLength + GetInPlaceMargin(compressedLength) - blockLength;
+        int tailLength = shortBy <= 0 ? 0 : (int)Math.Min(shortBy, compressedLength);
+        Span<byte> tail = tailLength == 0 ? default : stackalloc byte[InPlaceTailCapacity];
 
-        // Offsets: ip is relative to the source (block[s..]), op is absolute and the destination is block[..rawLength].
-        // Invariant after every write: op <= s + ip, so the decoded bytes lie wholly below the unread source.
+        // Source bytes [0, split) lie in the block at [s, blockLength), and bytes [split, srcLength) lie in the tail. In
+        // span offsets the source starts at s, as if the tail continued the block.
+        int split = compressedLength - tailLength;
+        int s = blockLength - split;
+        block.Slice(split, tailLength).CopyTo(tail);
+        block.Slice(0, split).CopyTo(block.Slice(s)); // Span.CopyTo is a memmove, so the overlap is fine.
+
+        // ip is relative to the source and op is absolute: the destination is block[..rawLength]. After every write,
+        // op <= s + ip, so the decoded bytes lie wholly below the unread source. Bytes in the tail are never written.
         ref byte b = ref MemoryMarshal.GetReference(block);
+        ref byte t = ref MemoryMarshal.GetReference(tail);
         int srcLength = compressedLength;
         int dstLength = rawLength;
         int ip = 0;
@@ -535,7 +583,7 @@ public static class Lz4Block
                 return false;
             }
 
-            int token = Unsafe.Add(ref b, s + ip++);
+            int token = SourceAt(ref b, ref t, s, split, ip++);
 
             // Literals.
             int literalLength = token >> MlBits;
@@ -549,7 +597,7 @@ public static class Lz4Block
                         return false;
                     }
 
-                    x = Unsafe.Add(ref b, s + ip++);
+                    x = SourceAt(ref b, ref t, s, split, ip++);
                     literalLength += x;
                     if (literalLength > dstLength)
                     {
@@ -564,12 +612,15 @@ public static class Lz4Block
                 return false;
             }
 
-            // The first unread source byte after this run, in block offsets.
+            // The first unread source byte after this run, in span offsets.
             long unread = (long)s + ip + literalLength;
-            if (literalLength <= 16 && srcLength - ip >= 16 && dstLength - op >= 16 && op + 16 <= unread)
+            if (literalLength <= 16 && srcLength - ip >= 16 && dstLength - op >= 16 && op + 16 <= unread
+                && (ip >= split || ip + 16 <= split))
             {
-                // Copy16 loads both halves before it stores, and its slack stays below the unread source.
-                Copy16(ref Unsafe.Add(ref b, op), ref Unsafe.Add(ref b, s + ip));
+                // Copy16 loads both halves before it stores, and its slack stays below the unread source. The 16 bytes it
+                // reads lie wholly in the block or wholly in the tail.
+                ref byte from = ref (ip >= split ? ref Unsafe.Add(ref t, ip - split) : ref Unsafe.Add(ref b, s + ip));
+                Copy16(ref Unsafe.Add(ref b, op), ref from);
             }
             else
             {
@@ -578,8 +629,18 @@ public static class Lz4Block
                     return false;
                 }
 
-                // The destination may overlap the run it copies (op <= s + ip): a memmove, never a cpblk.
-                block.Slice(s + ip, literalLength).CopyTo(block.Slice(op, literalLength));
+                // The part in the block may overlap its destination (op <= s + ip): a memmove, never a cpblk. The part in the
+                // tail follows it.
+                int inBlock = Math.Clamp(split - ip, 0, literalLength);
+                if (inBlock > 0)
+                {
+                    block.Slice(s + ip, inBlock).CopyTo(block.Slice(op, inBlock));
+                }
+
+                if (inBlock < literalLength)
+                {
+                    tail.Slice(ip + inBlock - split, literalLength - inBlock).CopyTo(block.Slice(op + inBlock));
+                }
             }
 
             ip += literalLength;
@@ -597,7 +658,7 @@ public static class Lz4Block
                 return false;
             }
 
-            int offset = Unsafe.Add(ref b, s + ip) | (Unsafe.Add(ref b, s + ip + 1) << 8);
+            int offset = SourceAt(ref b, ref t, s, split, ip) | (SourceAt(ref b, ref t, s, split, ip + 1) << 8);
             ip += 2;
             if (offset == 0 || offset > op)
             {
@@ -616,7 +677,7 @@ public static class Lz4Block
                         return false;
                     }
 
-                    x = Unsafe.Add(ref b, s + ip++);
+                    x = SourceAt(ref b, ref t, s, split, ip++);
                     matchLength += x;
                     if (matchLength > dstLength)
                     {
@@ -682,6 +743,11 @@ public static class Lz4Block
             }
         }
     }
+
+    /// <summary>Source byte <paramref name="ip"/> of an in-place decode: in the block below <paramref name="split"/>, else in the tail.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static byte SourceAt(ref byte block, ref byte tail, int s, int split, int ip) =>
+        ip < split ? Unsafe.Add(ref block, s + ip) : Unsafe.Add(ref tail, ip - split);
 
     private static int GetHashShift(int scratchLength)
     {

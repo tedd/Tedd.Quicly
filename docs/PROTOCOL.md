@@ -570,7 +570,7 @@ logging.
 | concurrent reassemblies per channel (`MaxReassemblies`) | 16 | evict oldest; reassembly expiry 2 × RTT + 100 ms; on a channel whose sequence carries ordering (`UnreliableSequenced`), a newer sequence for the same key abandons the older partial |
 | fragmented message size | ≤ 8 × (maxDatagram − header), the §2.1 `FragCount` cap, and ≤ `MaxMessageSize` | drop before any buffer is chosen |
 | control messages per second | 2 000 (per peer, configurable; size it from the channel table, because acks scale with keyed `ReliableLatest` traffic and one ack datagram carries about 170 keys) | connection close `LimitExceeded` |
-| decoded (decompressed) bytes per second per peer | 8 MiB/s | a compressed message of a reliable channel read with `Drain` waits in its queue (the channel's receive credit then holds its sender back); one dispatched to a handler, or of an unreliable channel, is dropped + counted (`DecodeFailures`) |
+| decoded (decompressed) bytes per second per peer | 8 MiB/s | a compressed message of a reliable channel read with `Drain` waits in its queue (the channel's receive credit then holds its sender back) — the only wait a `Drain` has for a compressed message: it never waits for a buffer; one dispatched to a handler, or of an unreliable channel, is dropped + counted (`DecodeFailures`) |
 | bulk transfers per direction per peer | 2 transfers, and an outbound range-request table of one more than that (3), so a further range can be asked for while both transfers run | `BulkReject` |
 | drain backlog of channels without a handler | a pool of min(ring depth, 1 024) messages (at least 2 per reliable channel); with a `ReliableOrdered` / `ReliableUnordered` channel in the table half of it is reserved for those, split evenly. What unreliable channels still have queued when a Poll begins, without having been drained empty since the Poll before (their *backlog*), may occupy the rest and pin ¼ of the byte budget (64 KiB, counted in buffer block sizes: 1 024 messages of ≤ 64 B, 256 of ≤ 256 B, 42 of ≤ 1 536 B) | `UnreliableUnordered` / `UnreliableSequenced` (not coalescing): the backlog is cut to the limit when a Poll begins and **drops oldest** + counts (`DrainQueueDrops`) after that — the oldest queued message of the backlogged channel furthest over its even share; a channel that is drained every frame, or has a handler, is not backlog and loses nothing. `ReliableOrdered` / `ReliableUnordered`: nothing is dropped; a channel nobody reads may have its reserved share of the pool and the same part of ¼ of the byte budget waiting, and beyond that the receiver stops consuming that channel's streams (transport back-pressure on those streams only) until the application drains the channel or registers a handler (see below) |
 | receive ring depth per peer | 4 096 entries | see byte budget row (a full ring drops datagrams newest-first, where the drain backlog above drops oldest-first: nothing can be evicted from the ring); latest/coalescing channels use per-key mailboxes instead of ring entries |
@@ -663,17 +663,21 @@ receiver-local; nothing on the wire changes and either end may run it alone.
   is disconnected (`LimitExceeded`): the receiver could not remember a further held stream, and would never
   resume it. That holds for the streams held back for a channel's credit and for those held back for the receive
   ring or the byte budget; a Poll also lets go of the entries beyond what the live streams account for, so a host
-  that polls every frame keeps neither list from growing. And a `Drain` that cannot get a buffer to decode a
-  compressed message of a reliable channel, or decode budget for it, leaves the message queued — the channel gives
-  nothing newer in that call, so its order holds — and returns what it has, instead of dropping it (§7 table,
-  decoded bytes). A decode buffer may take the byte budget past its limit by itself (the budget can be full of the
-  very compressed messages that wait), so the first message of a Drain that finds everything released, and a
-  message dispatched to a handler, get one — unless payloads the application still holds (drained and not yet
-  released, or retained) took the budget past its limit already; then a Drain waits and a handler's message is
-  dropped and counted. A message that can never get one is dropped and counted by both: a raw size that needs a
-  block larger than the budget, and a message whose own block is the pool's last block its decode could use (with
-  the default per-peer pool, whose largest class is one block of 256 KiB, a message above 64 KiB both compressed
-  and raw, on a channel whose `MaxMessageSize` was raised above the 64 KiB default).
+  that polls every frame keeps neither list from growing. And a compressed message of a reliable channel that no
+  handler reads is **staged in a block that holds its decoded size** (`RawLength` plus a small in-place margin,
+  within the largest pool block the byte budget can hold), taken all or nothing with its ring slot and its credit
+  at the message's start, charged to the credit and the byte budget from that start, and decoded in place. A
+  `Drain` therefore never waits for a buffer: without decode budget for such a message it leaves it queued — the
+  channel gives nothing newer in that call, so its order holds — and returns what it has, instead of dropping it
+  (§7 table, decoded bytes). `RawLength` is the peer's declaration, as `Length` is, and is held to the same caps:
+  `MaxMessageSize` at parse, the channel's credit, the byte budget and the stream idle rule below — a peer that
+  declares a large `RawLength` and stalls pins exactly what one that declares a large `Length` does. A start never
+  waits at the message's end: its bytes are consumed by then, and a transport that holds the rest of a stream back
+  may not deliver that end again. Any other compressed message (one that arrived while its channel had a handler, a
+  response, one of an unreliable channel, and one whose decoded size and margin do not fit that largest block) is
+  decoded in place when its block can hold it, and otherwise into a second buffer that may take the byte budget
+  past its limit by itself, tried once: without one it is dropped and counted (`DecodeFailures`), as are malformed
+  blocks and a decoded size that does not match `RawLength`.
 
 The **stream idle mid-message** rule is per receiving stream and applies to every stream mode: a stream that has
 delivered a message's frame header but not the rest of its payload for 30 s (`PeerOptions.StreamIdleTimeout`) is
@@ -727,8 +731,9 @@ until that channel is read (a large value waits for stream credit like a group d
 budget still ends it, with `Failed`, if the wait lasts that long). Streams that are already open (every
 ReliableOrdered channel that has sent anything) and all datagram channels are not affected.
 
-Decompression runs on the game thread inside `Poll` (never on a transport thread); compressed messages are
-staged compressed in a pooled lease. Every limit is configurable per channel or per peer, and every violation
+Decompression runs on the game thread inside `Poll` and `Drain` (never on a transport thread, except a Bulk
+transfer's chunks); compressed messages are staged compressed in a pooled lease — on a reliable channel no handler
+reads, a lease of their decoded size, in which they are then decoded in place. Every limit is configurable per channel or per peer, and every violation
 is a counter in the peer's statistics.
 
 ## 8. Clarifications (decided by the reference implementation)

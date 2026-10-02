@@ -218,3 +218,26 @@ so V0/V1/V2 are indistinguishable there; the 1 KiB rows separate cleanly in all 
   their own scratch span.
 * **Against the reference:** compression is 25–50 % faster than K4os at 1 KiB (identical output size) and
   equal at 64 KiB; decompression is 1.3–1.5× slower, bounded-input safety included.
+
+### In-place decode (2026-10-02, RC2-1)
+
+`Lz4Block.TryDecompressInPlace` decodes a block in the buffer it was staged in: the compressed bytes move to the
+buffer's end (one memmove), then the decode writes from the start towards them with the same parsing and bounds
+checks as `Decompress`, plus one compare per copy that its write ends before the first unread source byte. It is a
+separate method so the out-of-place decoder's code is unchanged. A receiver needs it so that a compressed reliable
+message never waits for a second buffer (session-layer.md, "Drain and compressed messages").
+
+Measured with a scratch probe, not BenchmarkDotNet: one process, pinned to one core, best of nine, game-like data
+(16 of every 64 bytes random), net10.0, three runs on a machine shared with other sessions' stress loops; separate
+runs, so read only the order of magnitude (ADR 0007).
+
+| Raw size | Out of place (`DecompressExact`) | In place (move + decode) |
+|---|---|---|
+| 1 KiB | 646–677 ns | 673–727 ns |
+| 16 KiB | 9.3–9.7 µs | 9.7–10.3 µs |
+| 64 KiB | 29–44 µs | 33–47 µs |
+| 200 000 B | 87–159 µs | 95–108 µs |
+
+**Decision: kept.** In place is 0–15 % slower than the out-of-place decode alone (the memmove of the compressed bytes
+and the extra compare), and it saves the second buffer's rent and return — and, which is the point, the wait for that
+buffer. Decoding still runs at well over 1 GB/s, far above the 8 MiB/s `DecodedBytesPerSecond` default.

@@ -29,18 +29,20 @@ the end that receives is the end to upgrade.
   a queued backlog got the ring's messages before the backlog. A message of a channel that has messages queued now
   goes behind them.
 * **Compressed messages of reliable channels were dropped for want of a decode buffer.** Every compressed message
-  is decoded into a second buffer of its raw size, and the compressed messages that wait for the application
+  was decoded into a second buffer of its raw size, and the compressed messages that wait for the application
   count in the receive budget too: a burst of them could fill it, and then every message that needed a buffer
   was dropped (`DecodeFailures`) after the sender had been told `Delivered` — through a handler (256 of 1 200
   messages of 20 000 bytes to a late receiver in the test that found it), and through `Drain`, which also went on
-  to drop the rest of the queue once the batch did not fit. A decode buffer may now take the receive budget past
-  its limit by itself (the transport takes nothing new until it is back within it), and a used-up size class is
-  replaced by a larger one within the budget, so a handler's message and the first message of a `Drain` have one
-  unless the application still holds decoded payloads that took the budget over already, or the message's own
-  block is the pool's last block its decode could use (see "Known limits"). On `ReliableOrdered` / `ReliableUnordered` channels `Drain` leaves a message it has no
-  buffer or no decode budget (`DecodedBytesPerSecond`) for queued, gives nothing newer of that channel in the same
-  call — the channel's order holds — and returns what it has. A message dropped for want of a buffer no longer
-  uses up the decode budget of the ones behind it.
+  to drop the rest of the queue once the batch did not fit. A compressed message of a `ReliableOrdered` /
+  `ReliableUnordered` channel **that no handler reads** is now staged in a block that holds its decoded size (and
+  the few bytes an in-place decode needs), taken all or nothing with its ring slot and its credit when the message
+  starts, and **decoded in place** in that block: it is never dropped for want of a buffer, never waits for one, and
+  the receive budget is not exceeded on that path. `Drain` waits only for the decode budget
+  (`DecodedBytesPerSecond`): a message it has no decode budget for stays queued, nothing newer of that channel comes
+  in the same call — the channel's order holds — and the call returns what it has. Any other compressed message
+  (a handler's, a response, an unreliable channel's) is decoded in place too when its block happens to fit, and is
+  otherwise decoded into a second buffer that may take the receive budget past its limit by itself, tried once; see
+  "Known limits". A message dropped for want of a buffer no longer uses up the decode budget of the ones behind it.
 * **A `ReliableUnordered` receiver that fell behind its sender lost whole groups, and the sender reported them
   `Delivered`** (the first known limit of the release below). A sender counts a group's stream as closed when the
   transport has acknowledged its data, which can be before the receiving application has read any of it, and
@@ -104,11 +106,23 @@ the end that receives is the end to upgrade.
   again), is treated as not reading it until a `Drain` empties the queue again. Nothing is lost either way — the
   rest waits at the sender — but to keep the throughput, drain until `Drain` returns 0, once per `Poll`.
 * **`Drain` can return fewer messages than the span holds while more are queued**, on a reliable channel that
-  compresses: see "Fixed". Loop until it returns 0 *after releasing* what the previous call returned. Such a
-  channel also waits for `DecodedBytesPerSecond` now instead of dropping what exceeds it.
-* **A compressed message's decode buffer may take the receive budget past its limit**, by that one buffer, while
-  the compressed messages waiting for the application fill it; the transport takes nothing new until it is back
-  within it. `ReceiveBytesOutstanding` can read above `ReceiveBudgetBytes` for that long.
+  compresses, when `DecodedBytesPerSecond` has no room for the next one: see "Fixed". Loop until it returns 0. Such
+  a channel waits for `DecodedBytesPerSecond` now instead of dropping what exceeds it.
+* **A compressed message of a reliable channel without a handler counts with its decoded size.** It is staged in a
+  block of its decoded size from its first byte, so it takes that of the channel's credit, of the shared half and
+  of the receive budget: back-pressure on a drained or unread compressed channel engages sooner than before (with
+  default options a 20 000-byte message that compresses to a few dozen bytes takes a 64 KiB block, which is larger
+  than the share of a channel nobody reads, so it waits for the channel's first `Drain`). A peer that declares a
+  large decoded size and stalls pins what one that declares a large wire length pins: the same block, under the
+  same caps (`MaxMessageSize`, which bounds both at parse; the channel's credit; the budget; `StreamIdleTimeout`).
+* **A compressed message's second decode buffer may take the receive budget past its limit**, by that one buffer
+  (handlers, responses, and the cases in "Known limits"); the transport takes nothing new until it is back within
+  it. `ReceiveBytesOutstanding` can read above `ReceiveBudgetBytes` for that long.
+* **The half of the budget the reliable channels no handler reads share is counted by the messages taken while
+  their channel had no handler.** A channel that gets a handler over its backlog keeps that backlog counted in the
+  half until the handler has seen it (about one `Poll`); messages taken while a handler existed and left queued by
+  `UnregisterHandler` are not counted in it (they are still bounded by the ring, the channel's own count and the
+  budget). The check now costs the same whatever the number of channels.
 * **`MsQuicTransportOptions.ClientPeerUnidiStreamCount` defaults to 0** (1 024 before). A QUICLY client raises it to
   its channel table's sum once it is admitted, as a server does, so a server's first streams wait one round trip
   for that credit. A larger grant is still honoured (the receiver keeps a record for every stream it admits), but
@@ -136,6 +150,9 @@ the end that receives is the end to upgrade.
   was waiting for the application. Rising on a channel the other end sends on: nobody reads it, or it is read more
   slowly than it is written. [TROUBLESHOOTING.md](TROUBLESHOOTING.md) has the row.
 * `SpscRing<T>.TryPeek`: a copy of the oldest element, which stays queued (consumer thread).
+* `Lz4Block.GetInPlaceMargin`: the bytes beyond the decoded size that a buffer needs to decode an LZ4 block in place
+  (the reference implementation's in-place margin), which is how a receiver sizes the block it stages a compressed
+  message in.
 
 ### Known limits
 
@@ -161,13 +178,13 @@ the end that receives is the end to upgrade.
   are refused (`OutOfBuffers`), datagrams included. `ChannelOptions.QueueLimitBytes` bounds one channel's part.
 * **Channels that were drained and are then abandoned keep what they accepted**, up to half the receive budget
   together with the channels nobody reads (and one message each on top of it), until they are drained again.
-* **A compressed message above 64 KiB both compressed and raw is dropped with the default per-peer pool**
-  (`DecodeFailures`), on reliable channels too, after the sender was told `Delivered`, through a handler and
-  through `Drain` alike: its compressed form takes the pool's only 256 KiB block, which is the only block its
-  decode could use. It needs a channel whose `MaxMessageSize` was raised above the 64 KiB default, and 0.2.1
-  dropped it as well. Give such a peer a pool with two blocks of 256 KiB (`PeerOptions.AllocatorOptions`), or a
-  shared allocator (`PeerOptions.Allocator`, as a server has); more generally a compressed message whose own block
-  is the pool's last block that its decode could use is dropped.
+* **Some compressed messages of reliable channels are still decoded into a second buffer, and dropped
+  (`DecodeFailures`) when none is free**, after the sender was told `Delivered`, as in 0.2.1. Each is tried once and
+  never waited for, so the channel goes on: a message whose decoded size and in-place margin do not fit the largest
+  pool block within `ReceiveBudgetBytes` (with the default pool, a channel whose `MaxMessageSize` is raised to about
+  256 KiB or more, or a budget below the decoded size); a message that arrived while its channel had a handler and
+  is read through `Drain` after `UnregisterHandler`; and a handler's message whose own block cannot hold its decoded
+  size (a handler never waits). A pool with a free block of the decoded size's class, within the budget, decodes them.
 * **An MsQuic receiver whose thread pool is starved for seconds can refuse peer streams, and lose what they
   carried.** Slots of closed streams come back when the thread pool's cleanup work item has closed them, and the
   stream table grows for them only up to twice its size (so a peer's churn cannot grow it without bound). Group
@@ -179,10 +196,14 @@ the end that receives is the end to upgrade.
   including a response to this end's own request on that channel.
 * A compressed message dispatched to a **handler** is still dropped (`DecodeFailures`) when it exceeds
   `DecodedBytesPerSecond` (8 MiB/s by default, and a burst of the same), on reliable channels too — a burst of
-  compressed messages that decode to more than that loses the rest — when the application still holds decoded
-  payloads (retained, or drained and not released) that took the receive budget past its limit, and when the pool
-  has no free block of the decode's size class or a larger one within the budget. Raise
-  `DecodedBytesPerSecond` for a channel that receives more, or read it with `Drain`, which waits instead.
+  compressed messages that decode to more than that loses the rest — and, when its own block cannot hold its decoded
+  size, when the application still holds decoded payloads (retained, or drained and not released) that took the
+  receive budget past its limit, or the pool has no free block of the decode's size class or a larger one within
+  the budget. Raise `DecodedBytesPerSecond` for a channel that receives more, or read it with `Drain`, which waits
+  for the decode budget and decodes in place instead.
+* **A pended message start on an undersized shared pool waits for any block holder.** A start that cannot have its
+  block holds nothing while it waits, so peers on one pool never wait for each other for good; but an application
+  that retains received payloads for ever starves the others, as it does for uncompressed messages.
 * **A Bulk sender that cancels more than three times `BulkTransfersPerDirection` transfers (six at the default)
   while the receiver's host is late** has its next transfer refused (`LimitExceeded`, the transfer ends `Failed`)
   until the receiver polls again.

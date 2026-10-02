@@ -99,11 +99,20 @@
   that polls every frame keeps them from growing at all. What an attacker keeps is what QUIC gives it anyway: it
   can stall its own streams, fill the stream slots of the connection that those streams occupy, and fill the
   connection's flow-control window with data nobody reads (16 MiB with the MsQuic defaults), which stops its own
-  other streams — not another connection's. A compressed message's decode buffer may take the receive budget past
-  its limit by that one buffer (the budget can be full of the compressed messages that wait for it): a decode is
-  refused once the budget is over its limit, so it is never exceeded by more than one decode buffer, and the
-  transport accepts nothing new until it is back within the limit — a peer gains one buffer of at most the
-  budget's size, not more.
+  other streams — not another connection's. A compressed message of a reliable channel no handler reads is staged
+  in a block of its declared decoded size (`RawLength`) from its start, and decoded in place: `RawLength` is the
+  peer's declaration exactly as `Length` is, and is held to the same start-time caps — `MaxMessageSize` at parse,
+  the largest pool block within the budget, the channel's credit and strict share, the budget, the stream idle
+  timeout — so declaring a large `RawLength` and stalling pins what declaring a large `Length` does, no more. Only
+  the decodes that are not staged that way (a handler's, a response, an unreliable channel's, and the edge band
+  whose decoded size does not fit the largest block within the budget) use a second buffer, which may take the
+  receive budget past its limit by that one buffer: such a decode is refused once the budget is over its limit, so
+  it is never exceeded by more than one decode buffer, and the transport accepts nothing new until it is back
+  within the limit — a peer gains one buffer of at most the budget's size, not more. A compressed message is
+  dropped and counted (`DecodeFailures`) for a raw size above the decode rate's burst, a malformed block, a decoded
+  size other than `RawLength`, a block an in-place decode would overwrite before reading, and — tried once, never
+  waited for — no free second buffer; nothing waits for a buffer, so no set of waiting messages can hold each
+  other's.
 * **Retransmission cannot be weaponised**: ReliableLatest has per-version and per-peer retry budgets;
   acks are coalesced per key (the highest accepted version); Pong is rate-limited; control message rate is capped.
 * **Sequence numbers give the peer nothing it did not have** (PROTOCOL §8 "sequence clock"). Only the

@@ -31,7 +31,13 @@
    changes, read-mostly). Neither thread writes the other's line, and each reads it only off the fast path: the
    transport thread when its private copy says the channel is full, the game thread when it decides which held-back
    streams to resume. Where one thread must not miss the other's change — a stream was held back while credit was
-   coming back — both store, fence (`Interlocked`) and then load, so at least one of them sees the other.
+   coming back — both store, fence (`Interlocked`) and then load, so at least one of them sees the other. The half of
+   the receive budget the channels no handler reads share (2026-10-02, RC2-2) is two peer-wide counters on two more
+   lines of their own: bytes taken by messages tagged at take (their channel was limited then), written by the
+   transport thread next to its private copy of the other; bytes given back of them, written by the game thread. The
+   tag travels with the message (`ReceiveEntry.CreditShared`), so membership never changes after the take and the
+   counters pair exactly. The same store-fence-load pairing covers them, on one line instead of a pass over every
+   channel's; no spin, no lock.
 5. **Rings are SPSC** per peer (`ReceiveRing`, `CompletionRing`, slab return ring): cached remote index,
    `Volatile.Read/Write` acquire/release, 128-byte padding between head, tail and entries, elements in a
    `NativeArray<T>` like every other hot struct array (invariant 12). One deliberate exception (2026-09-18): the

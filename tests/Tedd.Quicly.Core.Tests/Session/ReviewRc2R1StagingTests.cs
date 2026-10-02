@@ -2,10 +2,9 @@ using System.Buffers.Binary;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Adversarial review, RC2 round 1 of fix/stack-review (8f6c47c), lens: the decoded-size staging of RC2-1
@@ -20,6 +19,12 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// ReceiveBudgetBytes (256 KiB) one such message pins the peer's whole receive budget and the pool's only 256 KiB block
 /// from its first byte until the application drains it. At 6d41167 (and 0.2.1) the same message was staged at its wire
 /// length (a 1 536-byte block here) and decoded into a 64 KiB block.
+/// <para>
+/// Fixed since (RC2R1-1): <c>Lz4Block.TryDecompressInPlace</c> keeps the margin in a stack buffer, so the staging block is
+/// the larger of the decoded and the wire length (<c>Lz4Block.GetInPlaceLength</c>): a 64 KiB message takes a 64 KiB
+/// block and a 16 KiB one a 16 KiB block. The description above is what the tests found at 8f6c47c; the tests now pin
+/// the fix.
+/// </para>
 /// </remarks>
 public class ReviewRc2R1StagingTests
 {

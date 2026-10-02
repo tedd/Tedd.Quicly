@@ -3,13 +3,18 @@ using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
 
-namespace Tedd.Quicly.Server.Tests.Review;
+namespace Tedd.Quicly.Server.Tests;
 
 /// <summary>
 /// Adversarial review, RC2 round 1 of fix/stack-review (8f6c47c), lens: the decoded-size staging of RC2-1 with the pool a
 /// <see cref="QuiclyServer"/> builds by default (twelve 256 KiB blocks, 32 of 64 KiB, at ExpectedPeers ≤ 128) and a
 /// channel at its default MaxMessageSize (64 KiB). A test marked FINDING fails at 8f6c47c for the reason its comment gives.
 /// </summary>
+/// <remarks>
+/// Fixed since (RC2R1-1): the in-place decode keeps its margin on the stack, so each 64 KiB message is staged in one of
+/// the pool's 64 KiB blocks, not its 256 KiB ones. The description below is what the test found at 8f6c47c; the test now
+/// pins the fix.
+/// </remarks>
 public class ReviewRc2R1ServerPoolTests
 {
     private const ushort Packed = 6;

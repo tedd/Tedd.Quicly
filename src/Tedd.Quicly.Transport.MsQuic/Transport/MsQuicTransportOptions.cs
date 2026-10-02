@@ -122,17 +122,68 @@ public sealed class MsQuicTransportOptions
     public ushort ClientPeerBidiStreamCount { get; set; }
 
     /// <summary>
-    /// Unidirectional streams the server may have open towards the client (per-channel ordered streams, groups and bulk
-    /// transfers; ARCHITECTURE section 7 caps the sum at 4 096). Default 1 024.
+    /// Unidirectional streams the server may have open towards the client from the first packet on (per-channel ordered
+    /// streams, groups and bulk transfers; ARCHITECTURE section 7 caps the sum at 4 096). Default 1 024.
     /// </summary>
+    /// <remarks>
+    /// This is a grant in the connection's transport parameters, and QUIC never takes granted credit back: when a QUICLY
+    /// session later asks for fewer (its channel table's sum, after admission), the server can still have up to this many
+    /// open. The session is told (<see cref="Core.Transport.TransportCapabilities.PeerUnidirectionalStreams"/>) and keeps a
+    /// receive record for each of them (64 bytes, plus 8 in a ring), so a client that falls behind its server holds the
+    /// streams instead of resetting them. The stream table has room for them whatever <see cref="MaxStreams"/> says.
+    /// </remarks>
     public ushort ClientPeerUnidiStreamCount { get; set; } = 1024;
 
     /// <summary>
-    /// Capacity of each connection's stream table (local and peer streams open at once, including streams whose close is
-    /// still being processed). <see cref="Core.Transport.ITransport.OpenStream"/> answers <c>OutOfMemory</c> and peer streams are
-    /// refused when it is full. Default 1 024; must cover the peer limits plus the local streams.
+    /// Size of each connection's stream table (local and peer streams open at once, including streams whose close is still
+    /// being processed), unless the streams the peer is granted need a larger one. Default 2 048.
     /// </summary>
-    public int MaxStreams { get; set; } = 1024;
+    /// <remarks>
+    /// <para>
+    /// A peer stream is never refused for want of a slot. MsQuic admits a stream the peer has credit for, and one that
+    /// found no slot could only be dropped below the session with whatever it carried — so the table is sized for what
+    /// the peer may open: the role's initial grant (<see cref="ClientPeerUnidiStreamCount"/> and
+    /// <see cref="ClientPeerBidiStreamCount"/>, or the server's), and whatever
+    /// <see cref="Core.Transport.ITransport.UpdatePeerStreamLimits"/> asks for later. When this value has no room for
+    /// that next to the local streams, the connection's table is made larger (<see cref="StreamTableFor"/>) and
+    /// <see cref="Diagnostic"/> says so once. A receiver that falls behind holds its peer's streams open, so the whole
+    /// grant really is in use at times.
+    /// </para>
+    /// <para>
+    /// A quarter of the table is this end's own: <see cref="Core.Transport.ITransport.OpenStream"/> answers
+    /// <c>OutOfMemory</c> once the local streams hold everything the table has beyond the peer's grants, and never takes a
+    /// slot a granted peer stream may need. Slots are created as they are needed, so the size costs nothing until it is
+    /// used (the WebTransport carrier mirrors the slots that are in use, in chunks).
+    /// </para>
+    /// </remarks>
+    public int MaxStreams { get; set; } = 2048;
+
+    /// <summary>
+    /// Streams the peer can have open in a stream table of <paramref name="maxStreams"/> slots while a quarter of it (at least
+    /// one slot) stays free for the local streams.
+    /// </summary>
+    /// <param name="maxStreams">The table's capacity (<see cref="MaxStreams"/>).</param>
+    /// <returns>The room for peer streams.</returns>
+    public static int PeerStreamRoom(int maxStreams) => maxStreams - Math.Max(1, maxStreams / 4);
+
+    /// <summary>
+    /// The smallest stream table that has room for <paramref name="peerStreams"/> peer streams next to the local streams'
+    /// quarter: the least <c>n</c> with <see cref="PeerStreamRoom"/>(<c>n</c>) ≥ <paramref name="peerStreams"/>. A
+    /// connection's table is at least this large for the streams its peer was granted.
+    /// </summary>
+    /// <param name="peerStreams">Streams the peer may have open at once (both directions).</param>
+    /// <returns>The table size, at least 1.</returns>
+    public static int StreamTableFor(int peerStreams)
+    {
+        // n − max(1, ⌊n/4⌋) ≥ p holds from n = ⌈4p/3⌉ on; start just below and step up to the first n that fits.
+        int table = Math.Max(1, (int)((4L * Math.Max(peerStreams, 0)) / 3) - 1);
+        while (PeerStreamRoom(table) < peerStreams)
+        {
+            table++;
+        }
+
+        return table;
+    }
 
     /// <summary>Stream scheduling (ROUND_ROBIN: bulk must not starve ordered channels).</summary>
     public QUIC_STREAM_SCHEDULING_SCHEME StreamSchedulingScheme { get; set; } = QUIC_STREAM_SCHEDULING_SCHEME.ROUND_ROBIN;

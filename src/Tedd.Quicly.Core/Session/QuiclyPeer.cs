@@ -117,17 +117,20 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         _sink = new Sink(this);
         _core = new PeerCore(this, role, table, options);
         _handlers = new MessageHandler?[_core.ChannelCount];
+        _credited = _core.Credit.EnabledChannels;
         // Built here, never inside Poll: the drain queues are native memory sized once (ARCHITECTURE.md §3).
         // The class of a channel comes from its definition, not from the engines: they (and their mailboxes) do not exist yet.
         ReadOnlySpan<ChannelDefinition> channels = _core.Channels;
         byte[] queueClasses = new byte[channels.Length];
+        _decodeWaits = new bool[channels.Length];
         for (int i = 0; i < channels.Length; i++)
         {
             queueClasses[i] = ReceiveQueueClass.Of(channels[i]);
+            _decodeWaits[i] = queueClasses[i] == ReceiveQueueClass.Reliable && channels[i].Compression != ChannelCompression.None;
         }
 
         ReceiveQueueLayout layout = ReceiveQueueLayout.Compute(channels, options.ReceiveRingCapacity, options.ReceiveBudgetBytes);
-        _queues = new ReceiveQueues(in layout, queueClasses);
+        _queues = new ReceiveQueues(in layout, queueClasses, _credited);
         InitializeSendSide(options);
         long now = _clock.NowMicros;
         _controlBucket.Initialize(options.ControlMessagesPerSecond, options.ControlMessagesPerSecond, now);
@@ -282,6 +285,9 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
 
     internal PeerCore Core => _core;
 
+    /// <summary>The drain queues (tests).</summary>
+    internal ReceiveQueues DrainQueues => _queues;
+
     internal bool IsFreed => Volatile.Read(ref _freed) != 0;
 
     /// <summary>Sets a transport-to-game-thread signal bit and tells the host there is work (any thread).</summary>
@@ -408,6 +414,7 @@ public sealed unsafe partial class QuiclyPeer : IDisposable
         statistics.ReceiveTooLarge = Volatile.Read(ref recv.TooLarge);
         statistics.OutOfBuffers = Volatile.Read(ref recv.OutOfBuffers);
         statistics.DrainQueueDrops = _queues.Drops(index);
+        statistics.BacklogHolds = _core.Credit.Pends(index);
         _core.GetEngine(index).AddStatistics(index, ref statistics);
         return true;
     }

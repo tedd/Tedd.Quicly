@@ -23,6 +23,13 @@ public static unsafe partial class TransportConformance
     /// order, and nothing else for the stream). Either way the stream never starts: StartStream and SendStream(Start) on it
     /// return InvalidState, also after OnStreamsAvailable, and the peer never hears of it. CloseStream releases it, and a new
     /// stream started after OnStreamsAvailable delivers its data.
+    /// <para>
+    /// A third outcome is allowed for a send that carries the start (MsQuic has it: the start and the send are two calls,
+    /// and the worker can refuse the start between them): the call returns StreamLimitReached although OnStreamStarted
+    /// (StreamLimitReached) and OnStreamShutdownComplete were already delivered for the stream, and no send completion
+    /// follows, because the send was never accepted. A synchronous StreamLimitReached is final whether or not refusal
+    /// callbacks for the same stream arrive.
+    /// </para>
     /// </summary>
     public static void RefusedStreamNeverStartsAndIsRetriedOnANewStream(ITransportTestHarness harness)
     {
@@ -92,7 +99,12 @@ public static unsafe partial class TransportConformance
         }
         if (returned != TransportStatus.Success)
         {
-            s.Require(actual.Count == 0, $"a start refused synchronously ({returned}) was reported again for {id}: [{string.Join(", ", actual)}].");
+            // A synchronous refusal is final. The one combined case: the worker refused the start before the call queued its
+            // send, so the refusal callbacks may come with it — the start's report and the shutdown, never a send completion.
+            string refusedReport = "StreamStarted " + TransportStatus.StreamLimitReached;
+            bool combined = returned == TransportStatus.StreamLimitReached
+                && (actual.SequenceEqual([refusedReport]) || actual.SequenceEqual([refusedReport, nameof(RecordedEventKind.StreamShutdownComplete)]));
+            s.Require(actual.Count == 0 || combined, $"a start refused synchronously ({returned}) was reported again for {id}: [{string.Join(", ", actual)}].");
             return;
         }
         var expected = new List<string> { "StreamStarted " + TransportStatus.StreamLimitReached };
@@ -106,7 +118,8 @@ public static unsafe partial class TransportConformance
     /// callback (where MsQuic runs it inline): either synchronously (the call returns StreamLimitReached and nothing follows
     /// for the stream) or asynchronously (the call returns Success, exactly one OnStreamStarted carries StreamLimitReached and
     /// a send accepted with the start completes canceled, exactly once). ITransport: "If a send call returns anything but
-    /// Success no completion follows".
+    /// Success no completion follows". The combined case of <see cref="RefusedStreamNeverStartsAndIsRetriedOnANewStream"/>
+    /// is allowed here too: a synchronous refusal after which the start's report and the shutdown of the same stream arrive.
     /// </summary>
     public static void StartRefusedInsideACallbackIsReportedOnce(ITransportTestHarness harness)
     {
@@ -157,9 +170,18 @@ public static unsafe partial class TransportConformance
             return;
         }
         s.Require(returned == TransportStatus.StreamLimitReached, $"{what} returned {returned}, expected StreamLimitReached (or Success with an asynchronous report).");
+        // A synchronous refusal is final; the combined case (the worker refused the start before the send was queued) may
+        // have delivered the start's report and the shutdown, never a send completion.
         int streamEvents = 0;
-        foreach (RecordedEvent e in s.ClientSink.Events) streamEvents += IsStreamEvent(e.Kind) && e.StreamId == id ? 1 : 0;
-        s.Require(streamEvents == 0 && completions == 0, $"{what} returned {returned} synchronously, yet {streamEvents} stream callback(s) and {completions} send completion(s) followed for {id}.");
+        int shutdowns = 0;
+        foreach (RecordedEvent e in s.ClientSink.Events)
+        {
+            if (!IsStreamEvent(e.Kind) || e.StreamId != id) continue;
+            streamEvents++;
+            shutdowns += e.Kind == RecordedEventKind.StreamShutdownComplete ? 1 : 0;
+        }
+        bool combined = started <= 1 && shutdowns <= 1 && streamEvents == started + shutdowns && (started == 0 || status == TransportStatus.StreamLimitReached);
+        s.Require((streamEvents == 0 || combined) && completions == 0, $"{what} returned {returned} synchronously, yet {streamEvents} stream callback(s) and {completions} send completion(s) followed for {id}.");
     }
 
     /// <summary>Starts one stream and sends on another from inside the first datagram callback (MsQuic runs such calls inline).</summary>
@@ -662,6 +684,188 @@ public static unsafe partial class TransportConformance
         s.Require(Read(ref errors) == 0, "after a held FIN an indication did not start at the end of the stream.");
         s.Require(Taken().AsSpan().SequenceEqual(third.ToArray(0, Length)), "the third stream's data did not arrive exactly once.");
         s.CloseAndWait();
+    }
+
+    // ------------------------------------------------------------------ what a session sizes its per-stream state from
+
+    /// <summary>Sends one stream with FIN from inside <see cref="ITransportSink.OnConnected"/>: the earliest a sink can.</summary>
+    private sealed class EagerSender(TransportSegment* segment, ulong context) : SinkBase
+    {
+        public volatile ITransport? Transport;
+        public volatile bool Done;
+
+        public override void OnConnected(in TransportConnectedInfo info)
+        {
+            // A real transport may raise this before the scenario has stored the transport it was handed.
+            SpinWait spin = default;
+            long deadline = Environment.TickCount64 + 5_000;
+            while (Transport is null && Environment.TickCount64 < deadline) spin.SpinOnce();
+            if (Transport is { } transport && transport.OpenStream(StreamKind.Unidirectional, context, 32767, out TransportStreamId id) == TransportStatus.Success)
+            {
+                transport.SendStream(id, segment, 1, context + 1, TransportSendFlags.Start | TransportSendFlags.Fin);
+            }
+
+            Done = true;
+        }
+    }
+
+    /// <summary>
+    /// <see cref="ITransportSink.OnConnected"/> precedes every event of a peer stream, on both ends, even when each end
+    /// sends a stream from inside its own <c>OnConnected</c> and the client tries one before the handshake is over. A
+    /// session sizes what it keeps per peer stream in <c>OnConnected</c>, from
+    /// <see cref="TransportCapabilities.PeerUnidirectionalStreams"/>, so a peer stream that arrived earlier would meet
+    /// state that is not there yet. The capabilities reported there are the transport's: the grant does not read
+    /// differently afterwards.
+    /// </summary>
+    public static void PeerStreamsFollowOnConnected(ITransportTestHarness harness)
+    {
+        NativeBuffer data = new(48);
+        data.Fill(51);
+        NativeSegments segments = new(3);
+        for (int i = 0; i < 3; i++) segments.Set(i, data.Segment(i * 16, 16));
+        var clientEager = new EagerSender(segments.At(0), 0x510);
+        var serverEager = new EagerSender(segments.At(1), 0x520);
+        var clientSink = new RecordingSink(null, clientEager);
+        var serverSink = new RecordingSink(null, serverEager);
+        ITransport? server = null;
+        ITransport client = harness.Connect(clientSink, static (in NewConnectionInfo _) => PreHandshakeDecision.Accept, (ITransport transport, in NewConnectionInfo _) =>
+        {
+            serverEager.Transport = transport;
+            serverSink.Transport = transport;
+            Volatile.Write(ref server, transport);
+            return serverSink;
+        }, new ConformancePairOptions());
+        clientSink.Transport = client;
+        try
+        {
+            void Require(bool condition, string message)
+            {
+                if (!condition) throw new ConformanceException($"[{harness.Name}] {message}");
+            }
+
+            // Before the handshake is known to be over: whatever the transport answers, its peer must not see the stream
+            // before it has connected.
+            if (client.OpenStream(StreamKind.Unidirectional, 0x530, 32767, out TransportStreamId early) == TransportStatus.Success)
+            {
+                client.SendStream(early, segments.At(2), 1, 0x531, TransportSendFlags.Start | TransportSendFlags.Fin);
+            }
+
+            client.UpdatePeerStreamLimits(16, 16);
+            clientEager.Transport = client;
+            Require(harness.Pump(() => Volatile.Read(ref server) is not null, harness.DefaultTimeout), "the listener never accepted the connection.");
+            server!.UpdatePeerStreamLimits(16, 16);
+            Require(harness.Pump(() => clientEager.Done && serverEager.Done
+                    && clientSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) > 0 && serverSink.CountOf(RecordedEventKind.StreamPeerSendShutdown) > 0,
+                    harness.DefaultTimeout),
+                "the streams both ends sent from inside OnConnected did not arrive.");
+            RequirePeerStreamsAfterConnected(harness, clientSink, "client");
+            RequirePeerStreamsAfterConnected(harness, serverSink, "server");
+            Require(clientSink.OfKind(RecordedEventKind.Connected)[0].Capabilities.PeerUnidirectionalStreams == client.Capabilities.PeerUnidirectionalStreams,
+                "client: PeerUnidirectionalStreams reads differently after OnConnected than in it.");
+            Require(serverSink.OfKind(RecordedEventKind.Connected)[0].Capabilities.PeerUnidirectionalStreams == server.Capabilities.PeerUnidirectionalStreams,
+                "server: PeerUnidirectionalStreams reads differently after OnConnected than in it.");
+        }
+        finally
+        {
+            // The payload may go only once both ends reported their close: until then a transport may still read it.
+            client.Close(0, default);
+            ITransport? accepted = Volatile.Read(ref server);
+            accepted?.Close(0, default);
+            if (harness.Pump(() => clientSink.IsClosed && (accepted is null || serverSink.IsClosed), harness.DefaultTimeout))
+            {
+                segments.Dispose();
+                data.Dispose();
+            }
+        }
+    }
+
+    private static void RequirePeerStreamsAfterConnected(ITransportTestHarness harness, RecordingSink sink, string end)
+    {
+        IReadOnlyList<RecordedEvent> events = sink.Events;
+        var peerStreams = new HashSet<TransportStreamId>();
+        bool connected = false;
+        for (int i = 0; i < events.Count; i++)
+        {
+            RecordedEvent e = events[i];
+            if (e.Kind == RecordedEventKind.Connected)
+            {
+                if (connected) throw new ConformanceException($"[{harness.Name}] {end}: OnConnected was raised twice.");
+                connected = true;
+                continue;
+            }
+
+            if (e.Kind == RecordedEventKind.PeerStreamStarted) peerStreams.Add(e.StreamId);
+            bool ofPeerStream = e.Kind == RecordedEventKind.PeerStreamStarted
+                || (e.Kind is RecordedEventKind.StreamReceived or RecordedEventKind.StreamPeerSendShutdown or RecordedEventKind.StreamAborted or RecordedEventKind.StreamShutdownComplete
+                    && peerStreams.Contains(e.StreamId));
+            if (!connected && ofPeerStream) throw new ConformanceException($"[{harness.Name}] {end}: event {i} ({e}) of a peer stream precedes OnConnected.");
+        }
+
+        if (!connected) throw new ConformanceException($"[{harness.Name}] {end}: never connected.");
+    }
+
+    /// <summary>
+    /// <see cref="TransportCapabilities.PeerUnidirectionalStreams"/> is the number of unidirectional streams the peer can
+    /// have open before <see cref="ITransport.UpdatePeerStreamLimits"/> is called on the connection: each end opens three
+    /// streams more than the other end reports and leaves them open, and exactly the reported number start. A session keeps
+    /// a receive record for that many streams; a transport that admits more than it reports hands the session streams it
+    /// has no record for.
+    /// </summary>
+    public static void PeerUnidirectionalStreamsIsWhatThePeerCanOpen(ITransportTestHarness harness)
+    {
+        using var s = new Session(harness, new ConformancePairOptions { ClientPeerUnidiStreams = 5, ServerPeerUnidiStreams = 7 });
+        s.WaitConnected();
+        RequireGrantIsExact(s, s.Client, s.ClientSink, s.Server, s.ServerSink, "server", 7, 0x7000);
+        RequireGrantIsExact(s, s.Server, s.ServerSink, s.Client, s.ClientSink, "client", 5, 0x9000);
+        s.CloseAndWait();
+    }
+
+    private static void RequireGrantIsExact(Session s, ITransport opener, RecordingSink openerSink, ITransport granter, RecordingSink granterSink, string end, int pairGrant, ulong firstContext)
+    {
+        int granted = granter.Capabilities.PeerUnidirectionalStreams;
+        s.Require(granted == pairGrant, $"the pair was created with {pairGrant} unidirectional streams for the {end}'s peer, and the {end} reports {granted}.");
+        s.Require(granted == granterSink.OfKind(RecordedEventKind.Connected)[0].Capabilities.PeerUnidirectionalStreams,
+            $"{end}: PeerUnidirectionalStreams reads {granted} now and read differently in OnConnected.");
+        int attempts = granted + 3;
+        NativeBuffer data = s.Rent(attempts, seed: 61);
+        NativeSegments segments = s.RentSegments(attempts);
+        int accepted = 0;
+        int refusedAtOnce = 0;
+        for (int i = 0; i < attempts; i++)
+        {
+            segments.Set(i, data.Segment(i, 1));
+            TransportStatus status = opener.OpenStream(StreamKind.Unidirectional, firstContext + (ulong)i, 32767, out TransportStreamId id);
+            if (status == TransportStatus.Success)
+            {
+                status = opener.SendStream(id, segments.At(i), 1, firstContext + 0x800 + (ulong)i, TransportSendFlags.Start);
+            }
+
+            if (status == TransportStatus.Success)
+            {
+                accepted++;
+                continue;
+            }
+
+            s.Require(status == TransportStatus.StreamLimitReached, $"opening stream {i} towards the {end} failed with {status}.");
+            refusedAtOnce++;
+        }
+
+        int Answered(TransportStatus status)
+        {
+            int count = 0;
+            foreach (RecordedEvent e in openerSink.OfKind(RecordedEventKind.StreamStarted))
+            {
+                if (e.Context >= firstContext && e.Context < firstContext + (ulong)attempts && e.Status == status) count++;
+            }
+
+            return count;
+        }
+
+        s.Wait(() => Answered(TransportStatus.Success) + Answered(TransportStatus.StreamLimitReached) == accepted, $"an answer to every stream start towards the {end}");
+        int started = Answered(TransportStatus.Success);
+        int refused = refusedAtOnce + Answered(TransportStatus.StreamLimitReached);
+        s.Require(started == granted,
+            $"the {end} reports that its peer may have {granted} unidirectional streams open before UpdatePeerStreamLimits, and its peer started {started} of {attempts} ({refused} refused).");
     }
 
     // ------------------------------------------------------------------ refused connections and the ways a connection ends

@@ -90,6 +90,10 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
     private readonly MsQuicTransportOptions _options;
     private readonly MsQuicRegistration _registration;
     private readonly bool _ownsRegistration;
+
+    // What the server settings grant a client before admission (the same for every configuration this listener builds).
+    private int _initialPeerUnidiStreams;
+    private int _initialPeerBidiStreams;
     private readonly IPEndPoint _requestedEndPoint;
     private readonly byte[][] _alpns;
     private readonly Lock _gate = new();
@@ -303,7 +307,7 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
             Interlocked.Increment(ref _otherRefused);
             return null;
         }
-        var transport = new MsQuicTransport(connection, sink: null, _options, certificatePolicy: null, managed.ServerName);
+        var transport = new MsQuicTransport(connection, sink: null, _options, certificatePolicy: null, managed.ServerName, Volatile.Read(ref _initialPeerUnidiStreams), Volatile.Read(ref _initialPeerBidiStreams));
         ITransportSink? sink;
         try
         {
@@ -345,7 +349,10 @@ public sealed class MsQuicTransportListener : ITransportListener, IMsQuicListene
         {
             for (int i = 0; i < entries.Length; i++)
             {
-                MsQuicConfiguration configuration = MsQuicConfiguration.CreateServer(_registration, [_options.Alpns[i]], certificate, _options.CreateServerSettings(), _options.ServerCredentialMode, _options.ServerKeyStorage);
+                MsQuicSettings settings = _options.CreateServerSettings();
+                Volatile.Write(ref _initialPeerUnidiStreams, settings.PeerUnidiStreamCount ?? 0);
+                Volatile.Write(ref _initialPeerBidiStreams, settings.PeerBidiStreamCount ?? 0);
+                MsQuicConfiguration configuration = MsQuicConfiguration.CreateServer(_registration, [_options.Alpns[i]], certificate, settings, _options.ServerCredentialMode, _options.ServerKeyStorage);
                 entries[i] = new ConfigurationEntry(this, configuration, certificate);
                 lock (_gate) _certificateUses[certificate] = _certificateUses.GetValueOrDefault(certificate) + 1;
                 Interlocked.Increment(ref _openConfigurations);

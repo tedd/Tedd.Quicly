@@ -64,6 +64,10 @@ public class ReviewContractTests
         Assert.True(h.Admit(), "The raw client was not admitted.");
         ChannelDefinition ordered = h.Table[4]!;
 
+        // The channel is read (a handler): a channel nobody reads would not start a message whose block is larger than
+        // its byte share (the receive credit), and this test is about a message that was started.
+        h.Server!.RegisterHandler(4, static (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => { });
+
         // Channel 4 is ReliableOrdered (64 KiB MaxMessageSize): a frame header declaring 60 000 bytes, then one byte of
         // payload. The receiver stages the message in a lease of the declared length and waits for the rest.
         byte[] frame = new byte[StreamFraming.MaxFrameHeaderLength + 8];

@@ -12,9 +12,10 @@ namespace Tedd.Quicly.Core.Tests.Session;
 /// bounded backlog and loses its own oldest messages, counted in <c>DrainQueueDrops</c>; it closes the receive ring for
 /// one Poll interval at most, never stops mailbox dispatch, never pins the receive budget and never keeps the host busy.
 /// A channel that is drained every frame loses nothing the ring and the budget took, and neither does a channel with a
-/// handler whose messages a Drain of another channel met. A reliable channel loses nothing and therefore still holds the
-/// ring once the queue pool is full — but the mailboxes are dispatched all the same, and the backlog of the unreliable
-/// channels cannot keep the queue nodes reserved for it.
+/// handler whose messages a Drain of another channel met. A reliable channel loses nothing and no longer holds the ring:
+/// its receive credit keeps a channel nobody reads within the queue nodes reserved for it
+/// (<see cref="ReliableCreditTests"/>), and the backlog of the unreliable channels cannot take those nodes. What is still
+/// held — a message of a channel whose engine was replaced by one that takes no credit — does not stop the mailboxes.
 /// </summary>
 /// <remarks>
 /// The server's receive ring holds 64 messages in most tests, so with the table below (four unreliable ring channels, two
@@ -99,6 +100,34 @@ public class DrainBackpressureTests
             Assert.Equal(arrived, Channel(server, channel).Received);
             serverStep();
         }
+    }
+
+    /// <summary>
+    /// Fills the nodes reserved for the two reliable channels with messages nobody drains: <paramref name="perChannel"/>
+    /// on channel 10 (numbered from 0) and on channel 11 (numbered from 1 000). A reliable channel nobody reads accepts no
+    /// more than its share (its receive credit, <see cref="ReliableCreditTests"/>), so this is the most such channels
+    /// keep of the pool. The server is not polled.
+    /// </summary>
+    private static void FillReserved(SessionHarness h, int perChannel = 16)
+    {
+        QuiclyPeer client = h.Client;
+        QuiclyPeer server = h.Server!;
+        for (int i = 0; i < perChannel; i++)
+        {
+            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
+            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(11), Payload(1_000 + i)).Status);
+        }
+
+        client.Flush();
+        for (int step = 0; step < 1_000 && (Channel(server, 10).Received < perChannel || Channel(server, 11).Received < perChannel); step++)
+        {
+            h.Network.Advance(1_000);
+            client.Poll();
+            client.Flush();
+        }
+
+        Assert.Equal(perChannel, Channel(server, 10).Received);
+        Assert.Equal(perChannel, Channel(server, 11).Received);
     }
 
     private static List<int> DrainAll(QuiclyPeer peer, ushort channel)
@@ -264,24 +293,18 @@ public class DrainBackpressureTests
     [Fact]
     public void A_Handled_Channel_Met_By_A_Drain_Takes_Its_Room_From_The_Backlog_Nobody_Drains()
     {
-        // Channel 2 is never drained and keeps its backlog of 32; channel 10 (reliable, no handler) holds the other 32
-        // nodes. A Drain of channel 6 then meets 20 messages of channel 3, which has a handler: there is no free node, so
+        // Channel 2 is never drained and keeps its backlog of 32; channels 10 and 11 (reliable, no handler) hold the other
+        // 32 nodes. A Drain of channel 6 then meets 20 messages of channel 3, which has a handler: there is no free node, so
         // each one evicts the oldest message of the backlog nobody drains — never a message of the handled channel, and
         // nothing is held.
         using SessionHarness h = Harness();
-        QuiclyPeer client = h.Client;
         QuiclyPeer server = h.Server!;
         List<int> handled = [];
         server.RegisterHandler(3, CollectIndices(handled));
         ReceivedMessage[] buffer = new ReceivedMessage[4];
 
         Deliver(h, 2, 0, 64, () => server.Poll());
-        for (int i = 0; i < 32; i++)
-        {
-            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
-        }
-
-        Assert.True(h.RunUntil(() => Channel(server, 10).Received == 32), "the reliable messages did not arrive");
+        FillReserved(h);
         server.Poll();
         Assert.Equal(32, Channel(server, 2).DrainQueueDrops);
 
@@ -292,7 +315,8 @@ public class DrainBackpressureTests
         Assert.Equal(0, Channel(server, 3).DrainQueueDrops);
         Assert.Equal(32 + 20, Channel(server, 2).DrainQueueDrops);
         Assert.Equal(Enumerable.Range(64 - 12, 12), DrainAll(server, 2));
-        Assert.Equal(Enumerable.Range(0, 32), DrainAll(server, 10));
+        Assert.Equal(Enumerable.Range(0, 16), DrainAll(server, 10));
+        Assert.Equal(Enumerable.Range(1_000, 16), DrainAll(server, 11).Order());
     }
 
     // ------------------------------------------------------------------ a channel that is drained loses nothing
@@ -301,18 +325,12 @@ public class DrainBackpressureTests
     public void A_Burst_Larger_Than_The_Pool_Survives_Poll_Then_Drain()
     {
         // 600 messages in one frame on a channel that is drained after every Poll: more than the 512 nodes the backlog may
-        // keep, more than fits next to a reliable channel's backlog. They are queued while a node is free, the next one is
+        // keep, more than fits next to what two reliable channels nobody reads keep. They are queued while a node is free, the next one is
         // held, the rest stay in the ring, and the Drain takes all three in order. Nothing is evicted: the channel had
         // nothing queued when the Poll began.
         using SessionHarness h = Harness(ring: 4096);
-        QuiclyPeer client = h.Client;
         QuiclyPeer server = h.Server!;
-        for (int i = 0; i < 600; i++)
-        {
-            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
-        }
-
-        Assert.True(h.RunUntil(() => Channel(server, 10).Received == 600), "the reliable messages did not arrive");
+        FillReserved(h, 256);
         for (int frame = 0; frame < 3; frame++)
         {
             Deliver(h, 2, frame * 600, 600, () => { });
@@ -323,7 +341,8 @@ public class DrainBackpressureTests
 
         Assert.Equal(0, Channel(server, 2).DrainQueueDrops);
         Assert.Equal(0, DatagramKit.Statistics(server).ReceiveRingDrops);
-        Assert.Equal(Enumerable.Range(0, 600), DrainAll(server, 10));
+        Assert.Equal(Enumerable.Range(0, 256), DrainAll(server, 10));
+        Assert.Equal(Enumerable.Range(1_000, 256), DrainAll(server, 11).Order());
     }
 
     [Theory]
@@ -393,21 +412,15 @@ public class DrainBackpressureTests
     [Fact]
     public void An_Undrained_Unreliable_Channel_Holds_The_Ring_For_One_Poll_Interval_At_Most()
     {
-        // Channel 10 (reliable, no handler, not drained) has 40 of the 64 nodes. A burst of 56 on channel 2 then finds 24
-        // free: the 25th is held — the channel might be drained in this frame — and the ring stays closed behind it. It
+        // Channels 10 and 11 (reliable, no handler, not drained) have 32 of the 64 nodes. A burst of 56 on channel 2 then
+        // finds 32 free: the 33rd is held — the channel might be drained in this frame — and the ring stays closed behind it. It
         // is not drained, so the next Poll makes its queue backlog: the held message and the rest of the ring are queued by
         // evicting the channel's own oldest, the ring is open again, and a handled channel behind the burst is served.
         using SessionHarness h = Harness();
-        QuiclyPeer client = h.Client;
         QuiclyPeer server = h.Server!;
         List<int> handled = [];
         server.RegisterHandler(3, CollectIndices(handled));
-        for (int i = 0; i < 40; i++)
-        {
-            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
-        }
-
-        Assert.True(h.RunUntil(() => Channel(server, 10).Received == 40), "the reliable messages did not arrive");
+        FillReserved(h);
         server.Poll();
 
         Deliver(h, 2, 0, 56, () => { });
@@ -421,11 +434,12 @@ public class DrainBackpressureTests
         server.Flush();
 
         Assert.Equal(Enumerable.Range(0, 4), handled);
-        Assert.Equal(32, Channel(server, 2).DrainQueueDrops);
+        Assert.Equal(24, Channel(server, 2).DrainQueueDrops);
         Assert.Equal(0, DatagramKit.Statistics(server).ReceiveRingDrops);
         Assert.False(server.HasPendingWork, "a channel nobody drains keeps the peer reporting work");
-        Assert.Equal(Enumerable.Range(32, 24), DrainAll(server, 2));
-        Assert.Equal(Enumerable.Range(0, 40), DrainAll(server, 10));
+        Assert.Equal(Enumerable.Range(24, 32), DrainAll(server, 2));
+        Assert.Equal(Enumerable.Range(0, 16), DrainAll(server, 10));
+        Assert.Equal(Enumerable.Range(1_000, 16), DrainAll(server, 11).Order());
     }
 
     [Fact]
@@ -434,23 +448,18 @@ public class DrainBackpressureTests
         // The same hold, and a host that polls with maxItems 0: the held message of a channel without a handler is not a
         // dispatch, so the limit must not keep it — and the ring behind it — waiting.
         using SessionHarness h = Harness();
-        QuiclyPeer client = h.Client;
         QuiclyPeer server = h.Server!;
-        for (int i = 0; i < 40; i++)
-        {
-            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
-        }
-
-        Assert.True(h.RunUntil(() => Channel(server, 10).Received == 40), "the reliable messages did not arrive");
+        FillReserved(h);
         server.Poll();
-        Deliver(h, 2, 0, 25, () => { });
+        Deliver(h, 2, 0, 33, () => { });
         server.Poll();
         Assert.Equal(0, Channel(server, 2).DrainQueueDrops);
+        Assert.True(server.HasPendingWork, "the 33rd message was not held");
 
         server.Poll(0);
 
         Assert.Equal(1, Channel(server, 2).DrainQueueDrops);
-        Assert.Equal(Enumerable.Range(1, 24), DrainAll(server, 2));
+        Assert.Equal(Enumerable.Range(1, 32), DrainAll(server, 2));
     }
 
     [Fact]
@@ -458,26 +467,24 @@ public class DrainBackpressureTests
     {
         // A burst of 60 on channel 2 takes 60 of the 64 nodes in one pass (a channel that might be drained this frame
         // may borrow the reserved ones). It is not drained. The next Poll cuts the backlog to its 32 nodes before anything
-        // else, so 32 reliable messages that arrive then are queued, not held.
+        // else, so the 32 messages of the two reliable channels that arrive then find their reserved nodes free: they are
+        // queued in the pool, and no node beyond it is needed.
         using SessionHarness h = Harness();
-        QuiclyPeer client = h.Client;
         QuiclyPeer server = h.Server!;
 
         Deliver(h, 2, 0, 60, () => { });
         server.Poll();
         Assert.Equal(0, Channel(server, 2).DrainQueueDrops);
-        for (int i = 0; i < 32; i++)
-        {
-            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
-        }
-
-        Assert.True(h.RunUntil(() => Channel(server, 10).Received == 32), "the reliable messages did not arrive");
+        FillReserved(h);
         server.Poll();
         server.Flush();
 
         Assert.Equal(28, Channel(server, 2).DrainQueueDrops);
         Assert.False(server.HasPendingWork, "a reliable message is held although its reserved nodes are free");
-        Assert.Equal(Enumerable.Range(0, 32), DrainAll(server, 10));
+        Assert.Equal(0, server.DrainQueues.ExcessUsed);
+        Assert.Equal(64, server.DrainQueues.Used);
+        Assert.Equal(Enumerable.Range(0, 16), DrainAll(server, 10));
+        Assert.Equal(Enumerable.Range(1_000, 16), DrainAll(server, 11).Order());
         Assert.Equal(Enumerable.Range(28, 32), DrainAll(server, 2));
     }
 
@@ -503,7 +510,7 @@ public class DrainBackpressureTests
         }
     }
 
-    // ------------------------------------------------------------------ reliable channels: never lose, still hold
+    // ------------------------------------------------------------------ reliable channels: never lose, and keep to their share
 
     [Fact]
     public void Unreliable_Backlog_Leaves_The_Reserved_Nodes_To_Reliable_Channels()
@@ -512,33 +519,35 @@ public class DrainBackpressureTests
         // without a handler still finds its reserved nodes free: its messages are queued, nothing is held, the ring stays
         // open and a handled channel keeps receiving.
         using SessionHarness h = Harness();
-        QuiclyPeer client = h.Client;
         QuiclyPeer server = h.Server!;
         List<int> handled = [];
         server.RegisterHandler(3, CollectIndices(handled));
 
         Deliver(h, 2, 0, 200, () => server.Poll());
-        for (int i = 0; i < 32; i++)
-        {
-            Assert.Equal(SendStatus.Admitted, client.SendCopy(new SendHeader(10), Payload(i)).Status);
-        }
-
-        Assert.True(h.RunUntil(() => Channel(server, 10).Received == 32), "the reliable messages did not arrive");
+        FillReserved(h);
         Deliver(h, 3, 0, 10, () => server.Poll());
 
         Assert.Equal(Enumerable.Range(0, 10), handled);
         Assert.Equal(0, DatagramKit.Statistics(server).ReceiveRingDrops);
-        Assert.Equal(Enumerable.Range(0, 32), DrainAll(server, 10));
+        Assert.Equal(0, server.DrainQueues.ExcessUsed);
+        Assert.Equal(Enumerable.Range(0, 16), DrainAll(server, 10));
+        Assert.Equal(Enumerable.Range(1_000, 16), DrainAll(server, 11).Order());
         Assert.Equal(0, Channel(server, 10).DrainQueueDrops);
     }
 
     [Fact]
-    public void A_Held_Reliable_Message_Does_Not_Stop_Mailbox_Dispatch()
+    public void A_Held_Message_Does_Not_Stop_Mailbox_Dispatch()
     {
-        // A reliable channel nobody drains fills the pool, its next message is held and the ring stays closed — that much
-        // is the documented limit. The mailboxes do not pass through the ring, though: a coalescing channel's handler must
-        // keep running (the transport thread keeps accepting those values either way).
-        using SessionHarness h = Harness();
+        // A message that cannot be queued is held, and the ring stays closed behind it. A reliable channel no longer gets
+        // there — its receive credit and the nodes beyond the pool see to that (ReliableCreditTests) — but it is still the
+        // rule for a channel whose engine was replaced by one that takes no credit, as the ordered channel's is here. The
+        // mailboxes do not pass through the ring, though: a coalescing channel's handler must keep running (the transport
+        // thread keeps accepting those values either way).
+        using SessionHarness h = TestEngines.Create(out _, out TestEngine engine, ChannelMode.ReliableOrdered, table: Table, both: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.ReceiveRingCapacity = Ring;
+        });
         QuiclyPeer client = h.Client;
         QuiclyPeer server = h.Server!;
         Dictionary<ulong, int> latest = [];
@@ -550,7 +559,7 @@ public class DrainBackpressureTests
         }
 
         h.Run(100_000);
-        Assert.True(Channel(server, 10).Received > Ring, "the reliable flood did not fill the queue pool");
+        Assert.True(engine.Ends > Ring, "the flood did not fill the queue pool");
         Assert.True(server.HasPendingWork, "a held message is work the application has to resolve");
 
         for (ulong key = 1; key <= 8; key++)

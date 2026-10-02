@@ -227,10 +227,15 @@ is chosen:
   budget — and drops its **oldest** messages beyond it (`DrainQueueDrops`, per channel and per peer); a channel
   nobody drains closes the ring to the other channels once, for one Poll interval (two for a channel that was
   drained before, or when the burst arrives with the session's first Poll), and not again until it has been drained. A reliable channel is never
-  dropped, so an undrained one fills the pool and then holds the receive ring: every stream channel is
-  back-pressured and datagrams of ring channels are dropped on arrival until it is drained or gets a handler
-  (coalescing and `ReliableLatest` handlers keep running). Drain, or register a handler for, every reliable
-  channel the other end sends on.
+  dropped, so it is bounded where its messages are accepted: a per-channel receive credit, checked on the
+  transport thread, lets a channel nobody reads have its share of the pool and of a quarter of the budget
+  waiting (strictly: a message whose block does not fit is not started), and then holds back that channel's own
+  streams (QUIC flow control stops their sender; `ChannelStatistics.BacklogHolds`). The ring and the other
+  channels are not affected. A channel with a handler keeps the ring and the budget as its only limits; one that
+  is drained every frame, the ring and half the budget. What remains: an unread `ReliableUnordered` channel ends
+  up holding the connection's free stream slots, and unread channels that hold the transport's connection
+  flow-control window between them (16 MiB by default) stop its streams, so read every reliable channel that can
+  receive that much.
 * **Direct mode** (Bulk and large objects): `IReceiveRouter.SelectTarget(in ReceiveHeader)` runs on the
   transport thread and returns a `ReceiveTarget` — pre-sized caller `Memory<byte>` (never grown, not touched
   by the game thread until `OnMessage`), an `IBufferWriter<byte>` that never grows, a pooled lease, or
@@ -410,7 +415,7 @@ public sealed class QuiclyClient
 | Setting | Default | Why |
 |---|---|---|
 | `PeerBidiStreamCount` | 1 before admission | the control stream only |
-| `PeerUnidiStreamCount` | 0 before admission; after: channels + Σ MaxGroups + bulk concurrency (≤ 4 096) | per-channel streams and flush groups |
+| `PeerUnidiStreamCount` | server: 0 before admission. Client: 1 024 from the first packet (`MsQuicTransportOptions.ClientPeerUnidiStreamCount`; QUIC never takes it back). After admission both ask for Σ max(`MaxGroups`, 1) over the stream-capable channels (≤ 4 096) | per-channel streams and flush groups; the session keeps receive state for the larger of the two numbers (`PeerCore.PeerStreamCapacity`), and the transport's stream table is `MaxStreams` slots (2 048) or as many as those grants need next to a quarter for the local streams |
 | `StreamRecvWindowUnidiDefault` | 2 MiB | one Bulk stream per RTT must not be capped at 64 KiB |
 | `ConnFlowControlWindow` | 16 MiB | bulk throughput |
 | `IdleTimeoutMs` | 30 000 | dead-client detection when nothing is in flight |
@@ -465,7 +470,7 @@ logs a warning per connection). Session/auth token rules, admission timeouts, re
 | drain queues | peer | min(receive ring, 1 024) × 68 B (68 KiB), at least 2 nodes per reliable channel; plus 35 B per channel | per-channel queues for `Drain` consumers: a 64 B node plus its link, native, built with the peer; per channel the head, tail, count, queued bytes, drop counter, class, handler flag, backlog mark, the pass of its last complete drain and an index of the unreliable channels. Half the pool is reserved for `ReliableOrdered` / `ReliableUnordered` channels (split evenly) when the table has one; what unreliable channels leave undrained across a Poll (their backlog) may occupy the rest and at most ¼ of the receive byte budget, oldest-first eviction beyond that |
 | segment arena | peer | 1 024 × 16 B | per-submission gather arrays for stream sends |
 | channel state | peer × channel | 2 × 64 B | send + receive halves |
-| group records | peer × group channel | `(3 × max(MaxGroups, 1) + 4) × 64 B` send + `max(MaxGroups, 1) × 64 B` receive | `ReliableUnordered`: one record per live group (filling, waiting, or holding a stream) and one per accepted peer stream; the engine's notice ring adds `4 × its send records + 8` × 12 B |
+| group records | peer × group channel (send), peer (receive) | `(3 × max(MaxGroups, 1) + 4) × 64 B` send per channel + `PeerStreamCapacity × 64 B` receive per peer | `ReliableUnordered`: one send record per live group (filling, waiting, or holding a stream); one receive record for every stream the peer can have open on the connection, because a receiver that is behind holds more than a channel's `MaxGroups` of them (PROTOCOL.md §7). `PeerStreamCapacity` is the session's stream limit (Σ max(MaxGroups, 1), ≤ 4 096) or the transport's own initial grant when that is more: 0.6 KiB on a server peer whose table has one group channel and one ordered channel, 64 KiB on an MsQuic client at its default grant of 1 024 (plus 16 KiB for the pended-stream ring, which is sized from the same number), 256 KiB at the 4 096-stream cap; the engine's notice ring adds `4 × its send records + 8` × 12 B |
 | bulk transfers | peer (both directions) | `BulkTransfersPerDirection` × 128 B send + × 192 B receive | `Bulk`: one record per transfer in each direction (2 + 2 by default = 640 B), plus the engine's rings — stream notices `(4 × transfers + 8) × 24 B`, peer control messages 64 × 48 B, and two `transfers + 8` slot rings of 4 B — about 4 KiB per peer in total. A transfer that **compresses** also rents one `BulkChunkBytes` scratch block (64 KiB, lazily, per peer); the staging of a received compressed chunk comes from the receive budget, not from here |
 | key slots | peer × keyed channel | `MaxKeys` × 64 B (+ mailbox) | dense or hashed |
 | reassembly table | peer × fragmenting channel | `MaxReassemblies` × 64 B (1 KiB at the default of 16) | one record per partial message; its buffer comes from the receive byte budget (at most `MaxReassemblies` × `MaxMessageSize`, so 16 × 8 800 = 138 KiB per channel with the defaults — size `ReceiveBudgetBytes` for it, or lower `MaxReassemblies`) |
@@ -479,7 +484,7 @@ from the shared slab reserve, not additional per-peer allocations. `ServerOption
 it — 1 000 peers at the defaults would be ~550 MiB of tables alone, so a server with many peers lowers
 `ReceiveRingCapacity`, `SendTableCapacity` and the byte budgets (the defaults target tens to a few hundred peers
 per process). `MaxGroups` is the one channel option that can dominate this: at its default of 8 a group channel costs about
-1.8 KiB of send records, 0.5 KiB of receive records and 1.4 KiB of notice ring, but a channel raised to `MaxGroups = 1024` costs
+1.8 KiB of send records, 0.5 KiB of the peer's receive records and 1.4 KiB of notice ring, but a channel raised to `MaxGroups = 1024` costs
 about **192 KiB** of send records (3 076 of them), 64 KiB of receive records and ~144 KiB of ring — roughly 400 KiB for that one
 channel, per peer — so raise it only for a channel that really needs that many groups in flight at once. The numbers are
 published from the benchmark in `docs/benchmarks/memory.md`.

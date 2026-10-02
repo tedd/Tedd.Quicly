@@ -90,6 +90,9 @@ internal sealed unsafe class PeerCore : IDisposable
     private readonly int[] _entryOfToken;
     private readonly ReceiveMailbox?[] _mailboxByIndex;
     private ReceiveMailbox[] _mailboxes = [];
+    private SpscRing<TransportStreamId> _pendedStreams;
+    // Rings SetTransportPeerStreams replaced: kept until Dispose, because the game thread may still be reading one.
+    private SpscRing<TransportStreamId>[]? _retiredPendedStreams;
     // Cold, by slot: the shared payload an entry holds one reference on (SendShared), released in ReleasePayload.
     private readonly SharedLeaseTable?[] _sharedTables;
     private readonly SharedLease[] _sharedLeases;
@@ -184,7 +187,28 @@ internal sealed unsafe class PeerCore : IDisposable
         _sendOutcomes = new NativeArray<ChannelSendOutcomeCounters>(Math.Max(1, _channels.Length)); // zeroed by NativeArray
         _recvCounters = new NativeArray<ChannelRecvCounters>(Math.Max(1, _channels.Length));
         PeerUnidirectionalStreamLimit = ComputeUnidirectionalLimit(_channels);
-        PendedStreams = new SpscRing<TransportStreamId>(PeerUnidirectionalStreamLimit + 2);
+        PeerStreamCapacity = PeerUnidirectionalStreamLimit;
+        _pendedStreams = new SpscRing<TransportStreamId>(PeerStreamCapacity + 2);
+
+        // What a reliable channel nobody reads may have waiting is what the drain queues keep for it: the nodes the layout
+        // reserves per reliable channel, and an equal share of a quarter of the receive budget, counted in the pool's
+        // blocks. One the application drains: the ring, and half the budget.
+        ReceiveQueueLayout queueLayout = ReceiveQueueLayout.Compute(_channels, options.ReceiveRingCapacity, options.ReceiveBudgetBytes);
+        ReadOnlySpan<SizeClassDefinition> sizeClasses = _allocator.SizeClasses;
+        Span<int> blockSizes = stackalloc int[sizeClasses.Length];
+        for (int i = 0; i < sizeClasses.Length; i++)
+        {
+            blockSizes[i] = sizeClasses[i].BlockSize;
+        }
+
+        Credit = new ReceiveCredit(
+            _channels.Length,
+            PeerStreamCapacity + 2,
+            queueLayout.ReliableNodes,
+            ReceiveCredit.ByteLimitFor(options.ReceiveBudgetBytes, CountReliableQueueChannels(_channels)),
+            ReceiveRing.Capacity,
+            (int)Math.Clamp(options.ReceiveBudgetBytes / 2, 1, int.MaxValue - 1),
+            blockSizes);
         Streams = new StreamTable();
         SessionMaxMessageSize = role == PeerRole.Server ? options.MaxMessageSize : 0;
         FlushIntervalMicros = Math.Max(1, PeerOptions.ToMicros(options.FlushInterval));
@@ -632,7 +656,90 @@ internal sealed unsafe class PeerCore : IDisposable
     public SpscRing<ReceiveEntry> ReceiveRing { get; }
 
     /// <summary>Streams whose receive returned Pending, transport thread → game thread (resumed in Poll).</summary>
-    public SpscRing<TransportStreamId> PendedStreams { get; }
+    public SpscRing<TransportStreamId> PendedStreams => Volatile.Read(ref _pendedStreams);
+
+    /// <summary>
+    /// The rings <see cref="SetTransportPeerStreams"/> replaced, or null when there is none (any thread; the array is
+    /// published whole and never changed). A stream that was held when the ring was replaced is still in one of them, so
+    /// <see cref="QuiclyPeer.Poll"/> resumes from these as well: the replacement does not rest on the transport reporting
+    /// its grant before any stream can be held.
+    /// </summary>
+    public SpscRing<TransportStreamId>[]? RetiredPendedStreams => Volatile.Read(ref _retiredPendedStreams);
+
+    /// <summary>Whether a replaced ring still holds a stream to resume (any thread; part of the pending-work probe).</summary>
+    public bool HasRetiredPendedStreams
+    {
+        get
+        {
+            SpscRing<TransportStreamId>[]? retired = Volatile.Read(ref _retiredPendedStreams);
+            if (retired is null)
+            {
+                return false;
+            }
+
+            foreach (SpscRing<TransportStreamId> ring in retired)
+            {
+                if (!ring.IsEmpty)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Unidirectional streams the peer can have open at once on this connection: <see cref="PeerUnidirectionalStreamLimit"/>,
+    /// or what the transport granted by itself when that is more (<see cref="SetTransportPeerStreams"/>). Everything the
+    /// session keeps per peer stream — <see cref="PendedStreams"/>, the engines' receive records — is sized from it, so a
+    /// stream the transport admits always finds its place.
+    /// </summary>
+    public int PeerStreamCapacity { get; private set; }
+
+    /// <summary>
+    /// Makes room for the streams the transport admits by itself (transport thread, <see cref="ITransportSink.OnConnected"/>).
+    /// A QUIC transport grants the peer an initial number of unidirectional streams in its own configuration — an MsQuic
+    /// client 1 024 by default — and never takes them back, whatever the session asks for after admission. When that is more
+    /// than the session's limit, the streams a late receiver holds open can outnumber what the session was built for; a
+    /// stream without a record would have to be reset, and its sender has long completed its messages as delivered.
+    /// </summary>
+    /// <remarks>
+    /// Safe without a lock because of where it runs. No stream of a connection exists before its OnConnected, so the ring
+    /// being replaced is empty and nothing is in flight to it; the engines' receive records belong to the transport thread,
+    /// which is the caller. The game thread may still hold the old ring (a Poll in progress, the work probe of another
+    /// thread): it finds it empty, and the ring stays allocated until the peer is disposed, so that read is never a use
+    /// after free. The capacity only grows, so a reconnect to a transport with a smaller grant keeps what it has.
+    /// </remarks>
+    /// <param name="granted">The transport's own grant (<see cref="TransportCapabilities.PeerUnidirectionalStreams"/>).</param>
+    public void SetTransportPeerStreams(int granted)
+    {
+        int capacity = Math.Min(Math.Max(PeerUnidirectionalStreamLimit, granted), ushort.MaxValue);
+        if (capacity <= PeerStreamCapacity)
+        {
+            return;
+        }
+
+        PeerStreamCapacity = capacity;
+        SpscRing<TransportStreamId> current = _pendedStreams;
+        if (capacity + 2 > current.Capacity)
+        {
+            // The ring that is replaced stays allocated and stays readable: the game thread may be reading it, and streams
+            // held before this call are still in it (published before the new ring, so whoever sees the new one sees it).
+            SpscRing<TransportStreamId>[] retired = _retiredPendedStreams ?? [];
+            SpscRing<TransportStreamId>[] grown = new SpscRing<TransportStreamId>[retired.Length + 1];
+            retired.CopyTo(grown, 0);
+            grown[^1] = current;
+            Volatile.Write(ref _retiredPendedStreams, grown);
+            Volatile.Write(ref _pendedStreams, new SpscRing<TransportStreamId>(capacity + 2));
+        }
+
+        Credit.SetStreamCapacity(capacity + 2);
+        foreach (ChannelEngine engine in _activeEngines)
+        {
+            engine.OnPeerStreamCapacity(capacity);
+        }
+    }
 
     /// <summary>Receive-side stream records (transport thread).</summary>
     public StreamTable Streams { get; }
@@ -661,6 +768,12 @@ internal sealed unsafe class PeerCore : IDisposable
 
     /// <summary>Unidirectional streams the peer may open after admission: Σ max(MaxGroups, 1) over stream-capable channels, capped at 4 096.</summary>
     public int PeerUnidirectionalStreamLimit { get; }
+
+    /// <summary>
+    /// The credit of the reliable stream channels: how much of a channel without a handler may wait for the application
+    /// before its streams are held back (<see cref="ReceiveCredit"/>).
+    /// </summary>
+    public ReceiveCredit Credit { get; }
 
     /// <summary>Clock micros when the transport connected (connection-relative wire timestamps count from here).</summary>
     public long ConnectionStartMicros { get; set; }
@@ -796,6 +909,21 @@ internal sealed unsafe class PeerCore : IDisposable
         }
 
         return (int)Math.Min(total, MaxPeerUnidirectionalStreams);
+    }
+
+    /// <summary>Channels of the drain queues' reliable class (ReliableOrdered, ReliableUnordered): the ones that share the credit.</summary>
+    private static int CountReliableQueueChannels(ChannelDefinition[] channels)
+    {
+        int count = 0;
+        foreach (ChannelDefinition channel in channels)
+        {
+            if (ReceiveQueueClass.Of(channel) == ReceiveQueueClass.Reliable)
+            {
+                count++;
+            }
+        }
+
+        return count;
     }
 
     // ------------------------------------------------------------------ channels, engines, counters (any thread, read-only)
@@ -1128,6 +1256,27 @@ internal sealed unsafe class PeerCore : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Whether <see cref="TryRentReceive"/> can succeed for <paramref name="length"/> bytes at all while the caller holds
+    /// <paramref name="held"/> bytes of the budget itself: the pool has a block that holds them, and that block fits in
+    /// what is left of the receive budget. When it cannot, waiting for a buffer is pointless.
+    /// </summary>
+    /// <param name="length">Bytes needed.</param>
+    /// <param name="held">Budget bytes the caller keeps until the rent succeeded (a compressed message's own block).</param>
+    public bool CanEverRentReceive(int length, int held)
+    {
+        ReadOnlySpan<SizeClassDefinition> classes = _allocator.SizeClasses;
+        for (int i = 0; i < classes.Length; i++)
+        {
+            if (classes[i].BlockSize >= length)
+            {
+                return classes[i].BlockSize <= _receiveBudget - held;
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>Returns a receive lease (any thread; normally the game thread). Empty leases are ignored.</summary>
     /// <param name="lease">The lease.</param>
     public void ReturnReceive(in BufferLease lease)
@@ -1340,6 +1489,52 @@ internal sealed unsafe class PeerCore : IDisposable
             Counters.CallbackFaults++;
         }
 
+        NoteTransportWork();
+    }
+
+    /// <summary>
+    /// Remembers a stream whose receive was held back because its channel is out of credit (transport thread, the engine
+    /// answered <see cref="StreamConsume.PendCredit"/>). Unlike <see cref="NotePendedStream"/> it is not resumed by the
+    /// next Poll: the game thread resumes it when the application takes messages of the channel, or gives it a handler.
+    /// </summary>
+    /// <param name="id">The stream.</param>
+    /// <param name="channelIndex">Dense index of its channel.</param>
+    /// <param name="length">Payload length of the message the stream is held back with.</param>
+    /// <returns>
+    /// <see langword="false"/> when the stream could not be remembered, so nothing would ever resume it: the peer reset the
+    /// streams this end held back and opened new ones, many times over, since the game thread last looked
+    /// (<see cref="ReceiveCredit.ListGrowth"/>). The caller closes the connection.
+    /// </returns>
+    public bool NoteCreditPendedStream(TransportStreamId id, int channelIndex, int length)
+    {
+        Counters.StreamReceivePends++;
+        bool listed = Credit.NotePended(id, channelIndex, length);
+
+        // The Poll this asks for takes the stream off the list; after that a channel that stays out of credit is not work.
+        NoteTransportWork();
+        return listed;
+    }
+
+    /// <summary>
+    /// Gives back the credit of a message that was being received when its stream ended (the engine's transport-thread
+    /// release of a staged message; also the game thread while a reconnect clears the engines). The streams the channel
+    /// holds back may go on now although the application took nothing, so the host is told: the next Poll resumes them.
+    /// </summary>
+    /// <param name="channelIndex">Dense index of the message's channel.</param>
+    /// <param name="leaseBytes">The block size the message was counted with.</param>
+    public void ReturnStagedCredit(int channelIndex, int leaseBytes)
+    {
+        Credit.Untake(channelIndex, leaseBytes);
+        NoteTransportWork();
+    }
+
+    /// <summary>
+    /// A stream ended while its receive was held back for credit (transport thread): the game thread must not keep a turn
+    /// for it, so the host is told and the next Poll looks at the streams that wait (<see cref="ReceiveCredit.NoteGone"/>).
+    /// </summary>
+    public void NoteCreditStreamGone()
+    {
+        Credit.NoteGone();
         NoteTransportWork();
     }
 
@@ -1831,6 +2026,18 @@ internal sealed unsafe class PeerCore : IDisposable
         {
         }
 
+        if (RetiredPendedStreams is { } retiredPended)
+        {
+            foreach (SpscRing<TransportStreamId> ring in retiredPended)
+            {
+                while (ring.TryDequeue(out _))
+                {
+                }
+            }
+        }
+
+        // After the engines gave back what a half-received message had taken: the counts start over with the connection.
+        Credit.Reset();
         _localHead = 0;
         _localTail = 0;
         _localCount = 0;
@@ -1918,6 +2125,15 @@ internal sealed unsafe class PeerCore : IDisposable
         ReceiveRing.Dispose();
         CompletionRing.Dispose();
         PendedStreams.Dispose();
+        if (_retiredPendedStreams is not null)
+        {
+            foreach (SpscRing<TransportStreamId> retired in _retiredPendedStreams)
+            {
+                retired.Dispose();
+            }
+        }
+
+        Credit.Dispose();
         Completions.Dispose();
         _tokens.Dispose();
         _stamps.Dispose();

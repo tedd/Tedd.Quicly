@@ -268,6 +268,10 @@ public class ReviewRegressionsDrainTests
     /// empty) queue — or, with nothing of its class queued, dropped itself, newest first, every one of them. A consumer
     /// that drains both channels in the same frame got all of them on main (the first was held, the rest waited in the
     /// ring). With 1 000 reliable messages in front, channel 2 keeps 24 of 50; with 1 024, none.
+    /// <para>
+    /// Since the receive credit: a reliable channel the application drains keeps its reserved share of the pool and
+    /// queues the rest of a burst in nodes beyond it, so the unreliable messages behind it find the pool free.
+    /// </para>
     /// </summary>
     [Theory]
     [InlineData(1000, 50)]
@@ -276,6 +280,13 @@ public class ReviewRegressionsDrainTests
     {
         using SessionHarness h = Harness(Mixed);
         QuiclyPeer server = h.Server!;
+
+        // The frame before the burst: the host has been running and has drained both channels. That is what tells the
+        // peer that channel 10 is read: a reliable channel nobody has drained yet is held to the share of an unread one,
+        // and only that much of a burst is accepted before its first Drain (ReliableCreditTests).
+        server.Poll();
+        Assert.Empty(DrainAll(server, 10));
+        Assert.Empty(DrainAll(server, 2));
 
         Burst(h, 10, reliable, 4);
         Burst(h, 2, unreliable, 4);

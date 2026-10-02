@@ -227,7 +227,7 @@ public class LatestEdgeTests
     }
 
     [Fact]
-    public void A_Large_Value_Whose_Start_Is_Refused_Asynchronously_Is_Retransmitted()
+    public void A_Large_Value_Whose_Start_Is_Refused_Asynchronously_Goes_Out_Again_As_Its_First_Transmission()
     {
         AsyncRefusalConnector connector = null!;
         using SessionHarness h = new(link: new LinkOptions { DelayMicros = 2_000 }, table: Table,
@@ -255,7 +255,86 @@ public class LatestEdgeTests
         Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(result.Token) == DeliveryStatus.Delivered, 10_000_000),
             $"status {h.Client.GetDeliveryStatus(result.Token)}");
         Assert.True(LatestKit.Matches(received[^1].Payload, 7, 8_000));
-        Assert.True(DatagramKit.ChannelStats(h.Client, 2).Retries >= 1, "the refused start should have been retransmitted");
+
+        // The refused start put nothing on the wire, so the stream that carried the value is its first transmission: one
+        // Sent, and no retransmission (this test asserted Retries >= 1 while a refused start was counted as a transmission).
+        ChannelStatistics statistics = DatagramKit.ChannelStats(h.Client, 2);
+        Assert.Equal(1, transport.Refused);
+        Assert.Equal(1, statistics.Sent);
+        Assert.Equal(0, statistics.Retries);
+    }
+
+    [Fact]
+    public void A_Large_Value_Whose_Start_Is_Refused_Asynchronously_Waits_For_Credit_Without_Spending_Its_Transmissions()
+    {
+        // MsQuic and the simulator refuse a stream start after the send that carried it was accepted. The value must then
+        // wait for stream credit exactly as after a refusal the call itself reports: it must not open a stream on every
+        // pass, and a refused start is not one of the version's sixteen transmissions.
+        AsyncRefusalConnector connector = null!;
+        using SessionHarness h = new(link: new LinkOptions { DelayMicros = 2_000 }, table: Table,
+            client: o =>
+            {
+                LatestKit.Quiet(o);
+                LatestKit.Roomy(o);
+            },
+            server: o =>
+            {
+                LatestKit.Quiet(o);
+                LatestKit.Roomy(o);
+            },
+            connector: inner => connector = new AsyncRefusalConnector(inner));
+        h.Run(50_000);
+        List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
+        h.Server!.RegisterHandler(2, LatestKit.Collect(received));
+        AsyncRefusalTransport transport = connector.Transport!;
+        transport.RefuseStarts = int.MaxValue;
+        QuiclyPeer client = h.Client;
+
+        SendResult result = client.SendCopy(new SendHeader(2, 9), LatestKit.Payload(7, 8_000), SendOptions.Tracked);
+        client.Flush();
+        transport.Deliver();
+        Assert.Equal(1, transport.Refused);
+
+        // No credit arrives: a second of passes opens no further stream, and the refused start was taken back.
+        for (int step = 0; step < 100; step++)
+        {
+            client.Poll();
+            client.Flush();
+            transport.Deliver();
+            h.Network.Advance(10_000);
+        }
+
+        Assert.Equal(1, transport.Refused);
+        Assert.Equal(DeliveryStatus.Pending, client.GetDeliveryStatus(result.Token));
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 2).Sent);
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 2).BytesSent);
+
+        // Thirty more refusals, each after fresh credit — nearly twice the transmissions a version has: the value still waits.
+        for (int round = 0; round < 30; round++)
+        {
+            transport.GrantCredit();
+            client.Poll();
+            client.Flush();
+            transport.Deliver();
+            h.Network.Advance(10_000);
+        }
+
+        // One more pass takes the last refusal in; without new credit it opens nothing.
+        client.Poll();
+        client.Flush();
+        Assert.Equal(31, transport.Refused);
+        Assert.Equal(DeliveryStatus.Pending, client.GetDeliveryStatus(result.Token));
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 2).Sent);
+        Assert.Equal(0, DatagramKit.ChannelStats(client, 2).Retries);
+        Assert.Empty(received);
+
+        // The limit lets a stream through: the value goes out and is delivered.
+        transport.RefuseStarts = 0;
+        transport.GrantCredit();
+        Assert.True(h.RunUntil(() => client.GetDeliveryStatus(result.Token) == DeliveryStatus.Delivered, 10_000_000),
+            $"status {client.GetDeliveryStatus(result.Token)}");
+        Assert.True(LatestKit.Matches(received[^1].Payload, 7, 8_000));
+        Assert.Equal(1, DatagramKit.ChannelStats(client, 2).Sent);
     }
 
     [Fact]

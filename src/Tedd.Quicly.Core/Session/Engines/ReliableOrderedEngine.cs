@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
@@ -74,6 +75,9 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
     private const byte RecvOpen = 2;
     private const byte RecvReserved = 4;
 
+    /// <summary>The message being received is counted against its channel's credit (a response is not: it never waits for the application).</summary>
+    private const byte RecvCredited = 8;
+
     private PeerCore _core = null!;
     private ChannelDefinition[] _channels = [];
     private int[] _localOf = [];
@@ -144,6 +148,7 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
             int dense = core.ChannelIndexOf(channel.Id);
             _localOf[dense] = local;
             _denseOf[local] = dense;
+            core.Credit.Enable(dense);
             _expiryMicros[local] = channel.ResolveExpiryMicros(core.FlushIntervalMicros);
             ref OrderedSendState send = ref _send[local];
             send.QueueHead = -1;
@@ -505,7 +510,7 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
             _txStreams[local] = default;
             _txSerials[local] = 0;
             ref OrderedRecvState recv = ref _recv[local];
-            ReleaseReceive(ref recv);
+            ReleaseReceive(ref recv, local);
             recv = default;
         }
 
@@ -1000,6 +1005,13 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
                     return StreamConsume.CloseConnection(QuiclyErrorCode.LimitExceeded);
                 }
 
+                // Before the ring slot and the lease: a channel that is out of credit takes neither.
+                bool credited = TakesCredit(message.Header.RequestId);
+                if (credited && !_core.Credit.TryTake(message.ChannelIndex, length))
+                {
+                    return StreamConsume.PendCredit;
+                }
+
                 if (!_core.TryReserveReceive())
                 {
                     return StreamConsume.Pend;
@@ -1019,6 +1031,12 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
                 recv.RequestId = message.Header.RequestId;
                 recv.RawLength = message.Header.RawLength;
                 recv.Flags |= RecvReserved;
+                if (credited)
+                {
+                    _core.Credit.NoteTaken(message.ChannelIndex, lease.Length);
+                    recv.Flags |= RecvCredited;
+                }
+
                 return StreamConsume.Continue;
             }
 
@@ -1048,7 +1066,9 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
                 entry.ReceivedMicrosDelta = PeerCore.StampReceive(message.NowMicros);
                 _core.PublishReserved(in entry);
                 recv.Lease = BufferLease.Empty;
-                recv.Flags = (byte)(recv.Flags & ~RecvReserved);
+
+                // Published: the credit now comes back when the game thread hands the message on.
+                recv.Flags = (byte)(recv.Flags & ~(RecvReserved | RecvCredited));
                 ref ChannelRecvCounters counters = ref _core.RecvCounters(message.ChannelIndex);
                 counters.Received++;
                 counters.Bytes += entry.Length;
@@ -1077,6 +1097,13 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
             return StreamConsume.CloseConnection(QuiclyErrorCode.LimitExceeded);
         }
 
+        uint requestId = message.Header.RequestId;
+        bool credited = TakesCredit(requestId);
+        if (credited && !_core.Credit.TryTake(message.ChannelIndex, length))
+        {
+            return StreamConsume.PendCredit;
+        }
+
         if (!_core.TryReserveReceive())
         {
             return StreamConsume.Pend;
@@ -1094,10 +1121,14 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
             message.Chunk.CopyTo(new Span<byte>(_core.GetPointer(in lease), length));
         }
 
+        if (credited)
+        {
+            _core.Credit.NoteTaken(message.ChannelIndex, lease.Length);
+        }
+
         ReceiveEntry entry = default;
         entry.Channel = message.Channel;
         int rawLength = message.Header.RawLength;
-        uint requestId = message.Header.RequestId;
         entry.Flags = rawLength > 0 ? ReceiveFlags.Compressed : ReceiveFlags.None;
         if (requestId != 0)
         {
@@ -1125,7 +1156,7 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
             ref OrderedRecvState recv = ref _recv[local];
             if ((recv.Flags & RecvOpen) != 0 && recv.Stream == id)
             {
-                ReleaseReceive(ref recv);
+                ReleaseReceive(ref recv, local);
                 recv.Flags = (byte)(recv.Flags & ~RecvOpen);
                 return;
             }
@@ -1187,8 +1218,24 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
         }
     }
 
-    private void ReleaseReceive(ref OrderedRecvState recv)
+    /// <summary>
+    /// Whether a message waits for the application and so counts against its channel's credit (<see cref="ReceiveCredit"/>).
+    /// A response does not: the game thread hands it to its request the moment it leaves the receive ring, whether or not
+    /// the channel has a handler, so it can never pile up in a drain queue — and holding it back would stall every request
+    /// of a client that only sends them.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool TakesCredit(uint requestId) => requestId == 0 || (requestId & 1) != 0;
+
+    private void ReleaseReceive(ref OrderedRecvState recv, int local)
     {
+        if ((recv.Flags & RecvCredited) != 0)
+        {
+            // Before the lease goes back: its block size is what the message was counted with.
+            _core.ReturnStagedCredit(_denseOf[local], recv.Lease.Length);
+            recv.Flags = (byte)(recv.Flags & ~RecvCredited);
+        }
+
         if ((recv.Flags & RecvReserved) != 0)
         {
             _core.CancelReservation();
@@ -1299,7 +1346,7 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
         /// <summary>Request id (request/response channels).</summary>
         [FieldOffset(44)] public uint RequestId;
 
-        /// <summary><c>RecvSeen</c>, <c>RecvOpen</c>, <c>RecvReserved</c>.</summary>
+        /// <summary><c>RecvSeen</c>, <c>RecvOpen</c>, <c>RecvReserved</c>, <c>RecvCredited</c>.</summary>
         [FieldOffset(48)] public byte Flags;
     }
 }

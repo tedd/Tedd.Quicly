@@ -163,7 +163,7 @@ public sealed class CompletionTable : IDisposable
 
     /// <summary>
     /// Blocks until <paramref name="stage"/> completes or <paramref name="timeout"/> elapses. Owner thread only.
-    /// Spins briefly, then parks on an event that is allocated once per slot and reused.
+    /// Spins briefly without giving up the core, then parks on an event that is allocated once per slot and reused.
     /// </summary>
     /// <param name="token">Token of the send.</param>
     /// <param name="stage">Stage to wait for.</param>
@@ -461,7 +461,11 @@ public sealed class CompletionTable : IDisposable
             ManualResetEventSlim? ev = _event;
             if (ev is null)
             {
-                ev = new ManualResetEventSlim(false);
+                // Spin count 0: the loop above has spun already, without yielding. The event's default (35 rounds) would
+                // go on spinning with Thread.Yield and Thread.Sleep(0) before it blocks; on a machine with no free core each
+                // of those hands the core to a busy thread for a scheduler quantum, and a completion that arrives meanwhile
+                // cannot wake a thread that has not parked (docs/benchmarks/threading.md section 7).
+                ev = new ManualResetEventSlim(false, spinCount: 0);
                 Volatile.Write(ref _event, ev);
             }
 

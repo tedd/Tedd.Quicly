@@ -3,13 +3,19 @@ using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
 
-namespace Tedd.Quicly.Server.Tests.Review;
+namespace Tedd.Quicly.Server.Tests;
 
 /// <summary>
 /// Adversarial review, recheck round 2 of fix/stack-review (1b33437), lens: a1480f8 (RC-1 fix,
 /// <c>PeerCore.CanEverRentDecode(length, heldBlock)</c>) with the pool a <see cref="QuiclyServer"/> builds by default. A test
 /// marked FINDING fails at 1b33437 for the reason its comment gives.
 /// </summary>
+/// <remarks>
+/// Fixed since (RC2-1): each peer's large compressed message is staged in a 256 KiB block of its decoded size, taken all or
+/// nothing at its start, and decoded in place, so no head waits for a block another peer's head holds; the small message
+/// behind it waits holding nothing until the large one is released. The description below is what the test found at
+/// 1b33437; the test now pins the fix.
+/// </remarks>
 public class ReviewStackRecheck2SharedPoolTests
 {
     private const ushort Packed = 6;

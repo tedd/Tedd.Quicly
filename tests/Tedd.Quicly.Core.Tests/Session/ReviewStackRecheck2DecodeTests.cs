@@ -2,10 +2,9 @@ using System.Buffers.Binary;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Adversarial review, recheck round 2 of fix/stack-review (1b33437), lens: a1480f8 (RC-1 fix,
@@ -24,6 +23,14 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// At d567ba5 and in 0.2.1 these messages were dropped and counted (DecodeFailures) and the peers went on. The shapes below
 /// are the two remedies the release notes give for RC-1's known limit ("a pool with two blocks of 256 KiB", "or a shared
 /// allocator, as a server has"), and the one with a raised receive budget.
+/// </para>
+/// <para>
+/// Fixed since (RC2-1): no decode waits for a buffer any more. A compressed message of a reliable channel no handler reads
+/// is staged in a block that holds its decoded size, taken all or nothing with its ring slot and credit at its start
+/// (<c>PeerCore.LimitedStagingLength</c>), and decoded in place (<c>Lz4Block.TryDecompressInPlace</c>); a start that cannot
+/// have its block holds nothing while it waits. <c>CanEverRentDecode</c> is gone. The large messages here (about 100 KB
+/// compressed, 200 000 decoded) are staged in the 256 KiB block they already took, so the tests run unchanged and every
+/// message arrives, with nothing dropped. The descriptions below are what the tests found at 1b33437.
 /// </para>
 /// </remarks>
 public class ReviewStackRecheck2DecodeTests

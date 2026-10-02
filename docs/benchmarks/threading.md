@@ -336,7 +336,7 @@ round, and the combined B/A ratio with its 95 % interval.
 | 40 | 54–113 µs | 50.5–52.0 µs | 0.56 [0.38 .. 0.83] | |
 | 100 | 112–131 µs | 111–113 µs | 0.91 [0.85 .. 0.97] | |
 
-B is never slower, and its medians barely move between launches. Up to about 10 µs both builds catch the completion
+B is never slower here, and its medians barely move between launches. Up to about 10 µs both builds catch the completion
 while spinning. From there A's spin yields, and on these shared cores some of its windows lost the core, so its medians
 wander between launches. At 15 µs, deep in the old event's yielding rounds, A took 47–66 µs in every launch. At 20 µs B
 catches part of the rounds before its spin ends. From 40 µs on, B parks and pays one wake-up (about 11 µs). A pays that
@@ -346,6 +346,36 @@ do not touch the spin, and `Complete` now picks one of two event fields:
 - `CompleteThenAwaitPeerSized` 0.99 [0.96 .. 1.02];
 - `AwaitThenComplete` 1.040 [1.028 .. 1.052], then 1.013 [0.995 .. 1.032] when repeated, with its A/A at
   1.043 [1.018 .. 1.068]. That is the method's arm offset for this workload, not the change.
+
+The recheck review repeated the table-level pairs at finer delays: 4 launches × 12 blocks × 200 rounds on CPUs 16–23, with
+A/A differences of at most 0.43 µs.
+- At 0–12 µs B was within −0.3 to +0.1 µs of A.
+- At 15, 18 and 20 µs B was faster: 15.6 vs 18.3–25.3 µs, 18.6 vs 26.1–27.6 µs, and 22.1–22.5 vs 27.9–28.8 µs.
+- At 22 µs, just past B's spin, B cost +0.45 to +0.55 µs in 3 of 4 launches (A/A in the same launches up to +0.43 µs).
+- From 25 µs on the two were equal.
+
+So "never slower" holds to within about 0.5 µs.
+
+**Measurement, idle, MsQuic loopback.** This is the path the first review flagged, re-measured by the recheck review on
+the final design. Each arm (A = main, B = this branch, a = a second copy of main) ran in its own AssemblyLoadContext with
+its own client and server over MsQuic loopback; the client used `CompletionMode.ThreadPool`. Each op was
+`SendCopy(64 B, UnreliableUnordered, Tracked)`, then the timed `Flush` + `QuiclyPeer.Wait(BufferReleased)`, then `Poll`.
+Blocks rotated between the arms, 30 blocks × 400 ops per arm per launch. There were 16 launches on net10.0 and net11.0,
+pinned to CPUs 16–23, which carried 15–55 % load from other sessions.
+
+| | A (main) | a (main again) | B (this branch) |
+|---|---:|---:|---:|
+| p50 per launch | 14.1–28.6 µs (typically 21–25) | 13.6–31.9 µs | 17.2–19.1 µs |
+| p90 per launch | 45.3–74.4 µs | | 46.4–49.5 µs |
+
+- The paired B−A block-median difference had a median of −5.15 µs (range −8.47 to +4.15).
+- B was lower than A in 15 of 16 launches. The one launch above had A/A at +8.43 µs.
+- The A/A difference had a median magnitude of 2.0 µs.
+- On this busier machine 37–41 % of B's completions landed after 20 µs, and p05–p30 landed at 7.5–15 µs.
+- With eight busy threads in the same process, A's p50 was 1.75–3.79 ms (p90 up to 10 ms) and B's 14.0–20.5 µs (p90
+  about 45–50 µs).
+
+The first review's +6.7–8.2 µs regression of spin count 0 on this path is gone: B is typically about 5 µs faster than main.
 
 **Measurement, loaded.** The same benchmark under BenchmarkDotNet (ShortRun, in-process; on net11.0 each run reports two
 in-process jobs), pinned to CPUs 8–11 with `DOTNET_PROCESSOR_COUNT=4` and eight `powershell -Command "while(1){}"` on the
@@ -408,6 +438,7 @@ The whole Core.Tests project passed 2 379 of 2 379:
   no credit hold (every message arrived; that test does not use the blocking wait).
 
 **Decision.** Kept: spin without yielding until 20 µs into the wait, then park on a spin-0 event per stage. Idle it is as
-fast as main or faster everywhere in the paired runs. Under load a wait never hands its core away: rounds that cost main
-0.3–0.8 ms take the delay plus at most 7 µs. Spin count 0 alone (`04cf395`) was rejected for its idle cost to datagram
+fast as main (within about 0.5 µs) or faster in every paired run, and about 5 µs faster on a loopback datagram's
+`BufferReleased`. Under load a wait never hands its core away: rounds that cost main 0.3–0.8 ms take the delay plus at
+most 7 µs. Spin count 0 alone (`04cf395`) was rejected for its idle cost to datagram
 completions. Spin count 10 measured the same as 0.

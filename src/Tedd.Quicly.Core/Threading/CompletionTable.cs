@@ -168,7 +168,10 @@ public sealed class CompletionTable : IDisposable
     /// </summary>
     /// <param name="token">Token of the send.</param>
     /// <param name="stage">Stage to wait for.</param>
-    /// <param name="timeout">Maximum time to wait; <see cref="Timeout.InfiniteTimeSpan"/> waits forever.</param>
+    /// <param name="timeout">
+    /// Maximum time to wait, in whole milliseconds (the fraction is dropped, so a timeout under 1 ms acts as zero: no
+    /// 20 µs spin and no park); <see cref="Timeout.InfiniteTimeSpan"/> waits forever.
+    /// </param>
     /// <returns>
     /// The send's status once the stage completed, or <see cref="DeliveryStatus.Pending"/> when the timeout
     /// elapsed first (use <see cref="IsCompleted"/> to tell the two apart when the stage itself may complete
@@ -259,8 +262,8 @@ public sealed class CompletionTable : IDisposable
         private static readonly Action<object?, CancellationToken> s_cancel1 = static (s, ct) => ((Slot)s!).OnCanceled(1, ct);
 
         // How long a blocking wait spins before it parks, counted from the start of the wait (docs/benchmarks/threading.md
-        // section 7): parking costs a kernel wake-up of 6-12 µs, and a tracked datagram's BufferReleased typically lands
-        // 7-14 µs after Flush over loopback.
+        // section 7): parking costs a kernel wake-up of 6-12 µs, and over loopback a tracked datagram's BufferReleased lands
+        // from about 8 µs after Flush (p05), with a median of 11-18 µs depending on the machine's load.
         private static readonly long s_spinTicks = Stopwatch.Frequency * 20 / 1_000_000;
 
         private readonly CompletionTable _owner;

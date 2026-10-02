@@ -59,7 +59,9 @@ the end that receives is the end to upgrade.
   without ever yielding until about 20 µs into the wait, then parks on an event that does not spin.
   - Loaded (four cores shared with eight busy loops, measured on Windows): a wait woken 5–100 µs after it began took
     0.26–0.82 ms; it now takes the delay plus at most 7 µs.
-  - Idle: it is as fast as before or faster.
+  - Idle: it is as fast as before (within about 0.5 µs) or faster. A tracked datagram's `Flush` + `Wait(BufferReleased)`
+    over loopback took a median of 17–19 µs, against 21–25 µs before.
+  - The timeout counts in whole milliseconds: a timeout under 1 ms acts as zero, as it did before.
   - Two blocking waits on the two stages of one token no longer share one event, so one can no longer swallow the
     other's wake-up and leave it waiting until its timeout.
   - `WaitAsync` is unchanged.

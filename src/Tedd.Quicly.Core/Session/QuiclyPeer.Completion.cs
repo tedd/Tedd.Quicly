@@ -44,6 +44,12 @@ public sealed unsafe partial class QuiclyPeer
     /// returns <see cref="DeliveryStatus.Pending"/> when its timeout elapses: use <see cref="WaitAsync"/> instead, or poll and
     /// read <see cref="GetDeliveryStatus"/>.
     /// </para>
+    /// <para>
+    /// The timeout counts in whole milliseconds, and the fraction is dropped. A timeout under 1 ms acts as zero: the call
+    /// checks the stage, spins a few microseconds and returns <see cref="DeliveryStatus.Pending"/>, without the 20 µs spin.
+    /// A short timeout can also take longer than asked. Once parked, the wait times out on the system timer: a 1–2 ms
+    /// timeout returns after about 15 ms on Windows.
+    /// </para>
     /// </remarks>
     /// <param name="token">The token.</param>
     /// <param name="stage">The stage.</param>

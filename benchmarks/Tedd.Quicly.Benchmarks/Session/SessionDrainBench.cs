@@ -40,24 +40,41 @@ public class SessionDrainBench
     private SimulatedNetwork _network = null!;
     private long _received;
 
+    /// <summary>Reliable channels in the table: the measured one and the others, which nobody reads.</summary>
+    protected virtual int ReliableChannels => 1;
+
     [GlobalSetup]
     public void Setup()
     {
-        _fixture = new SessionFixture(1);
+        _fixture = new SessionFixture(1, table: SessionFixture.TableWith(ReliableChannels));
         _client = _fixture.Clients[0];
         _server = _fixture.Servers[0];
         _network = _fixture.Network;
+        long startupHolds = 0;
         for (int i = 0; i < 200; i++)
         {
+            if (i == 100)
+            {
+                // Before its first Drain a channel is unread and has a strict share of the budget, which a batch of a
+                // many-channel table can exceed once; that is the start-up, and the steady state follows.
+                _server.GetChannelStatistics(Ordered, out ChannelStatistics early);
+                startupHolds = early.BacklogHolds;
+            }
+
             OrderedDrain64();
             OrderedDrain4K();
             OrderedDrain64Burst();
         }
 
         // What the remarks promise: a channel that is drained every cycle is never held back for its credit.
-        if (!_server.GetChannelStatistics(Ordered, out ChannelStatistics statistics) || statistics.BacklogHolds != 0)
+        if (!_server.GetChannelStatistics(Ordered, out ChannelStatistics statistics) || statistics.BacklogHolds != startupHolds)
         {
-            throw new InvalidOperationException($"The drained channel was held back {statistics.BacklogHolds} times during warm-up.");
+            throw new InvalidOperationException($"The drained channel was held back {statistics.BacklogHolds - startupHolds} times in the second half of the warm-up ({startupHolds} before).");
+        }
+
+        if (Environment.GetEnvironmentVariable("BENCH_SETUP_NOTE") == "1")
+        {
+            Console.Error.WriteLine($"[setup] channels={ReliableChannels} holds at start-up={startupHolds}");
         }
     }
 
@@ -146,4 +163,18 @@ public class SessionDrainBench
         _network.Advance(0);
         _client.Poll();
     }
+}
+
+/// <summary><see cref="SessionDrainBench"/> with eight reliable channels in the table (seven that nobody reads).</summary>
+[Config(typeof(InProcessShortRunConfig))]
+public class SessionDrainBench8 : SessionDrainBench
+{
+    protected override int ReliableChannels => 8;
+}
+
+/// <summary><see cref="SessionDrainBench"/> with 32 reliable channels in the table (31 that nobody reads).</summary>
+[Config(typeof(InProcessShortRunConfig))]
+public class SessionDrainBench32 : SessionDrainBench
+{
+    protected override int ReliableChannels => 32;
 }

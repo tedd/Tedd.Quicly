@@ -24,8 +24,32 @@ internal sealed class SessionFixture : IDisposable
         .Add(4, "ordered", ChannelMode.ReliableOrdered)
         .Build();
 
-    public SessionFixture(int pairs, bool compact = false)
+    /// <summary>
+    /// The table of <see cref="Table"/> with <paramref name="reliableChannels"/> reliable (ordered) channels in all: the
+    /// measured channel 4 and <c>reliableChannels - 1</c> that nobody reads, ids 100 and up.
+    /// </summary>
+    /// <param name="reliableChannels">Reliable channels in the table (at least 1).</param>
+    public static ChannelTable TableWith(int reliableChannels)
     {
+        ChannelTableBuilder builder = ChannelTable.Create()
+            .Add(2, "unordered", ChannelMode.UnreliableUnordered)
+            .Add(3, "sequenced", ChannelMode.UnreliableSequenced, o =>
+            {
+                o.Keyed = true;
+                o.ExpiryMicros = 0;
+            })
+            .Add(4, "ordered", ChannelMode.ReliableOrdered);
+        for (int i = 1; i < reliableChannels; i++)
+        {
+            builder.Add((ushort)(100 + i), "unread" + i, ChannelMode.ReliableOrdered);
+        }
+
+        return builder.Build();
+    }
+
+    public SessionFixture(int pairs, bool compact = false, ChannelTable? table = null)
+    {
+        ChannelTable channels = table ?? Table;
         Network = new SimulatedNetwork(Clock, 1);
         Listener = new SimulatedListener(Network);
         Clients = new QuiclyPeer[pairs];
@@ -35,13 +59,13 @@ internal sealed class SessionFixture : IDisposable
         QuiclyPeer? accepted = null;
         Listener.Start(static (in NewConnectionInfo _) => PreHandshakeDecision.Accept, (ITransport transport, in NewConnectionInfo info) =>
         {
-            accepted = QuiclyPeer.CreateServerPeer(transport, in info, Table, serverOptions, AcceptAll.Instance);
+            accepted = QuiclyPeer.CreateServerPeer(transport, in info, channels, serverOptions, AcceptAll.Instance);
             return accepted.TransportSink;
         });
         for (int i = 0; i < pairs; i++)
         {
             accepted = null;
-            QuiclyPeer client = QuiclyPeer.Connect(new SimulatedConnector(Network), Listener.LocalEndPoint, "bench", Table, clientOptions);
+            QuiclyPeer client = QuiclyPeer.Connect(new SimulatedConnector(Network), Listener.LocalEndPoint, "bench", channels, clientOptions);
             for (int step = 0; step < 10_000 && !(client.State == PeerState.Connected && accepted?.State == PeerState.Connected); step++)
             {
                 client.Poll();

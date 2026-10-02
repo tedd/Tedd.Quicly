@@ -12,17 +12,25 @@ public class CompletionTableBlockingWaitTests
     /// <remarks>
     /// <para>
     /// The waiting thread and a busy loop are pinned to the same CPU, and a third thread completes the stage 200 us after
-    /// it saw the token, long after the table's short spin has ended. A wait that has parked is woken by the completion and,
-    /// boosted by the wake-up, takes the CPU back from the busy loop at once. A wait that is still spinning with
-    /// <see cref="Thread.Yield"/> or <c>Thread.Sleep(0)</c> (a <see cref="ManualResetEventSlim"/> with its default spin
-    /// count does 25 such rounds before it blocks) has handed the CPU to the busy loop for a scheduler quantum, 15-30 ms,
-    /// and nothing can wake a thread that has not parked: it runs again when the busy loop's quantum ends. On a machine
-    /// with no free core every thread is in that position (a stress test went from 3-4 s to 22-26 s on four loaded cores).
+    /// it saw the token, long after the table's short spin has ended. A wait that has parked is woken by the completion and
+    /// takes the CPU back from the busy loop at once. A wait that is still spinning with <see cref="Thread.Yield"/> (a
+    /// <see cref="ManualResetEventSlim"/> with its default spin count does 25 rounds of yields and spins before it blocks)
+    /// has handed the CPU to the busy loop, and nothing can wake a thread that has not parked: it runs again when the busy
+    /// loop's time slice ends. On a machine with no free core every thread is in that position, and a stress test that
+    /// waits this way ran several times longer on four loaded cores (docs/benchmarks/threading.md section 7).
+    /// </para>
+    /// <para>
+    /// The waiter and the busy loop both run at the highest thread priority. Once woken, the waiter (boosted above the
+    /// busy loop by the wake-up) preempts it and every normal-priority thread: in a full test run other tests' threads,
+    /// boosted by their own wake-ups, would otherwise hold its CPU for a quantum and delay even a parked waiter. A yielding
+    /// waiter gives the CPU to a busy loop of equal priority for the whole of its quantum, which is a fixed amount of CPU
+    /// time (a busy loop of lower priority would lose the CPU again at the next clock tick, and the clock may tick every
+    /// millisecond when another application asked for that).
     /// </para>
     /// <para>
     /// The measured latency runs from just before the completion to the waiter's return, so a completer delayed by the
-    /// machine's load does not count. The median of 21 rounds must stay under 5 ms: a parked wait takes tens of
-    /// microseconds, a yielding one a quantum. Windows only (thread affinity through kernel32), and the process must be
+    /// machine's load does not count. The median of 21 rounds must stay under 1 ms: a parked wait takes microseconds, a
+    /// yielding one a quantum (about 31 ms here). Windows only (thread affinity through kernel32), and the process must be
     /// allowed at least two CPUs.
     /// </para>
     /// </remarks>
@@ -58,7 +66,7 @@ public class CompletionTableBlockingWaitTests
             {
             }
         })
-        { IsBackground = true, Name = "busy" };
+        { IsBackground = true, Name = "busy", Priority = ThreadPriority.Highest };
 
         var completer = new Thread(() =>
         {
@@ -113,7 +121,7 @@ public class CompletionTableBlockingWaitTests
                 failure = e;
             }
         })
-        { IsBackground = true, Name = "waiter" };
+        { IsBackground = true, Name = "waiter", Priority = ThreadPriority.Highest };
 
         busy.Start();
         completer.Start();
@@ -130,7 +138,7 @@ public class CompletionTableBlockingWaitTests
         double median = sorted[rounds / 2];
         string report = $"Median wake-up {median:F3} ms after the completion; every round (ms): {string.Join(", ", latencies.Select(l => l.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)))}";
         TestContext.Current.TestOutputHelper?.WriteLine(report);
-        Assert.True(median < 5, report);
+        Assert.True(median < 1, report);
     }
 
     private static void Pin(ulong mask)

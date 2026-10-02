@@ -22,6 +22,9 @@ namespace Tedd.Quicly.Core.Primitives;
 /// <see cref="Decompress"/> is safe against malicious input: every read and write is bounds-checked and malformed
 /// input reports <c>-1</c> instead of throwing. <see cref="DecompressExact"/> additionally requires the decoded
 /// length to equal the destination length, which is what protocol receivers need (PROTOCOL.md §2.1).
+/// <see cref="TryDecompressInPlace"/> decodes a block in the buffer it arrived in, given
+/// <see cref="GetInPlaceMargin"/> bytes beyond the decoded size: a receiver stages a compressed reliable message in a
+/// block that large and needs no second buffer for it.
 /// </para>
 /// <para>
 /// Performance history (table clearing, 8-byte match counting, 16-byte short copies, and the rejected

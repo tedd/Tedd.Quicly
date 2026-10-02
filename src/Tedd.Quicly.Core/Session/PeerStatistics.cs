@@ -113,10 +113,13 @@ public struct PeerStatistics
     public long CallbackFaults;
 
     /// <summary>
-    /// Compressed messages dropped because decoding failed, exceeded the decode budget
-    /// (<see cref="PeerOptions.DecodedBytesPerSecond"/>), or found no buffer for the decoded payload within the receive
-    /// budget. The last does not apply to <see cref="QuiclyPeer.Drain"/> on a ReliableOrdered or ReliableUnordered
-    /// channel: there the message waits for the next Drain.
+    /// Compressed messages dropped because decoding failed (a malformed block, a decoded size other than the announced one,
+    /// or a block an in-place decode would overwrite before reading it), exceeded the decode budget
+    /// (<see cref="PeerOptions.DecodedBytesPerSecond"/>; <see cref="QuiclyPeer.Drain"/> of a ReliableOrdered or
+    /// ReliableUnordered channel waits for it instead), or needed a second buffer for the decoded payload and found none,
+    /// tried once. A compressed message of a ReliableOrdered or ReliableUnordered channel that no handler reads is staged in
+    /// a block of its decoded size and decoded in place, so it never needs one unless its decoded size does not fit the
+    /// largest pool block within the receive budget.
     /// </summary>
     public long DecodeFailures;
 

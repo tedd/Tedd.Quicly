@@ -36,7 +36,9 @@ internal enum CreditState : byte
     /// nobody reads, together keep at most that half, plus one message each, and the other half is what is left for the
     /// channels that are read. Channels with a handler do not count, and neither does a channel with nothing waiting. The
     /// limit is a threshold: a message is started while less than it waits, and one message is always accepted on an
-    /// empty channel, whatever its size.
+    /// empty channel, whatever its size. As in <see cref="Unread"/>, a compressed message is counted with the block it is
+    /// staged in, which holds its decoded size (<see cref="PeerCore.LimitedStagingLength"/>); "waiting" counts the messages
+    /// taken while their channel was limited, whatever it is now (the tag a message carries from its take).
     /// </summary>
     Drained = 2,
 }

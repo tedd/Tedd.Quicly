@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Tedd.Quicly.Core.Threading;
 
 namespace Tedd.Quicly.Core.Tests.Threading;
@@ -88,20 +89,68 @@ public class SpscRingTests
         Assert.Equal(6, ring.Count);
     }
 
+    /// <remarks>
+    /// <para>The producer waits for room and the consumer for an item through a <see cref="Doorbell"/>: each spins for a while
+    /// and then blocks until the other rings, so that on a machine with no core to spare a wait costs a thread wake-up rather
+    /// than the scheduler quantum a yielding spin loses at every yield (which made the run take minutes).</para>
+    /// <para>Each side rings once per <c>RingBatch</c> items, before it waits itself, and at the end, not per item: a ring is
+    /// a full fence, and one per item slowed the consumer so much that it never caught up with the producer. A waiter is never
+    /// left asleep: it blocks only once it has announced that it does and looked again, and the other side rings within a
+    /// batch (a full ring holds many) or before it waits.</para>
+    /// <para>At full speed the producer keeps the ring full, so the consumer seldom looks at an empty ring while an item is
+    /// published; one phase of <c>PhaseItems</c> in eight is therefore paced, the producer pausing a random 0-31 spins before
+    /// each item. The run must have handed over <c>RequiredHandOvers</c> items at each end of the ring while the waiting
+    /// thread spun, that is while both threads ran.</para>
+    /// </remarks>
     [Fact]
     public void Stress_One_Producer_One_Consumer_Five_Million_Items_Checksum()
     {
         const long items = 5_000_000;
+        const int RingBatch = 64;
+        const int PhaseItems = 8_192;
+        const long RequiredHandOvers = 100_000;
+        long start = Stopwatch.GetTimestamp();
         var ring = new SpscRing<long>(1024);
+        using var room = new Doorbell();
+        using var arrival = new Doorbell();
+        Exception? failure = null;
 
         var producer = new Thread(() =>
         {
-            SpinWait spinner = default;
-            for (long i = 1; i <= items; i++)
+            try
             {
-                while (!ring.TryEnqueue(i))
-                    spinner.SpinOnce(sleep1Threshold: -1);
-                spinner.Reset();
+                var random = new Random(1);
+                int unrung = 0;
+                for (long i = 1; i <= items; i++)
+                {
+                    // One phase in eight is paced: the consumer catches up and looks at the empty ring as items arrive.
+                    if (((i / PhaseItems) & 7) == 7)
+                        Thread.SpinWait(random.Next(0, 32));
+
+                    if (!ring.TryEnqueue(i))
+                    {
+                        arrival.Ring();
+                        unrung = 0;
+                        do
+                        {
+                            room.Wait();
+                        }
+                        while (!ring.TryEnqueue(i));
+                        room.Satisfied();
+                    }
+
+                    if (++unrung == RingBatch)
+                    {
+                        arrival.Ring();
+                        unrung = 0;
+                    }
+                }
+
+                arrival.Ring();
+            }
+            catch (Exception e)
+            {
+                failure = e;
             }
         })
         { IsBackground = true, Name = "spsc-producer" };
@@ -110,25 +159,53 @@ public class SpscRingTests
         long sum = 0;
         long received = 0;
         long expected = 1;
-        SpinWait consumerSpinner = default;
-        while (received < items)
+        int unrungRoom = 0;
+        try
         {
-            if (ring.TryDequeue(out long item))
+            while (received < items)
             {
+                if (!ring.TryDequeue(out long item))
+                {
+                    if (unrungRoom != 0)
+                    {
+                        room.Ring();
+                        unrungRoom = 0;
+                    }
+
+                    arrival.Wait();
+                    continue;
+                }
+
+                arrival.Satisfied();
+                if (++unrungRoom == RingBatch)
+                {
+                    room.Ring();
+                    unrungRoom = 0;
+                }
+
                 Assert.Equal(expected++, item);
                 sum += item;
                 received++;
-                consumerSpinner.Reset();
             }
-            else
-            {
-                consumerSpinner.SpinOnce(sleep1Threshold: -1);
-            }
+
+            Assert.True(producer.Join(HandOff.Timeout));
+        }
+        finally
+        {
+            TestContext.Current.TestOutputHelper?.WriteLine(
+                $"{received:N0} items in {Stopwatch.GetElapsedTime(start).TotalSeconds:F1} s: the producer found the ring full {room.Waits:N0} times "
+                + $"({room.SpunWaits:N0} ended while it spun), the consumer found it empty {arrival.Waits:N0} times ({arrival.SpunWaits:N0}).");
         }
 
-        producer.Join();
+        Assert.Null(failure);
         Assert.Equal(items * (items + 1) / 2, sum);
         Assert.True(ring.IsEmpty);
+
+        // The two windows a ring's indices can go wrong in, each run while the other thread was running: room made while the
+        // producer looked at a full ring, and an item published while the consumer looked at an empty one.
+        Assert.True(
+            room.SpunWaits >= RequiredHandOvers && arrival.SpunWaits >= RequiredHandOvers,
+            $"The run did not exercise both ends of the ring: {room.SpunWaits:N0} and {arrival.SpunWaits:N0} hand-overs of {RequiredHandOvers:N0} required.");
     }
 
     [Fact]

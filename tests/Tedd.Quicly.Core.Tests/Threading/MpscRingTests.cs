@@ -1,9 +1,16 @@
+using System.Diagnostics;
 using Tedd.Quicly.Core.Threading;
 
 namespace Tedd.Quicly.Core.Tests.Threading;
 
 public class MpscRingTests
 {
+    /// <summary>
+    /// How long a producer of the stress test spins for room before it blocks: briefly, because eight producers outnumber
+    /// the cores of a small machine, and a spinning producer holds a core the consumer needs to make the room.
+    /// </summary>
+    private static readonly TimeSpan ProducerSpin = TimeSpan.FromMicroseconds(5);
+
     [Theory]
     [InlineData(1, 2)]
     [InlineData(2, 2)]
@@ -101,26 +108,75 @@ public class MpscRingTests
         Assert.False(ring.TryEnqueue(-1));
     }
 
+    /// <remarks>
+    /// <para>A producer waits for room and the consumer for an item through a <see cref="Doorbell"/>: each spins for a while
+    /// and then blocks until it is rung, so that on a machine with no core to spare a wait costs a thread wake-up rather than
+    /// the scheduler quantum a yielding spin loses at every yield (which made the run take minutes). A producer spins only
+    /// <see cref="ProducerSpin"/>; producers ring the consumer per <c>ArrivalBatch</c> items, before they wait and at the end,
+    /// and the consumer rings them per <c>RoomBatch</c> freed slots and before it waits (see the loop).</para>
+    /// <para>At full speed the producers keep the ring full, so the consumer seldom looks at an empty ring while an item is
+    /// published; one phase of <c>PhaseItems</c> in eight is therefore paced, every producer pausing a random 0-63 spins before
+    /// each item. The run must have handed over <c>RequiredHandOvers</c> items at each end of the ring while the waiting
+    /// thread spun, that is while both sides ran.</para>
+    /// </remarks>
     [Fact]
     public void Stress_Eight_Producers_One_Consumer_Per_Producer_Sequence()
     {
         const int producers = 8;
         const int itemsPerProducer = 500_000;
+        const int RoomBatch = 256;
+        const int ArrivalBatch = 64;
+        const int PhaseItems = 8_192;
+        const long RequiredHandOvers = 20_000;
+        long start = Stopwatch.GetTimestamp();
         var ring = new MpscRing<long>(1024);
+        var room = new Doorbell[producers];
+        using var arrival = new Doorbell();
+        Exception? failure = null;
+        int paced = 0;
 
         var threads = new Thread[producers];
         for (int p = 0; p < producers; p++)
         {
             long producerId = p;
+            Doorbell bell = room[p] = new Doorbell(ProducerSpin);
             threads[p] = new Thread(() =>
             {
-                SpinWait spinner = default;
-                for (long seq = 0; seq < itemsPerProducer; seq++)
+                try
                 {
-                    long item = (producerId << 32) | seq;
-                    while (!ring.TryEnqueue(item))
-                        spinner.SpinOnce(sleep1Threshold: -1);
-                    spinner.Reset();
+                    var random = new Random((int)producerId + 1);
+                    int unrung = 0;
+                    for (long seq = 0; seq < itemsPerProducer; seq++)
+                    {
+                        // In a paced phase the consumer catches up and looks at the empty ring as items arrive.
+                        if (Volatile.Read(ref paced) != 0)
+                            Thread.SpinWait(random.Next(0, 64));
+
+                        long item = (producerId << 32) | seq;
+                        if (!ring.TryEnqueue(item))
+                        {
+                            arrival.Ring();
+                            unrung = 0;
+                            do
+                            {
+                                bell.Wait();
+                            }
+                            while (!ring.TryEnqueue(item));
+                            bell.Satisfied();
+                        }
+
+                        if (++unrung == ArrivalBatch)
+                        {
+                            arrival.Ring();
+                            unrung = 0;
+                        }
+                    }
+
+                    arrival.Ring();
+                }
+                catch (Exception e)
+                {
+                    Interlocked.CompareExchange(ref failure, e, null);
                 }
             })
             { IsBackground = true, Name = "mpsc-producer-" + p };
@@ -132,46 +188,90 @@ public class MpscRingTests
         long[] expected = new long[producers];
         long received = 0;
         long[] batch = new long[32];
-        SpinWait consumerSpinner = default;
         bool useBatch = false;
-        while (received < (long)producers * itemsPerProducer)
+        int freedSinceRing = 0;
+        try
         {
-            int count;
-            if (useBatch)
+            while (received < (long)producers * itemsPerProducer)
             {
-                count = ring.TryDequeueBatch(batch);
-            }
-            else
-            {
-                count = ring.TryDequeue(out batch[0]) ? 1 : 0;
+                int count;
+                if (useBatch)
+                {
+                    count = ring.TryDequeueBatch(batch);
+                }
+                else
+                {
+                    count = ring.TryDequeue(out batch[0]) ? 1 : 0;
+                }
+
+                useBatch = !useBatch;
+                if (count == 0)
+                {
+                    // Producers that blocked on a full ring get the room freed since the last ring before the consumer waits.
+                    if (freedSinceRing != 0)
+                    {
+                        Doorbell.RingAll(room);
+                        freedSinceRing = 0;
+                    }
+
+                    arrival.Wait();
+                    continue;
+                }
+
+                arrival.Satisfied();
+
+                // Eight producers outrun one consumer, so the ring is full most of the time: ringing them per freed slot
+                // would wake every blocked producer to fight over one slot. They are rung per RoomBatch freed slots
+                // instead, and before the consumer waits; a producer that blocked saw the ring full, so the consumer
+                // has at least a ring's worth of items, and with them several rings, still to come.
+                freedSinceRing += count;
+                if (freedSinceRing >= RoomBatch)
+                {
+                    Doorbell.RingAll(room);
+                    freedSinceRing = 0;
+                }
+
+                for (int i = 0; i < count; i++)
+                {
+                    long item = batch[i];
+                    int producer = (int)(item >> 32);
+                    long seq = item & 0xFFFF_FFFF;
+                    Assert.Equal(expected[producer], seq);
+                    expected[producer]++;
+                }
+
+                received += count;
+
+                // One phase in eight is paced, for every producer at once.
+                int phase = ((received / PhaseItems) & 7) == 7 ? 1 : 0;
+                if (phase != paced)
+                    Volatile.Write(ref paced, phase);
             }
 
-            useBatch = !useBatch;
-            if (count == 0)
-            {
-                consumerSpinner.SpinOnce(sleep1Threshold: -1);
-                continue;
-            }
-
-            consumerSpinner.Reset();
-            for (int i = 0; i < count; i++)
-            {
-                long item = batch[i];
-                int producer = (int)(item >> 32);
-                long seq = item & 0xFFFF_FFFF;
-                Assert.Equal(expected[producer], seq);
-                expected[producer]++;
-            }
-
-            received += count;
+            foreach (Thread t in threads)
+                Assert.True(t.Join(HandOff.Timeout));
+        }
+        finally
+        {
+            TestContext.Current.TestOutputHelper?.WriteLine(
+                $"{received:N0} items in {Stopwatch.GetElapsedTime(start).TotalSeconds:F1} s: producers found the ring full {room.Sum(b => b.Waits):N0} "
+                + $"times ({room.Sum(b => b.SpunWaits):N0} ended while they spun), the consumer found it empty {arrival.Waits:N0} times "
+                + $"({arrival.SpunWaits:N0}).");
+            foreach (Doorbell bell in room)
+                bell.Dispose();
         }
 
-        foreach (Thread t in threads)
-            t.Join();
-
+        Assert.Null(failure);
         Assert.True(ring.IsEmpty);
         foreach (long e in expected)
             Assert.Equal(itemsPerProducer, e);
+
+        // The windows a ring's slots can go wrong in, each run while the other side was running: room made while producers
+        // looked at a full ring (and raced each other for it), and an item published while the consumer looked at an empty one.
+        long roomHandOvers = room.Sum(b => b.SpunWaits);
+        Assert.True(
+            roomHandOvers >= RequiredHandOvers && arrival.SpunWaits >= RequiredHandOvers,
+            $"The run did not exercise both ends of the ring: {roomHandOvers:N0} and {arrival.SpunWaits:N0} hand-overs of {RequiredHandOvers:N0} required.");
     }
 
     [Fact]

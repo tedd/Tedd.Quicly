@@ -467,6 +467,219 @@ public static class Lz4Block
     public static bool DecompressExact(ReadOnlySpan<byte> source, Span<byte> destination) =>
         Decompress(source, destination) == destination.Length;
 
+    /// <summary>
+    /// The room an in-place decode needs beyond the decoded length (<see cref="TryDecompressInPlace"/>): a block of
+    /// <c>rawLength + GetInPlaceMargin(compressedLength)</c> bytes decodes any block the compressor wrote in place, with
+    /// the compressed bytes moved to its end. The same margin as the reference implementation's
+    /// <c>LZ4_DECOMPRESS_INPLACE_MARGIN</c>; this decoder writes at most 16 bytes past a copy, which it covers.
+    /// </summary>
+    /// <param name="compressedLength">The compressed length.</param>
+    /// <returns>The margin in bytes.</returns>
+    public static int GetInPlaceMargin(int compressedLength) => (compressedLength >> 8) + 32;
+
+    /// <summary>
+    /// Decodes an LZ4 block that occupies the first <paramref name="compressedLength"/> bytes of <paramref name="block"/>
+    /// into the first <paramref name="rawLength"/> bytes of the same block, and requires exactly that decoded length
+    /// (PROTOCOL.md §2.1), without a second buffer. Allocation-free and stateless.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The compressed bytes are first moved to the end of the block (one memmove); the decode then writes from the start
+    /// of the block towards them. Before every write the decoder checks that the bytes it writes, including the slack of a
+    /// 16-byte copy, end at or before the first compressed byte it has not read yet. With the margin of
+    /// <see cref="GetInPlaceMargin"/> the compressor's output never fails that check; a block that does (hostile input, or
+    /// one that needs more room than the block has) is refused, never decoded over its own unread input.
+    /// </para>
+    /// <para>
+    /// Never throws and never touches memory outside <paramref name="block"/>, whatever the input. On
+    /// <see langword="false"/> the contents of <paramref name="block"/> are unspecified (the compressed bytes are gone).
+    /// </para>
+    /// </remarks>
+    /// <param name="block">The buffer: the compressed block at its start, room for the decoded payload and the margin.</param>
+    /// <param name="compressedLength">Length of the compressed block at the start of <paramref name="block"/>.</param>
+    /// <param name="rawLength">The exact decoded length.</param>
+    /// <returns>
+    /// <see langword="true"/> if the block decoded to exactly <paramref name="rawLength"/> bytes at the start of
+    /// <paramref name="block"/>; <see langword="false"/> if the lengths are out of range, <paramref name="block"/> lacks
+    /// <c>rawLength + GetInPlaceMargin(compressedLength)</c> bytes, or the input is malformed, truncated, decodes to another
+    /// length or would overwrite its own unread bytes.
+    /// </returns>
+    internal static bool TryDecompressInPlace(Span<byte> block, int compressedLength, int rawLength)
+    {
+        int blockLength = block.Length;
+        if (compressedLength <= 0 || rawLength <= 0 || compressedLength > blockLength
+            || rawLength > blockLength - GetInPlaceMargin(compressedLength))
+        {
+            return false;
+        }
+
+        // The source moves to the end of the block; Span.CopyTo is a memmove, so the overlap is fine.
+        int s = blockLength - compressedLength;
+        block.Slice(0, compressedLength).CopyTo(block.Slice(s));
+
+        // Offsets: ip is relative to the source (block[s..]), op is absolute and the destination is block[..rawLength].
+        // Invariant after every write: op <= s + ip, so the decoded bytes lie wholly below the unread source.
+        ref byte b = ref MemoryMarshal.GetReference(block);
+        int srcLength = compressedLength;
+        int dstLength = rawLength;
+        int ip = 0;
+        int op = 0;
+
+        while (true)
+        {
+            if (ip >= srcLength)
+            {
+                return false;
+            }
+
+            int token = Unsafe.Add(ref b, s + ip++);
+
+            // Literals.
+            int literalLength = token >> MlBits;
+            if (literalLength == RunMask)
+            {
+                int x;
+                do
+                {
+                    if (ip >= srcLength)
+                    {
+                        return false;
+                    }
+
+                    x = Unsafe.Add(ref b, s + ip++);
+                    literalLength += x;
+                    if (literalLength > dstLength)
+                    {
+                        return false;
+                    }
+                }
+                while (x == 255);
+            }
+
+            if (literalLength > srcLength - ip || literalLength > dstLength - op)
+            {
+                return false;
+            }
+
+            // The first unread source byte after this run, in block offsets.
+            long unread = (long)s + ip + literalLength;
+            if (literalLength <= 16 && srcLength - ip >= 16 && dstLength - op >= 16 && op + 16 <= unread)
+            {
+                // Copy16 loads both halves before it stores, and its slack stays below the unread source.
+                Copy16(ref Unsafe.Add(ref b, op), ref Unsafe.Add(ref b, s + ip));
+            }
+            else
+            {
+                if (op + literalLength > unread)
+                {
+                    return false;
+                }
+
+                // The destination may overlap the run it copies (op <= s + ip): a memmove, never a cpblk.
+                block.Slice(s + ip, literalLength).CopyTo(block.Slice(op, literalLength));
+            }
+
+            ip += literalLength;
+            op += literalLength;
+
+            if (ip == srcLength)
+            {
+                // The final sequence carries literals only.
+                return op == dstLength;
+            }
+
+            // Offset.
+            if (srcLength - ip < 2)
+            {
+                return false;
+            }
+
+            int offset = Unsafe.Add(ref b, s + ip) | (Unsafe.Add(ref b, s + ip + 1) << 8);
+            ip += 2;
+            if (offset == 0 || offset > op)
+            {
+                return false;
+            }
+
+            // Match length.
+            int matchLength = token & MlMask;
+            if (matchLength == MlMask)
+            {
+                int x;
+                do
+                {
+                    if (ip >= srcLength)
+                    {
+                        return false;
+                    }
+
+                    x = Unsafe.Add(ref b, s + ip++);
+                    matchLength += x;
+                    if (matchLength > dstLength)
+                    {
+                        return false;
+                    }
+                }
+                while (x == 255);
+            }
+
+            matchLength += MinMatch;
+            if (matchLength > dstLength - op)
+            {
+                return false;
+            }
+
+            // The match reads decoded bytes only (below op); its writes must stay below the unread source.
+            unread = (long)s + ip;
+            int matchPos = op - offset;
+            int end = op + matchLength;
+            if (offset >= 16 && matchLength <= 16 && dstLength - op >= 16 && op + 16 <= unread)
+            {
+                Copy16(ref Unsafe.Add(ref b, op), ref Unsafe.Add(ref b, matchPos));
+                op = end;
+                continue;
+            }
+
+            if (end > unread)
+            {
+                return false;
+            }
+
+            if (offset >= matchLength)
+            {
+                Unsafe.CopyBlockUnaligned(ref Unsafe.Add(ref b, op), ref Unsafe.Add(ref b, matchPos), (uint)matchLength);
+                op = end;
+            }
+            else
+            {
+                // Overlapping copy: the pattern repeats every `offset` bytes (as Decompress).
+                if (offset < 8)
+                {
+                    int primed = Math.Min(16, matchLength);
+                    for (int k = 0; k < primed; k++)
+                    {
+                        Unsafe.Add(ref b, op++) = Unsafe.Add(ref b, matchPos++);
+                    }
+
+                    int stride = (16 / offset) * offset;
+                    matchPos = op - stride;
+                }
+
+                while (end - op >= 8)
+                {
+                    Unsafe.WriteUnaligned(ref Unsafe.Add(ref b, op), Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref b, matchPos)));
+                    op += 8;
+                    matchPos += 8;
+                }
+
+                while (op < end)
+                {
+                    Unsafe.Add(ref b, op++) = Unsafe.Add(ref b, matchPos++);
+                }
+            }
+        }
+    }
+
     private static int GetHashShift(int scratchLength)
     {
         if (scratchLength < MinScratchLength || scratchLength > MaxScratchLength || !BitOperations.IsPow2(scratchLength))

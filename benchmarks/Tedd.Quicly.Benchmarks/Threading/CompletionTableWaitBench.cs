@@ -13,8 +13,9 @@ namespace Tedd.Quicly.Benchmarks.Threading;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <see cref="DelayUs"/> picks the phase of the wait that sees the completion: 0 — the table's own short spin; 10 — just
-/// past it, where an event that spins before it blocks still catches it; 100 — after the waiter has parked on the event.
+/// <see cref="DelayUs"/> picks the phase of the wait that sees the completion: 0 — the table's first, exponential spin
+/// (a few µs); 5 to 15 — past it, where a waiter that parked at once pays a kernel wake-up and one that goes on spinning
+/// does not; 20 and up — around and after the end of the wait's spin (about 20 µs), where every design parks.
 /// </para>
 /// <para>
 /// The completer polls for the next token with non-yielding spins, so it only ever loses its core to the scheduler.
@@ -36,7 +37,7 @@ public class CompletionTableWaitBench
     private int _delivered;
 
     /// <summary>Microseconds between the completer seeing the token and completing the stage.</summary>
-    [Params(0, 10, 20, 40, 100)]
+    [Params(0, 5, 10, 15, 20, 40, 100)]
     public int DelayUs { get; set; }
 
     [GlobalSetup]

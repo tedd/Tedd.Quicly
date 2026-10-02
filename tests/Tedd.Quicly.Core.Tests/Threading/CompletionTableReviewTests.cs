@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Numerics;
 using Tedd.Quicly.Core.Threading;
 
 namespace Tedd.Quicly.Core.Tests.Threading;
@@ -26,8 +27,9 @@ public class CompletionTableReviewTests
     /// The window is a Complete that took its token before the owner's Release and has not returned when the slot has been
     /// re-allocated. A transport thread polls for the token in a hot loop, so that its Complete starts a nearly fixed time
     /// after the owner publishes, and the owner sweeps its Release across that Complete with a random delay: both threads
-    /// of a pair have to run at once. There is therefore one pair per two logical processors (at most eight), sharing the
-    /// 3.2 million iterations that found the race, and a thread that waits longer than a hand-off takes while both run
+    /// of a pair have to run at once. There is therefore one pair per two logical processors the process may run on (at
+    /// most <see cref="MaxPairs"/>; see <see cref="UsableProcessors"/>), sharing the 3.2 million iterations that found the
+    /// race, and a thread that waits longer than a hand-off takes while both run
     /// blocks instead of spinning (<see cref="HandOff"/>), so that on a machine with no core to spare a hand-off costs a
     /// thread wake-up rather than a scheduler quantum (which made the run take many minutes). The run must hit the window
     /// at least <see cref="RequiredOverlaps"/> times: it ends after its iterations once it has, and otherwise goes on until
@@ -36,7 +38,7 @@ public class CompletionTableReviewTests
     [Fact]
     public void Review_Late_Complete_Racing_Release_And_Reallocation_Must_Not_Touch_The_New_Occupant()
     {
-        int pairs = Math.Clamp(Environment.ProcessorCount / 2, 1, 8);
+        int pairs = Math.Clamp(UsableProcessors() / 2, 1, MaxPairs);
         int iterationsPerPair = TotalIterations / pairs;
         long start = Stopwatch.GetTimestamp();
         long deadline = start + (long)(Budget.TotalSeconds * Stopwatch.Frequency);
@@ -141,6 +143,32 @@ public class CompletionTableReviewTests
 
     /// <summary>Iterations of the race test, shared by its pairs: the count that found the race (275 corruptions).</summary>
     private const int TotalIterations = 3_200_000;
+
+    /// <summary>
+    /// Most pairs the race test runs. Four run its iterations in about a second on idle cores; more only compete with each
+    /// other for cores when the machine is busy, and a pair whose two threads seldom run at once seldom hits the window.
+    /// </summary>
+    private const int MaxPairs = 4;
+
+    /// <summary>
+    /// Logical processors the process may run on: <see cref="Environment.ProcessorCount"/>, but no more than its affinity
+    /// allows. DOTNET_PROCESSOR_COUNT can claim more processors than that, and the pairs beyond the real ones only compete.
+    /// </summary>
+    private static int UsableProcessors()
+    {
+        int count = Environment.ProcessorCount;
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux())
+        {
+            using Process self = Process.GetCurrentProcess();
+            int allowed = BitOperations.PopCount((ulong)(long)self.ProcessorAffinity);
+            if (allowed > 0)
+            {
+                count = Math.Min(count, allowed);
+            }
+        }
+
+        return count;
+    }
 
     /// <summary>Wall-clock time after which the race test stops, whatever its iteration count and hits.</summary>
     private static readonly TimeSpan Budget = TimeSpan.FromSeconds(20);

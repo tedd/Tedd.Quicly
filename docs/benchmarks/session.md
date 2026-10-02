@@ -680,3 +680,67 @@ channel it is 1.000. The machine was noisier than during the hot-path pass (othe
 `Unreliable64Packed` gave 1.031 [0.992 .. 1.071] over 10 launches and 1.022 [0.998 .. 1.047] over 20, so the plain
 `Unreliable64Packed` and `Ordered64` ratios of 1.03–1.04 measured then are within the method's own offset; the interleaved
 comparison (each branch launch paired with an A/A launch under the same load) is the one reported.
+
+## Receive credit (2026-10-02): what the per-channel credit costs
+
+The credit of session-layer.md §4.4 puts a count on every reliable stream message: on the transport thread a read of the
+channel's limit, a store to the thread's own line and, for a limited channel, a compare; on the game thread a store when the
+message is handed back; and, since the recheck round, the peer-wide counters of the half of the receive budget that the channels
+no handler reads share. This section is the paired measurement of that, on the stack at the 0.2.2 release candidate.
+
+**Arms.** A is `1052e58` (the commit that added `SessionDrainBench`, before any credit code), B is `4b86ad1` (`main` at the
+0.2.2 release candidate): 117 commits apart, so B is the credit with its three review rounds, the decoded-size staging with the in-place decode, the
+`StreamLimitReached` answer of the MsQuic transport and the `CompletionTable.Wait` change, not the credit alone. Both arms got the
+same channel-count preparation (`SessionDrainBench8` and `SessionDrainBench32`: the table of `SessionFixture.TableWith(n)` has
+`n` reliable ordered channels, the measured channel 4 and `n - 1` that nobody reads, so a Drain meets a table with unread
+channels in it). Method of ADR 0007: `benchmarks/scripts/pair.sh`, net10.0, in-process pairs in one pinned (CPUs 20 and 22),
+High-priority host, 12 pairs of 0.4 s windows per launch, 10 launches per series, the launch is the unit; B/A below 1 means B is
+faster. A/A controls (the same arm loaded twice) ran in the same session for the series named below. The machine was shared
+with other projects' test runs (total CPU load 21–66 %, 31 % on average over the re-runs).
+
+| Benchmark | 1 reliable channel | 8 | 32 |
+|---|---|---|---|
+| `SessionDrainBench.OrderedDrain64` | 1.068 [1.051 .. 1.086], +18.0 ns of 253.8 | 1.080 [1.070 .. 1.090], +21.6 ns of 264.4 | 1.077 [1.065 .. 1.089], +19.8 ns of 264.7 |
+| `OrderedDrain4K` | 1.016 [1.002 .. 1.030], +17.4 ns of 1 458 | 1.019 [1.007 .. 1.032], +30.4 ns of 1 476 | 1.024 [1.008 .. 1.040], +38.8 ns of 1 637 |
+| `OrderedDrain64Burst` | 1.077 [1.067 .. 1.086], +19.6 ns of 259.9 | 1.080 (30 launches in three runs, median 1.074) | 1.089 [1.075 .. 1.104], +23.5 ns of 278.6 |
+| A/A of `OrderedDrain64` | 1.009 [0.996 .. 1.022] | 0.995 [0.978 .. 1.011] | 0.984 [0.970 .. 0.998] |
+
+| Benchmark | B/A [95 % CI] | Absolute |
+|---|---|---|
+| `SessionEndToEndBench.Ordered64` (a handler dispatches) | 1.005 [0.959 .. 1.054], re-run 1.008 [0.983 .. 1.035], 20 launches together 1.007 | +1.2 ns of 236.9 |
+| `SessionEndToEndBench.Ordered4K` | 1.009 [0.990 .. 1.027] | +14.0 ns of 1 430 |
+| `GroupStreamBench.Group64` (ReliableUnordered, a handler) | 1.065 [1.045 .. 1.086] | +15.3 ns of 235.6 |
+| `GroupStreamBench.Group4K` | 0.983 [0.970 .. 0.996] | −4.6 ns of 1 400 |
+| `stages.Ordered64` | 1.023 [1.006 .. 1.040] | |
+| `stages.Packed` (unreliable datagrams, no credit) | 1.020 [1.001 .. 1.040] | |
+
+Controls in the same session: A/A of `SessionEndToEndBench.Ordered64` 0.981 [0.968 .. 0.993], of `stages.Packed` 1.005
+[0.995 .. 1.016], of the 8-channel burst 1.004 [0.989 .. 1.020], of `GroupStreamBench.Group64` 0.987 [0.945 .. 1.032] (one launch
+in ten at 0.835); B against its own copy at 32 channels (`OrderedDrain64`) 0.994 [0.979 .. 1.009]. The layout offset of a pair
+is therefore about −2 % to +1 %, and a difference of 2 % or less is not evidence of anything.
+
+### Reading
+
+* **The Drain path pays 18–24 ns per message of 64 bytes** (+7 to +9 %), the same with 1, 8 or 32 reliable channels. The
+  first measurement of the credit, on `d567ba5` before the review rounds, gave 1.076, 1.025 and 1.052 for the three Drain
+  benchmarks at one channel; the stack that carries the shared half's counters and the in-place decode costs the same, and
+  the cost does not grow with the channel count: the O(channels) scan of the first recheck (175 to 273 ns per message at 128
+  channels) is gone. For 4 KB messages the same absolute cost is +1.2 to +2.4 %. The 4 KB difference rises from +17 to +39 ns
+  from one to 32 channels, but the intervals overlap and arm A itself is 12 % slower at 32 channels (the fixture with 32
+  channels costs more in both arms), so it is not a finding of its own.
+* **The handler path shows no cost** at 64 bytes and 4 KB (within ±1 %, inside the controls), and the unreliable path
+  `stages.Packed` is +2.0 % against an A/A of +0.5 %: the credit does not touch it, so that is what the other 116 commits and
+  a launch's layout add. `stages.Ordered64` +2.3 % is the same size.
+* **Group streams: `Group64` +6.5 % (+15 ns), `Group4K` −1.7 %.** The 64-byte group costs about what the ordered Drain does; the
+  A/A of that benchmark had one launch in ten disturbed (A 275 ns, ratio 0.835), the other nine within ±2.5 %.
+* **A drained channel in a table of 32 is held back once, at start-up.** Before its first `Drain` a channel is unread and has a
+  strict share of the budget (§4.4), which the first batch of the 32-channel table exceeds once (`BacklogHolds` 1); after that it
+  is drained every cycle and never held back (0 holds in the second half of the warm-up, at 1, 8 and 32 channels). The
+  benchmark's setup checks exactly that: no hold in the second half of the warm-up, and the start-up count on request
+  (`BENCH_SETUP_NOTE=1`).
+* **Noise.** Of about 260 timed launches, a handful had one arm inflated by 8 to 28 % for that launch only, in both directions:
+  B in two launches of the 8-channel burst (B/A 1.24 and 1.28), A in the end-to-end `Ordered64` (0.84 in the first run, 0.92
+  in the re-run), in one launch of the 8-channel burst re-run (0.97) and in the A/A of `GroupStreamBench.Group64` (0.835). The
+  two B-inflated launches did not come back in 20 more launches of that series. They are in the pooled figures above. A run
+  on a quiet machine would narrow the intervals; it would not move a 7 % cost on the Drain path, which every series of that
+  kind showed.

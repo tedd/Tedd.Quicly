@@ -163,7 +163,8 @@ public sealed class CompletionTable : IDisposable
 
     /// <summary>
     /// Blocks until <paramref name="stage"/> completes or <paramref name="timeout"/> elapses. Owner thread only.
-    /// Spins briefly without giving up the core, then parks on an event that is allocated once per slot and reused.
+    /// Spins for up to about 20 µs without ever giving up the core, then parks on an event that is allocated once per slot
+    /// and stage and reused.
     /// </summary>
     /// <param name="token">Token of the send.</param>
     /// <param name="stage">Stage to wait for.</param>
@@ -257,6 +258,11 @@ public sealed class CompletionTable : IDisposable
         private static readonly Action<object?, CancellationToken> s_cancel0 = static (s, ct) => ((Slot)s!).OnCanceled(0, ct);
         private static readonly Action<object?, CancellationToken> s_cancel1 = static (s, ct) => ((Slot)s!).OnCanceled(1, ct);
 
+        // How long a blocking wait spins before it parks, counted from the start of the wait (docs/benchmarks/threading.md
+        // section 7): parking costs a kernel wake-up of 6-12 µs, and a tracked datagram's BufferReleased typically lands
+        // 7-14 µs after Flush over loopback.
+        private static readonly long s_spinTicks = Stopwatch.Frequency * 20 / 1_000_000;
+
         private readonly CompletionTable _owner;
         private readonly int _index;
 
@@ -268,7 +274,11 @@ public sealed class CompletionTable : IDisposable
         private ManualResetValueTaskSourceCore<DeliveryStatus> _core1;
         private CancellationTokenRegistration _registration0;
         private CancellationTokenRegistration _registration1;
-        private ManualResetEventSlim? _event;
+
+        // One event per stage, created by the first blocking wait on it, so that a waiter only ever resets its own stage's
+        // event: with one shared event, a wait on one stage could reset away the wake-up of a wait on the other.
+        private ManualResetEventSlim? _event0;
+        private ManualResetEventSlim? _event1;
 
         // Generations start at 1 and step by 2, so they are always odd and never wrap to 0, the invalid generation.
         private long _state = 1L << GenerationShift;
@@ -344,7 +354,7 @@ public sealed class CompletionTable : IDisposable
                     _core1.SetResult(result);
             }
 
-            Volatile.Read(ref _event)?.Set();
+            (stage == 0 ? Volatile.Read(ref _event0) : Volatile.Read(ref _event1))?.Set();
             ReleaseIfDone(next);
         }
 
@@ -450,6 +460,7 @@ public sealed class CompletionTable : IDisposable
             if (TryGetCompleted(generation, stage, out DeliveryStatus status))
                 return status;
 
+            long start = Stopwatch.GetTimestamp();
             SpinWait spinner = default;
             while (!spinner.NextSpinWillYield)
             {
@@ -458,18 +469,31 @@ public sealed class CompletionTable : IDisposable
                     return status;
             }
 
-            ManualResetEventSlim? ev = _event;
-            if (ev is null)
+            // Go on spinning, never yielding, until s_spinTicks into the wait: a completion that lands by then costs the spin
+            // instead of a kernel wake-up. A spin that yields (Thread.Yield, Thread.Sleep(0), a ManualResetEventSlim's default
+            // spin) hands the core to a ready thread for the rest of its quantum when no core is free, and a completion that
+            // arrives meanwhile cannot wake a thread that has not parked (docs/benchmarks/threading.md section 7). On one
+            // processor the completing thread cannot run while this one spins, so the spin is skipped.
+            if (timeoutMs != 0 && Environment.ProcessorCount > 1)
             {
-                // Spin count 0: the loop above has spun already, without yielding. The event's default (35 rounds) would
-                // go on spinning with Thread.Yield and Thread.Sleep(0) before it blocks; on a machine with no free core each
-                // of those hands the core to a busy thread for a scheduler quantum, and a completion that arrives meanwhile
-                // cannot wake a thread that has not parked (docs/benchmarks/threading.md section 7).
-                ev = new ManualResetEventSlim(false, spinCount: 0);
-                Volatile.Write(ref _event, ev);
+                long spinUntil = start + s_spinTicks;
+                while (Stopwatch.GetTimestamp() < spinUntil)
+                {
+                    Thread.SpinWait(8);
+                    if (TryGetCompleted(generation, stage, out status))
+                        return status;
+                }
             }
 
-            long start = Stopwatch.GetTimestamp();
+            ref ManualResetEventSlim? field = ref stage == 0 ? ref _event0 : ref _event1;
+            ManualResetEventSlim? ev = field;
+            if (ev is null)
+            {
+                // Spin count 0: the event must not spin again, with yields, before it blocks (see above).
+                ev = new ManualResetEventSlim(false, spinCount: 0);
+                Volatile.Write(ref field, ev);
+            }
+
             while (true)
             {
                 ev.Reset();
@@ -490,7 +514,8 @@ public sealed class CompletionTable : IDisposable
                 if (!signaled)
                     return DeliveryStatus.Pending;
 
-                // Woken by the other stage completing: go back to sleep for the remaining time.
+                // Woken by a late Set of the slot's previous occupant (its completer had not reached the Set when this owner
+                // saw the stage done and reused the slot): go back to sleep for the remaining time.
             }
         }
 

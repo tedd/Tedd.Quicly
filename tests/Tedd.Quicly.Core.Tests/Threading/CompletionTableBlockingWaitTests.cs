@@ -1,18 +1,50 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using Tedd.Quicly.Core.Threading;
 
 namespace Tedd.Quicly.Core.Tests.Threading;
 
-/// <summary>The blocking <see cref="CompletionTable.Wait"/> on a CPU that a busy thread wants too.</summary>
+/// <summary>The blocking <see cref="CompletionTable.Wait"/> parks instead of yielding its CPU.</summary>
 public class CompletionTableBlockingWaitTests
 {
     private const CompletionStage Remote = CompletionStage.RemoteAccepted;
 
+    /// <summary>
+    /// The events a blocking wait parks on do not spin: a <see cref="ManualResetEventSlim"/> with its default spin count
+    /// spins on with <see cref="Thread.Yield"/> and <c>Thread.Sleep(0)</c> (<c>sched_yield</c> elsewhere) before it blocks,
+    /// which loses a scheduler quantum per yield when no core is free. Timing-free, so it guards every platform; the test
+    /// below shows the effect on Windows.
+    /// </summary>
+    [Fact]
+    public void The_Events_A_Blocking_Wait_Parks_On_Do_Not_Spin()
+    {
+        var table = new CompletionTable(1);
+        Assert.True(table.TryAllocate(out SendToken token));
+        Assert.Equal(DeliveryStatus.Pending, table.Wait(token, CompletionStage.BufferReleased, TimeSpan.FromMilliseconds(5)));
+        Assert.Equal(DeliveryStatus.Pending, table.Wait(token, Remote, TimeSpan.FromMilliseconds(5)));
+
+        const BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Instance;
+        object slot = ((Array)typeof(CompletionTable).GetField("_slots", flags)!.GetValue(table)!).GetValue(0)!;
+        foreach (string name in new[] { "_event0", "_event1" })
+        {
+            FieldInfo? field = slot.GetType().GetField(name, flags);
+            Assert.True(field is not null, $"CompletionTable's slot has no field {name}: update this test with the wait's design.");
+            var parkedOn = (ManualResetEventSlim?)field.GetValue(slot);
+            Assert.True(parkedOn is not null, $"The wait did not park on {name}.");
+
+            // A ManualResetEventSlim forces a spin count of 1 on a single processor, whatever it was given.
+            Assert.Equal(Environment.ProcessorCount == 1 ? 1 : 0, parkedOn.SpinCount);
+        }
+
+        table.Release(token);
+        Assert.Equal(1, table.Available);
+    }
+
     /// <remarks>
     /// <para>
     /// The waiting thread and a busy loop are pinned to the same CPU, and a third thread completes the stage 200 us after
-    /// it saw the token, long after the table's short spin has ended. A wait that has parked is woken by the completion and
+    /// it saw the token, long after the table's spin (about 20 us, never yielding) has ended. A wait that has parked is woken by the completion and
     /// takes the CPU back from the busy loop at once. A wait that is still spinning with <see cref="Thread.Yield"/> (a
     /// <see cref="ManualResetEventSlim"/> with its default spin count does 25 rounds of yields and spins before it blocks)
     /// has handed the CPU to the busy loop, and nothing can wake a thread that has not parked: it runs again when the busy

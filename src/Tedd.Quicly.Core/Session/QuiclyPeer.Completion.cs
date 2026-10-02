@@ -25,9 +25,26 @@ public sealed unsafe partial class QuiclyPeer
     }
 
     /// <summary>
-    /// Blocks until a stage of a tracked send completes (native hosts only; never on the thread that polls in
-    /// <see cref="CompletionMode.PollOnly"/> mode, where the completion is only observed inside <see cref="Poll"/>).
+    /// Blocks the game thread until a stage of a tracked send completes or <paramref name="timeout"/> elapses (native hosts
+    /// only). Spins for up to about 20 µs, then parks.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Call it on the game thread, like every other member (one thread at a time), with at most one wait (blocking or
+    /// <see cref="WaitAsync"/>) per stage of a token.
+    /// </para>
+    /// <para>
+    /// While the game thread is blocked here nothing polls, so only a completion that the transport thread signals itself
+    /// can end the wait. It does so only with <see cref="CompletionMode.ThreadPool"/>, and only for an unfragmented message on
+    /// an <see cref="Channels.ChannelMode.UnreliableUnordered"/> or <see cref="Channels.ChannelMode.UnreliableSequenced"/>
+    /// channel that left in a datagram of its own (<see cref="CompletionStage.BufferReleased"/> once the transport has sent
+    /// it, both stages at its outcome). Every other stage completes inside <see cref="Poll"/> or <see cref="Flush"/>: every
+    /// stage with <see cref="CompletionMode.PollOnly"/>, messages packed together into one datagram, fragmented or expired
+    /// messages, <see cref="Channels.ChannelMode.ReliableLatest"/> and every stream channel. A blocking wait for one of those
+    /// returns <see cref="DeliveryStatus.Pending"/> when its timeout elapses: use <see cref="WaitAsync"/> instead, or poll and
+    /// read <see cref="GetDeliveryStatus"/>.
+    /// </para>
+    /// </remarks>
     /// <param name="token">The token.</param>
     /// <param name="stage">The stage.</param>
     /// <param name="timeout">Longest wait; <see cref="Timeout.InfiniteTimeSpan"/> waits forever.</param>

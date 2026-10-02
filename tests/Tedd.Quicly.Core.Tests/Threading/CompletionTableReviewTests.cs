@@ -286,9 +286,11 @@ public class CompletionTableReviewFollowUpTests
     /// Each thread waits a random 0 to 7 spin iterations before its Complete, so that either may come first and the two
     /// often meet (against the table before the fix, which wrote a losing call's status, this found 10 to 51 bad statuses
     /// per run; racing without the delays found 0 to 6, and none in four runs of nine), and each must have won at least
-    /// 1 000 times. The rival thread takes each token through a hand-off that spins and then blocks, and hands back when its
-    /// Complete has returned (<see cref="HandOff"/>): on a machine with no core to spare a hand-off costs a thread wake-up
-    /// rather than a scheduler quantum, and the second look at the status comes after both calls.
+    /// 1 000 times: a run that is short of that after its 20 000 iterations goes on until it has, or until 20 s have passed
+    /// (in a whole-suite run the rival, often without a core, won 810 of 20 000). The rival thread takes each token through
+    /// a hand-off that spins and then blocks, and hands back when its Complete has returned (<see cref="HandOff"/>): on a
+    /// machine with no core to spare a hand-off costs a thread wake-up rather than a scheduler quantum, and the second look
+    /// at the status comes after both calls.
     /// </remarks>
     [Fact]
     public void Losing_Concurrent_Complete_Never_Writes_Its_Status()
@@ -296,6 +298,8 @@ public class CompletionTableReviewFollowUpTests
         const int iterations = 20_000;
         const int requiredWins = 1_000;
         const long stop = long.MinValue;
+        long start = Stopwatch.GetTimestamp();
+        long deadline = start + (20 * Stopwatch.Frequency);
         var table = new CompletionTable(1);
         using var published = new HandOff();
         using var rivalDone = new HandOff();
@@ -325,10 +329,16 @@ public class CompletionTableReviewFollowUpTests
         { IsBackground = true, Name = "rival" };
         rival.Start();
 
+        int i = 0;
         try
         {
-            for (int i = 0; i < iterations; i++)
+            for (; ; i++)
             {
+                if ((i & 255) == 0 && Stopwatch.GetTimestamp() >= deadline)
+                    break;
+                if (i >= iterations && rivalWins >= requiredWins && i - rivalWins >= requiredWins)
+                    break;
+
                 Assert.True(table.TryAllocate(out SendToken token));
                 published.Publish(Pack(token));
                 Thread.SpinWait(random.Next(0, 8));
@@ -354,11 +364,13 @@ public class CompletionTableReviewFollowUpTests
             rival.Join();
         }
 
+        string run = $"the rival won {rivalWins:N0} of {i:N0} races in {Stopwatch.GetElapsedTime(start).TotalSeconds:F1} s";
+        TestContext.Current.TestOutputHelper?.WriteLine(run);
         Assert.True(rivalFailure is null, $"The rival thread failed: {rivalFailure}");
         Assert.Equal(0, mismatches);
         Assert.Equal(1, table.Available);
-        Assert.True(rivalWins >= requiredWins && iterations - rivalWins >= requiredWins,
-            $"The two calls did not race: the rival won {rivalWins:N0} of {iterations:N0} times.");
+        Assert.True(rivalWins >= requiredWins && i - rivalWins >= requiredWins,
+            $"The two calls did not race enough: {run}, and each side needs {requiredWins:N0} wins.");
     }
 
     [Fact]

@@ -20,18 +20,19 @@ public class CompletionTableBlockingWaitTests
     /// waits this way ran several times longer on four loaded cores (docs/benchmarks/threading.md section 7).
     /// </para>
     /// <para>
-    /// The waiter and the busy loop both run at the highest thread priority. Once woken, the waiter (boosted above the
-    /// busy loop by the wake-up) preempts it and every normal-priority thread: in a full test run other tests' threads,
-    /// boosted by their own wake-ups, would otherwise hold its CPU for a quantum and delay even a parked waiter. A yielding
-    /// waiter gives the CPU to a busy loop of equal priority for the whole of its quantum, which is a fixed amount of CPU
-    /// time (a busy loop of lower priority would lose the CPU again at the next clock tick, and the clock may tick every
-    /// millisecond when another application asked for that).
+    /// The waiter and the busy loop both run at the highest thread priority. Once woken, the waiter (boosted above the busy
+    /// loop by the wake-up) preempts it and every normal-priority thread. A yielding waiter gives the CPU to a busy loop of
+    /// equal priority for the whole of its quantum, which is a fixed amount of CPU time (a busy loop of lower priority would
+    /// lose the CPU again at the next clock tick, and the clock ticks every millisecond while some application asks for it).
     /// </para>
     /// <para>
-    /// The measured latency runs from just before the completion to the waiter's return, so a completer delayed by the
-    /// machine's load does not count. The median of 21 rounds must stay under 1 ms: a parked wait takes microseconds, a
-    /// yielding one a quantum (about 31 ms here). Windows only (thread affinity through kernel32), and the process must be
-    /// allowed at least two CPUs.
+    /// What is measured is the time from just before the completion to the waiter's return. Rounds alternate between the
+    /// table and a reference: a <see cref="ManualResetEventSlim"/> with spin count 0, which parks at once, set by the same
+    /// completer. In a full test run the whole process is paused now and then (garbage collections, other tests' threads),
+    /// which delays both kinds of round alike; the median of the paired differences (table minus the reference round next
+    /// to it) must stay under 5 ms. A parked table wait is within microseconds of the reference; a yielding one is a
+    /// quantum (about 31 ms) behind it. Windows only (thread affinity through kernel32), and the process must be allowed
+    /// at least two CPUs.
     /// </para>
     /// </remarks>
     [Fact]
@@ -48,11 +49,13 @@ public class CompletionTableBlockingWaitTests
         ulong others = allowed & ~shared;
         Assert.SkipWhen(others == 0, "The process is allowed a single CPU.");
 
-        const int rounds = 21;
+        const int pairs = 21;
         long delayTicks = Stopwatch.Frequency / 5_000;
         var table = new CompletionTable(4);
-        var latencies = new double[rounds];
-        var statuses = new DeliveryStatus[rounds];
+        using var reference = new ManualResetEventSlim(false, spinCount: 0);
+        var tableLatencies = new double[pairs];
+        var referenceLatencies = new double[pairs];
+        var statuses = new DeliveryStatus[pairs];
         long request = 0;
         long completedAt = 0;
         int stop = 0;
@@ -68,6 +71,7 @@ public class CompletionTableBlockingWaitTests
         })
         { IsBackground = true, Name = "busy", Priority = ThreadPriority.Highest };
 
+        // Odd requests complete the table's current token, even ones set the reference event.
         var completer = new Thread(() =>
         {
             try
@@ -90,7 +94,10 @@ public class CompletionTableBlockingWaitTests
                     while (Stopwatch.GetTimestamp() < until)
                         Thread.SpinWait(8);
                     Volatile.Write(ref completedAt, Stopwatch.GetTimestamp());
-                    table.Complete(token, Remote, DeliveryStatus.Delivered);
+                    if ((next & 1) != 0)
+                        table.Complete(token, Remote, DeliveryStatus.Delivered);
+                    else
+                        reference.Set();
                 }
             }
             catch (Exception e)
@@ -105,15 +112,22 @@ public class CompletionTableBlockingWaitTests
             try
             {
                 Pin(shared);
-                for (int i = 0; i < rounds; i++)
+                long next = 0;
+                for (int i = 0; i < pairs; i++)
                 {
                     Assert.True(table.TryAllocate(out SendToken token));
                     current = token;
-                    Volatile.Write(ref request, i + 1);
+                    Volatile.Write(ref request, ++next);
                     statuses[i] = table.Wait(token, Remote, TimeSpan.FromSeconds(10));
                     long woke = Stopwatch.GetTimestamp();
-                    latencies[i] = Stopwatch.GetElapsedTime(Volatile.Read(ref completedAt), woke).TotalMilliseconds;
+                    tableLatencies[i] = Stopwatch.GetElapsedTime(Volatile.Read(ref completedAt), woke).TotalMilliseconds;
                     table.Release(token);
+
+                    reference.Reset();
+                    Volatile.Write(ref request, ++next);
+                    Assert.True(reference.Wait(TimeSpan.FromSeconds(10)));
+                    woke = Stopwatch.GetTimestamp();
+                    referenceLatencies[i] = Stopwatch.GetElapsedTime(Volatile.Read(ref completedAt), woke).TotalMilliseconds;
                 }
             }
             catch (Exception e)
@@ -133,12 +147,15 @@ public class CompletionTableBlockingWaitTests
 
         Assert.True(failure is null, $"A thread failed: {failure}");
         Assert.All(statuses, s => Assert.Equal(DeliveryStatus.Delivered, s));
-        double[] sorted = (double[])latencies.Clone();
-        Array.Sort(sorted);
-        double median = sorted[rounds / 2];
-        string report = $"Median wake-up {median:F3} ms after the completion; every round (ms): {string.Join(", ", latencies.Select(l => l.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)))}";
+        double[] differences = new double[pairs];
+        for (int i = 0; i < pairs; i++)
+            differences[i] = tableLatencies[i] - referenceLatencies[i];
+        Array.Sort(differences);
+        double median = differences[pairs / 2];
+        string report = string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"Median of (table - reference) {median:F3} ms; table (ms): {string.Join(", ", tableLatencies.Select(l => l.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)))}; reference (ms): {string.Join(", ", referenceLatencies.Select(l => l.ToString("F3", System.Globalization.CultureInfo.InvariantCulture)))}");
         TestContext.Current.TestOutputHelper?.WriteLine(report);
-        Assert.True(median < 1, report);
+        Assert.True(median < 5, report);
     }
 
     private static void Pin(ulong mask)

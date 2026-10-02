@@ -317,7 +317,7 @@ is back in `Filling` and still owned by the caller.
    mailboxes do not pass through the ring, and stopping them would silence every coalescing and ReliableLatest handler for as
    long as a hold lasts, while the transport thread keeps acknowledging those values to the sender.
    Compressed messages are decoded by `TryDecode` (decoded-bytes budget): in place in their own lease when it holds the decoded
-   size and the in-place margin (`Lz4Block.TryDecompressInPlace`), otherwise with `Lz4Block.DecompressExact` into a second
+   size (`Lz4Block.TryDecompressInPlace`, which keeps the in-place margin on its stack), otherwise with `Lz4Block.DecompressExact` into a second
    lease tried once (`PeerCore.TryRentDecode`); a failure drops and counts `DecodeFailures`, and never waits. The lease is
    released after the handler unless `Retain` was called; handler exceptions propagate.
 5. `ResumePendedStreams()` (streams the ring or the budget held back, oldest first: as many as the ring has free slots and
@@ -430,7 +430,7 @@ allocated in native memory in chunks that double from 64.
     a channel of a replaced engine.
   * **The check.** The engines ask `TryTake(channel, length, limitedLength)` at the start of a message (`StreamMessagePhase.Start`
     and `Whole`); one read of the channel's limit answers `Unlimited` (a handler: staged at `length`), `Limited` (staged at
-    `limitedLength`, `PeerCore.LimitedStagingLength` — a compressed message's decoded size plus the in-place margin when that
+    `limitedLength`, `PeerCore.LimitedStagingLength` — a compressed message's decoded size (or its wire length if larger) when that
     fits the largest pool block within the budget; the message is tagged *shared*, below) or `Blocked`. A channel at its limit answers `StreamConsume.PendCredit`: the parser un-reads the event, the receive returns `PendingAfter`, the
     bytes stay in the transport and QUIC flow control holds **that stream's** sender. The transport thread reads only its own
     line and the read-mostly limits in the common case; it looks at the game thread's counters (`Refresh`) only when its
@@ -551,8 +551,10 @@ allocated in native memory in chunks that double from 64.
     none decoded first, so all waited for each other (second recheck round, RC2-1: twelve of twelve peers of a server
     stalled). Now **no decode waits for a buffer**:
     * *Staging.* A compressed message of a reliable channel no handler reads (the credit answered `Limited`) is staged in
-      a block of its decoded size plus the in-place margin (`PeerCore.LimitedStagingLength`, at most `MaxStageLength`, the
-      largest pool block within the budget), rented all or nothing with its ring slot and its credit at the message's
+      a block of its decoded size (`PeerCore.LimitedStagingLength` = `Lz4Block.GetInPlaceLength`, the larger of `RawLength`
+      and `Length`, at most `MaxStageLength`, the largest pool block within the budget). The in-place margin is not part of
+      the block (review RC2R1-1: with it, a 64 KiB message took a 256 KiB block, a whole default budget); it is
+      kept on the decoder's stack, below. The block is rented all or nothing with its ring slot and its credit at the message's
       start: a start that cannot have all of it returns what it took, answers `Pend` / `PendCredit` with
       `StreamMessageContext.PendLength`, and holds nothing while it waits. Never at its end: the bytes are consumed by then,
       and MsQuic answers `PendingAfter` by keeping the indication's tail only, so the end may never come again (with the
@@ -560,10 +562,14 @@ allocated in native memory in chunks that double from 64.
       declaration as `Length` and is held to the same caps (`MaxMessageSize` at parse, `MaxStageLength`, the credit and
       the strict share, the budget, the idle timeout), so a declared-and-stalled `RawLength` pins what a declared-and-
       stalled `Length` pins.
-    * *Decode.* `TryDecode` decodes in place (`Lz4Block.TryDecompressInPlace`: one memmove of the compressed bytes to the
-      block's end, then a decode towards them that refuses any write reaching unread input) whenever the block holds the
-      decoded size and margin (`PeerCore.FitsInPlace`) — every limited-staged message, and any other whose block happens
-      to fit. The lease, the budget and the credit do not change, since the credit came back before the decode with the
+    * *Decode.* `TryDecode` decodes in place (`Lz4Block.TryDecompressInPlace`) whenever the block holds the decoded size
+      (`PeerCore.FitsInPlace`): every limited-staged message, and any other whose block happens to fit. The decode works
+      on a span of `RawLength + GetInPlaceMargin(Length)` bytes with the compressed bytes at its end. That span is the
+      block followed by a stack buffer of at most `InPlaceTailCapacity` (2 KiB, no allocation): the last compressed bytes
+      that do not fit the block are copied there, and the rest are moved to the block's end (one memmove). The decode
+      writes towards them and refuses any write that would reach unread input; it never writes to the stack part. The
+      2 KiB covers the margin of any compressed block up to 504 KiB. A larger one needs the rest of its margin in the
+      block (`GetInPlaceLength`). The lease, the budget and the credit do not change, since the credit came back before the decode with the
       same block it was taken with. Anything else (staged while handled, a response, an unreliable channel's, the edge
       band beyond `MaxStageLength`) gets one try at a second lease from `PeerCore.TryRentDecode` (which may take the budget
       past its limit by that buffer) and is otherwise dropped and counted, as in 0.2.1. `TryDecode` rents before it
@@ -1005,6 +1011,17 @@ nothing; a stream value overtaken by a newer datagram dropped at its end with it
 after a long quiet still a duplicate; a new epoch and a retired key starting over); and `LatestZeroAllocationTests`
 (1 000 keys at 60 Hz, superseding plus retiring keys, and duplicates dropped and re-acked behind a long ack delay).
 
+The compressed staging of unread and drained reliable channels (§4.4, "Drain and compressed messages") has
+`Lz4BlockInPlaceTests` and `CompressedStagingTests`. `Lz4BlockInPlaceTests` covers the in-place decode against the
+out-of-place one, for this library's encoder and the reference encoders. It decodes in a block of exactly the larger of
+the two lengths, with every share of the margin between the stack and the block, including decoded sizes at and just
+below every pool class size. It also checks a compressed block above 504 KiB, and garbage between canaries.
+`CompressedStagingTests` covers staging, waiting, the edge band and responses. Three review suites pin the size
+classes with default options, so the in-place margin cannot move a message into a larger class again:
+`ReviewRc2R1StagingTests` (a 64 KiB message takes a 64 KiB block, and a datagram of the same frame is not refused;
+eight 16 KiB messages fit the drained half), `ReviewRc2R1ServerPoolTests` (sixteen peers on a server's default shared
+pool do not wait for each other) and `ReviewRc2R1ReconnectTests`.
+
 ## 7. Engine boundary and implementation waves
 
 The peer never contains mode-specific logic. It owns the shared tables (send entries, receive ring, mailboxes,
@@ -1317,8 +1334,8 @@ channel owned by the transport thread (the peer's stream, the lease and header f
 * **Receive** (transport thread). `OnStreamOpened` accepts one stream per channel per connection; a second is
   `CloseConnection(ProtocolViolation)` (PROTOCOL.md §3). `Start`: a message that could never be buffered (larger than the receive
   budget or the largest pool block) ⇒ `CloseConnection(LimitExceeded)`; otherwise the credit (§4.4), `TryReserveReceive`, then
-  `TryRentReceive` of the staging length — `Length`, or for a compressed message of a limited channel its decoded size plus the
-  in-place margin (`LimitedStagingLength`) — (nothing for an empty message) — either failing ⇒ `Pend` (the peer un-reads the event and Poll resumes the stream;
+  `TryRentReceive` of the staging length — `Length`, or for a compressed message of a limited channel its decoded size
+  (`LimitedStagingLength`) — (nothing for an empty message) — either failing ⇒ `Pend` (the peer un-reads the event and Poll resumes the stream;
   `PeerStatistics.StreamReceivePends`). `Chunk` ⇒ copied into the lease. `End` ⇒ `PublishReserved` (`Compressed` and `RawLength`
   for LZ4, decoded in Poll; `IsRequest`/`IsResponse` when a request id is present). `OnStreamClosed` ⇒ the reservation is cancelled
   and the lease returned, and the peer's mid-message idle sweep (§4.3) resets a stream that stops half way through a message.

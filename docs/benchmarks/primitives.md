@@ -241,3 +241,20 @@ runs, so read only the order of magnitude (ADR 0007).
 **Decision: kept.** In place is 0–15 % slower than the out-of-place decode alone (the memmove of the compressed bytes
 and the extra compare), and it saves the second buffer's rent and return — and, which is the point, the wait for that
 buffer. Decoding still runs at well over 1 GB/s, far above the 8 MiB/s `DecodedBytesPerSecond` default.
+
+**Margin on the stack (2026-10-02, review RC2R1-1).** With the margin in the block, a message whose decoded size is a
+pool block size (64 KiB, the default `MaxMessageSize`) needed the next class, four times larger. The decode now
+keeps the last compressed bytes that do not fit the block in a stack buffer of at most 2 KiB (`[SkipLocalsInit]`, so
+it is not cleared). It reads the source through one compare per header byte, and splits a literal run that crosses
+into the stack part. Same probe, game-like data, pinned to one core, three runs while other sessions' stress loops
+ran, so only the order of magnitude counts:
+
+| Raw size | Out of place | In place, margin in the block | In place, block = raw size |
+|---|---|---|---|
+| 1 KiB | 662–888 ns | 743–1 022 ns | 771–862 ns |
+| 16 KiB | 11.0–14.0 µs | 12.0–12.8 µs | 12.2–16.7 µs |
+| 64 KiB | 35–46 µs | 37–66 µs | 47–62 µs |
+| 200 000 B | 116–140 µs | 130–160 µs | 157–166 µs |
+
+**Decision: kept.** The cost is within the noise of the shared machine, and decoding stays well above 1 GB/s. The
+block it saves is a whole size class.

@@ -664,8 +664,9 @@ receiver-local; nothing on the wire changes and either end may run it alone.
   resume it. That holds for the streams held back for a channel's credit and for those held back for the receive
   ring or the byte budget; a Poll also lets go of the entries beyond what the live streams account for, so a host
   that polls every frame keeps neither list from growing. And a compressed message of a reliable channel that no
-  handler reads is **staged in a block that holds its decoded size** (`RawLength` plus a small in-place margin,
-  within the largest pool block the byte budget can hold), taken all or nothing with its ring slot and its credit
+  handler reads is **staged in a block that holds its decoded size** (`RawLength`, or `Length` if larger, within
+  the largest pool block the byte budget can hold; the in-place decode keeps its margin on the stack, so the
+  margin never moves a message into a larger block), taken all or nothing with its ring slot and its credit
   at the message's start, charged to the credit and the byte budget from that start, and decoded in place. A
   `Drain` therefore never waits for a buffer: without decode budget for such a message it leaves it queued — the
   channel gives nothing newer in that call, so its order holds — and returns what it has, instead of dropping it
@@ -674,10 +675,11 @@ receiver-local; nothing on the wire changes and either end may run it alone.
   declares a large `RawLength` and stalls pins exactly what one that declares a large `Length` does. A start never
   waits at the message's end: its bytes are consumed by then, and a transport that holds the rest of a stream back
   may not deliver that end again. Any other compressed message (one that arrived while its channel had a handler, a
-  response, one of an unreliable channel, and one whose decoded size and margin do not fit that largest block) is
+  response, one of an unreliable channel, and one whose decoded size does not fit that largest block) is
   decoded in place when its block can hold it, and otherwise into a second buffer that may take the byte budget
   past its limit by itself, tried once: without one it is dropped and counted (`DecodeFailures`), as are malformed
-  blocks and a decoded size that does not match `RawLength`.
+  blocks and a decoded size that does not match `RawLength`. A decoded size larger than every block within the
+  byte budget never gets a buffer, as in 0.2.1.
 
 The **stream idle mid-message** rule is per receiving stream and applies to every stream mode: a stream that has
 delivered a message's frame header but not the rest of its payload for 30 s (`PeerOptions.StreamIdleTimeout`) is

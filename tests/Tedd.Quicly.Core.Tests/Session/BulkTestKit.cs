@@ -1,4 +1,5 @@
 using System.Net;
+using System.Numerics;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Framing;
@@ -245,6 +246,15 @@ internal sealed class ShortSource(long available) : IBulkSource
 /// </summary>
 internal sealed class PatternSource(long total) : IBulkSource
 {
+    /// <summary>Bytes in which <c>offset &gt;&gt; 11</c>, the second term of <see cref="At"/>, stays the same.</summary>
+    private const int Block = 2048;
+
+    /// <summary>
+    /// The first term of <see cref="At"/>, <c>(byte)(n * 131)</c>, for <c>n</c> from 0 on: it depends only on <c>n &amp; 255</c>,
+    /// so the run of a whole block starts somewhere in the first 256 bytes.
+    /// </summary>
+    private static readonly byte[] Cycle = MakeCycle();
+
     public static byte At(long offset) => (byte)((offset * 131) ^ (offset >> 11));
 
     public long Total => total;
@@ -257,12 +267,78 @@ internal sealed class PatternSource(long total) : IBulkSource
         }
 
         int take = (int)Math.Min(destination.Length, total - offset);
-        for (int i = 0; i < take; i++)
+        Fill(offset, destination.Slice(0, take));
+        return take;
+    }
+
+    /// <summary>Writes the pattern's bytes from <paramref name="offset"/> on: <see cref="At"/> a block at a time.</summary>
+    public static void Fill(long offset, Span<byte> destination)
+    {
+        while (!destination.IsEmpty)
         {
-            destination[i] = At(offset + i);
+            int take = Math.Min(destination.Length, Block - (int)(offset & (Block - 1)));
+            ReadOnlySpan<byte> cycle = Cycle.AsSpan((int)(offset & 255), take);
+            byte k = (byte)(offset >> 11);
+            Vector<byte> kv = new(k);
+            int i = 0;
+            for (; i <= take - Vector<byte>.Count; i += Vector<byte>.Count)
+            {
+                (new Vector<byte>(cycle.Slice(i)) ^ kv).CopyTo(destination.Slice(i));
+            }
+
+            for (; i < take; i++)
+            {
+                destination[i] = (byte)(cycle[i] ^ k);
+            }
+
+            destination = destination.Slice(take);
+            offset += take;
+        }
+    }
+
+    /// <summary>How many of <paramref name="data"/>'s bytes differ from the pattern's from <paramref name="offset"/> on.</summary>
+    public static long Mismatches(long offset, ReadOnlySpan<byte> data)
+    {
+        long mismatches = 0;
+        while (!data.IsEmpty)
+        {
+            int take = Math.Min(data.Length, Block - (int)(offset & (Block - 1)));
+            ReadOnlySpan<byte> cycle = Cycle.AsSpan((int)(offset & 255), take);
+            byte k = (byte)(offset >> 11);
+            Vector<byte> kv = new(k);
+            int i = 0;
+            for (; i <= take - Vector<byte>.Count; i += Vector<byte>.Count)
+            {
+                if (!Vector.EqualsAll(new Vector<byte>(data.Slice(i)) ^ kv, new Vector<byte>(cycle.Slice(i))))
+                {
+                    for (int j = i; j < i + Vector<byte>.Count; j++)
+                    {
+                        mismatches += data[j] != (byte)(cycle[j] ^ k) ? 1 : 0;
+                    }
+                }
+            }
+
+            for (; i < take; i++)
+            {
+                mismatches += data[i] != (byte)(cycle[i] ^ k) ? 1 : 0;
+            }
+
+            data = data.Slice(take);
+            offset += take;
         }
 
-        return take;
+        return mismatches;
+    }
+
+    private static byte[] MakeCycle()
+    {
+        byte[] cycle = new byte[256 + Block];
+        for (int n = 0; n < cycle.Length; n++)
+        {
+            cycle[n] = (byte)(n * 131);
+        }
+
+        return cycle;
     }
 }
 
@@ -312,14 +388,7 @@ internal sealed class PatternSink : IBulkSink
 
     public void Write(long objectOffset, ReadOnlySpan<byte> data)
     {
-        for (int i = 0; i < data.Length; i++)
-        {
-            if (data[i] != PatternSource.At(objectOffset + i))
-            {
-                Mismatches++;
-            }
-        }
-
+        Mismatches += PatternSource.Mismatches(objectOffset, data);
         BytesWritten += data.Length;
     }
 
@@ -763,14 +832,7 @@ internal sealed class PatternObjectSink : IBulkObjectSink
 
     public void Write(long objectOffset, ReadOnlySpan<byte> data)
     {
-        for (int i = 0; i < data.Length; i++)
-        {
-            if (data[i] != PatternSource.At(objectOffset + i))
-            {
-                Mismatches++;
-            }
-        }
-
+        Mismatches += PatternSource.Mismatches(objectOffset, data);
         BytesWritten += data.Length;
     }
 

@@ -1076,7 +1076,8 @@ public class ReviewCreditThreadingTests
     /// thread, and the test thread is the receiver's game thread. The simulator serialises transport API calls with
     /// its callbacks, but everything the session shares between its two threads — the receive ring, the credit counters,
     /// the lists of held-back streams, <c>WaitsForCredit</c> — is driven concurrently, as it is over MsQuic. A receiver
-    /// that reads both channels and gets nothing for four seconds has lost a wake-up.
+    /// that reads both channels and gets nothing for four seconds has lost a wake-up. Every run starts by leaving the group
+    /// channel unread until one of its streams is held back, so that every run has a hold to lift.
     /// </summary>
     /// <param name="seed">Seed of the receiver's and the sender's choices.</param>
     /// <param name="onProbe">The receiver ends as a host that polls only while <see cref="QuiclyPeer.HasPendingWork"/> is set.</param>
@@ -1204,11 +1205,32 @@ public class ReviewCreditThreadingTests
         sender.Start();
         try
         {
+            // First a hold the run is sure to have. Whether the choices below leave the group channel unread long enough for
+            // its streams to be held back depends on how the scheduler interleaves the three threads, and some runs had none
+            // (seeds 22 and 24 on four busy cores). So the group channel is left unread here, without a handler or a Drain,
+            // while the ordered channel is read, until the transport thread has held a group stream back for credit; the
+            // choices below then lift that hold, with the threads running as before.
+            Stopwatch holding = Stopwatch.StartNew();
+            while (server.Core.Credit.Pends(server.Core.ChannelIndexOf(Groups)) == 0 && failure is null)
+            {
+                if (holding.ElapsedMilliseconds > 10_000)
+                {
+                    stall = $"the group channel was left unread for {holding.ElapsedMilliseconds} ms and no group stream was held back for credit";
+                    break;
+                }
+
+                server.Poll();
+                ordered.AddRange(DrainAll(server, Ordered));
+                server.Flush();
+            }
+
+            TestContext.Current.TestOutputHelper?.WriteLine(
+                $"seed {seed}: a group stream was held back after {holding.ElapsedMilliseconds} ms, with {groups.Count} group and {ordered.Count} ordered messages read");
             Stopwatch wall = Stopwatch.StartNew();
             long lastProgress = 0;
             int lastTotal = -1;
             bool settled = false;
-            while (ordered.Count < count || groups.Count < count)
+            while (stall is null && (ordered.Count < count || groups.Count < count))
             {
                 if (failure is not null)
                 {

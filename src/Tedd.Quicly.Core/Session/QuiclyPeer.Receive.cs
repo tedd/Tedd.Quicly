@@ -827,9 +827,12 @@ public sealed unsafe partial class QuiclyPeer
                             record.Parser.Rewind(in mark);
                         }
 
+                        // What the start asks for when it is resumed (a compressed message of a limited channel is staged
+                        // at its decoded size): the stream is let go when that fits, not when its wire length would.
+                        int pendLength = context.PendLength != 0 ? context.PendLength : context.Header.Length;
                         if (result.Action == StreamConsumeAction.PendCredit)
                         {
-                            if (!_core.NoteCreditPendedStream(id, record.ChannelIndex, context.Header.Length))
+                            if (!_core.NoteCreditPendedStream(id, record.ChannelIndex, pendLength))
                             {
                                 // The list of held-back streams is full, many times over, of streams the peer reset while
                                 // they waited: this one would never be resumed. No sender of this library does that.
@@ -840,7 +843,7 @@ public sealed unsafe partial class QuiclyPeer
 
                             record.WaitsForCredit = true;
                         }
-                        else if (!_core.NotePendedStream(id, context.Header.Length))
+                        else if (!_core.NotePendedStream(id, pendLength))
                         {
                             // The ring of held streams is full, many times over, of streams the peer reset while they
                             // were held: this one would never be resumed. No sender of this library does that.

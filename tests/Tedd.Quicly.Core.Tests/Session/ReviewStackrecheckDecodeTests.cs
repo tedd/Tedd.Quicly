@@ -12,10 +12,14 @@ namespace Tedd.Quicly.Core.Tests.Session;
 /// subtracts the block the waiting message holds). A test marked FINDING fails at e8af1f8 for the reason its comment gives.
 /// </summary>
 /// <remarks>
-/// Fixed since (recheck round, RC-1): <c>PeerCore.CanEverRentDecode(raw, heldBlock)</c> counts the pool's blocks of the
-/// classes a decode could use minus the message's own, so the message is dropped and counted again, as at d567ba5 and in
-/// 0.2.1 (a known limit of the default pool, RELEASE-NOTES.md). The description below is what the test found at e8af1f8;
-/// the test now pins the fix, and the tests after it the handler's side and the remedy.
+/// Fixed since (recheck round, RC-1): <c>PeerCore.CanEverRentDecode(raw, heldBlock)</c> counted the pool's blocks of the
+/// classes a decode could use minus the message's own, so the message was dropped and counted again, as at d567ba5 and in
+/// 0.2.1. That left the circular wait among several waiting messages (recheck round 2, RC2-1). Since then nothing waits for
+/// a decode buffer: a compressed message is decoded in place in its own block when the block holds its raw size and the
+/// in-place margin (<c>Lz4Block.TryDecompressInPlace</c>; a channel no handler reads stages it in such a block,
+/// <c>PeerCore.LimitedStagingLength</c>), so the message below is delivered, through Drain and to a handler alike. The
+/// description below is what the test found at e8af1f8; the test now pins the fix, and the tests after it the handler's
+/// side and a pool with a second block.
 /// </remarks>
 public class ReviewStackrecheckDecodeTests
 {
@@ -78,6 +82,8 @@ public class ReviewStackrecheckDecodeTests
 
         // The application drains the channel every frame and releases what it got straight away.
         List<int> got = [];
+        bool intact = true;
+        byte[] large = Payload(0, 200_000, 100_000);
         ReceivedMessage[] buffer = new ReceivedMessage[16];
         bool chatSent = false;
         h.RunUntil(() =>
@@ -95,7 +101,9 @@ public class ReviewStackrecheckDecodeTests
             {
                 for (int i = 0; i < taken; i++)
                 {
-                    got.Add(BinaryPrimitives.ReadInt32LittleEndian(buffer[i].Payload));
+                    int index = BinaryPrimitives.ReadInt32LittleEndian(buffer[i].Payload);
+                    got.Add(index);
+                    intact &= index != 0 || buffer[i].Payload.SequenceEqual(large);
                 }
 
                 server.Release(buffer.AsSpan(0, taken));
@@ -110,17 +118,19 @@ public class ReviewStackrecheckDecodeTests
             + $"the handled channel {chat.Count} of 1; ReceiveBytesOutstanding {statistics.ReceiveBytesOutstanding} of 262144, DecodeFailures {statistics.DecodeFailures}, "
             + $"StreamReceivePends {statistics.StreamReceivePends}, the drained channel's Received {DatagramKit.ChannelStats(server, Packed).Received} (chat sent after it arrived: {chatSent})");
 
-        // As fixed: the message that can never be decoded is dropped and counted, and nothing more.
-        Assert.Equal([1], got);
-        Assert.Equal(1, statistics.DecodeFailures);
+        // As fixed: the message is decoded in its own block (the pool has no other of its class), intact and in order.
+        Assert.Equal([0, 1], got);
+        Assert.True(intact, "the message decoded in its own block is not the payload that was sent");
+        Assert.Equal(0, statistics.DecodeFailures);
+        Assert.Equal(0, statistics.ReceiveBytesOutstanding);
     }
 
     /// <summary>
-    /// The same message on a channel read by a handler: dropped and counted (no block for its decode), and the handler gets
-    /// the message behind it, as every channel of the peer gets its own.
+    /// The same message on a channel read by a handler: decoded in its own block too (the pool has no other of its class),
+    /// and the handler gets it and the message behind it, as every channel of the peer gets its own.
     /// </summary>
     [Fact]
-    public void The_Same_Message_To_A_Handler_Is_Dropped_And_Counted_And_The_Peer_Goes_On()
+    public void The_Same_Message_To_A_Handler_Is_Decoded_In_Its_Own_Block_And_The_Peer_Goes_On()
     {
         using SessionHarness h = new(table: Table, client: o =>
         {
@@ -130,22 +140,30 @@ public class ReviewStackrecheckDecodeTests
         QuiclyPeer server = h.Server!;
         List<int> packed = [];
         List<int> chat = [];
-        server.RegisterHandler(Packed, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => packed.Add(BinaryPrimitives.ReadInt32LittleEndian(payload)));
+        byte[] large = Payload(0, 200_000, 100_000);
+        bool intact = true;
+        server.RegisterHandler(Packed, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) =>
+        {
+            int index = BinaryPrimitives.ReadInt32LittleEndian(payload);
+            packed.Add(index);
+            intact &= index != 0 || payload.SequenceEqual(large);
+        });
         server.RegisterHandler(Chat, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> payload) => chat.Add(BinaryPrimitives.ReadInt32LittleEndian(payload)));
 
-        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(0, 200_000, 100_000)).Status);
+        Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), large).Status);
         Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(1, 2_000, 0)).Status);
         Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Chat), BitConverter.GetBytes(42)).Status);
 
         Assert.True(h.RunUntil(() => packed.Contains(1) && chat.Count == 1, 2_000_000),
             $"the handled channel gave [{string.Join(",", packed)}], chat {chat.Count} of 1, DecodeFailures {DatagramKit.Statistics(server).DecodeFailures}");
-        Assert.Equal([1], packed);
-        Assert.Equal(1, DatagramKit.Statistics(server).DecodeFailures);
+        Assert.Equal([0, 1], packed);
+        Assert.True(intact, "the message decoded in its own block is not the payload that was sent");
+        Assert.Equal(0, DatagramKit.Statistics(server).DecodeFailures);
     }
 
     /// <summary>
-    /// The remedy the release notes give: a pool with a second block of 256 KiB decodes the message, through <c>Drain</c>
-    /// (its decode buffer takes the budget past its limit by that one block) and in order with the message behind it.
+    /// A pool with a second block of 256 KiB (the remedy the release notes gave before RC2-1) decodes the message through
+    /// <c>Drain</c> as well — in place, in its own block — and in order with the message behind it.
     /// </summary>
     [Fact]
     public void A_Pool_With_Two_Blocks_Of_The_Class_Decodes_The_Message()

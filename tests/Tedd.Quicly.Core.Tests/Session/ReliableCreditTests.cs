@@ -976,23 +976,23 @@ public class ReliableCreditTests
         // Seven messages are taken across the 32-bit wrap of both counters, the eighth is refused.
         for (int i = 0; i < 7; i++)
         {
-            Assert.True(credit.TryTake(1), $"message {i} was refused");
+            Assert.True(credit.TryTake(1, 0, 0) != CreditTake.Blocked, $"message {i} was refused");
             credit.NoteTaken(1, 64);
         }
 
-        Assert.False(credit.TryTake(1));
+        Assert.False(credit.TryTake(1, 0, 0) != CreditTake.Blocked);
         Assert.Equal(7, credit.Waiting(1));
         Assert.Equal(7 * 64, credit.WaitingBytes(1));
 
         // One comes back: exactly one more is accepted.
         credit.NoteReturned(1, 64);
-        Assert.True(credit.TryTake(1));
+        Assert.True(credit.TryTake(1, 0, 0) != CreditTake.Blocked);
         credit.NoteTaken(1, 64);
-        Assert.False(credit.TryTake(1));
+        Assert.False(credit.TryTake(1, 0, 0) != CreditTake.Blocked);
 
         // A channel that was never enabled is not limited and not counted.
         Assert.False(credit.IsEnabled(0));
-        Assert.True(credit.TryTake(0));
+        Assert.True(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
     }
 
     [Fact]
@@ -1003,22 +1003,22 @@ public class ReliableCreditTests
         credit.SetCountersForTest(0, 0xFFFF_FFFF, 0xFFFF_FE00);
 
         // Empty: a message above the byte limit is accepted, and the next one waits for it.
-        Assert.True(credit.TryTake(0));
+        Assert.True(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
         credit.NoteTaken(0, 4_096);
-        Assert.False(credit.TryTake(0));
+        Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
         credit.NoteReturned(0, 4_096);
 
         // Below the limit messages are accepted until the bytes that wait reach it (the check precedes the message).
-        Assert.True(credit.TryTake(0));
+        Assert.True(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
         credit.NoteTaken(0, 600);
-        Assert.True(credit.TryTake(0));
+        Assert.True(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
         credit.NoteTaken(0, 600);
-        Assert.False(credit.TryTake(0));
+        Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
         Assert.Equal(1_200, credit.WaitingBytes(0));
 
         // A message given up half-way (its stream ended) is taken back by the thread that took it.
         credit.Untake(0, 600);
-        Assert.True(credit.TryTake(0));
+        Assert.True(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
 
         // An empty message counts as a message, not as bytes.
         credit.NoteTaken(0, 0);
@@ -1038,7 +1038,7 @@ public class ReliableCreditTests
         TransportStreamId c = new(3, 1);
         credit.NoteTaken(0, 10);
         credit.NoteTaken(1, 10);
-        Assert.False(credit.TryTake(0));
+        Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
         Assert.True(credit.NotePended(a, 0));
         Assert.True(credit.NotePended(b, 1));
         Assert.True(credit.NotePended(c, 1));
@@ -1063,7 +1063,7 @@ public class ReliableCreditTests
         Assert.Equal([b], transport.Resumed);
 
         // The resumed stream takes the credit; when that message is taken too, it is the other stream's turn.
-        Assert.True(credit.TryTake(1));
+        Assert.True(credit.TryTake(1, 0, 0) != CreditTake.Blocked);
         credit.NoteTaken(1, 10);
         credit.NoteReturned(1, 10);
         credit.Resume(transport);
@@ -1073,7 +1073,7 @@ public class ReliableCreditTests
         // Lifting a limit (a handler was registered) resumes the channel's streams too.
         transport.Resumed.Clear();
         credit.SetLimited(0, limited: false);
-        Assert.True(credit.TryTake(0));
+        Assert.True(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
         credit.Resume(transport);
         Assert.Equal([a], transport.Resumed);
         Assert.Equal(0, credit.ParkedStreams);
@@ -1118,7 +1118,7 @@ public class ReliableCreditTests
         for (int i = 0; i < streams.Length; i++)
         {
             streams[i] = new TransportStreamId(i + 1, 1);
-            Assert.False(credit.TryTake(0));
+            Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             Assert.True(credit.NotePended(streams[i], 0));
         }
 
@@ -1136,7 +1136,7 @@ public class ReliableCreditTests
         Assert.Equal(37, credit.ParkedStreams);
         for (int i = 0; i < 3; i++)
         {
-            Assert.True(credit.TryTake(0));
+            Assert.True(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             credit.NoteTaken(0, 10);
         }
 
@@ -1179,7 +1179,7 @@ public class ReliableCreditTests
         credit.Resume(transport);
         Assert.Equal([gone, live], transport.Resumed);
         Assert.Equal(0, credit.ParkedStreams);
-        Assert.False(credit.TryTake(0));
+        Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
         Assert.True(credit.NotePended(live, 0));
         credit.Resume(transport);
         Assert.Equal(1, credit.ParkedStreams);
@@ -1328,7 +1328,7 @@ public class ReliableCreditTests
         TransportStreamId a = new(1, 1);
         TransportStreamId b = new(2, 1);
         TransportStreamId c = new(3, 1);
-        Assert.False(credit.TryTake(0));
+        Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
         Assert.True(credit.NotePended(a, 0));
         Assert.True(credit.NotePended(b, 0));
 

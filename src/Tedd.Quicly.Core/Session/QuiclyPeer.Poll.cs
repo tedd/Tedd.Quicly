@@ -16,10 +16,8 @@ public sealed unsafe partial class QuiclyPeer
     private readonly MessageHandler?[] _handlers;
 
     /// <summary>
-    /// Per dense channel: a reliable stream channel that compresses. <see cref="Drain"/> hands out decoded payloads the
-    /// caller releases only after the call, so a batch can need more decode buffers than the receive budget has; such a
-    /// channel's message then waits for the next Drain instead of being dropped (<see cref="TryRentForDecode"/>), and so
-    /// does one the decoded-bytes budget has no room for yet.
+    /// Per dense channel: a reliable stream channel that compresses. Its message waits in <see cref="Drain"/> for the
+    /// decoded-bytes budget instead of being dropped (<see cref="CanDecodeNow"/>); it never waits for a buffer.
     /// </summary>
     private readonly bool[] _decodeWaits;
     private readonly ReceiveQueues _queues;
@@ -210,19 +208,15 @@ public sealed unsafe partial class QuiclyPeer
     /// returns nothing.
     /// </para>
     /// <para>
-    /// A compressed message is decoded here, into a second buffer of its raw size, and the caller can release nothing
-    /// before the call returns. The first such buffer may take the receive budget past its limit (the budget can be full
-    /// of the compressed messages that wait for this very call); once it is over, a reliable channel's next message has
-    /// no buffer, and neither does one that would exceed <see cref="PeerOptions.DecodedBytesPerSecond"/>. On a reliable
-    /// channel such a message is not dropped: it stays queued, the channel gives nothing newer in this call (its order
-    /// holds), and the call returns what it has — possibly fewer messages than the span holds, or none. Release them and
-    /// drain again; a Drain that finds everything released gets the next message's buffer (unless a shared pool's blocks
-    /// that fit within the budget are all in use by other peers for the moment). A message that could never be decoded
-    /// is dropped and counted in <see cref="PeerStatistics.DecodeFailures"/>, as are compressed messages of unreliable
-    /// channels that find no buffer or no decode budget: one whose raw size needs a block larger than the budget, and one
-    /// whose own block is the pool's last block its decode could use — with the default private pool, a message whose
-    /// compressed form is above 64 KiB and whose raw size is too (a channel whose <c>MaxMessageSize</c> is raised above the
-    /// 64 KiB default). Give such a channel a pool with two blocks of that class (<see cref="PeerOptions.AllocatorOptions"/>).
+    /// A compressed message is decoded here. A compressed message of a reliable channel without a handler is staged in a
+    /// block that holds its decoded size and is decoded in place; Drain waits only for the
+    /// <see cref="PeerOptions.DecodedBytesPerSecond"/> budget. While that budget has no room for such a message it is not
+    /// dropped: it stays queued, the channel gives nothing newer in this call (its order holds), and the call returns what
+    /// it has — possibly fewer messages than the span holds, or none; the budget refills with time. Messages staged while
+    /// the channel had a handler, and messages whose decoded size does not fit the largest block within the receive budget,
+    /// are decoded into a second buffer if one is free and are otherwise dropped and counted in
+    /// <see cref="PeerStatistics.DecodeFailures"/>, as are malformed ones and compressed messages of unreliable channels
+    /// that find no buffer or no decode budget.
     /// </para>
     /// </remarks>
     /// <param name="channel">The channel.</param>
@@ -250,11 +244,9 @@ public sealed unsafe partial class QuiclyPeer
         bool stalled = false;
         while (written < into.Length)
         {
-            // A compressed message of a reliable channel is looked at first: without a buffer to decode it into, or decode
-            // budget for it, it stays queued and the channel gives nothing more in this call. The caller releases what it
-            // got and drains again.
-            BufferLease room = BufferLease.Empty;
-            if (waits && queues.TryPeek(index, out ReceiveEntry head) && !TryRentForDecode(in head, now, out room))
+            // A compressed message of a reliable channel is looked at first: without decode budget for it, it stays queued
+            // and the channel gives nothing more in this call. The caller drains again later; the budget refills with time.
+            if (waits && queues.TryPeek(index, out ReceiveEntry head) && !CanDecodeNow(in head, now))
             {
                 stalled = true;
                 break;
@@ -269,7 +261,7 @@ public sealed unsafe partial class QuiclyPeer
             // way into a per-channel queue or the held slot, so neither can hold one (see IsResponse).
             Debug.Assert(!IsResponse(in entry), "a response never reaches a per-channel queue");
             ReturnCredit(index, in entry);
-            Emit(ref entry, now, into, ref written, in room);
+            Emit(ref entry, now, into, ref written);
         }
 
         if (_hasHeld && written < into.Length)
@@ -277,13 +269,12 @@ public sealed unsafe partial class QuiclyPeer
             Debug.Assert(!IsResponse(in _held), "a response never reaches the held slot");
             if (_held.Channel == channel)
             {
-                BufferLease room = BufferLease.Empty;
-                if (!stalled && (!waits || TryRentForDecode(in _held, now, out room)))
+                if (!stalled && (!waits || CanDecodeNow(in _held, now)))
                 {
                     ReceiveEntry entry = _held;
                     _hasHeld = false;
                     ReturnCredit(index, in entry);
-                    Emit(ref entry, now, into, ref written, in room);
+                    Emit(ref entry, now, into, ref written);
                 }
                 else
                 {
@@ -311,11 +302,10 @@ public sealed unsafe partial class QuiclyPeer
             }
             else if (entry.Channel == channel)
             {
-                BufferLease room = BufferLease.Empty;
-                if (stalled || (waits && !TryRentForDecode(in entry, now, out room)))
+                if (stalled || (waits && !CanDecodeNow(in entry, now)))
                 {
-                    // It cannot be decoded yet, or an older message of the channel cannot: it waits in the channel's queue
-                    // (a reliable channel without a handler always has a node there) for the next Drain.
+                    // The decode budget has no room for it yet, or not for an older message of the channel: it waits in the
+                    // channel's queue (a reliable channel without a handler always has a node there) for the next Drain.
                     stalled = true;
                     if (!TryQueue(in entry, mayHold: true))
                     {
@@ -326,7 +316,7 @@ public sealed unsafe partial class QuiclyPeer
                 else
                 {
                     ReturnCredit(index, in entry);
-                    Emit(ref entry, now, into, ref written, in room);
+                    Emit(ref entry, now, into, ref written);
                 }
             }
             else if (!TryQueue(in entry, mayHold: true))
@@ -347,7 +337,7 @@ public sealed unsafe partial class QuiclyPeer
                 {
                     if (box.TryTake(keys[i], out ReceiveEntry entry))
                     {
-                        Emit(ref entry, now, into, ref written, BufferLease.Empty);
+                        Emit(ref entry, now, into, ref written);
                     }
                 }
             }
@@ -714,7 +704,7 @@ public sealed unsafe partial class QuiclyPeer
 
     private void Dispatch(MessageHandler handler, ref ReceiveEntry entry, long now)
     {
-        if ((entry.Flags & ReceiveFlags.Compressed) != 0 && !TryDecode(ref entry, now, BufferLease.Empty))
+        if ((entry.Flags & ReceiveFlags.Compressed) != 0 && !TryDecode(ref entry, now))
         {
             return;
         }
@@ -759,7 +749,7 @@ public sealed unsafe partial class QuiclyPeer
     /// </summary>
     private void TakeResponse(ref ReceiveEntry entry, long now)
     {
-        if ((entry.Flags & ReceiveFlags.Compressed) != 0 && !TryDecode(ref entry, now, BufferLease.Empty))
+        if ((entry.Flags & ReceiveFlags.Compressed) != 0 && !TryDecode(ref entry, now))
         {
             // Dropped and counted (DecodeFailures); the request ends with its timeout.
             return;
@@ -780,9 +770,9 @@ public sealed unsafe partial class QuiclyPeer
         _core.ReturnReceive(in entry.Lease);
     }
 
-    private void Emit(ref ReceiveEntry entry, long now, Span<ReceivedMessage> into, ref int written, in BufferLease room)
+    private void Emit(ref ReceiveEntry entry, long now, Span<ReceivedMessage> into, ref int written)
     {
-        if ((entry.Flags & ReceiveFlags.Compressed) != 0 && !TryDecode(ref entry, now, in room))
+        if ((entry.Flags & ReceiveFlags.Compressed) != 0 && !TryDecode(ref entry, now))
         {
             return;
         }
@@ -792,64 +782,83 @@ public sealed unsafe partial class QuiclyPeer
     }
 
     /// <summary>
-    /// Rents the buffer a compressed message of a reliable channel will be decoded into, before <see cref="Drain"/> takes
-    /// the message (game thread), and checks that the decoded-bytes budget has room for it.
+    /// Whether <see cref="Drain"/> can hand out a message of a reliable channel that compresses now (game thread): the
+    /// decoded-bytes budget (<see cref="PeerOptions.DecodedBytesPerSecond"/>) has room for it. Nothing else is waited for —
+    /// least of all a buffer: a compressed message of a channel no handler reads is staged in a block that holds its decoded
+    /// size and is decoded in place, and every other one is decoded into a second buffer if one is free and is otherwise
+    /// dropped and counted (<see cref="TryDecode"/>). The bucket refills with time alone, so this wait always ends.
     /// </summary>
     /// <remarks>
-    /// Drain hands decoded payloads to a caller that can release nothing before the call returns, so one call can ask for
-    /// more decode buffers than the receive budget holds. Dropping the message for that — as a dispatch to a handler does,
-    /// which needs one buffer at a time — would lose reliable messages to the size of the caller's own span, and the loop
-    /// would go on to drop the rest of the queue. So the message waits: <see langword="false"/> means there is no buffer
-    /// now, or <see cref="PeerOptions.DecodedBytesPerSecond"/> has no room for it yet, and the caller leaves the message
-    /// where it is (its channel's receive credit then holds its sender back). The buffer may take the receive budget past
-    /// its limit by itself (<see cref="PeerCore.TryRentDecode"/>): the budget can be full of the very messages that wait,
-    /// and the first message of a Drain that finds everything released gets one. A message that could never be
-    /// decoded (no block of its raw size within the budget but the one it holds itself — <see cref="PeerCore.CanEverRentDecode"/>
-    /// —, a raw size above the decode budget's burst, or no raw size at all) gets <see langword="true"/> without a
-    /// buffer, and <see cref="TryDecode"/> drops and counts it.
+    /// Drain hands decoded payloads to a caller that can release nothing before the call returns. Dropping a message for
+    /// want of decode budget — as a dispatch to a handler does — would lose reliable messages to the size of the caller's
+    /// own span, so the message waits where it is (its channel's receive credit then holds its sender back). A message
+    /// that the budget can never take (a raw size above its burst), or that is not compressed or has nothing to decode,
+    /// gets <see langword="true"/>, and <see cref="TryDecode"/> drops and counts what cannot be decoded.
     /// </remarks>
     /// <param name="entry">The message (not taken yet).</param>
     /// <param name="now">Clock micros.</param>
-    /// <param name="room">The buffer for its decoded payload, or empty when it needs none or can never have one.</param>
-    /// <returns><see langword="false"/> when the message has to wait.</returns>
-    private bool TryRentForDecode(in ReceiveEntry entry, long now, out BufferLease room)
+    /// <returns><see langword="false"/> when the message has to wait for the decoded-bytes budget.</returns>
+    private bool CanDecodeNow(in ReceiveEntry entry, long now)
     {
-        room = BufferLease.Empty;
         int rawLength = entry.RawLength;
-        if ((entry.Flags & ReceiveFlags.Compressed) == 0 || rawLength <= 0 || entry.Lease.IsEmpty
-            || rawLength > _decodeBucket.Burst || !_core.CanEverRentDecode(rawLength, entry.Lease.Length))
+        if ((entry.Flags & ReceiveFlags.Compressed) == 0 || rawLength <= 0 || entry.Lease.IsEmpty || rawLength > _decodeBucket.Burst)
         {
             return true;
         }
 
-        return _decodeBucket.Available(now) >= rawLength && _core.TryRentDecode(rawLength, out room);
+        return _decodeBucket.Available(now) >= rawLength;
     }
 
     /// <summary>
-    /// Decodes an LZ4-compressed message into a second receive lease of exactly <c>RawLength</c> bytes (PROTOCOL.md §2.1,
-    /// §7: game thread, bounded by the decoded-bytes budget). On failure the message is dropped and counted.
+    /// Decodes an LZ4-compressed message to exactly <c>RawLength</c> bytes (PROTOCOL.md §2.1, §7: game thread, bounded by the
+    /// decoded-bytes budget) — the one decode of <see cref="Drain"/>, a handler's dispatch and a response. On failure the
+    /// message is dropped and counted in <see cref="PeerStatistics.DecodeFailures"/>; nothing here ever waits.
     /// </summary>
     /// <remarks>
-    /// The buffer is rented before the decoded-bytes budget is charged, so a message dropped for want of a buffer does not
-    /// use up the budget of the ones behind it. The buffer may take the receive budget past its limit by itself
-    /// (<see cref="PeerCore.TryRentDecode"/>): the message's own compressed block goes back straight after.
+    /// <para>
+    /// A message whose block holds its decoded size and the in-place margin (<see cref="PeerCore.FitsInPlace"/>) is decoded
+    /// in place (<see cref="Lz4Block.TryDecompressInPlace"/>): it keeps its lease, and so the receive budget and its
+    /// channel's credit, which were counted with that block, do not change. That is every compressed message of a reliable
+    /// channel no handler reads (<see cref="PeerCore.LimitedStagingLength"/>), and any other whose block happens to fit.
+    /// </para>
+    /// <para>
+    /// Any other message is decoded into a second buffer, tried once (<see cref="PeerCore.TryRentDecode"/>, which may take the
+    /// receive budget past its limit by that buffer); its own block goes back straight after. Without a buffer it is dropped
+    /// and counted, as in 0.2.1.
+    /// </para>
     /// </remarks>
     /// <param name="entry">The message; on success its lease and length are the decoded payload's.</param>
     /// <param name="now">Clock micros.</param>
-    /// <param name="room">A buffer rented for the decoded payload already (<see cref="TryRentForDecode"/>), or empty.</param>
-    private bool TryDecode(ref ReceiveEntry entry, long now, in BufferLease room)
+    private bool TryDecode(ref ReceiveEntry entry, long now)
     {
         BufferLease compressed = entry.Lease;
         int rawLength = entry.RawLength;
-        BufferLease decoded = room;
+        bool inPlace = rawLength > 0 && !compressed.IsEmpty && PeerCore.FitsInPlace(compressed.Length, entry.Length, rawLength);
+
+        // The second buffer, when one is needed, before the decoded-bytes budget is charged: a message dropped for want of a
+        // buffer does not use up the budget of the ones behind it.
+        BufferLease decoded = BufferLease.Empty;
         if (rawLength <= 0 || compressed.IsEmpty
-            || (decoded.IsEmpty && !_core.TryRentDecode(rawLength, out decoded))
+            || (!inPlace && !_core.TryRentDecode(rawLength, out decoded))
             || !_decodeBucket.TryTake(now, rawLength))
         {
             _core.ReturnReceive(in compressed);
             _core.ReturnReceive(in decoded);
             _core.Counters.DecodeFailures++;
             return false;
+        }
+
+        if (inPlace)
+        {
+            if (!Lz4Block.TryDecompressInPlace(new Span<byte>(_core.GetPointer(in compressed), compressed.Length), entry.Length, rawLength))
+            {
+                _core.ReturnReceive(in compressed);
+                _core.Counters.DecodeFailures++;
+                return false;
+            }
+
+            entry.Length = rawLength;
+            return true;
         }
 
         bool ok = Lz4Block.DecompressExact(

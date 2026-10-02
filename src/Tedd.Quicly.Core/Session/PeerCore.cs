@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Control;
 using Tedd.Quicly.Core.Memory;
+using Tedd.Quicly.Core.Primitives;
 using Tedd.Quicly.Core.Session.Engines;
 using Tedd.Quicly.Core.State;
 using Tedd.Quicly.Core.Threading;
@@ -199,6 +200,16 @@ internal sealed unsafe class PeerCore : IDisposable
         for (int i = 0; i < sizeClasses.Length; i++)
         {
             blockSizes[i] = sizeClasses[i].BlockSize;
+        }
+
+        // The largest block a message can be staged in: a pool block that the receive budget can hold.
+        long stageCap = Math.Min(_receiveBudget, _allocator.MaxBlockSize);
+        for (int i = 0; i < blockSizes.Length; i++)
+        {
+            if (blockSizes[i] <= stageCap)
+            {
+                MaxStageLength = Math.Max(MaxStageLength, blockSizes[i]);
+            }
         }
 
         int reliableChannels = CountReliableQueueChannels(_channels);
@@ -823,6 +834,50 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>The receive budget (<see cref="PeerOptions.ReceiveBudgetBytes"/>).</summary>
     public long ReceiveBudgetBytes => _receiveBudget;
 
+    /// <summary>
+    /// The largest block a received message can be staged in: the largest block of the pool that is not larger than the
+    /// receive budget (0 when there is none). Fixed at construction; any thread.
+    /// </summary>
+    public int MaxStageLength { get; }
+
+    /// <summary>
+    /// The staging length of a message of a reliable stream channel that is limited when the transport thread takes it — no
+    /// handler reads the channel (<see cref="ReceiveCredit.TryTake"/> answered <see cref="CreditTake.Limited"/>): for a
+    /// compressed message, its decoded length plus the room an in-place decode needs
+    /// (<see cref="Lz4Block.GetInPlaceMargin"/>), so that its decode needs no second buffer and can never wait for one
+    /// (transport thread). A message whose decoded footprint does not fit <see cref="MaxStageLength"/> — the edge band — and
+    /// an uncompressed one are staged at their wire length.
+    /// </summary>
+    /// <remarks>
+    /// The decoded length is the peer's declaration, as the wire length is: a peer that declares a large raw length and
+    /// stalls pins a block exactly as one that declares a large wire length does, under the same caps (MaxMessageSize, which
+    /// bounds RawLength at parse; <see cref="MaxStageLength"/>; the channel's credit; the receive budget; the stream idle
+    /// timeout).
+    /// </remarks>
+    /// <param name="length">The wire (compressed) length.</param>
+    /// <param name="rawLength">The decoded length of a compressed message, else 0.</param>
+    /// <returns>The length to rent the staging block for.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int LimitedStagingLength(int length, int rawLength)
+    {
+        if (rawLength <= 0 || length <= 0)
+        {
+            return length; // uncompressed, or a compressed message without a payload (dropped when it is decoded)
+        }
+
+        // In long: RawLength is the peer's, bounded by MaxMessageSize at parse but not trusted to be small here.
+        long need = Math.Max(length, (long)rawLength + Lz4Block.GetInPlaceMargin(length));
+        return need <= MaxStageLength ? (int)need : length;
+    }
+
+    /// <summary>Whether a compressed message staged in a block of <paramref name="blockLength"/> bytes decodes in place in it.</summary>
+    /// <param name="blockLength">The staging lease's block size.</param>
+    /// <param name="length">The compressed length.</param>
+    /// <param name="rawLength">The decoded length.</param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool FitsInPlace(int blockLength, int length, int rawLength) =>
+        length <= blockLength && rawLength <= blockLength - Lz4Block.GetInPlaceMargin(length);
+
     // ------------------------------------------------------------------ construction
 
     /// <summary>Creates one engine per mode present in the table and initialises it (constructor time, game thread).</summary>
@@ -1253,19 +1308,20 @@ internal sealed unsafe class PeerCore : IDisposable
     }
 
     /// <summary>
-    /// Rents the buffer a compressed message is decoded into (game thread). Unlike <see cref="TryRentReceive"/> it may take
-    /// the receive budget past its limit, by this one buffer: it succeeds whenever what is outstanding does not exceed the
-    /// budget yet. The compressed messages that wait for the application are counted in the budget too, and they can be
-    /// what fills it — so a decode held to the budget could wait for buffers that only its own channel's messages can free,
-    /// for ever. A decode that finds the budget already over its limit (an earlier decoded payload the application still
-    /// holds) fails, so the budget is exceeded by at most one decode buffer at a time, and the transport thread takes
-    /// nothing new until it is back within it. For the same reason a used-up size class is not the end: a block of a
-    /// larger class within the budget is taken instead. The waiting messages cannot hold every block of the classes a
-    /// decode may use while the budget holds them (the default private pool has at least the budget's worth in every
-    /// class up to 64 KiB, and one block of 256 KiB), with one exception: a message whose own block is the pool's last
-    /// block that its decode could use — with the default pool, a message whose compressed form takes the 256 KiB
-    /// block and whose raw size needs it too. <see cref="CanEverRentDecode"/> tells that message apart; it is dropped.
+    /// Rents a second buffer for a compressed message that cannot be decoded in place in its own block (game thread): one
+    /// staged at its wire length — while its channel had a handler, a response, a message of an unreliable channel, a
+    /// mailbox or ReliableLatest value, or one whose decoded size does not fit <see cref="MaxStageLength"/> — whose block
+    /// does not hold its decoded size and margin (<see cref="FitsInPlace"/>). A compressed message of a reliable channel
+    /// that no handler reads is staged in a block that does, and never gets here.
     /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="TryRentReceive"/> it may take the receive budget past its limit, by this one buffer: it succeeds
+    /// whenever what is outstanding does not exceed the budget yet (the message's own block is given back straight after
+    /// the decode). One that finds the budget already over its limit fails, so the budget is exceeded by at most one decode
+    /// buffer at a time. A used-up size class is not the end: a block of a larger class within the budget is taken
+    /// instead. It is tried once and never waited for: on <see langword="false"/> the caller drops the message and counts it
+    /// in <see cref="PeerCounters.DecodeFailures"/>, as 0.2.1 did.
+    /// </remarks>
     /// <param name="length">Bytes needed (the message's raw length).</param>
     /// <param name="lease">The lease, or empty.</param>
     /// <returns><see langword="false"/> when the budget is over its limit already or the pool has no block.</returns>
@@ -1290,7 +1346,7 @@ internal sealed unsafe class PeerCore : IDisposable
 
             if (block > _receiveBudget)
             {
-                // Larger than the whole budget: never, not even past it (CanEverRentDecode).
+                // Larger than the whole budget: never, not even past it.
                 return false;
             }
 
@@ -1303,37 +1359,6 @@ internal sealed unsafe class PeerCore : IDisposable
 
         lease = BufferLease.Empty;
         return false;
-    }
-
-    /// <summary>
-    /// Whether <see cref="TryRentDecode"/> can succeed for <paramref name="length"/> bytes at all while the message holds
-    /// its own block (game thread): the pool has a block that holds them, not larger than the receive budget, besides
-    /// <paramref name="heldBlock"/>. When it cannot, waiting for a buffer is pointless — the one block that could take the
-    /// decode is the message's own, and waiting would pin it, and with it the receive budget, for good.
-    /// </summary>
-    /// <param name="length">Bytes needed.</param>
-    /// <param name="heldBlock">Block size of the lease the message holds (0 for none): that block cannot take its decode.</param>
-    public bool CanEverRentDecode(int length, int heldBlock)
-    {
-        ReadOnlySpan<SizeClassDefinition> classes = _allocator.SizeClasses;
-        long blocks = 0;
-        for (int i = 0; i < classes.Length; i++)
-        {
-            int block = classes[i].BlockSize;
-            if (block < length)
-            {
-                continue;
-            }
-
-            if (block > _receiveBudget)
-            {
-                break;
-            }
-
-            blocks += classes[i].BlockCount - (block == heldBlock ? 1 : 0);
-        }
-
-        return blocks > 0;
     }
 
     /// <summary>Returns a receive lease (any thread; normally the game thread). Empty leases are ignored.</summary>

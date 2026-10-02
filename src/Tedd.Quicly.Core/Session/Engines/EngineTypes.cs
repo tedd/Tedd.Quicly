@@ -245,6 +245,13 @@ internal enum StreamConsumeAction : byte
     /// (<see cref="PeerCore.NotePendedStream"/>). Intended for <see cref="StreamMessagePhase.Start"/> and
     /// <see cref="StreamMessagePhase.Chunk"/>: an engine reserves its receive-ring slot at the start of a message
     /// (<see cref="PeerCore.TryReserveReceive"/>), so publishing at the end never fails.
+    /// <para>
+    /// Never returned at <see cref="StreamMessagePhase.End"/>: the message's bytes are consumed by then, and a transport
+    /// answered <see cref="ReceiveResult.PendingAfter"/> keeps only what follows them, so the end may never be delivered
+    /// again (with the FIN in the same indication the stream counts as ended, and the staged message would be lost). Whatever
+    /// a message needs is therefore taken all at once at its start — the ring slot, the credit and the staging block sized
+    /// for its decode (<see cref="PeerCore.LimitedStagingLength"/>) — and a start that cannot have all of it holds nothing.
+    /// </para>
     /// </summary>
     Pend = 1,
 
@@ -258,7 +265,8 @@ internal enum StreamConsumeAction : byte
     /// Back-pressure of one channel: as <see cref="Pend"/>, but the stream is held back because its channel has no handler
     /// and as many of its messages wait for the application as it may hold (<see cref="ReceiveCredit"/>). Another Poll
     /// changes nothing about that, so the stream is resumed when the application takes messages of the channel or gives it
-    /// a handler (<see cref="PeerCore.NoteCreditPendedStream"/>). Only for the start of a message.
+    /// a handler (<see cref="PeerCore.NoteCreditPendedStream"/>). Only for the start of a message (never at the end, as
+    /// <see cref="Pend"/>).
     /// </summary>
     PendCredit = 4,
 }
@@ -362,4 +370,11 @@ internal ref struct StreamMessageContext
 
     /// <summary>Clock micros of the receive callback.</summary>
     public long NowMicros;
+
+    /// <summary>
+    /// Set by an engine that answers <see cref="StreamConsume.Pend"/> or <see cref="StreamConsume.PendCredit"/> at a start: the
+    /// length the start asks for when it is resumed (its staging length, <see cref="PeerCore.LimitedStagingLength"/>), so the
+    /// held stream is resumed when that fits. 0 means <see cref="StreamMessageHeader.Length"/>.
+    /// </summary>
+    public int PendLength;
 }

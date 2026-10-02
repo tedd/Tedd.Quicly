@@ -41,6 +41,19 @@ internal enum CreditState : byte
     Drained = 2,
 }
 
+/// <summary>The answer of <see cref="ReceiveCredit.TryTake"/>.</summary>
+internal enum CreditTake : byte
+{
+    /// <summary>The channel is out of credit: the stream is held back (<see cref="Engines.StreamConsume.PendCredit"/>).</summary>
+    Blocked = 0,
+
+    /// <summary>The channel has a handler (or is not accounted): no limit, the message is staged at its wire length.</summary>
+    Unlimited = 1,
+
+    /// <summary>The channel is limited (no handler reads it) and has credit: the message is staged at its limited length.</summary>
+    Limited = 2,
+}
+
 /// <summary>
 /// Per-channel credit of the reliable stream channels (ReliableOrdered, ReliableUnordered): how many complete messages of
 /// a channel, and how many bytes of them, may wait between the transport thread and the application.
@@ -260,18 +273,31 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     // ------------------------------------------------------------------ transport thread
 
     /// <summary>
-    /// Whether the channel may start another message (transport thread, before the ring reservation and the lease). Takes
-    /// nothing: the message is counted by <see cref="NoteTaken"/> once it has its reservation and its lease.
+    /// Whether the channel may start another message, and whether a limit applies to it (transport thread, before the ring
+    /// reservation and the lease). Takes nothing: the message is counted by <see cref="NoteTaken"/> once it has its
+    /// reservation and its lease.
     /// </summary>
+    /// <remarks>
+    /// One read of the channel's limit decides both: a channel with a handler (<see cref="CreditTake.Unlimited"/>) stages
+    /// the message at <paramref name="length"/>, a limited one (<see cref="CreditTake.Limited"/>) at
+    /// <paramref name="limitedLength"/> — a compressed message at its decoded size, so that its decode never waits for a
+    /// second buffer (<see cref="PeerCore.LimitedStagingLength"/>) — and is judged by that length.
+    /// </remarks>
     /// <param name="channel">Dense index of an enabled channel.</param>
-    /// <param name="length">The message's payload length: what it will take of the receive budget is the block that holds it.</param>
-    /// <returns><see langword="false"/> when the channel's waiting messages reached the limit of its <see cref="CreditState"/>.</returns>
+    /// <param name="length">The message's payload length on the wire: what it takes of the receive budget when unlimited.</param>
+    /// <param name="limitedLength">What it is staged in when the channel is limited: the block that holds it is what it takes.</param>
+    /// <returns><see cref="CreditTake.Blocked"/> when the channel's waiting messages reached the limit of its <see cref="CreditState"/>.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool TryTake(int channel, int length = 0)
+    public CreditTake TryTake(int channel, int length, int limitedLength)
     {
         // A read-mostly line: the game thread writes it when a handler is registered or removed.
         int count = Volatile.Read(ref _limits[channel].Count);
-        return count == Unlimited || TryTakeLimited(channel, count, length);
+        if (count == Unlimited)
+        {
+            return CreditTake.Unlimited;
+        }
+
+        return TryTakeLimited(channel, count, limitedLength) ? CreditTake.Limited : CreditTake.Blocked;
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
@@ -384,7 +410,10 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     /// </summary>
     /// <param name="id">The stream.</param>
     /// <param name="channel">Dense index of its channel.</param>
-    /// <param name="length">Payload length of the message the stream waits with (what <see cref="TryTake"/> was asked for).</param>
+    /// <param name="length">
+    /// Staging length of the message the stream waits with (the limited length <see cref="TryTake"/> was asked for, which the
+    /// message's start asks for again when it is resumed).
+    /// </param>
     /// <returns>
     /// <see langword="false"/> when the stream could not be listed: the list holds every stream the peer may have open and
     /// <see cref="ListGrowth"/> times as many that ended while they waited. Nothing will resume the stream then, so the

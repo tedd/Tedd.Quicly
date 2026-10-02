@@ -1451,21 +1451,29 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
                     return StreamConsume.ResetStream(QuiclyErrorCode.LimitExceeded);
                 }
 
-                // Before the ring slot and the lease: a channel that is out of credit takes neither.
-                if (!_core.Credit.TryTake(message.ChannelIndex, length))
+                // Before the ring slot and the lease: a channel that is out of credit takes neither. A limited channel stages a
+                // compressed message in a block that holds its decoded size, so that its decode never waits for a buffer.
+                int limitedLength = _core.LimitedStagingLength(length, message.Header.RawLength);
+                CreditTake take = _core.Credit.TryTake(message.ChannelIndex, length, limitedLength);
+                if (take == CreditTake.Blocked)
                 {
+                    message.PendLength = limitedLength;
                     return StreamConsume.PendCredit;
                 }
 
+                // All or nothing: a start that cannot have the slot and the whole block holds neither while it waits.
+                int staging = take == CreditTake.Limited ? limitedLength : length;
                 if (!_core.TryReserveReceive())
                 {
+                    message.PendLength = staging;
                     return StreamConsume.Pend;
                 }
 
                 BufferLease lease = BufferLease.Empty;
-                if (length > 0 && !_core.TryRentReceive(length, out lease))
+                if (staging > 0 && !_core.TryRentReceive(staging, out lease))
                 {
                     _core.CancelReservation();
+                    message.PendLength = staging;
                     return StreamConsume.Pend;
                 }
 
@@ -1544,22 +1552,28 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             return StreamConsume.ResetStream(QuiclyErrorCode.ProtocolViolation);
         }
 
-        if (!_core.Credit.TryTake(message.ChannelIndex, length))
+        int limitedLength = _core.LimitedStagingLength(length, message.Header.RawLength);
+        CreditTake take = _core.Credit.TryTake(message.ChannelIndex, length, limitedLength);
+        if (take == CreditTake.Blocked)
         {
+            message.PendLength = limitedLength;
             return StreamConsume.PendCredit;
         }
 
+        int staging = take == CreditTake.Limited ? limitedLength : length;
         if (!_core.TryReserveReceive())
         {
+            message.PendLength = staging;
             return StreamConsume.Pend;
         }
 
         BufferLease lease = BufferLease.Empty;
         if (length > 0)
         {
-            if (!_core.TryRentReceive(length, out lease))
+            if (!_core.TryRentReceive(staging, out lease))
             {
                 _core.CancelReservation();
+                message.PendLength = staging;
                 return StreamConsume.Pend;
             }
 

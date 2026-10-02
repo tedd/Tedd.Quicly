@@ -85,16 +85,27 @@ public class ReviewStackstandaloneDrainTests
     /// when that one needs no buffer (an uncompressed message: shorter than MinCompressSize, or one LZ4 did not shrink).
     /// A ReliableOrdered channel read with Drain is handed its messages out of order: 0, 1, 2, 8, 3, 4, ...
     /// </summary>
+    /// <remarks>
+    /// Since RC2-1 a Drain waits for nothing but the decoded-bytes budget (a compressed message of a channel no handler reads
+    /// is staged in a block that holds its decoded size and decoded in place), so the head is made to wait for that budget
+    /// here: a burst of 30 000 decoded bytes takes two of the 12 000-byte messages. Each is staged in a 16 KiB block (its
+    /// decoded size), so the receiver has the roomy budget, whose share for a channel nobody reads holds all eight.
+    /// </remarks>
     [Fact]
     public void FINDING_Drain_That_Leaves_A_Compressed_Message_Queued_Does_Not_Hand_Out_A_Newer_Message_Of_The_Channel()
     {
-        using SessionHarness h = new(table: OrderedTables.Main, client: GroupKit.Prompt, server: GroupKit.Prompt);
+        using SessionHarness h = new(table: OrderedTables.Main, client: GroupKit.Prompt, server: o =>
+        {
+            GroupKit.Prompt(o);
+            OrderedKit.Roomy(o);
+            o.DecodedBytesPerSecond = 30_000;
+        });
         QuiclyPeer server = h.Server!;
 
-        // Eight compressed messages of 20 000 bytes; the server's Polls move them to the channel's drain queue.
+        // Eight compressed messages of 12 000 bytes; the server's Polls move them to the channel's drain queue.
         for (int i = 0; i < 8; i++)
         {
-            Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(i, 20_000)).Status);
+            Assert.Equal(SendStatus.Admitted, h.Client.SendCopy(new SendHeader(Packed), Payload(i, 12_000)).Status);
             h.Run(2_000);
         }
 
@@ -105,11 +116,11 @@ public class ReviewStackstandaloneDrainTests
         SendToALateReceiver(h, Packed, 8, 1, 4);
         Assert.Equal(9, Received(server, Packed));
 
-        // One Drain with a span of sixteen: the default budget (256 KiB) decodes three of the queued messages into 64 KiB
-        // blocks, the fourth waits in the queue — and message 8 must wait behind it.
+        // One Drain with a span of sixteen: the decoded-bytes budget takes two of the queued messages, the third waits in the
+        // queue — and message 8 must wait behind it.
         List<int> got = [];
         ReceivedMessage[] buffer = new ReceivedMessage[16];
-        DrainInto(server, Packed, buffer, got);
+        Assert.Equal(2, DrainInto(server, Packed, buffer, got));
         h.RunUntil(() =>
         {
             while (DrainInto(server, Packed, buffer, got) > 0)
@@ -117,7 +128,7 @@ public class ReviewStackstandaloneDrainTests
             }
 
             return got.Count >= 9;
-        }, 1_000_000);
+        }, 5_000_000);
 
         Assert.True(got.SequenceEqual(Enumerable.Range(0, 9)),
             $"a ReliableOrdered channel read with Drain was handed its messages out of order: {string.Join(",", got)}");

@@ -524,12 +524,15 @@ public class ReviewCreditAccountingTests
         QuiclyPeer server = h.Server!;
         ReceiveCredit credit = server.Core.Credit;
 
-        // Nobody reads the channel: the share waits, counted in the blocks of the compressed messages.
+        // Nobody reads the channel: the share waits, counted in the blocks the messages are staged in. Since RC2-1 a
+        // compressed message of a channel no handler reads is staged at its decoded size (3 000 bytes: a 4 KiB block), so the
+        // strict byte share holds as many of them as 4 KiB blocks fit in it, not the share's count of compressed blocks.
         Send(h, h.Client, channel, 0, 120, size: 3_000);
         h.Run(50_000);
-        int limit = credit.CountLimit;
+        int limit = Math.Min(credit.CountLimit, credit.ByteLimit / 4_096);
+        Assert.True(limit >= 1);
         Assert.Equal(limit, Waiting(server, channel));
-        Assert.True(WaitingBytes(server, channel) <= limit * 256, $"{WaitingBytes(server, channel)} bytes are counted for {limit} compressed messages");
+        Assert.Equal(limit * 4_096, WaitingBytes(server, channel));
 
         // Half by Drain, the rest by a handler.
         List<int> got = [];
@@ -588,7 +591,12 @@ public class ReviewCreditAccountingTests
         h.Run(50_000);
         int waiting = Waiting(server, 6);
         int waitingBytes = WaitingBytes(server, 6);
-        Assert.True(waiting >= 16, $"{waiting} messages wait");
+
+        // Since RC2-1 the share counts the block a message is staged in, and a compressed message of a channel no handler
+        // reads is staged at its decoded size (a 64 KiB block here, larger than the share): what waits for the unread channel
+        // can no longer decode to more than the budget holds — nothing waits, the stream is held back until the first Drain.
+        Assert.Equal(0, waiting);
+        Assert.True(Channel(server, 6).BacklogHolds > 0);
 
         // The application comes back and drains, sixteen messages at a time, releasing each batch.
         List<int> got = [];

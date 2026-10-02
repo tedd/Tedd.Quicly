@@ -101,13 +101,13 @@ public class ReviewCreditThreadingTests
         // them), each end frees its slot, and a fifth stream — alive — takes one of the slots and is held back as well.
         for (uint i = 1; i <= 4; i++)
         {
-            Assert.False(credit.TryTake(0));
+            Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             Assert.True(credit.NotePended(new TransportStreamId((int)i, 1), 0));
             credit.NoteGone();
         }
 
         TransportStreamId live = new(1, 2);
-        Assert.False(credit.TryTake(0));
+        Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
         bool listed = credit.NotePended(live, 0);
 
         // Game thread: the application takes the message, which gives the channel its whole credit back.
@@ -344,7 +344,7 @@ public class ReviewCreditThreadingTests
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
             credit.NoteTaken(0, 10);
-            Assert.False(credit.TryTake(0));
+            Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             credit.NoteReturned(0, 10);
             credit.Resume(transport);
             Assert.True(credit.NotePended(a, 0));
@@ -358,7 +358,7 @@ public class ReviewCreditThreadingTests
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
             credit.NoteTaken(0, 10);
-            Assert.False(credit.TryTake(0));
+            Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             Assert.True(credit.NotePended(a, 0));
             credit.NoteReturned(0, 10);
             credit.Resume(transport);
@@ -369,7 +369,7 @@ public class ReviewCreditThreadingTests
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
             credit.NoteTaken(0, 10);
-            Assert.False(credit.TryTake(0));
+            Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             Assert.True(credit.NotePended(a, 0));
             credit.Resume(transport);
             Assert.False(credit.HasWork);
@@ -387,7 +387,7 @@ public class ReviewCreditThreadingTests
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
             credit.NoteTaken(0, 10);
-            Assert.False(credit.TryTake(0));
+            Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             credit.SetState(0, CreditState.Handled);
             credit.Resume(transport);
             Assert.True(credit.NotePended(a, 0));
@@ -402,7 +402,7 @@ public class ReviewCreditThreadingTests
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
             credit.NoteTaken(0, 10);
-            Assert.False(credit.TryTake(0));
+            Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             credit.SetState(0, CreditState.Handled);
             credit.Resume(transport);
             credit.NoteReturned(0, 10);
@@ -420,7 +420,7 @@ public class ReviewCreditThreadingTests
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
             credit.NoteTaken(0, 10);
-            Assert.False(credit.TryTake(0));
+            Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             credit.SetState(0, CreditState.Handled);
             credit.Resume(transport);
             credit.SetState(0, CreditState.Unread);
@@ -438,7 +438,7 @@ public class ReviewCreditThreadingTests
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
             credit.NoteTaken(0, 10);
-            Assert.False(credit.TryTake(0));
+            Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             Assert.True(credit.NotePended(b, 0));
             credit.Resume(transport);
             Assert.Equal(1, credit.ParkedStreams);
@@ -455,7 +455,7 @@ public class ReviewCreditThreadingTests
             RecordingTransport transport = new();
             credit.Enable(0);
             credit.NoteTaken(0, 500);
-            Assert.False(credit.TryTake(0));
+            Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             credit.SetState(0, CreditState.Drained);
             credit.Resume(transport);
             Assert.True(credit.NotePended(a, 0));
@@ -603,7 +603,7 @@ public class ReviewCreditThreadingTests
                             continue;
                         }
 
-                        if (!credit.TryTake(channel))
+                        if (credit.TryTake(channel, 0, 0) == CreditTake.Blocked)
                         {
                             if (!credit.NotePended(ids[s], channel))
                             {

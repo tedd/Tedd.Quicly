@@ -52,6 +52,15 @@ the end that receives is the end to upgrade.
   value's first transmission, and values that wait for a stream no longer hold up the small values behind them.
 * **A `Poll` resumed more held streams than the receive ring had room for**, so with many streams waiting every
   Poll resumed all of them only for most to be held again. It now resumes as many as the ring can take.
+* **`QuiclyPeer.Wait` lost a scheduler quantum per yield on a machine with no free core.** The blocking wait for a
+  tracked send's stage spins briefly and then parks on an event, but that event spun again before it blocked, with
+  `Thread.Yield` and `Thread.Sleep(0)`. Each yield handed the core to a busy thread for up to a quantum (about 31 ms on
+  Windows), and a completion that arrived meanwhile could not wake a thread that had not parked. It now parks as soon as
+  its own non-yielding spin ends. With four cores shared with eight busy loops, a wait woken 10–100 µs after it began
+  took 0.7–4 ms; it now takes the delay plus 6–8 µs. On an idle machine nothing changes, except that a completion arriving
+  after the short spin but within the first 10–20 µs of the wait now costs one kernel wake-up (about 11 µs) that the
+  yielding spin used to save.
+  `WaitAsync` is unchanged.
 
 ### Behaviour changes
 

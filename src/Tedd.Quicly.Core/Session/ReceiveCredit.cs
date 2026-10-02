@@ -83,10 +83,19 @@ internal enum CreditTake : byte
 /// <para>
 /// Threads (ADR 0008 invariants 4 and 5). The transport thread owns what it took (<see cref="Taken"/>, with a private copy
 /// of what came back) and only looks at the game thread's counters when its copies say the channel is blocked — by its
-/// own limit, or by the half the channels no handler reads share (then it refreshes its copy of each of them). The game
-/// thread owns what it gave back and the limits; it reads the transport thread's counters only to decide which held-back
-/// streams to resume. Both count in wrapping 32-bit arithmetic: the difference is what matters, and it is bounded by the
-/// ring, the queues and the receive budget.
+/// own limit, or by the half the channels no handler reads share (then it refreshes its copy of the peer-wide count of
+/// what came back of that half). The game thread owns what it gave back and the limits; it reads the transport thread's
+/// counters only to decide which held-back streams to resume. Both count in wrapping 32-bit arithmetic: the difference is
+/// what matters, and it is bounded by the ring, the queues and the receive budget.
+/// </para>
+/// <para>
+/// The shared half is counted peer-wide, on two cache lines (one per thread), so its check costs the same whatever the
+/// number of channels. Which messages it counts is decided when each is taken: those of a channel that is limited then
+/// (<see cref="CreditTake.Limited"/>). The message carries that tag to where its credit comes back
+/// (<see cref="NoteReturned"/>, <see cref="Untake"/>), so every tagged take is paired with exactly one tagged return, or
+/// cleared by <see cref="Reset"/>. Two consequences, bounded and never accumulating: a channel that gets a handler over its
+/// backlog keeps that backlog counted until it is dispatched; and messages taken while a handler existed and left behind
+/// by its removal are not in the half (they are bounded by the ring, that channel's own count and the receive budget).
 /// </para>
 /// <para>
 /// A stream held back here is resumed by the game thread when its channel has credit again (or its limit is lifted), not
@@ -122,10 +131,17 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     // Block sizes of the receive pool, ascending: what a message of a given length takes of the receive budget.
     private readonly int[] _blockSizes;
 
-    // The accounted channels' dense indices (Enable; fixed once the engines are initialized): the channels whose waiting
-    // bytes the shared half counts when they are not handled (IsSharedFull, SharedWaiting).
-    private readonly int[] _accounted;
+    // Channels accounted (Enable; fixed once the engines are initialized). With fewer than two, a channel's own limit says
+    // everything the shared half would.
     private int _accountedCount;
+
+    // The half the channels no handler reads share, counted peer-wide (O(1) per message whatever the number of channels):
+    // two cache lines of one native array. TransportLine is the transport thread's — the lease bytes of the messages it
+    // took while their channel was limited (CreditTake.Limited, the "shared" tag a message carries to its return) and its
+    // private copy of what came back of them; GameLine is the game thread's — what came back of them.
+    private readonly NativeArray<SharedLine> _shared;
+    private const int TransportLine = 0;
+    private const int GameLine = 1;
     private NativeArray<Pended> _parked;
     private SpscRing<Pended> _pended;
 
@@ -190,7 +206,7 @@ internal sealed unsafe class ReceiveCredit : IDisposable
         _streamCapacity = _pended.Capacity;
         _parked = new NativeArray<Pended>(_pended.Capacity);
         _enabled = new bool[count];
-        _accounted = new int[count];
+        _shared = new NativeArray<SharedLine>(2);
         _state = new byte[count];
         _countLimit = Math.Max(countLimit, 1);
         _byteLimit = Math.Max(byteLimit, 1);
@@ -252,7 +268,7 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     {
         if (!_enabled[channel])
         {
-            _accounted[_accountedCount++] = channel;
+            _accountedCount++;
         }
 
         _enabled[channel] = true;
@@ -320,13 +336,16 @@ internal sealed unsafe class ReceiveCredit : IDisposable
 
     /// <summary>
     /// Whether the reliable channels no handler reads have <see cref="DrainedByteLimit"/> waiting between them (transport
-    /// thread), by this thread's copies of what came back — which can only make them look fuller than they are — or,
-    /// with <paramref name="refresh"/>, after refreshing each copy. A threshold (<paramref name="bytes"/> positive) lets
-    /// a message start on an empty channel; a strict limit asks whether <paramref name="need"/> fits in what is left.
+    /// thread), by this thread's copy of what came back — which can only make them look fuller than they are — or, with
+    /// <paramref name="refresh"/>, after refreshing the copy. A threshold (<paramref name="bytes"/> positive) lets a
+    /// message start on an empty channel; a strict limit asks whether <paramref name="need"/> fits in what is left.
     /// </summary>
     /// <remarks>
-    /// One pass over the accounted channels, for a message of a limited channel only: a channel with a handler never gets
-    /// here, and with a single accounted channel the channel's own limit says it all.
+    /// Constant time, whatever the number of channels: the half is counted peer-wide, by the messages that were taken
+    /// while their channel was limited and have not come back (<see cref="NoteTaken"/>, <see cref="NoteReturned"/>). A
+    /// message is counted there or not when it is taken, and stays so until it comes back: a channel that gets a handler
+    /// over its backlog keeps that backlog counted until it is dispatched, and messages taken while a handler existed that
+    /// a removed handler leaves behind are not counted (bounded by the ring, that channel's own count and the budget).
     /// </remarks>
     private bool IsSharedFull(in Taken own, int bytes, int need, bool refresh)
     {
@@ -335,25 +354,14 @@ internal sealed unsafe class ReceiveCredit : IDisposable
             return false;
         }
 
-        ulong waiting = 0;
-        for (int i = 0; i < _accountedCount; i++)
+        ref SharedLine line = ref _shared[TransportLine];
+        if (refresh)
         {
-            int channel = _accounted[i];
-            if (Volatile.Read(ref _limits[channel].Count) == Unlimited)
-            {
-                continue;
-            }
-
-            ref Taken taken = ref _taken[channel];
-            if (refresh)
-            {
-                Refresh(ref taken, channel);
-            }
-
-            waiting += unchecked(taken.Bytes - taken.SeenBytes);
+            line.Seen = Volatile.Read(ref _shared[GameLine].Bytes);
         }
 
-        return bytes < 0 ? waiting + (uint)need > (uint)_drainedByteLimit : waiting >= (uint)_drainedByteLimit;
+        uint waiting = unchecked(line.Bytes - line.Seen);
+        return bytes < 0 ? (ulong)waiting + (uint)need > (uint)_drainedByteLimit : waiting >= (uint)_drainedByteLimit;
     }
 
     /// <summary>What a message of <paramref name="length"/> bytes takes of the receive budget: the smallest block that holds it.</summary>
@@ -379,12 +387,22 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     /// <summary>Counts a message that got its ring reservation and its lease (transport thread).</summary>
     /// <param name="channel">Dense index of an enabled channel.</param>
     /// <param name="leaseBytes">The lease's block size (0 for an empty payload): what the message holds of the receive budget.</param>
+    /// <param name="shared">
+    /// Whether the channel was limited when the message was taken (<see cref="CreditTake.Limited"/>): the message then counts
+    /// in the half the channels no handler reads share until it comes back, and carries the tag to its
+    /// <see cref="NoteReturned"/> or <see cref="Untake"/>.
+    /// </param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void NoteTaken(int channel, int leaseBytes)
+    public void NoteTaken(int channel, int leaseBytes, bool shared)
     {
         ref Taken taken = ref _taken[channel];
         Volatile.Write(ref taken.Bytes, taken.Bytes + (uint)leaseBytes);
         Volatile.Write(ref taken.Count, taken.Count + 1);
+        if (shared)
+        {
+            ref SharedLine line = ref _shared[TransportLine];
+            Volatile.Write(ref line.Bytes, line.Bytes + (uint)leaseBytes);
+        }
     }
 
     /// <summary>
@@ -393,11 +411,17 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     /// </summary>
     /// <param name="channel">Dense index of an enabled channel.</param>
     /// <param name="leaseBytes">What <see cref="NoteTaken"/> counted.</param>
-    public void Untake(int channel, int leaseBytes)
+    /// <param name="shared">The tag <see cref="NoteTaken"/> was given.</param>
+    public void Untake(int channel, int leaseBytes, bool shared)
     {
         ref Taken taken = ref _taken[channel];
         Volatile.Write(ref taken.Count, taken.Count - 1);
         Volatile.Write(ref taken.Bytes, taken.Bytes - (uint)leaseBytes);
+        if (shared)
+        {
+            ref SharedLine line = ref _shared[TransportLine];
+            Volatile.Write(ref line.Bytes, line.Bytes - (uint)leaseBytes);
+        }
 
         // Credit came back without the game thread: nothing it does will mark the channel, so the streams the channel
         // holds back would wait for a Drain that may have nothing to take. Ask for another look.
@@ -584,13 +608,21 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     /// </summary>
     /// <param name="channel">Dense index of an enabled channel.</param>
     /// <param name="leaseBytes">The lease's block size as the transport thread counted it.</param>
+    /// <param name="shared">The tag the message was taken with (<see cref="NoteTaken"/>).</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void NoteReturned(int channel, int leaseBytes)
+    public void NoteReturned(int channel, int leaseBytes, bool shared)
     {
         ref Returned returned = ref _returned[channel];
         Volatile.Write(ref returned.Bytes, returned.Bytes + (uint)leaseBytes);
         Volatile.Write(ref returned.Count, returned.Count + 1);
-        if (_state[channel] != (byte)CreditState.Handled && !_changed)
+        if (shared)
+        {
+            ref SharedLine line = ref _shared[GameLine];
+            Volatile.Write(ref line.Bytes, line.Bytes + (uint)leaseBytes);
+        }
+
+        // The shared half gained room even when the channel is handled by now: other channels' streams may go on.
+        if ((shared || _state[channel] != (byte)CreditState.Handled) && !_changed)
         {
             // Written once per Drain, not once per message: the transport thread reads this object's fields for every
             // message it takes.
@@ -833,23 +865,15 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     }
 
     /// <summary>
-    /// Lease bytes waiting in the reliable channels no handler reads (game thread), from the transport thread's counts as
-    /// they are: a moment old, they can only be lower, which lets a stream go that is then held back again.
+    /// Lease bytes waiting in the reliable channels no handler reads — the messages taken while their channel was limited
+    /// (game thread) — from the transport thread's count as it is: a moment old, it can only be lower, which lets a stream
+    /// go that is then held back again (a staged message given back since is counted down a moment late, and that asks
+    /// for another look itself, <see cref="Untake"/>).
     /// </summary>
-    private ulong SharedWaiting()
-    {
-        ulong waiting = 0;
-        for (int i = 0; i < _accountedCount; i++)
-        {
-            int channel = _accounted[i];
-            if (_state[channel] != (byte)CreditState.Handled)
-            {
-                waiting += unchecked(Volatile.Read(ref _taken[channel].Bytes) - _returned[channel].Bytes);
-            }
-        }
+    private uint SharedWaiting() => unchecked(Volatile.Read(ref _shared[TransportLine].Bytes) - _shared[GameLine].Bytes);
 
-        return waiting;
-    }
+    /// <summary>Lease bytes counted in the shared half (tests; exact only while both threads are idle).</summary>
+    internal int SharedWaitingBytes => (int)SharedWaiting();
 
     /// <summary>Moves the streams the transport thread held back into the game thread's own list.</summary>
     private void Collect(SpscRing<Pended> ring, ITransport? transport)
@@ -906,6 +930,7 @@ internal sealed unsafe class ReceiveCredit : IDisposable
         }
 
         _returned.Clear();
+        _shared.Clear();
         while (Volatile.Read(ref _pended).TryDequeue(out _))
         {
         }
@@ -943,12 +968,21 @@ internal sealed unsafe class ReceiveCredit : IDisposable
         _returned[channel] = new Returned { Count = count, Bytes = bytes };
     }
 
+    /// <summary>Moves the shared half's counters to a chosen point of their 32-bit range (tests of the wrapping arithmetic; both threads idle).</summary>
+    /// <param name="bytes">The counters' new value, taken and returned alike (nothing waits).</param>
+    internal void SetSharedCountersForTest(uint bytes)
+    {
+        _shared[TransportLine] = new SharedLine { Bytes = bytes, Seen = bytes };
+        _shared[GameLine] = new SharedLine { Bytes = bytes, Seen = bytes };
+    }
+
     /// <summary>Frees the native memory (after the transport can no longer call back).</summary>
     public void Dispose()
     {
         _taken.Dispose();
         _returned.Dispose();
         _limits.Dispose();
+        _shared.Dispose();
         _parked.Dispose();
         _pended.Dispose();
         if (_retiredPended is not null)
@@ -977,6 +1011,17 @@ internal sealed unsafe class ReceiveCredit : IDisposable
     {
         public uint Count;
         public uint Bytes;
+    }
+
+    /// <summary>
+    /// One thread's cache line of the shared half: <see cref="Bytes"/> are the lease bytes it counted (taken, or given back);
+    /// <see cref="Seen"/> is, on the transport thread's line, its copy of the game thread's <see cref="Bytes"/>.
+    /// </summary>
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    private struct SharedLine
+    {
+        [FieldOffset(0)] public uint Bytes;
+        [FieldOffset(4)] public uint Seen;
     }
 
     /// <summary>

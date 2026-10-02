@@ -78,6 +78,9 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
     /// <summary>The message being received is counted against its channel's credit (a response is not: it never waits for the application).</summary>
     private const byte RecvCredited = 8;
 
+    /// <summary>The message being received was taken while its channel was limited: it counts in the shared half (<see cref="ReceiveCredit"/>).</summary>
+    private const byte RecvShared = 16;
+
     private PeerCore _core = null!;
     private ChannelDefinition[] _channels = [];
     private int[] _localOf = [];
@@ -1041,8 +1044,9 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
                 recv.Flags |= RecvReserved;
                 if (credited)
                 {
-                    _core.Credit.NoteTaken(message.ChannelIndex, lease.Length);
-                    recv.Flags |= RecvCredited;
+                    bool shared = take == CreditTake.Limited;
+                    _core.Credit.NoteTaken(message.ChannelIndex, lease.Length, shared);
+                    recv.Flags |= shared ? (byte)(RecvCredited | RecvShared) : RecvCredited;
                 }
 
                 return StreamConsume.Continue;
@@ -1071,12 +1075,13 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
                 entry.Length = recv.Length;
                 entry.RawLength = recv.RawLength;
                 entry.RequestId = recv.RequestId;
+                entry.CreditShared = (recv.Flags & RecvShared) != 0 ? (byte)1 : (byte)0;
                 entry.ReceivedMicrosDelta = PeerCore.StampReceive(message.NowMicros);
                 _core.PublishReserved(in entry);
                 recv.Lease = BufferLease.Empty;
 
                 // Published: the credit now comes back when the game thread hands the message on.
-                recv.Flags = (byte)(recv.Flags & ~(RecvReserved | RecvCredited));
+                recv.Flags = (byte)(recv.Flags & ~(RecvReserved | RecvCredited | RecvShared));
                 ref ChannelRecvCounters counters = ref _core.RecvCounters(message.ChannelIndex);
                 counters.Received++;
                 counters.Bytes += entry.Length;
@@ -1137,7 +1142,7 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
 
         if (credited)
         {
-            _core.Credit.NoteTaken(message.ChannelIndex, lease.Length);
+            _core.Credit.NoteTaken(message.ChannelIndex, lease.Length, take == CreditTake.Limited);
         }
 
         ReceiveEntry entry = default;
@@ -1154,6 +1159,7 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
         entry.Length = length;
         entry.RawLength = rawLength;
         entry.RequestId = requestId;
+        entry.CreditShared = take == CreditTake.Limited ? (byte)1 : (byte)0;
         entry.ReceivedMicrosDelta = PeerCore.StampReceive(message.NowMicros);
         _core.PublishReserved(in entry);
         ref ChannelRecvCounters counters = ref _core.RecvCounters(message.ChannelIndex);
@@ -1246,8 +1252,8 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
         if ((recv.Flags & RecvCredited) != 0)
         {
             // Before the lease goes back: its block size is what the message was counted with.
-            _core.ReturnStagedCredit(_denseOf[local], recv.Lease.Length);
-            recv.Flags = (byte)(recv.Flags & ~RecvCredited);
+            _core.ReturnStagedCredit(_denseOf[local], recv.Lease.Length, (recv.Flags & RecvShared) != 0);
+            recv.Flags = (byte)(recv.Flags & ~(RecvCredited | RecvShared));
         }
 
         if ((recv.Flags & RecvReserved) != 0)
@@ -1360,7 +1366,7 @@ internal sealed unsafe partial class ReliableOrderedEngine : ChannelEngine
         /// <summary>Request id (request/response channels).</summary>
         [FieldOffset(44)] public uint RequestId;
 
-        /// <summary><c>RecvSeen</c>, <c>RecvOpen</c>, <c>RecvReserved</c>, <c>RecvCredited</c>.</summary>
+        /// <summary><c>RecvSeen</c>, <c>RecvOpen</c>, <c>RecvReserved</c>, <c>RecvCredited</c>, <c>RecvShared</c>.</summary>
         [FieldOffset(48)] public byte Flags;
     }
 }

@@ -27,7 +27,7 @@ public sealed unsafe partial class QuiclyPeer
     {
         if (_credited[index])
         {
-            _core.Credit.NoteReturned(index, entry.Lease.Length);
+            _core.Credit.NoteReturned(index, entry.Lease.Length, entry.CreditShared != 0);
         }
     }
 

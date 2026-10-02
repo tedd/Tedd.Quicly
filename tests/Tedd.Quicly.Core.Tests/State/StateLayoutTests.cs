@@ -25,6 +25,9 @@ public unsafe class StateLayoutTests
         Assert.Equal(40, (int)((byte*)&e.ReceivedMicrosDelta - b));
         Assert.Equal(44, (int)((byte*)&e.SenderTick - b));
         Assert.Equal(48, (int)((byte*)&e.RequestId - b));
+
+        // The receive credit's tag (RC2-2) sits in what was padding: the entry is still one cache line.
+        Assert.Equal(52, (int)((byte*)&e.CreditShared - b));
         Assert.Equal(2, sizeof(ReceiveFlags));
     }
 

@@ -32,7 +32,8 @@ public enum ReceiveFlags : ushort
 /// <remarks>
 /// Layout (sequential, 8-byte packed): <see cref="Channel"/> (2), <see cref="Flags"/> (2), <see cref="Sequence"/> (4),
 /// <see cref="Key"/> (8), <see cref="Lease"/> (16), <see cref="Length"/> (4), <see cref="RawLength"/> (4),
-/// <see cref="ReceivedMicrosDelta"/> (4), <see cref="SenderTick"/> (4), <see cref="RequestId"/> (4), padding to 64.
+/// <see cref="ReceivedMicrosDelta"/> (4), <see cref="SenderTick"/> (4), <see cref="RequestId"/> (4), the internal
+/// credit tag (1, at 52), padding to 64.
 /// Written by the transport thread before the ring publish; read by the game thread after the ring's acquire.
 /// </remarks>
 [StructLayout(LayoutKind.Sequential, Size = Size)]
@@ -61,4 +62,11 @@ public struct ReceiveEntry
     public uint SenderTick;
     /// <summary>Request id for request/response channels (odd for requests), else 0.</summary>
     public uint RequestId;
+
+    /// <summary>
+    /// 1 when the message was taken while its channel was limited (<c>ReceiveCredit</c>, CreditTake.Limited): it counts in
+    /// the half of the receive budget the reliable channels no handler reads share, and gives that back with its credit.
+    /// Written by the transport thread before the ring publish (padding of the 64 bytes; never seen by the application).
+    /// </summary>
+    internal byte CreditShared;
 }

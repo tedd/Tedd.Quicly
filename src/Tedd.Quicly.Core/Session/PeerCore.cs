@@ -1671,9 +1671,10 @@ internal sealed unsafe class PeerCore : IDisposable
     /// </summary>
     /// <param name="channelIndex">Dense index of the message's channel.</param>
     /// <param name="leaseBytes">The block size the message was counted with.</param>
-    public void ReturnStagedCredit(int channelIndex, int leaseBytes)
+    /// <param name="shared">Whether the message was taken while its channel was limited (<see cref="CreditTake.Limited"/>).</param>
+    public void ReturnStagedCredit(int channelIndex, int leaseBytes, bool shared)
     {
-        Credit.Untake(channelIndex, leaseBytes);
+        Credit.Untake(channelIndex, leaseBytes, shared);
         NoteTransportWork();
     }
 

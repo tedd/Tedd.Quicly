@@ -70,6 +70,9 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
     private const byte RecvInUse = 1;
     private const byte RecvReserved = 2;
 
+    /// <summary>The staged message was taken while its channel was limited: it counts in the shared half (<see cref="ReceiveCredit"/>).</summary>
+    private const byte RecvShared = 4;
+
     private const byte GroupImmediate = 1;
     private const byte GroupFinSent = 2;
     private const byte GroupCounted = 4;
@@ -1478,13 +1481,14 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
                 }
 
                 // Counted from here until the game thread hands the message on, or ReleaseReceive gives it up.
-                _core.Credit.NoteTaken(message.ChannelIndex, lease.Length);
+                bool shared = take == CreditTake.Limited;
+                _core.Credit.NoteTaken(message.ChannelIndex, lease.Length, shared);
                 recv.Lease = lease;
                 recv.Length = length;
                 recv.Filled = 0;
                 recv.Key = message.Header.Key;
                 recv.RawLength = message.Header.RawLength;
-                recv.Flags |= RecvReserved;
+                recv.Flags |= shared ? (byte)(RecvReserved | RecvShared) : RecvReserved;
                 return StreamConsume.Continue;
             }
 
@@ -1513,10 +1517,11 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
                 entry.Lease = recv.Lease;
                 entry.Length = recv.Length;
                 entry.RawLength = recv.RawLength;
+                entry.CreditShared = (recv.Flags & RecvShared) != 0 ? (byte)1 : (byte)0;
                 entry.ReceivedMicrosDelta = PeerCore.StampReceive(message.NowMicros);
                 _core.PublishReserved(in entry);
                 recv.Lease = BufferLease.Empty;
-                recv.Flags = (byte)(recv.Flags & ~RecvReserved);
+                recv.Flags = (byte)(recv.Flags & ~(RecvReserved | RecvShared));
                 ref ChannelRecvCounters counters = ref _core.RecvCounters(message.ChannelIndex);
                 counters.Received++;
                 counters.Bytes += entry.Length;
@@ -1580,7 +1585,7 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
             message.Chunk.CopyTo(new Span<byte>(_core.GetPointer(in lease), length));
         }
 
-        _core.Credit.NoteTaken(message.ChannelIndex, lease.Length);
+        _core.Credit.NoteTaken(message.ChannelIndex, lease.Length, take == CreditTake.Limited);
         ReceiveEntry entry = default;
         entry.Channel = message.Channel;
         int rawLength = message.Header.RawLength;
@@ -1589,6 +1594,7 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         entry.Lease = lease;
         entry.Length = length;
         entry.RawLength = rawLength;
+        entry.CreditShared = take == CreditTake.Limited ? (byte)1 : (byte)0;
         entry.ReceivedMicrosDelta = PeerCore.StampReceive(message.NowMicros);
         _core.PublishReserved(in entry);
         ref ChannelRecvCounters counters = ref _core.RecvCounters(message.ChannelIndex);
@@ -1703,9 +1709,9 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         {
             // A staged message is counted against its channel's credit; before the lease goes back, because its block
             // size is what the message was counted with. recv.Local is valid here: a record in use staged it.
-            _core.ReturnStagedCredit(_denseOf[recv.Local], recv.Lease.Length);
+            _core.ReturnStagedCredit(_denseOf[recv.Local], recv.Lease.Length, (recv.Flags & RecvShared) != 0);
             _core.CancelReservation();
-            recv.Flags = (byte)(recv.Flags & ~RecvReserved);
+            recv.Flags = (byte)(recv.Flags & ~(RecvReserved | RecvShared));
         }
 
         if (!recv.Lease.IsEmpty)
@@ -1868,7 +1874,7 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         /// <summary>Next free record (-1 = none).</summary>
         [FieldOffset(48)] public int Next;
 
-        /// <summary><see cref="RecvInUse"/>, <see cref="RecvReserved"/>.</summary>
+        /// <summary><see cref="RecvInUse"/>, <see cref="RecvReserved"/>, <see cref="RecvShared"/>.</summary>
         [FieldOffset(52)] public byte Flags;
     }
 }

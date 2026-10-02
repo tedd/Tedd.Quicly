@@ -95,7 +95,7 @@ public class ReviewCreditThreadingTests
         using ReceiveCredit credit = new(channels: 1, streams: 4, countLimit: 1, byteLimit: 1_000);
         RecordingTransport transport = new();
         credit.Enable(0);
-        credit.NoteTaken(0, 10);
+        credit.NoteTaken(0, 10, shared: true);
 
         // Transport thread, between two looks of the game thread: four streams are held back and end (their sender reset
         // them), each end frees its slot, and a fifth stream — alive — takes one of the slots and is held back as well.
@@ -112,7 +112,7 @@ public class ReviewCreditThreadingTests
 
         // Game thread: the application takes the message, which gives the channel its whole credit back.
         credit.Resume(transport);
-        credit.NoteReturned(0, 10);
+        credit.NoteReturned(0, 10, shared: true);
         credit.Resume(transport);
         credit.Resume(transport);
 
@@ -343,9 +343,9 @@ public class ReviewCreditThreadingTests
         // (1) The message is taken and the game thread looks (nothing listed yet) before the stream is listed.
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
-            credit.NoteTaken(0, 10);
+            credit.NoteTaken(0, 10, shared: true);
             Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
-            credit.NoteReturned(0, 10);
+            credit.NoteReturned(0, 10, shared: true);
             credit.Resume(transport);
             Assert.True(credit.NotePended(a, 0));
             Assert.True(credit.HasWork);
@@ -357,10 +357,10 @@ public class ReviewCreditThreadingTests
         // (2) The stream is listed, then the message is taken.
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
-            credit.NoteTaken(0, 10);
+            credit.NoteTaken(0, 10, shared: true);
             Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             Assert.True(credit.NotePended(a, 0));
-            credit.NoteReturned(0, 10);
+            credit.NoteReturned(0, 10, shared: true);
             credit.Resume(transport);
             Assert.Equal([a], transport.Resumed);
         }
@@ -368,12 +368,12 @@ public class ReviewCreditThreadingTests
         // (3) The stream is listed and collected by a look that found nothing to do; the message is taken afterwards.
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
-            credit.NoteTaken(0, 10);
+            credit.NoteTaken(0, 10, shared: true);
             Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             Assert.True(credit.NotePended(a, 0));
             credit.Resume(transport);
             Assert.False(credit.HasWork);
-            credit.NoteReturned(0, 10);
+            credit.NoteReturned(0, 10, shared: true);
 
             // Credit that came back is work until the game thread has looked: the Drain or Poll that took the message
             // looks before it returns, and a Poll that a throwing handler cut short leaves the probe set (finding 2).
@@ -386,7 +386,7 @@ public class ReviewCreditThreadingTests
         // (4) A handler is registered and looks before the stream is listed: no limit is left, the transport thread asks.
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
-            credit.NoteTaken(0, 10);
+            credit.NoteTaken(0, 10, shared: true);
             Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             credit.SetState(0, CreditState.Handled);
             credit.Resume(transport);
@@ -401,11 +401,11 @@ public class ReviewCreditThreadingTests
         // thread's second look at the counters saves the stream.
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
-            credit.NoteTaken(0, 10);
+            credit.NoteTaken(0, 10, shared: true);
             Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             credit.SetState(0, CreditState.Handled);
             credit.Resume(transport);
-            credit.NoteReturned(0, 10);
+            credit.NoteReturned(0, 10, shared: true);
             credit.Resume(transport);
             credit.SetState(0, CreditState.Unread);
             Assert.False(credit.HasWork);
@@ -419,7 +419,7 @@ public class ReviewCreditThreadingTests
         // stream waits, and the Drain that takes the message resumes it.
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
-            credit.NoteTaken(0, 10);
+            credit.NoteTaken(0, 10, shared: true);
             Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             credit.SetState(0, CreditState.Handled);
             credit.Resume(transport);
@@ -428,7 +428,7 @@ public class ReviewCreditThreadingTests
             credit.Resume(transport);
             Assert.Empty(transport.Resumed);
             Assert.False(credit.HasWork);
-            credit.NoteReturned(0, 10);
+            credit.NoteReturned(0, 10, shared: true);
             credit.Resume(transport);
             Assert.Equal([a], transport.Resumed);
         }
@@ -437,12 +437,12 @@ public class ReviewCreditThreadingTests
         // read the old count keeps the stream, and the transport thread's request brings the next one.
         {
             using ReceiveCredit credit = NewCredit(out RecordingTransport transport);
-            credit.NoteTaken(0, 10);
+            credit.NoteTaken(0, 10, shared: true);
             Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             Assert.True(credit.NotePended(b, 0));
             credit.Resume(transport);
             Assert.Equal(1, credit.ParkedStreams);
-            credit.Untake(0, 10);
+            credit.Untake(0, 10, shared: true);
             Assert.True(credit.HasWork);
             credit.Resume(transport);
             Assert.Equal([b], transport.Resumed);
@@ -454,7 +454,7 @@ public class ReviewCreditThreadingTests
             using ReceiveCredit credit = new(channels: 1, streams: 8, countLimit: 4, byteLimit: 100, drainedCountLimit: 64);
             RecordingTransport transport = new();
             credit.Enable(0);
-            credit.NoteTaken(0, 500);
+            credit.NoteTaken(0, 500, shared: true);
             Assert.False(credit.TryTake(0, 0, 0) != CreditTake.Blocked);
             credit.SetState(0, CreditState.Drained);
             credit.Resume(transport);
@@ -603,7 +603,8 @@ public class ReviewCreditThreadingTests
                             continue;
                         }
 
-                        if (credit.TryTake(channel, 0, 0) == CreditTake.Blocked)
+                        CreditTake take = credit.TryTake(channel, 0, 0);
+                        if (take == CreditTake.Blocked)
                         {
                             if (!credit.NotePended(ids[s], channel))
                             {
@@ -620,17 +621,18 @@ public class ReviewCreditThreadingTests
                         }
 
                         int bytes = random.Next(0, 600);
-                        credit.NoteTaken(channel, bytes);
+                        bool shared = take == CreditTake.Limited;
+                        credit.NoteTaken(channel, bytes, shared);
                         if (!tailSet && random.Next(1 << 10) == 0)
                         {
                             // The stream ends in the middle of the message; another one takes its slot.
-                            credit.Untake(channel, bytes);
+                            credit.Untake(channel, bytes, shared);
                             ids[s] = new TransportStreamId(s, ++generation);
                             untakes++;
                             continue;
                         }
 
-                        ModelMessage message = new() { Channel = channel, Bytes = bytes };
+                        ModelMessage message = new() { Channel = channel, Bytes = bytes, Shared = shared };
                         ring.TryEnqueue(in message);
                         left[s]--;
                         Volatile.Write(ref delivered[s], delivered[s] + 1);
@@ -675,7 +677,7 @@ public class ReviewCreditThreadingTests
                     int batch = random.Next(0, 12);
                     for (int i = 0; i < batch && ring.TryDequeue(out ModelMessage message); i++)
                     {
-                        credit.NoteReturned(message.Channel, message.Bytes);
+                        credit.NoteReturned(message.Channel, message.Bytes, message.Shared);
                         returned++;
                         look = true;
                     }
@@ -803,6 +805,7 @@ public class ReviewCreditThreadingTests
     {
         public int Channel;
         public int Bytes;
+        public bool Shared;
     }
 
     // ------------------------------------------------------------------ guards: the ways an application can read

@@ -8,16 +8,17 @@ using System.Runtime.Loader;
 // measurement windows A,B / B,A / A,B ... on one pinned, high-priority thread. Clock, SMT-sibling and load drift then hit
 // both arms alike, and each adjacent pair gives one ratio.
 //
-// Usage: PairHost <armA> <armB> <Class.Method | stages.<workload>> [pairs=40] [windowSeconds=0.5] [tfm=net10.0]
+// Usage: PairHost <armA> <armB> <Class.Method[:Prop=Value,...] | stages.<workload>> [pairs=40] [windowSeconds=0.5] [tfm=net10.0]
 // Output: per-arm median/mean, the paired ratio B/A (median, mean, 95 % CI of the geometric mean) and, for stages, the
-// per-phase medians. PROF_AFFINITY (hex mask, default 0x50 = CPUs 4 and 6; 0 = off) as in the driver.
+// per-phase medians. PROF_AFFINITY (hex mask, default 0x50 = CPUs 4 and 6; 0 = off) as in the driver. Prop=Value sets a
+// public property of the benchmark class (a [Params] value, for example DelayUs=10) before its [GlobalSetup] runs.
 public static class PairHost
 {
     public static int Main(string[] args)
     {
         if (args.Length < 3)
         {
-            Console.Error.WriteLine("usage: PairHost <armA> <armB> <Class.Method|stages.<workload>> [pairs] [windowSeconds] [tfm]");
+            Console.Error.WriteLine("usage: PairHost <armA> <armB> <Class.Method[:Prop=Value,...]|stages.<workload>> [pairs] [windowSeconds] [tfm]");
             return 2;
         }
 
@@ -123,8 +124,10 @@ public static class PairHost
             }
             else
             {
-                string cls = workload[..workload.IndexOf('.')];
-                string method = workload[(workload.IndexOf('.') + 1)..];
+                int colon = workload.IndexOf(':');
+                string target = colon < 0 ? workload : workload[..colon];
+                string cls = target[..target.IndexOf('.')];
+                string method = target[(target.IndexOf('.') + 1)..];
                 Type type = asm.GetTypes().Single(t => t.Name == cls);
                 MethodInfo m = type.GetMethod(method) ?? throw new ArgumentException("no method " + method);
                 int ops = 1;
@@ -137,6 +140,19 @@ public static class PairHost
                 }
 
                 object instance = Activator.CreateInstance(type)!;
+                if (colon >= 0)
+                {
+                    foreach (string assignment in workload[(colon + 1)..].Split(',', StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        string[] parts = assignment.Split('=', 2);
+                        PropertyInfo property = type.GetProperty(parts[0]) ?? throw new ArgumentException($"{cls} has no property {parts[0]}");
+                        object value = property.PropertyType.IsEnum
+                            ? Enum.Parse(property.PropertyType, parts[1])
+                            : Convert.ChangeType(parts[1], property.PropertyType, CultureInfo.InvariantCulture);
+                        property.SetValue(instance, value);
+                    }
+                }
+
                 foreach (MethodInfo setup in type.GetMethods().Where(x => x.CustomAttributes.Any(c => c.AttributeType.Name == "GlobalSetupAttribute")))
                 {
                     setup.Invoke(instance, null);

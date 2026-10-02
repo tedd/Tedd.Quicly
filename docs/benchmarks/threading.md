@@ -280,3 +280,165 @@ cross-CCD busy 0.53×), but parked leases can only be reclaimed by the transport
 the same private pool refused `OutOfBuffers` and a compressed reliable message lost at decode near a full budget, and on a server's
 shared pool one peer's parked blocks cannot be reclaimed by another. It was reverted; a design that returns dispatched leases in one
 chain per Poll (before any game-thread rent) is the open follow-up.
+
+## 7. The blocking `Wait` under CPU load (2026-10-02)
+
+**Finding.** `CompletionTable.Wait` (behind `QuiclyPeer.Wait`) spun ten `SpinWait` rounds, the ones that never yield (a
+few µs), then parked on the slot's `ManualResetEventSlim`. That event had the default spin count, 35, so its own `Wait`
+spun again before it blocked: ten more busy rounds, then 25 rounds that alternate busy spins with `Thread.Yield` and
+`Thread.Sleep(0)`. On an idle machine a yield returns at once, and the whole phase ended 15–20 µs into the wait. On a
+machine with no free core every yield hands the core to a ready thread for the rest of its quantum (about 31 ms on this
+Windows build), and a completion that arrives meanwhile cannot wake the waiter: `Set` signals only a thread that has
+parked. The load-independence work on Core.Tests (branch `tests/load-independent`) found it:
+`CompletionTableTests.Stress_Transport_Thread_Completes_While_Owner_Awaits`, whose mode 2 is this `Wait`, took 22–26 s
+instead of 3–4 s on four cores shared with eight busy loops.
+
+**First change, and what its review found.** `3d60a10` created the event with spin count 0, so the waiter parked as soon
+as the table's spin ended. Under load that removed the lost quanta. Idle, though, every completion that landed about
+3–14 µs into the wait now paid a kernel wake-up: +6–8 µs (+1.6 µs at 3 µs, nothing from 15 µs on). The first version of
+this section claimed a send's stages "practically never" land there. That was wrong for datagrams. Over MsQuic loopback a
+tracked datagram's `BufferReleased` completes 7–17 µs after `Flush` (p05 7.2, p20 8.9, p50 10.8–11.3, p75 13.7–17.4 µs;
+65–72 % within 13 µs). With spin count 0, `Flush` + `QuiclyPeer.Wait(BufferReleased)` went from a median of 10.9–11.3 µs
+to 17.6–20.3 µs, B above A in 30 of 30 blocks.
+
+The perf review measured all of this with a paired in-process harness on CPUs 16–23. It seeded every slot's event by
+reflection and alternated the variants per block; its A/A offset was ±0.15 µs; this was on Windows, Zen 3. The contract
+review found an older defect next to it. Two blocking waits on the two stages of one token shared the slot's one event,
+and the second-stage waiter's `Reset` could swallow the first stage's wake-up, which then came up to the whole timeout
+late. That hit about a quarter of the rounds, the same on main (`ReviewCwaitcontractTwoWaiterTests`).
+
+**Hypothesis.** The yields were the problem, not the spinning. Spinning on with `Thread.SpinWait` alone, until about
+20 µs into the wait, keeps the old event's idle profile (it had parked by 15–20 µs) and still never hands the core away.
+Under load the spin costs at most 20 µs of CPU for each wait that completes later, against a quantum per yield. The
+review had measured exactly that from the caller's side (a pre-spin on `IsCompleted`, then the spin-0 event): within
+0.3–0.5 µs of main over MsQuic loopback, and equal to spin count 0 under eight busy loops.
+
+**Change.** After its ten `SpinWait` rounds, `Slot.Wait` spins with `Thread.SpinWait(8)`, checking the state after each
+call, until 20 µs (Stopwatch) since the wait began. The spin is skipped for a zero timeout, and on a single processor,
+where the completing thread cannot run meanwhile. Then it parks on an event with spin count 0. Each stage has its own
+lazily created event, so a waiter only ever resets its own.
+
+**Measurement, idle.** `CompletionTableWaitBench` (new): the owner allocates a slot, hands the token to a completer
+thread and calls `Wait`; the completer completes the stage `DelayUs` after it saw the token; the owner releases the slot.
+The time per operation is one round: delay + hand-off + wake-up. No quiet machine could be had, so both builds ran in
+one PairHost process. That is the ADR 0007 addendum method; PairHost now takes `Class.Method:DelayUs=10`. The process was
+pinned to CPUs 16–23, which other sessions' builds and test runs shared, with alternating 0.4 s windows, 12 pairs per
+launch and 6 launches. A = main (`5ab528b`), B = this branch; A/A = two copies of main. Columns: per-launch medians per
+round, and the combined B/A ratio with its 95 % interval.
+
+| DelayUs | A | B | B/A | A/A |
+|--------:|---:|---:|---:|---:|
+| 0 | 355–411 ns | 347–374 ns | 0.95 [0.92 .. 0.97] | |
+| 5 | 5.65–5.81 µs | 5.62–5.67 µs | 0.92 [0.87 .. 0.98] | 1.08 [0.94 .. 1.24] |
+| 10 | 10.8–21.0 µs | 10.65–10.78 µs | 0.70 [0.44 .. 1.11] | 0.96 [0.89 .. 1.03] |
+| 15 | 47–66 µs | 15.8–15.9 µs | 0.28 [0.25 .. 0.32] | |
+| 20 | 29.1–80.9 µs | 23.2–24.6 µs | 0.65 [0.46 .. 0.93] | 1.03 [0.98 .. 1.09] |
+| 40 | 54–113 µs | 50.5–52.0 µs | 0.56 [0.38 .. 0.83] | |
+| 100 | 112–131 µs | 111–113 µs | 0.91 [0.85 .. 0.97] | |
+
+B is never slower here, and its medians barely move between launches. Up to about 10 µs both builds catch the completion
+while spinning. From there A's spin yields, and on these shared cores some of its windows lost the core, so its medians
+wander between launches. At 15 µs, deep in the old event's yielding rounds, A took 47–66 µs in every launch. At 20 µs B
+catches part of the rounds before its spin ends. From 40 µs on, B parks and pays one wake-up (about 11 µs). A pays that
+too, and on these cores sometimes a lost core as well. The `WaitAsync` and `Complete` paths
+do not touch the spin, and `Complete` now picks one of two event fields:
+- `CompletionTableRoundTripBench.CompleteThenAwait` B/A 0.97 [0.90 .. 1.04] (its A/A 1.00 [0.97 .. 1.03]);
+- `CompleteThenAwaitPeerSized` 0.99 [0.96 .. 1.02];
+- `AwaitThenComplete` 1.040 [1.028 .. 1.052], then 1.013 [0.995 .. 1.032] when repeated, with its A/A at
+  1.043 [1.018 .. 1.068]. That is the method's arm offset for this workload, not the change.
+
+The recheck review repeated the table-level pairs at finer delays: 4 launches × 12 blocks × 200 rounds on CPUs 16–23, with
+A/A differences of at most 0.43 µs.
+- At 0–12 µs B was within −0.3 to +0.1 µs of A.
+- At 15, 18 and 20 µs B was faster: 15.6 vs 18.3–25.3 µs, 18.6 vs 26.1–27.6 µs, and 22.1–22.5 vs 27.9–28.8 µs.
+- At 22 µs, just past B's spin, B cost +0.45 to +0.55 µs in 3 of 4 launches (A/A in the same launches up to +0.43 µs).
+- From 25 µs on the two were equal.
+
+So "never slower" holds to within about 0.5 µs.
+
+**Measurement, idle, MsQuic loopback.** This is the path the first review flagged, re-measured by the recheck review on
+the final design. Each arm (A = main, B = this branch, a = a second copy of main) ran in its own AssemblyLoadContext with
+its own client and server over MsQuic loopback; the client used `CompletionMode.ThreadPool`. Each op was
+`SendCopy(64 B, UnreliableUnordered, Tracked)`, then the timed `Flush` + `QuiclyPeer.Wait(BufferReleased)`, then `Poll`.
+Blocks rotated between the arms, 30 blocks × 400 ops per arm per launch. There were 16 launches on net10.0 and net11.0,
+pinned to CPUs 16–23, which carried 15–55 % load from other sessions.
+
+| | A (main) | a (main again) | B (this branch) |
+|---|---:|---:|---:|
+| p50 per launch | 14.1–28.6 µs (typically 21–25) | 13.6–31.9 µs | 17.2–19.1 µs |
+| p90 per launch | 45.3–74.4 µs | | 46.4–49.5 µs |
+
+- The paired B−A block-median difference had a median of −5.15 µs (range −8.47 to +4.15).
+- B was lower than A in 15 of 16 launches. The one launch above had A/A at +8.43 µs.
+- The A/A difference had a median magnitude of 2.0 µs.
+- On this busier machine 37–41 % of B's completions landed after 20 µs, and p05–p30 landed at 7.5–15 µs.
+- With eight busy threads in the same process, A's p50 was 1.75–3.79 ms (p90 up to 10 ms) and B's 14.0–20.5 µs (p90
+  about 45–50 µs).
+
+The first review's +6.7–8.2 µs regression of spin count 0 on this path is gone: B is typically about 5 µs faster than main.
+
+**Measurement, loaded.** The same benchmark under BenchmarkDotNet (ShortRun, in-process; on net11.0 each run reports two
+in-process jobs), pinned to CPUs 8–11 with `DOTNET_PROCESSOR_COUNT=4` and eight `powershell -Command "while(1){}"` on the
+same four CPUs, A and B interleaved three times each. Mean per round, range over all jobs. The spin-0 column is
+`04cf395`, measured earlier in the day; main read 0.66–4.1 ms per round then.
+
+| DelayUs | A (main) | B (this branch) | spin count 0 |
+|--------:|---:|---:|---:|
+| 0 | 0.51–0.65 µs | 0.36–0.41 µs | 0.35–0.39 µs |
+| 5 | 256–651 µs | 5.63–5.71 µs | |
+| 10 | 502–709 µs | 10.6–10.9 µs | 16.0–17.2 µs |
+| 15 | 641–687 µs | 15.6–15.8 µs | |
+| 20 | 401–679 µs | 23.8–24.7 µs | 26.5–27.5 µs |
+| 40 | 358–720 µs | 46.3–46.9 µs | 46.7–48.0 µs |
+| 100 | 390–821 µs | 106.6–107.2 µs | 106.6–107.9 µs |
+
+B never loses a quantum: up to 15 µs it pays the delay plus 0.6–0.9 µs, after that the delay plus 4–7 µs. Busy cores wake
+a parked thread faster than idle cores in a sleep state.
+
+**The stress test.** Wall time of a fresh test process (`--filter-method`, including ~0.4 s start-up). It ran the test
+version that `tests/load-independent` ships (`7f43be8`, whose own hand-offs no longer yield), on CPUs 8–11 with
+`DOTNET_PROCESSOR_COUNT=4`, runs interleaved. Each batch ran at a different time with its own main column, and other
+sessions loaded the rest of the machine differently each time.
+
+| batch | | main | change |
+|---|---|---:|---:|
+| spin count 0 (`04cf395`) | idle, 5 runs | 1.42–1.52 s | 1.49–1.56 s |
+| | eight busy loops, 7 runs | 31.6–47.3 s (median 33.3) | 10.2–13.9 s (median 12.7) |
+| this branch | idle, 5 runs | 1.66–1.83 s | 1.64–2.72 s (one run 2.72, the others ≤ 2.10) |
+| | eight busy loops, 6 runs | 9.3–12.9 s (median 11.6) | 2.7–3.3 s (median 2.9) |
+
+On main's own version of that test, whose spin awaiters also yield, one loaded run took 484 s on main and 397 s with spin
+count 0: the test itself was then the bigger problem.
+
+**Tests.** `CompletionTableBlockingWaitTests` (new):
+- *The_Events_A_Blocking_Wait_Parks_On_Do_Not_Spin* reads both stage events by reflection after a parked wait and
+  requires spin count 0. It is timing-free and runs on every platform.
+- *A_Blocking_Wait_Parks_Instead_Of_Handing_Its_Cpu_To_A_Busy_Thread* is Windows only. It pins the waiter and a busy
+  loop of equal (highest) priority to one CPU. It compares each table wait, completed 200 µs in, with a reference wait on
+  an event that parks at once, in the round next to it: table minus reference must have a median under 5 ms. Main reads
+  26.6–31.6 ms (the busy loop's quantum), this branch 0.000 ms. Two simpler designs failed in full Core.Tests runs: an
+  absolute bound on the wake-up, and the same bound at the highest priority. Other tests' boosted threads and pauses of
+  the whole test process delayed even a parked waiter.
+
+The review added two tests:
+- `ReviewCwaitperfIdleWakeTests` completes 6 µs in and compares against a spinning reference. 04cf395 read 7.2–10.3 µs
+  behind and failed; main and this branch read 0.2–0.3 µs.
+- `ReviewCwaitcontractTwoWaiterTests` covers the shared event.
+
+Mutations, each failing the test that guards it:
+- the event's default spin count fails both new tests;
+- a `Thread.Yield` in place of the `Thread.SpinWait` fails the Windows test;
+- parking at once (`04cf395`) fails the 6 µs test, 7 of 7;
+- one shared event fails the two-waiter test, 6 of 6.
+
+The whole Core.Tests project passed 2 379 of 2 379:
+- on this branch, on CPUs 16–31, net10.0 and net11.0;
+- on `7f43be8` with this change, on four CPUs (0xF00), in three of four runs. The fourth, on net10.0, failed only
+  `ReviewCreditThreadingTests.Guard_A_Receiver_On_Its_Own_Thread_Gets_Every_Message(seed 22)`, whose coverage guard saw
+  no credit hold (every message arrived; that test does not use the blocking wait).
+
+**Decision.** Kept: spin without yielding until 20 µs into the wait, then park on a spin-0 event per stage. Idle it is as
+fast as main (within about 0.5 µs) or faster in every paired run, and about 5 µs faster on a loopback datagram's
+`BufferReleased`. Under load a wait never hands its core away: rounds that cost main 0.3–0.8 ms take the delay plus at
+most 7 µs. Spin count 0 alone (`04cf395`) was rejected for its idle cost to datagram
+completions. Spin count 10 measured the same as 0.

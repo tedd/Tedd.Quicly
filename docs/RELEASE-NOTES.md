@@ -84,6 +84,24 @@ the end that receives is the end to upgrade.
   (`LimitExceeded`, the transfer `Failed`) although it never had more transfers live than allowed: a canceled
   transfer's slot comes back with its stream's close, while the receiver's record of it waits for its game thread.
   The receiver keeps four records per transfer it accepts at once. (This was in 0.2.1 already.)
+* **`QuiclyPeer.Wait` lost a scheduler quantum per yield on a machine with no free core.** The blocking wait for a
+  tracked send's stage spins briefly and then parks on an event, but that event spun again before it blocked, with
+  `Thread.Yield` and `Thread.Sleep(0)`. Each yield handed the core to a busy thread for up to a quantum (about 31 ms on
+  Windows), and a completion that arrived meanwhile could not wake a thread that had not parked. The wait now spins
+  without ever yielding until about 20 µs into the wait, then parks on an event that does not spin.
+  - Loaded (four cores shared with eight busy loops, measured on Windows): a wait woken 5–100 µs after it began took
+    0.26–0.82 ms; it now takes the delay plus at most 7 µs.
+  - Idle: it is as fast as before (within about 0.5 µs) or faster. A tracked datagram's `Flush` + `Wait(BufferReleased)`
+    over loopback took a median of 17–19 µs, against 21–25 µs before.
+  - The timeout counts in whole milliseconds: a timeout under 1 ms acts as zero, as it did before.
+  - Two blocking waits on the two stages of one token no longer share one event, so one can no longer swallow the
+    other's wake-up and leave it waiting until its timeout.
+  - `WaitAsync` is unchanged.
+* **`QuiclyPeer.Wait` documents which completions can end it.** Call it on the game thread, like every other member.
+  While it blocks nothing polls, so only completions that the transport thread signals itself can end it. That happens
+  only with `CompletionMode.ThreadPool`, and only for an unfragmented `UnreliableUnordered` or `UnreliableSequenced`
+  message sent in a datagram of its own. Every other stage completes in `Poll` or `Flush`, so a blocking wait for it
+  returns `Pending` at its timeout: use `WaitAsync`, or poll and read `GetDeliveryStatus`.
 
 ### Behaviour changes
 

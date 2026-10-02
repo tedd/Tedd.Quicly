@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Transport;
@@ -25,9 +26,16 @@ public class ReviewRecheck2R1WorkSignalTests
         })
         .Build();
 
+    /// <summary>
+    /// A wait spins for its first ten rounds, which never yield the core, and then blocks. The default spin count (35) goes
+    /// on for another 25 rounds that yield the core, and when no core is free every yield hands it to a busy thread for a
+    /// scheduler quantum.
+    /// </summary>
+    private const int SpinCount = 10;
+
     private sealed class EventSignal : IPeerWorkSignal
     {
-        public readonly ManualResetEventSlim Event = new(false);
+        public readonly ManualResetEventSlim Event = new(false, SpinCount);
         public long Calls;
 
         public void OnWork(QuiclyPeer peer)
@@ -119,6 +127,14 @@ public class ReviewRecheck2R1WorkSignalTests
     /// signal and, woken, does what the documentation describes. If it ever sleeps its whole timeout while something is
     /// waiting, a wake-up was lost.
     /// </summary>
+    /// <remarks>
+    /// A long pause lasts until the host has gone back to the signal once more. It used to be a fixed spin of about a
+    /// millisecond, which let the host fall asleep only if the host had a core during it: on a machine with no core to
+    /// spare the host then woke a few hundred times in a run instead of thousands, and the coverage guard failed. Neither
+    /// thread yields while it waits for the other (<see cref="SpinCount"/>). The publisher stops after its messages or
+    /// after 10 s, whichever comes first; on four cores with two busy-looping processes per core the host still wakes
+    /// tens of thousands of times.
+    /// </remarks>
     /// <param name="style">
     /// 0: probe, Poll only when it says so, then Drain. 1: Poll on every wake, then Drain. 2: as 0, while a third thread
     /// asks the probe in a tight loop (the probe may be called from any thread, and every false answer re-arms the edge).
@@ -137,13 +153,18 @@ public class ReviewRecheck2R1WorkSignalTests
         int handled = 0;
         server.RegisterHandler(2, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => handled++);
 
+        // The host counts its returns to the signal; a long pause of the publisher lasts until it has returned once more.
+        using ManualResetEventSlim hostReturned = new(false, SpinCount);
+        int hostReturns = 0;
+        long start = Stopwatch.GetTimestamp();
+        long deadline = start + (10 * Stopwatch.Frequency);
         int published = 0;
         bool publisherDone = false;
         Thread publisher = new(() =>
         {
             Random random = new(style + 1);
             int nextValue = 0;
-            for (int i = 0; i < handledMessages; i++)
+            for (int i = 0; i < handledMessages && ((i & 255) != 0 || Stopwatch.GetTimestamp() < deadline); i++)
             {
                 if (nextValue < mailbox.Count && random.Next(7) == 0)
                 {
@@ -153,7 +174,23 @@ public class ReviewRecheck2R1WorkSignalTests
                 sink.OnDatagramReceived(handledDatagram);
                 Volatile.Write(ref published, i + 1);
                 int pause = random.Next(64);
-                Thread.SpinWait(pause == 0 ? 40_000 : pause * 4);
+                if (pause == 0)
+                {
+                    int seen = Volatile.Read(ref hostReturns);
+                    while (Volatile.Read(ref hostReturns) == seen)
+                    {
+                        // Reset, then look: a return after the look sets the event after this reset.
+                        hostReturned.Reset();
+                        if (Volatile.Read(ref hostReturns) != seen || !hostReturned.Wait(TimeSpan.FromSeconds(30)))
+                        {
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    Thread.SpinWait(pause * 4);
+                }
             }
 
             while (nextValue < mailbox.Count)
@@ -188,6 +225,8 @@ public class ReviewRecheck2R1WorkSignalTests
         {
             while (true)
             {
+                Interlocked.Increment(ref hostReturns);
+                hostReturned.Set();
                 bool signalled = signal.Event.Wait(400);
                 bool done = Volatile.Read(ref publisherDone);
                 if (!signalled)
@@ -242,9 +281,11 @@ public class ReviewRecheck2R1WorkSignalTests
         }
 
         PeerStatistics stats = DatagramKit.Statistics(server);
+        TestContext.Current.TestOutputHelper?.WriteLine(
+            $"style {style}: published {published} in {Stopwatch.GetElapsedTime(start).TotalSeconds:F1} s, wakes {wakes}, values {values}, OnWork calls {signal.Calls}");
         Assert.True(lost == 0, $"style {style}: the host slept its whole timeout over waiting work {lost} time(s); first: {firstLoss}; OnWork calls {signal.Calls}, foreign probes {foreignProbes}");
-        Assert.True(handled + stats.ReceiveRingDrops + stats.OutOfReceiveBuffers == handledMessages,
-            $"style {style}: handled {handled} of {handledMessages} (ReceiveRingDrops {stats.ReceiveRingDrops}, OutOfReceiveBuffers {stats.OutOfReceiveBuffers})");
-        Assert.True(values > 0 && wakes > 1_000, $"style {style}: the run did not exercise the wake-up path (values {values}, wakes {wakes})");
+        Assert.True(handled + stats.ReceiveRingDrops + stats.OutOfReceiveBuffers == published,
+            $"style {style}: handled {handled} of {published} (ReceiveRingDrops {stats.ReceiveRingDrops}, OutOfReceiveBuffers {stats.OutOfReceiveBuffers})");
+        Assert.True(values > 0 && wakes > 1_000, $"style {style}: the run did not exercise the wake-up path (values {values}, wakes {wakes}, published {published})");
     }
 }

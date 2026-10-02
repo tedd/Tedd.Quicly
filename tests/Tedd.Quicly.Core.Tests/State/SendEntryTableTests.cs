@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.State;
+using Tedd.Quicly.Core.Tests.Threading;
 using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Core.Transport;
 
@@ -544,82 +546,146 @@ public unsafe class SendEntryTableTests
         // context → enqueue slot on the completion ring, then replay the previous (now stale) context at a slot the
         // owner is busy reusing. Owner frees only after observing the completion (ADR 0008 §3/§4). A replayed
         // context must never change the state of the slot's next occupant.
+        //
+        // The owner waits for a completion when every slot is in use, and the transport for a submission, through a
+        // Doorbell: each spins for a while (the transport replaying its stale context all the while, as before) and then
+        // blocks until the other rings, so that on a machine with no core to spare a wait costs a thread wake-up rather than
+        // the scheduler quantum a yielding spin loses at every yield (which made the run take minutes). The transport counts
+        // the replays that began on the slot's previous occupant and ended on its next one, the window a stale context could
+        // win in; the run sends at least Sends and goes on until it has RequiredStraddles of them, within 20 s.
         const int Sends = 200_000;
+        const long RequiredStraddles = 2_000;
+        long start = Stopwatch.GetTimestamp();
+        long deadline = start + (20 * Stopwatch.Frequency);
         using var table = new SendEntryTable(8);
         var submitted = new SpscRing<ulong>(8);
         var completed = new SpscRing<int>(9);
+        using var submission = new Doorbell();
+        using var completion = new Doorbell();
         int failedCompletions = 0;
         int staleWins = 0;
+        long replays = 0;
+        long straddles = 0;
+        bool stop = false;
+        Exception? failure = null;
 
         var transport = new Thread(() =>
         {
-            SpinWait spinner = default;
-            ulong previous = 0;
-            for (int n = 0; n < Sends;)
+            try
             {
-                if (previous != 0)
+                ulong previous = 0;
+                while (true)
                 {
-                    if (table.TryTransitionContext(previous, SendEntryState.InFlight, SendEntryState.Completed, out _)
-                        || table.TryTransitionContext(previous, SendEntryState.Filling, SendEntryState.Completed, out _))
-                        staleWins++;
-                }
+                    if (previous != 0)
+                    {
+                        // The slot's generation before and after the replay: a replay that began on the previous occupant
+                        // and ended on the next one ran while the owner freed and reallocated the slot.
+                        int previousSlot = (int)(uint)previous;
+                        uint before = Volatile.Read(ref table[previousSlot].Generation);
+                        if (table.TryTransitionContext(previous, SendEntryState.InFlight, SendEntryState.Completed, out _)
+                            || table.TryTransitionContext(previous, SendEntryState.Filling, SendEntryState.Completed, out _))
+                            staleWins++;
+                        replays++;
+                        if (before == (uint)(previous >> 32) && Volatile.Read(ref table[previousSlot].Generation) != before)
+                            Volatile.Write(ref straddles, straddles + 1);
+                    }
 
-                if (!submitted.TryDequeue(out ulong context))
-                {
-                    spinner.SpinOnce(sleep1Threshold: -1);
-                    continue;
-                }
+                    // The owner raises stop after its last submission, so a stop seen before an empty ring ends the run.
+                    bool stopping = Volatile.Read(ref stop);
+                    if (!submitted.TryDequeue(out ulong context))
+                    {
+                        if (stopping)
+                            return;
+                        submission.Wait();
+                        continue;
+                    }
 
-                if (!table.TryTransitionContext(context, SendEntryState.InFlight, SendEntryState.Completed, out int slot))
-                {
-                    failedCompletions++;
-                    slot = (int)(uint)context;
-                }
+                    submission.Satisfied();
+                    if (!table.TryTransitionContext(context, SendEntryState.InFlight, SendEntryState.Completed, out int slot))
+                    {
+                        failedCompletions++;
+                        slot = (int)(uint)context;
+                    }
 
-                while (!completed.TryEnqueue(slot))
-                    spinner.SpinOnce(sleep1Threshold: -1);
-                previous = context;
-                n++;
+                    // The ring has more room than the table has slots, so it always takes the completion.
+                    Assert.True(completed.TryEnqueue(slot));
+                    completion.Ring();
+                    previous = context;
+                }
+            }
+            catch (Exception e)
+            {
+                failure = e;
             }
         })
         { IsBackground = true };
         transport.Start();
 
-        SpinWait owner = default;
+        int sent = 0;
         int freed = 0;
         int wrongState = 0;
-        for (int sent = 0; sent < Sends;)
+        bool joined = false;
+        try
         {
-            if (table.TryAllocate(out int slot))
+            for (long round = 0; sent < Sends || Volatile.Read(ref straddles) < RequiredStraddles; round++)
             {
-                table[slot].Channel = (ushort)(sent & 0xFF);
-                table.Publish(slot);
-                ulong context = table.Contexts[slot];
-                while (!submitted.TryEnqueue(context))
-                    owner.SpinOnce(sleep1Threshold: -1);
-                sent++;
-            }
+                if ((round & 1023) == 0 && Stopwatch.GetTimestamp() >= deadline)
+                    break;
 
-            while (completed.TryDequeue(out int done))
-            {
-                if (table.GetState(done) != SendEntryState.Completed)
-                    wrongState++;
-                table.Free(done);
-                freed++;
+                bool progressed = false;
+                if (table.TryAllocate(out int slot))
+                {
+                    table[slot].Channel = (ushort)(sent & 0xFF);
+                    table.Publish(slot);
+                    ulong context = table.Contexts[slot];
+
+                    // The ring holds as many contexts as the table has slots, so it always takes this one.
+                    Assert.True(submitted.TryEnqueue(context));
+                    submission.Ring();
+                    sent++;
+                    progressed = true;
+                }
+
+                while (completed.TryDequeue(out int done))
+                {
+                    if (table.GetState(done) != SendEntryState.Completed)
+                        wrongState++;
+                    table.Free(done);
+                    freed++;
+                    progressed = true;
+                }
+
+                // Every slot is in flight: wait for the transport to complete one.
+                if (progressed)
+                    completion.Satisfied();
+                else
+                    completion.Wait();
             }
         }
+        finally
+        {
+            Volatile.Write(ref stop, true);
+            submission.Ring();
+            joined = transport.Join(HandOff.Timeout);
+            TestContext.Current.TestOutputHelper?.WriteLine(
+                $"{sent:N0} sends in {Stopwatch.GetElapsedTime(start).TotalSeconds:F1} s: {replays:N0} stale replays, {straddles:N0} of them while "
+                + $"the owner reallocated the slot; the owner waited for a completion {completion.Waits:N0} times ({completion.SpunWaits:N0} "
+                + $"ended while it spun), the transport for a submission {submission.Waits:N0} times ({submission.SpunWaits:N0}).");
+        }
 
-        transport.Join();
+        Assert.True(joined);
+        Assert.Null(failure);
         while (completed.TryDequeue(out int done))
         {
             table.Free(done);
             freed++;
         }
 
-        Assert.Equal(Sends, freed);
+        Assert.Equal(sent, freed);
         Assert.Equal(0, failedCompletions);
         Assert.Equal(0, staleWins);
         Assert.Equal(0, wrongState);
         Assert.Equal(0, table.Count);
+        Assert.True(straddles >= RequiredStraddles, $"Only {straddles:N0} replays ran while their slot was reallocated, of {RequiredStraddles:N0} required.");
     }
 }

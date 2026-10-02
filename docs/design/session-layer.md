@@ -565,11 +565,14 @@ allocated in native memory in chunks that double from 64.
     * *Decode.* `TryDecode` decodes in place (`Lz4Block.TryDecompressInPlace`) whenever the block holds the decoded size
       (`PeerCore.FitsInPlace`): every limited-staged message, and any other whose block happens to fit. The decode works
       on a span of `RawLength + GetInPlaceMargin(Length)` bytes with the compressed bytes at its end. That span is the
-      block followed by a stack buffer of at most `InPlaceTailCapacity` (2 KiB, no allocation): the last compressed bytes
-      that do not fit the block are copied there, and the rest are moved to the block's end (one memmove). The decode
-      writes towards them and refuses any write that would reach unread input; it never writes to the stack part. The
-      2 KiB covers the margin of any compressed block up to 504 KiB. A larger one needs the rest of its margin in the
-      block (`GetInPlaceLength`). The lease, the budget and the credit do not change, since the credit came back before the decode with the
+      block followed by a stack buffer of at most `InPlaceTailCapacity` (4 128 bytes, `[SkipLocalsInit]`, no allocation):
+      the last compressed bytes that do not fit the block are copied there, and the rest are moved to the block's end (one
+      memmove). The decode writes towards them and refuses any write that would reach unread input; it never writes to the
+      stack part. The buffer covers the margin of any compressed block up to 1 MiB, so of every compressed message a
+      channel carries (`Length` < `RawLength` ≤ 1 MiB); its block is the larger of `RawLength` and `Length` (review
+      RC2R2-1: a 2 KiB buffer covered only up to 504 KiB, so a 1 MiB message that compressed to more than that needed a
+      block above 1 MiB and fell into the edge band). Only a block above 1 MiB, which no channel sends, would need the
+      rest of its margin in the block (`GetInPlaceLength`). The lease, the budget and the credit do not change, since the credit came back before the decode with the
       same block it was taken with. Anything else (staged while handled, a response, an unreliable channel's, the edge
       band beyond `MaxStageLength`) gets one try at a second lease from `PeerCore.TryRentDecode` (which may take the budget
       past its limit by that buffer) and is otherwise dropped and counted, as in 0.2.1. `TryDecode` rents before it
@@ -1015,12 +1018,15 @@ The compressed staging of unread and drained reliable channels (§4.4, "Drain an
 `Lz4BlockInPlaceTests` and `CompressedStagingTests`. `Lz4BlockInPlaceTests` covers the in-place decode against the
 out-of-place one, for this library's encoder and the reference encoders. It decodes in a block of exactly the larger of
 the two lengths, with every share of the margin between the stack and the block, including decoded sizes at and just
-below every pool class size. It also checks a compressed block above 504 KiB, and garbage between canaries.
+below every pool class size and 1 MiB messages that compress to more than 504 KiB (decoded in a block of their decoded
+size). It also checks a compressed block above 1 MiB, and garbage between canaries.
 `CompressedStagingTests` covers staging, waiting, the edge band and responses. Three review suites pin the size
 classes with default options, so the in-place margin cannot move a message into a larger class again:
 `ReviewRc2R1StagingTests` (a 64 KiB message takes a 64 KiB block, and a datagram of the same frame is not refused;
 eight 16 KiB messages fit the drained half), `ReviewRc2R1ServerPoolTests` (sixteen peers on a server's default shared
-pool do not wait for each other) and `ReviewRc2R1ReconnectTests`.
+pool do not wait for each other) and `ReviewRc2R1ReconnectTests`. `ReviewRc2R2InPlaceTailTests` pins the stack buffer:
+the in-place block is the larger of the two lengths for every compressed length a channel carries, and a 1 MiB message
+about 600 KB on the wire is decoded in place in a pool whose largest block within the budget is 1 MiB.
 
 ## 7. Engine boundary and implementation waves
 

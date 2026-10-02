@@ -244,7 +244,8 @@ buffer. Decoding still runs at well over 1 GB/s, far above the 8 MiB/s `DecodedB
 
 **Margin on the stack (2026-10-02, review RC2R1-1).** With the margin in the block, a message whose decoded size is a
 pool block size (64 KiB, the default `MaxMessageSize`) needed the next class, four times larger. The decode now
-keeps the last compressed bytes that do not fit the block in a stack buffer of at most 2 KiB (`[SkipLocalsInit]`, so
+keeps the last compressed bytes that do not fit the block in a stack buffer of at most 2 KiB (4 128 bytes since
+RC2R2-1, below) (`[SkipLocalsInit]`, so
 it is not cleared). It reads the source through one compare per header byte, and splits a literal run that crosses
 into the stack part. Same probe, game-like data, pinned to one core, three runs while other sessions' stress loops
 ran, so only the order of magnitude counts:
@@ -258,3 +259,11 @@ ran, so only the order of magnitude counts:
 
 **Decision: kept.** The cost is within the noise of the shared machine, and decoding stays well above 1 GB/s. The
 block it saves is a whole size class.
+
+**Stack buffer sized for 1 MiB (2026-10-02, review RC2R2-1).** 2 KiB covered the margin only up to a compressed length
+of 504 KiB, so a 1 MiB message that compressed to more than that needed a block above 1 MiB. `InPlaceTailCapacity` is
+now the margin of a 1 MiB compressed block (4 128 bytes, still `[SkipLocalsInit]`, one more stack page to probe). Same
+probe, same conditions (core 3, three runs, other sessions' loops running), last column only: 1 KiB 764–980 ns, 16 KiB
+11.2–18.2 µs, 64 KiB 45–51 µs, 200 000 B 150–166 µs in two runs and 365 µs in
+one (an outlier: in these runs the margin-in-block column, which this change does not touch, reached 281 µs at that
+size). Within the noise of the 2 KiB buffer's numbers above.

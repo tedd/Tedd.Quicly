@@ -362,17 +362,20 @@ public class CompressedStagingTests
     }
 
     /// <summary>
-    /// The edge band: a decoded size whose block and margin do not fit the largest block within the budget (a channel whose
-    /// MaxMessageSize is raised to 1 MiB, a message of 255.98 KiB) is staged at its wire length and decoded into a second
-    /// buffer when one is free; with the class held by the application it is dropped and counted, never waited for.
+    /// A decoded size up to the largest block within the budget is staged in that block, however close to its size
+    /// (review RC2R1-1: the in-place margin is kept on the decoder's stack and no longer pushes it into the edge band).
+    /// While the application holds that block the message's start waits for it and holds nothing. It is never dropped,
+    /// and it arrives, in order, once the block is back.
     /// </summary>
     [Fact]
-    public void The_Edge_Band_Is_Decoded_When_A_Buffer_Is_Free_And_Dropped_Never_Stalled_When_None_Is()
+    public void A_Decoded_Size_Of_The_Largest_Block_Is_Staged_In_It_And_Waits_For_It_Never_Dropped()
     {
-        const int Raw = 262_130;
+        const int Raw = 262_144;
         using SessionHarness h = new(table: Table, client: Client, server: GroupKit.Prompt);
         QuiclyPeer server = h.Server!;
-        Assert.True(server.Core.LimitedStagingLength(1_100, Raw) == 1_100, "the message is not in the edge band");
+        Assert.Equal(262_144, server.Core.MaxStageLength);
+        Assert.Equal(Raw, server.Core.LimitedStagingLength(1_100, Raw));
+        Assert.Equal(Raw - 14, server.Core.LimitedStagingLength(1_100, Raw - 14)); // in the edge band at 8f6c47c
         Dictionary<int, byte[]> sent = new();
         List<int> got = [];
         MarkDrained(h, Huge);
@@ -386,23 +389,71 @@ public class CompressedStagingTests
         Assert.Equal(0, DatagramKit.Statistics(server).DecodeFailures);
 
         Assert.True(server.Core.Allocator.TryRent(262_144, out BufferLease held));
+        bool returned = false;
         try
         {
-            Send(h.Client, Huge, sent, 1, Payload(1, Raw, 1_000));
+            Send(h.Client, Huge, sent, 1, Payload(1, Raw - 14, 1_000));
             Send(h.Client, Huge, sent, 2, BitConverter.GetBytes(2));
+            h.Run(200_000);
+            DrainAll(server, Huge, got, sent);
+            Assert.Equal([0], got);
+
+            server.Core.Allocator.Return(in held);
+            returned = true;
             Assert.True(h.RunUntil(() =>
             {
                 DrainAll(server, Huge, got, sent);
                 return got.Contains(2);
             }), $"the channel gave [{string.Join(",", got)}]");
-            Assert.Equal([0, 2], got);
-            Assert.Equal(1, DatagramKit.Statistics(server).DecodeFailures);
+            Assert.Equal([0, 1, 2], got);
+            Assert.Equal(0, DatagramKit.Statistics(server).DecodeFailures);
         }
         finally
         {
-            server.Core.Allocator.Return(in held);
+            if (!returned)
+            {
+                server.Core.Allocator.Return(in held);
+            }
         }
 
+        Assert.Equal(0, server.Core.ReceiveBytesOutstanding);
+    }
+
+    /// <summary>
+    /// The edge band: a decoded size larger than the largest block within the budget (a channel whose MaxMessageSize is
+    /// raised to 1 MiB, a message of 300 000 bytes) is staged at its wire length. It has no block to decode into, so it is
+    /// dropped and counted as in 0.2.1, and the message behind it arrives: never stalled.
+    /// </summary>
+    [Fact]
+    public void The_Edge_Band_Is_Dropped_And_Counted_Never_Stalled()
+    {
+        const int Raw = 300_000;
+
+        // The sender's pool has a 512 KiB class, so it can send what the receiver's pool cannot decode.
+        using SessionHarness h = new(table: Table, client: o =>
+        {
+            Client(o);
+            o.AllocatorOptions = new SlabAllocatorOptions
+            {
+                FreeListShards = 2,
+                SizeClasses = [.. o.AllocatorOptions!.SizeClasses!, new SizeClassDefinition(524_288, 2)],
+            };
+        }, server: GroupKit.Prompt);
+        QuiclyPeer server = h.Server!;
+        Assert.True(server.Core.LimitedStagingLength(1_100, Raw) == 1_100, "the message is not in the edge band");
+        Dictionary<int, byte[]> sent = new();
+        List<int> got = [];
+        MarkDrained(h, Huge);
+
+        Send(h.Client, Huge, sent, 0, Payload(0, Raw, 1_000));
+        Send(h.Client, Huge, sent, 1, BitConverter.GetBytes(1));
+        Assert.True(h.RunUntil(() =>
+        {
+            DrainAll(server, Huge, got, sent);
+            return got.Contains(1);
+        }), $"the channel gave [{string.Join(",", got)}]");
+        Assert.Equal([1], got);
+        Assert.Equal(1, DatagramKit.Statistics(server).DecodeFailures);
         Assert.Equal(0, server.Core.ReceiveBytesOutstanding);
     }
 

@@ -816,10 +816,11 @@ public sealed unsafe partial class QuiclyPeer
     /// </summary>
     /// <remarks>
     /// <para>
-    /// A message whose block holds its decoded size and the in-place margin (<see cref="PeerCore.FitsInPlace"/>) is decoded
-    /// in place (<see cref="Lz4Block.TryDecompressInPlace"/>): it keeps its lease, and so the receive budget and its
-    /// channel's credit, which were counted with that block, do not change. That is every compressed message of a reliable
-    /// channel no handler reads (<see cref="PeerCore.LimitedStagingLength"/>), and any other whose block happens to fit.
+    /// A message whose block holds its decoded size (<see cref="PeerCore.FitsInPlace"/>; the in-place margin is kept on the
+    /// decoder's stack) is decoded in place (<see cref="Lz4Block.TryDecompressInPlace"/>). It keeps its lease, so the
+    /// receive budget and its channel's credit, which were counted with that block, do not change. That is every compressed
+    /// message of a reliable channel no handler reads whose decoded size fits <see cref="PeerCore.MaxStageLength"/>
+    /// (<see cref="PeerCore.LimitedStagingLength"/>), and any other whose block happens to fit.
     /// </para>
     /// <para>
     /// Any other message is decoded into a second buffer, tried once (<see cref="PeerCore.TryRentDecode"/>, which may take the

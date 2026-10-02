@@ -843,9 +843,10 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <summary>
     /// The staging length of a message of a reliable stream channel that is limited when the transport thread takes it — no
     /// handler reads the channel (<see cref="ReceiveCredit.TryTake"/> answered <see cref="CreditTake.Limited"/>): for a
-    /// compressed message, its decoded length plus the room an in-place decode needs
-    /// (<see cref="Lz4Block.GetInPlaceMargin"/>), so that its decode needs no second buffer and can never wait for one
-    /// (transport thread). A message whose decoded footprint does not fit <see cref="MaxStageLength"/> — the edge band — and
+    /// compressed message, the block an in-place decode needs (<see cref="Lz4Block.GetInPlaceLength"/>: its decoded length,
+    /// or its wire length if larger; the decode keeps the in-place margin on the stack, so the margin never moves the
+    /// message into a larger size class), so that its decode needs no second buffer and can never wait for one
+    /// (transport thread). A message whose decoded size does not fit <see cref="MaxStageLength"/> (the edge band) and
     /// an uncompressed one are staged at their wire length.
     /// </summary>
     /// <remarks>
@@ -866,7 +867,7 @@ internal sealed unsafe class PeerCore : IDisposable
         }
 
         // In long: RawLength is the peer's, bounded by MaxMessageSize at parse but not trusted to be small here.
-        long need = Math.Max(length, (long)rawLength + Lz4Block.GetInPlaceMargin(length));
+        long need = Lz4Block.GetInPlaceLength(length, rawLength);
         return need <= MaxStageLength ? (int)need : length;
     }
 
@@ -876,7 +877,7 @@ internal sealed unsafe class PeerCore : IDisposable
     /// <param name="rawLength">The decoded length.</param>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool FitsInPlace(int blockLength, int length, int rawLength) =>
-        length <= blockLength && rawLength <= blockLength - Lz4Block.GetInPlaceMargin(length);
+        length > 0 && rawLength > 0 && Lz4Block.GetInPlaceLength(length, rawLength) <= blockLength;
 
     // ------------------------------------------------------------------ construction
 
@@ -1311,8 +1312,10 @@ internal sealed unsafe class PeerCore : IDisposable
     /// Rents a second buffer for a compressed message that cannot be decoded in place in its own block (game thread): one
     /// staged at its wire length — while its channel had a handler, a response, a message of an unreliable channel, a
     /// mailbox or ReliableLatest value, or one whose decoded size does not fit <see cref="MaxStageLength"/> — whose block
-    /// does not hold its decoded size and margin (<see cref="FitsInPlace"/>). A compressed message of a reliable channel
-    /// that no handler reads is staged in a block that does, and never gets here.
+    /// does not hold its decoded size (<see cref="FitsInPlace"/>). A compressed message of a reliable channel that no
+    /// handler reads is staged in a block that does, and gets here only when its decoded size does not fit
+    /// <see cref="MaxStageLength"/>; it then gets no buffer here either, since every block that holds it is larger than
+    /// the budget.
     /// </summary>
     /// <remarks>
     /// Unlike <see cref="TryRentReceive"/> it may take the receive budget past its limit, by this one buffer: it succeeds

@@ -1,5 +1,6 @@
 using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Session;
+using Tedd.Quicly.Core.Tests.Threading;
 using Tedd.Quicly.Testing.Simulation;
 
 namespace Tedd.Quicly.Core.Tests.Session;
@@ -168,6 +169,11 @@ public class OrderedZeroAllocationTests
         Assert.True(received > 1_000 * 8);
     }
 
+    /// <remarks>
+    /// The game thread and the producer take turns through <see cref="HandOff"/>, which allocates nothing: each spins for a
+    /// while and then blocks until the other hands over, so that on a machine with no core to spare a turn costs a thread
+    /// wake-up rather than the scheduler quanta a semaphore's yielding spin loses (which made the run take a minute).
+    /// </remarks>
     [Fact]
     public void Admitting_Sends_Queued_By_Another_Thread_Does_Not_Allocate_On_The_Game_Thread()
     {
@@ -178,26 +184,30 @@ public class OrderedZeroAllocationTests
         long received = 0;
         server.RegisterHandler(4, (QuiclyPeer _, in ReceiveHeader _, ReadOnlySpan<byte> _) => received++);
         client.Poll();
-        using SemaphoreSlim go = new(0);
-        using SemaphoreSlim done = new(0);
-        bool stop = false;
+        const long Go = 1;
+        const long Stop = 2;
+        using HandOff go = new();
+        using HandOff done = new();
+        Exception? failure = null;
         Thread producer = new(() =>
         {
             byte[] payload = new byte[64];
-            while (true)
+            try
             {
-                go.Wait();
-                if (Volatile.Read(ref stop))
+                while (go.Take() != Stop)
                 {
-                    return;
-                }
+                    for (int i = 0; i < 10; i++)
+                    {
+                        client.SendCopy(new SendHeader(4), payload);
+                    }
 
-                for (int i = 0; i < 10; i++)
-                {
-                    client.SendCopy(new SendHeader(4), payload);
+                    done.Put(1);
                 }
-
-                done.Release();
+            }
+            catch (Exception e)
+            {
+                failure = e;
+                done.Put(1);
             }
         })
         {
@@ -206,8 +216,13 @@ public class OrderedZeroAllocationTests
         producer.Start();
         void Tick()
         {
-            go.Release();
-            done.Wait();
+            go.Put(Go);
+            done.Take();
+            if (failure is not null)
+            {
+                Assert.Fail($"The producer failed: {failure}");
+            }
+
             client.Flush();
             network.Advance(1_000);
             server.Poll();
@@ -226,8 +241,7 @@ public class OrderedZeroAllocationTests
                 Tick();
             }
         });
-        Volatile.Write(ref stop, true);
-        go.Release();
+        go.Put(Stop);
         Assert.True(producer.Join(TimeSpan.FromSeconds(10)));
         Assert.True(received > 1_000 * 10);
     }

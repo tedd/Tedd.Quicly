@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Tedd.Quicly.Core.Channels;
+using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Core.Threading;
 using Tedd.Quicly.Core.Transport;
@@ -40,15 +41,19 @@ public class ReliableCreditMsQuicTests
         private readonly MsQuicTransportHarness _harness = new();
         private QuiclyPeer? _server;
 
-        public Pair(ushort clientPeerUnidiStreams = 0)
+        public Pair(ushort clientPeerUnidiStreams = 0, ChannelTable? table = null, Action<PeerOptions>? client = null, Action<PeerOptions>? server = null)
         {
             PeerOptions serverOptions = new() { GroupMinInterval = TimeSpan.Zero };
+            server?.Invoke(serverOptions);
+            ChannelTable channels = table ?? Table;
+            PeerOptions clientOptions = new();
+            client?.Invoke(clientOptions);
             AcceptAll admission = new();
             MsQuicTransportListener listener = _harness.StartListener(new MsQuicTransportOptions(), static (in NewConnectionInfo _) => PreHandshakeDecision.Accept,
                 (ITransport transport, in NewConnectionInfo info) =>
                 {
                     _harness.Track((MsQuicTransport)transport);
-                    QuiclyPeer peer = QuiclyPeer.CreateServerPeer(transport, in info, Table, serverOptions, admission);
+                    QuiclyPeer peer = QuiclyPeer.CreateServerPeer(transport, in info, channels, serverOptions, admission);
                     Volatile.Write(ref _server, peer);
                     return peer.TransportSink;
                 });
@@ -58,7 +63,7 @@ public class ReliableCreditMsQuicTests
                 PinnedSpkiSha256 = [_harness.Pin],
                 ClientPeerUnidiStreamCount = clientPeerUnidiStreams,
             };
-            Client = QuiclyPeer.Connect(new TrackingConnector(_harness, _harness.CreateConnector(clientTransport)), listener.LocalEndPoint, "localhost", Table, new PeerOptions());
+            Client = QuiclyPeer.Connect(new TrackingConnector(_harness, _harness.CreateConnector(clientTransport)), listener.LocalEndPoint, "localhost", channels, clientOptions);
             Assert.True(Pump(() => Client.State == PeerState.Connected && Volatile.Read(ref _server)?.State == PeerState.Connected, 10_000), "the handshake did not complete");
         }
 
@@ -310,5 +315,141 @@ public class ReliableCreditMsQuicTests
         // A frame's burst is far above the share of an unread channel (170 messages here: half of the 1 024 queue nodes,
         // among three reliable channels), and nothing was held for it.
         Assert.Equal(before, Channel(client, 10).BacklogHolds);
+    }
+
+    /// <summary>2 unordered datagrams · 4 ordered · 6 ordered, LZ4, messages up to 256 KiB.</summary>
+    private static readonly ChannelTable Packed = ChannelTable.Create()
+        .Add(2, "a", ChannelMode.UnreliableUnordered)
+        .Add(4, "chat", ChannelMode.ReliableOrdered)
+        .Add(6, "packed", ChannelMode.ReliableOrdered, o => { o.Compression = ChannelCompression.Lz4; o.MinCompressSize = 16; o.MaxMessageSize = 256 * 1024; })
+        .Build();
+
+    /// <summary>200 000 bytes whose first 100 000 LZ4 cannot shrink: about 100 KB compressed, 200 000 decoded.</summary>
+    private static byte[] Large(int index)
+    {
+        byte[] payload = new byte[200_000];
+        new Random(index + 1).NextBytes(payload.AsSpan(0, 100_000));
+        BitConverter.TryWriteBytes(payload, index);
+        return payload;
+    }
+
+    /// <summary>
+    /// RC2-1 over real MsQuic: two receiving peers on one shared pool with two blocks of 256 KiB, each drained from its own
+    /// thread, each receiving large compressed messages. Each message is staged in a 256 KiB block of its decoded size and
+    /// decoded in place; a start that finds no block holds nothing, so neither peer waits for the other's block for good,
+    /// every message arrives intact and in order, and every block is back when both are done.
+    /// </summary>
+    [Fact]
+    public void Two_Peers_On_One_Shared_Pool_Drained_From_Two_Threads_Both_Get_Every_Large_Compressed_Message()
+    {
+        if (!MsQuicApi.TryGetInstance(out _, out _))
+        {
+            Assert.Skip("MsQuic is not available on this host.");
+        }
+
+        const int Count = 6;
+        SizeClassDefinition[] classes =
+            [new(64, 4096), new(256, 1024), new(1536, 192), new(4096, 64), new(16384, 16), new(65536, 4), new(262144, 2)];
+        using SlabAllocator shared = new(new SlabAllocatorOptions { FreeListShards = 2, SizeClasses = classes });
+        void Roomy(PeerOptions o)
+        {
+            o.SendBudgetBytes = 4 * 1024 * 1024;
+            o.AllocatorOptions = new SlabAllocatorOptions
+            {
+                FreeListShards = 2,
+                SizeClasses = [new(64, 4096), new(256, 1024), new(1536, 256), new(4096, 64), new(16384, 64), new(65536, 16), new(262144, 4)],
+            };
+        }
+
+        Pair first = new(table: Packed, client: o => o.Allocator = shared, server: Roomy);
+        Pair second = new(table: Packed, client: o => o.Allocator = shared, server: Roomy);
+        try
+        {
+            List<int>[] got = [[], []];
+            string?[] failures = new string?[2];
+            Thread[] threads = new Thread[2];
+            Pair[] pairs = [first, second];
+            for (int p = 0; p < 2; p++)
+            {
+                int index = p;
+                threads[p] = new Thread(() =>
+                {
+                    try
+                    {
+                        Pair pair = pairs[index];
+                        QuiclyPeer client = pair.Client;
+                        ReceivedMessage[] buffer = new ReceivedMessage[4];
+                        client.Poll();
+                        Assert.Equal(0, client.Drain(6, buffer)); // the application drains the channel from the start
+                        int sent = 0;
+                        Stopwatch watch = Stopwatch.StartNew();
+                        while (got[index].Count < Count + 1 && watch.ElapsedMilliseconds < 60_000)
+                        {
+                            if (sent < Count && pair.Server.SendCopy(new SendHeader(6), Large((index * 100) + sent)).IsAdmitted)
+                            {
+                                sent++;
+                            }
+                            else if (sent == Count && pair.Server.SendCopy(new SendHeader(6), BitConverter.GetBytes((index * 100) + Count)).IsAdmitted)
+                            {
+                                sent++;
+                            }
+
+                            pair.Server.Poll();
+                            pair.Server.Flush();
+                            client.Poll();
+                            int taken;
+                            while ((taken = client.Drain(6, buffer)) > 0)
+                            {
+                                for (int i = 0; i < taken; i++)
+                                {
+                                    int number = BitConverter.ToInt32(buffer[i].Payload);
+                                    got[index].Add(number);
+                                    if (number % 100 < Count && !buffer[i].Payload.SequenceEqual(Large(number)))
+                                    {
+                                        failures[index] = $"message {number} is not the payload that was sent";
+                                    }
+                                }
+
+                                client.Release(buffer.AsSpan(0, taken));
+                            }
+
+                            client.Flush();
+                            Thread.Sleep(1);
+                        }
+                    }
+                    catch (Exception exception)
+                    {
+                        failures[index] = exception.ToString();
+                    }
+                })
+                { IsBackground = true, Name = "receiver-" + p };
+                threads[p].Start();
+            }
+
+            foreach (Thread thread in threads)
+            {
+                Assert.True(thread.Join(90_000), "a receiver thread did not finish");
+            }
+
+            for (int p = 0; p < 2; p++)
+            {
+                Assert.Null(failures[p]);
+                Assert.Equal(Enumerable.Range(p * 100, Count + 1), got[p]);
+                pairs[p].Client.GetStatistics(out PeerStatistics statistics);
+                Assert.Equal(0, statistics.DecodeFailures);
+                Assert.Equal(0, statistics.ReceiveBytesOutstanding);
+            }
+        }
+        finally
+        {
+            first.Dispose();
+            second.Dispose();
+        }
+
+        SlabStatistics pool = shared.GetStatistics();
+        for (int i = 0; i < pool.ClassCount; i++)
+        {
+            Assert.Equal(0, pool[i].Rented);
+        }
     }
 }

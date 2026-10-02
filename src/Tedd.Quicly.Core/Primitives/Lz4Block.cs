@@ -472,9 +472,12 @@ public static class Lz4Block
 
     /// <summary>
     /// The most source bytes <see cref="TryDecompressInPlace"/> keeps outside the block, in a stack buffer, while it decodes
-    /// (<see cref="GetInPlaceLength"/>). It covers the whole margin of a compressed block of up to 504 KiB.
+    /// (<see cref="GetInPlaceLength"/>): the margin of a compressed block of 1 MiB (4 128 bytes). It covers the whole margin
+    /// of every compressed message a channel can carry (<see cref="Channels.ChannelDefinition.ReliableMaxMessageSize"/>; the
+    /// wire length of a compressed message is below its <c>RawLength</c>, PROTOCOL.md §2.1), so a receiver's in-place block
+    /// is never larger than the decoded or the wire length (review RC2R2-1: a 2 KiB buffer covered only up to 504 KiB).
     /// </summary>
-    internal const int InPlaceTailCapacity = 2048;
+    internal const int InPlaceTailCapacity = (Channels.ChannelDefinition.ReliableMaxMessageSize >> 8) + 32;
 
     /// <summary>
     /// The room an in-place decode needs beyond the decoded length when the whole compressed block sits in the buffer
@@ -492,8 +495,9 @@ public static class Lz4Block
     /// <summary>
     /// The smallest block <see cref="TryDecompressInPlace"/> decodes a compressed block of
     /// <paramref name="compressedLength"/> bytes in, to <paramref name="rawLength"/> bytes. It is the larger of the two
-    /// lengths whenever the margin fits <see cref="InPlaceTailCapacity"/> (any compressed block of up to 504 KiB), so the
-    /// margin never moves a message into a larger pool block than its decoded size needs.
+    /// lengths whenever the margin fits <see cref="InPlaceTailCapacity"/> (any compressed block of up to 1 MiB, so every
+    /// compressed message a channel carries), so the margin never moves a message into a larger pool block than its
+    /// decoded size needs. Only a larger block keeps the rest of its margin in the block.
     /// </summary>
     /// <param name="compressedLength">The compressed length (positive).</param>
     /// <param name="rawLength">The decoded length (positive).</param>

@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using K4os.Compression.LZ4;
+using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Primitives;
 
 namespace Tedd.Quicly.Core.Tests.Primitives;
@@ -22,7 +23,7 @@ public unsafe class Lz4BlockInPlaceTests
 
     /// <summary>
     /// The staging block a message gets: room for the compressed bytes and the decoded ones. The margin lives on the decoder's
-    /// stack, unless the compressed block is larger than 504 KiB.
+    /// stack, unless the compressed block is larger than 1 MiB (more than any channel carries).
     /// </summary>
     private static int BlockFor(int compressed, int raw) => checked((int)Lz4Block.GetInPlaceLength(compressed, raw));
 
@@ -43,7 +44,7 @@ public unsafe class Lz4BlockInPlaceTests
         Assert.Equal(input, reference);
 
         int block = BlockFor(compressed.Length, input.Length);
-        if (compressed.Length <= 504 * 1024)
+        if (compressed.Length <= ChannelDefinition.ReliableMaxMessageSize)
         {
             Assert.Equal(Math.Max(compressed.Length, input.Length), block); // the margin never grows the block
         }
@@ -195,7 +196,29 @@ public unsafe class Lz4BlockInPlaceTests
     }
 
     [Fact]
-    public void A_Compressed_Block_Above_504_KiB_Keeps_The_Rest_Of_Its_Margin_In_The_Block()
+    public void Decodes_The_Largest_Messages_A_Channel_Carries_In_A_Block_Of_Their_Decoded_Size()
+    {
+        // Review RC2R2-1: a 2 KiB stack buffer covered the margin only up to a compressed length of 504 KiB, so a 1 MiB
+        // message that compressed to more than that needed a block larger than 1 MiB. The stack buffer now holds the margin
+        // of any compressed length a channel can carry (the wire length is below RawLength, which is at most 1 MiB).
+        int max = ChannelDefinition.ReliableMaxMessageSize;
+        Assert.Equal(Lz4Block.GetInPlaceMargin(max), Lz4Block.InPlaceTailCapacity);
+        foreach (int raw in new[] { max, max - 1, max - 4128, 600_000 })
+        {
+            foreach (int noise in new[] { 540_000, raw - 8192, raw - 6000 })
+            {
+                byte[] input = new byte[raw];
+                new Random(raw ^ noise).NextBytes(input.AsSpan(0, noise));
+                byte[] compressed = Compress(input);
+                Assert.InRange(compressed.Length, (504 * 1024) + 1, raw - 1);
+                Assert.Equal(raw, BlockFor(compressed.Length, raw));
+                AssertDecodesInPlace(input, compressed, $"raw {raw} noise {noise} C {compressed.Length}");
+            }
+        }
+    }
+
+    [Fact]
+    public void A_Compressed_Block_Above_1_MiB_Keeps_The_Rest_Of_Its_Margin_In_The_Block()
     {
         // The stack holds InPlaceTailCapacity bytes of the margin; a larger margin needs the rest of it in the block.
         byte[] input = Mixed(3 * 1024 * 1024, 11);

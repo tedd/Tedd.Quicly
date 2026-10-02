@@ -346,9 +346,15 @@ public class GroupEngineTests
         // One byte does fit, and the reset that follows gives the staging lease and the reservation back.
         chunk.Chunk = [1];
         Assert.Equal(StreamConsumeAction.Continue, engine.OnStreamMessage(ref chunk).Action);
-        engine.OnStreamClosed(stream, aborted: true, (ulong)QuiclyErrorCode.ProtocolViolation);
+        // A peer stream's close names its record (the cookie). A cookie that does not is not trusted: the record is found by
+        // the stream's id, and a close for a stream the engine does not hold releases nothing.
+        engine.OnPeerStreamClosed(new TransportStreamId(78, 3), record, aborted: true, 5);
+        Assert.Equal(1, GroupKit.OpenPeerGroups(h.Client, 5));
+        engine.OnPeerStreamClosed(stream, record + 100_000, aborted: true, (ulong)QuiclyErrorCode.ProtocolViolation);
         Assert.Equal(0, GroupKit.OpenPeerGroups(h.Client, 5));
         Assert.Equal(0, DatagramKit.Statistics(h.Client).ReceiveBytesOutstanding);
+        engine.OnPeerStreamClosed(stream, record, aborted: true, (ulong)QuiclyErrorCode.ProtocolViolation);
+        Assert.Equal(0, GroupKit.OpenPeerGroups(h.Client, 5));
 
         // Neither an invalid stream id nor one this engine never opened matches anything.
         engine.OnStreamClosed(default, aborted: false, 0);

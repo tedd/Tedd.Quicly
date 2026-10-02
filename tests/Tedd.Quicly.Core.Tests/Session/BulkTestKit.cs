@@ -436,6 +436,13 @@ internal sealed unsafe class BulkRefusalTransport(ITransport inner, ITransportSi
 
     public int FailedStarts { get; private set; }
 
+    /// <summary>Inject the sole credit grant before a refused start returns.</summary>
+    public bool GrantCreditOnFailedStart { get; set; }
+
+    public int InjectedCreditGrants { get; private set; }
+
+    public int BulkStartAttempts { get; private set; }
+
     /// <summary>Report all-zero statistics — no congestion window, no RTT — like a transport that measures nothing.</summary>
     public bool ReportNoStatistics { get; set; }
 
@@ -489,12 +496,21 @@ internal sealed unsafe class BulkRefusalTransport(ITransport inner, ITransportSi
 
     public TransportStatus SendStream(TransportStreamId id, TransportSegment* segments, int count, ulong context, TransportSendFlags flags)
     {
-        if (FailStarts > 0 && (flags & TransportSendFlags.Start) != 0
+        if ((flags & TransportSendFlags.Start) != 0
             && _openContexts.TryGetValue(id, out ulong open) && IsBulk(open))
         {
-            FailStarts--;
-            FailedStarts++;
-            return StartStatus;
+            BulkStartAttempts++;
+            if (FailStarts > 0)
+            {
+                FailStarts--;
+                FailedStarts++;
+                if (GrantCreditOnFailedStart)
+                {
+                    InjectedCreditGrants++;
+                    GrantCredit();
+                }
+                return StartStatus;
+            }
         }
 
         return inner.SendStream(id, segments, count, context, flags);

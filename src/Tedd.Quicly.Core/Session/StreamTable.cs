@@ -49,6 +49,13 @@ internal struct StreamRecord
     public long Cookie;
 
     /// <summary>
+    /// The stream's receive is held back for its channel's credit (<see cref="ReceiveCredit"/>): set when the engine answers
+    /// <see cref="Engines.StreamConsume.PendCredit"/>, cleared by the stream's next receive. A stream that ends with it set
+    /// is reported to the credit, which would otherwise keep a turn for it (<see cref="ReceiveCredit.NoteGone"/>).
+    /// </summary>
+    public bool WaitsForCredit;
+
+    /// <summary>
     /// Clock micros of the last progress on a message this end is receiving, or 0 while no message is in flight
     /// (PROTOCOL.md §7 "stream idle mid-message"). The transport thread arms it when a message starts, refreshes it on
     /// every accepted event and clears it when the message ends or the stream is given up; the game thread reads it in

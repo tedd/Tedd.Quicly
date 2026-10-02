@@ -21,6 +21,33 @@
   Decompression runs on the game thread with a per-peer decoded-bytes budget.
 * **Remote-chosen identifiers are capped and have an eviction rule** (keys, groups, streams, reassemblies,
   transfers, requests); the rule is written per limit in PROTOCOL §7, and every violation is a counter.
+  The cap on a `ReliableUnordered` channel's group streams is the connection's unidirectional stream limit, not
+  the channel's `MaxGroups` (amended 2026-09-30). `MaxGroups` was enforced by the receiver with a reset, on the
+  belief that both ends free a stream's slot at the same event. They do not: a stream is over for its sender
+  when its data and FIN are acknowledged, and the receiver holds it open until it has read it, so a receiver
+  that was behind reset streams of a sender that had kept the limit — after the sender had completed their
+  messages `Delivered`. The bound is what the transport admits, and a slot returns only when the receiver has
+  closed a stream: the limit the session asks for after admission (Σ max(`MaxGroups`, 1) over the stream
+  channels, at most 4 096), or the transport's own initial grant when that is more
+  (`TransportCapabilities.PeerUnidirectionalStreams`; an MsQuic client grants 1 024 in its transport parameters
+  by default, and QUIC never takes granted credit back). The session keeps its per-stream receive state for the
+  larger of the two (`PeerCore.PeerStreamCapacity`): one 64-byte record of the group engine and 8 bytes of the
+  pended-stream ring per stream. **Both numbers are this end's own configuration — its channel table and its
+  transport options — so a peer cannot make the state larger than the host chose.** On a server peer the grant is
+  0 and the state is the table's sum: 0.6 KiB of records for one group channel and one ordered channel. On a
+  client peer at the default grant it is 64 KiB of records and a 16 KiB ring; at the most the option allows
+  (65 535) it would be 4 MiB and 1 MiB. The transport's stream table follows the same two numbers: it is
+  `MaxStreams` slots (default 2 048) or as many as the grants need next to a quarter for this end's own streams,
+  so a stream the peer was allowed to open always finds a slot, and the local streams cannot take the slots of
+  the granted ones; slots are created as streams use them, and the WebTransport carrier's mirror of the table
+  grows the same way (slot records on first use, preamble storage in chunks of 256 slots). A peer that
+  opens every stream it may on a single channel holds one half-received message per stream — a ring reservation
+  and a staging lease, the lease inside the receive byte budget. That is more than the per-channel cap allowed
+  it on that one channel, and the same total it could always hold across the group and ordered channels; the
+  shares of ReliableLatest and Bulk channels, whose receive paths reserve no ring slot, are now usable for it
+  too. The stream idle rule still resets the streams it leaves unfinished, the records are per connection, so
+  it takes none from another peer or another channel, and what it does take is the stream slots of its own
+  other channels.
 * **A channel the application does not read is bounded per class** (PROTOCOL §7 "Channels nobody drains", added
   2026-09-30). A peer chooses which channels it sends on, so it must not be able to stall a receiver through a
   channel the application happens not to drain. What unreliable ring channels still have queued when a Poll begins,
@@ -36,9 +63,24 @@
   unread channels could take turns at closing the ring. A peer can therefore close the ring through the unread
   unreliable channels of a table for one Poll interval per channel in total (two for a channel the application
   stopped draining, and at the start of a session, whose first Poll counts as drained), not longer, and pin more
-  than the quarter of the budget for as long, not longer. Reliable channels cannot be evicted; an undrained one
-  still back-pressures the whole ring (a known limit, to be confined to its own streams by per-channel receive
-  credit), so a host must handle or drain every reliable channel in its table.
+  than the quarter of the budget for as long, not longer. Reliable channels cannot be evicted, so they are bounded
+  where a message is accepted: a per-channel **receive credit**, checked on the transport thread before a message
+  takes a ring entry and a buffer. A reliable channel nobody reads may have its reserved share of the queue pool
+  and the same part of a quarter of the byte budget waiting; past that the receiver stops consuming that channel's
+  streams and QUIC flow control holds their sender — the peer that floods the channel is the one that waits. The
+  ring, the other channels and the host's work probe are untouched, for any number of unread reliable channels:
+  together they can pin half the queue pool and a quarter of the budget — the byte share is strict, a message
+  whose buffer block does not fit in it is not started — which leaves the other half of each to the traffic that
+  is read. A channel with a handler is not held to the share (the ring and the budget bound it, as before). A
+  channel the application drains every frame is bounded by the ring and by half the budget, because it keeps what
+  it accepted when the application stops draining it and falls back to the share (within two Poll intervals): the
+  peer chooses the burst, the application chooses when it stops, and half the budget is what one such channel can
+  then hold. The list of held-back streams is bounded too: a peer that resets held streams and opens new ones
+  leaves an entry per stream until the receiver's next Poll; the list grows to eight times the streams the peer may
+  have open and then the connection is closed (`LimitExceeded`). What an attacker keeps is what QUIC gives it
+  anyway: it can stall its own streams, fill the stream slots of the connection that those streams occupy, and
+  fill the connection's flow-control window with data nobody reads (16 MiB with the MsQuic defaults), which stops
+  its own other streams — not another connection's.
 * **Retransmission cannot be weaponised**: ReliableLatest has per-version and per-peer retry budgets;
   acks are coalesced per key (the highest accepted version); Pong is rate-limited; control message rate is capped.
 * **Sequence numbers give the peer nothing it did not have** (PROTOCOL §8 "sequence clock"). Only the

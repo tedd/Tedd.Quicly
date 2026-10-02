@@ -208,6 +208,7 @@ public sealed unsafe partial class QuiclyPeer
         // The new transport will call back again, so the old close must not let Dispose free the native memory early.
         Interlocked.And(ref _lifetime, ~LifetimeClosedSeen);
         _core.ResetForReconnect();
+        ResetCreditLimitsForReconnect();
 
         _signals = 0;
         _helloBody = null;

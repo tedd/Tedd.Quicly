@@ -27,8 +27,10 @@ namespace Tedd.Quicly.Transport.MsQuic;
 /// <c>OUT_OF_MEMORY</c> is <see cref="TransportStatus.OutOfMemory"/>; <c>STREAM_LIMIT_REACHED</c> is
 /// <see cref="TransportStatus.StreamLimitReached"/>; <c>NOT_SUPPORTED</c> is <see cref="TransportStatus.NotSupported"/>;
 /// anything else is <see cref="TransportStatus.Failed"/>.</para>
-/// <para><b>Streams.</b> Streams live in a generation-tagged table of at most <see cref="MsQuicTransportOptions.MaxStreams"/>
-/// slots (grown on demand, slots reused). A local stream is started by <see cref="StartStream"/> or by the first send
+/// <para><b>Streams.</b> Streams live in a generation-tagged table of <see cref="MsQuicTransportOptions.MaxStreams"/>
+/// slots (grown on demand, slots reused), or more when the streams the peer was granted need more room: a peer stream is
+/// never refused for want of a slot, and a quarter of the table is this end's own
+/// (<see cref="MsQuicTransportOptions.StreamTableFor"/>). A local stream is started by <see cref="StartStream"/> or by the first send
 /// carrying <see cref="TransportSendFlags.Start"/>, with <c>FAIL_BLOCKED | SHUTDOWN_ON_FAIL</c>. MsQuic queues the start,
 /// so a start the peer's stream limit refuses is reported asynchronously: <see cref="ITransportSink.OnStreamStarted"/> with
 /// <see cref="TransportStatus.StreamLimitReached"/>, a canceled completion for every send accepted with the start, then
@@ -131,8 +133,13 @@ public sealed unsafe partial class MsQuicTransport : ITransport, IMsQuicConnecti
     private TransportConnectedInfo _connectedInfo;
     private MsQuicTransportListener.ConfigurationEntry? _configurationLease;
 
-    internal MsQuicTransport(MsQuicConnection connection, ITransportSink? sink, MsQuicTransportOptions options, ServerCertificatePolicy? certificatePolicy, string? serverName)
+    /// <summary>Unidirectional streams the connection's settings grant the peer before <see cref="UpdatePeerStreamLimits"/> (<see cref="TransportCapabilities.PeerUnidirectionalStreams"/>).</summary>
+    private readonly int _initialPeerUnidiStreams;
+    private int _streamTableRaised;
+
+    internal MsQuicTransport(MsQuicConnection connection, ITransportSink? sink, MsQuicTransportOptions options, ServerCertificatePolicy? certificatePolicy, string? serverName, int initialPeerUnidiStreams = 0, int initialPeerBidiStreams = 0)
     {
+        _initialPeerUnidiStreams = initialPeerUnidiStreams;
         ThrowIfSegmentLayoutUnsupported();
         _connection = connection;
         _sink = sink;
@@ -143,6 +150,7 @@ public sealed unsafe partial class MsQuicTransport : ITransport, IMsQuicConnecti
         _supportedSendFlags = connection.Api.SupportedSendFlags;
         _cancelOnBlockedSupported = (_supportedSendFlags & QUIC_SEND_FLAGS.CANCEL_ON_BLOCKED) != 0;
         InitializeStreams(options.MaxStreams);
+        MakeRoomForPeerStreams(initialPeerBidiStreams, initialPeerUnidiStreams);
         connection.Events = this;
     }
 
@@ -173,7 +181,10 @@ public sealed unsafe partial class MsQuicTransport : ITransport, IMsQuicConnecti
     /// <summary>Number of exceptions thrown by sink callbacks (and by the transport's handling of MsQuic events).</summary>
     public long SinkExceptionCount => Interlocked.Read(ref _sinkExceptions);
 
-    /// <summary>Peer streams refused because the stream table was full.</summary>
+    /// <summary>
+    /// Peer streams refused because the stream table was full. Stays 0: the table is sized for every stream the peer was
+    /// granted (<see cref="MsQuicTransportOptions.StreamTableFor"/>), and MsQuic admits no other.
+    /// </summary>
     public long RefusedPeerStreamCount => Interlocked.Read(ref _refusedPeerStreams);
 
     /// <summary>MsQuic events that arrived after <see cref="ITransportSink.OnClosed"/> and were dropped (expected to stay 0).</summary>
@@ -218,6 +229,10 @@ public sealed unsafe partial class MsQuicTransport : ITransport, IMsQuicConnecti
                 AppOwnedReceiveBuffers = false,
                 IdealSendBufferSize = true,
                 CancelOnBlocked = _cancelOnBlockedSupported,
+
+                // What the connection's own settings let the peer open from the first packet on. It is in the transport
+                // parameters, so nothing the session asks for later takes it back.
+                PeerUnidirectionalStreams = _initialPeerUnidiStreams,
             };
         }
     }
@@ -289,6 +304,8 @@ public sealed unsafe partial class MsQuicTransport : ITransport, IMsQuicConnecti
     {
         int state = Volatile.Read(ref _state);
         if (state is StateClosing or StateClosed || _connection.IsClosed) return;
+        // Before the grant: the table has the room when the first peer stream beyond the old limit arrives.
+        MakeRoomForPeerStreams(bidirectional, unidirectional);
         _connection.UpdatePeerStreamLimits(bidirectional, unidirectional);
     }
 

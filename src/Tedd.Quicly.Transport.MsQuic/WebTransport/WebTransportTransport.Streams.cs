@@ -62,6 +62,16 @@ public sealed unsafe partial class WebTransportTransport
         /// <summary>The deferred stream's preamble carried the FIN, which has to be replayed when it is exposed.</summary>
         public bool DeferredFin;
 
+        /// <summary>
+        /// A deferred stream that has been given one of the session's stream slots and whose inner receive was resumed: the
+        /// next thing the inner transport reports for it exposes it (on the inner transport's thread, where Core's
+        /// callbacks belong).
+        /// </summary>
+        public bool ExposeReserved;
+
+        /// <summary>The stream holds one of the session's peer unidirectional stream slots (<see cref="_peerUniExposed"/>).</summary>
+        public bool Counted;
+
         /// <summary>Preamble sends whose completions the carrier still has to swallow (they are not Core's).</summary>
         public int PreambleSendsPending;
 
@@ -104,14 +114,38 @@ public sealed unsafe partial class WebTransportTransport
         public bool HeadersSeen;
     }
 
+    /// <summary>Slot references the mirror starts with; it grows with the inner transport's slots in use.</summary>
+    private const int InitialMirrorSlots = 64;
+
+    /// <summary>Slots per chunk of preamble storage.</summary>
+    private const int PreambleChunkSlots = 256;
+
+    /// <summary>A slot index no transport's table reaches: beyond it the carrier refuses to mirror.</summary>
+    private const int MaxMirrorSlots = 1 << 21;
+
+    /// <summary>
+    /// The mirror of the inner transport's stream table, indexed by its slot. Grown under <see cref="_streamLock"/> when
+    /// the inner transport uses a slot beyond it (its table grows with the streams it grants), and published whole, so a
+    /// reader takes the reference once.
+    /// </summary>
     private StreamSlot?[] _streamSlots = [];
     private readonly Lock _streamLock = new();
 
-    /// <summary>Preamble bytes, <see cref="PreambleCapacity"/> per slot, kept alive until the preamble send completes.</summary>
-    private NativeArray<byte> _preambleBytes = null!;
+    /// <summary>
+    /// Preamble bytes, <see cref="PreambleCapacity"/> per slot, kept alive until the preamble send completes: native
+    /// memory in chunks of <see cref="PreambleChunkSlots"/> slots, allocated when a local stream first needs one and
+    /// never moved, because the inner transport reads the bytes until that send completes.
+    /// </summary>
+    private NativeArray<byte>?[] _preambleBytes = [];
 
-    /// <summary>One gather segment per slot, describing that slot's preamble on its own (a bare <see cref="StartStream"/>).</summary>
-    private NativeArray<TransportSegment> _preambleSegments = null!;
+    /// <summary>One gather segment per slot, describing that slot's preamble on its own (a bare <see cref="StartStream"/>); chunked like the bytes.</summary>
+    private NativeArray<TransportSegment>?[] _preambleSegments = [];
+
+    // Under _streamLock. What the session may have open of the peer's unidirectional streams (what was reported to it at
+    // first, then the most it asked for), how many of them it has been shown, and how many data streams wait unexposed.
+    private int _sessionUniAllowed;
+    private int _peerUniExposed;
+    private int _deferredStreams;
 
     /// <summary>Gather arrays of streams' first sends: preamble plus the caller's segments.</summary>
     private NativeArray<TransportSegment> _firstSendScratch = null!;
@@ -122,9 +156,7 @@ public sealed unsafe partial class WebTransportTransport
 
     private void InitialiseStreams(WebTransportOptions options)
     {
-        _streamSlots = new StreamSlot?[options.MaxStreams];
-        _preambleBytes = new NativeArray<byte>(options.MaxStreams * PreambleCapacity);
-        _preambleSegments = new NativeArray<TransportSegment>(options.MaxStreams);
+        _streamSlots = new StreamSlot?[Math.Min(options.MaxStreams, InitialMirrorSlots)];
         _firstSendStride = options.MaxStreamSegments + 1;
         _firstSendScratch = new NativeArray<TransportSegment>(options.MaxConcurrentStreamStarts * _firstSendStride);
         _firstSendState = new int[options.MaxConcurrentStreamStarts];
@@ -133,8 +165,28 @@ public sealed unsafe partial class WebTransportTransport
     private void DisposeStreams()
     {
         _firstSendScratch.Dispose();
-        _preambleSegments.Dispose();
-        _preambleBytes.Dispose();
+        foreach (NativeArray<TransportSegment>? chunk in _preambleSegments) chunk?.Dispose();
+        foreach (NativeArray<byte>? chunk in _preambleBytes) chunk?.Dispose();
+    }
+
+    /// <summary>The slot's preamble bytes and its gather segment (allocating the chunk they live in on first use).</summary>
+    private byte* PreambleStorage(int slot, out TransportSegment* segment)
+    {
+        int chunk = slot / PreambleChunkSlots;
+        int offset = slot % PreambleChunkSlots;
+        lock (_streamLock)
+        {
+            if (chunk >= _preambleBytes.Length)
+            {
+                Array.Resize(ref _preambleBytes, chunk + 1);
+                Array.Resize(ref _preambleSegments, chunk + 1);
+            }
+
+            NativeArray<byte> bytes = _preambleBytes[chunk] ??= new NativeArray<byte>(PreambleChunkSlots * PreambleCapacity);
+            NativeArray<TransportSegment> segments = _preambleSegments[chunk] ??= new NativeArray<TransportSegment>(PreambleChunkSlots);
+            segment = segments.Pointer + offset;
+            return bytes.Pointer + ((long)offset * PreambleCapacity);
+        }
     }
 
     // ---------------------------------------------------------------- slot table
@@ -142,19 +194,30 @@ public sealed unsafe partial class WebTransportTransport
     /// <summary>The slot for <paramref name="id"/>, re-stamped when the inner transport reused it for a new stream.</summary>
     private StreamSlot? EnsureSlot(TransportStreamId id, StreamRole role, StreamKind kind, bool local)
     {
-        if ((uint)id.Slot >= (uint)_streamSlots.Length)
+        if ((uint)id.Slot >= MaxMirrorSlots)
         {
-            Diagnostic(TransportDiagnosticLevel.Error, $"Inner stream slot {id.Slot} is outside the carrier's table of {_streamSlots.Length}; raise WebTransportOptions.MaxStreams.");
+            Diagnostic(TransportDiagnosticLevel.Error, $"Inner stream slot {id.Slot} is not one a stream table can have; the stream is not mirrored.");
             return null;
         }
 
         lock (_streamLock)
         {
-            StreamSlot? slot = _streamSlots[id.Slot];
+            StreamSlot?[] slots = _streamSlots;
+            if (id.Slot >= slots.Length)
+            {
+                // The inner transport sizes its table for the streams it grants, which can be more than its options say:
+                // the mirror follows the slots it really uses.
+                var grown = new StreamSlot?[Math.Min(MaxMirrorSlots, Math.Max(id.Slot + 1, slots.Length * 2))];
+                Array.Copy(slots, grown, slots.Length);
+                Volatile.Write(ref _streamSlots, grown);
+                slots = grown;
+            }
+
+            StreamSlot? slot = slots[id.Slot];
             if (slot is null)
             {
                 slot = new StreamSlot();
-                _streamSlots[id.Slot] = slot;
+                Volatile.Write(ref slots[id.Slot], slot);
             }
             else if (slot.Generation != id.Generation)
             {
@@ -178,6 +241,8 @@ public sealed unsafe partial class WebTransportTransport
         slot.Exposed = false;
         slot.Deferred = false;
         slot.DeferredFin = false;
+        slot.ExposeReserved = false;
+        slot.Counted = false;
         slot.PreambleSendsPending = 0;
         slot.PreambleQueued = false;
         slot.PreambleBytes = 0;
@@ -190,8 +255,9 @@ public sealed unsafe partial class WebTransportTransport
     /// <summary>The live slot for <paramref name="id"/>, or null when the id is stale or the slot is free.</summary>
     private StreamSlot? Lookup(TransportStreamId id)
     {
-        if ((uint)id.Slot >= (uint)_streamSlots.Length) return null;
-        StreamSlot? slot = Volatile.Read(ref _streamSlots[id.Slot]);
+        StreamSlot?[] slots = Volatile.Read(ref _streamSlots);
+        if ((uint)id.Slot >= (uint)slots.Length) return null;
+        StreamSlot? slot = Volatile.Read(ref slots[id.Slot]);
         if (slot is null) return null;
         lock (_streamLock)
         {
@@ -293,7 +359,7 @@ public sealed unsafe partial class WebTransportTransport
     private bool WritePreamble(StreamSlot slot, TransportStreamId id, out TransportSegment segment)
     {
         segment = default;
-        byte* buffer = _preambleBytes.Pointer + ((long)id.Slot * PreambleCapacity);
+        byte* buffer = PreambleStorage(id.Slot, out TransportSegment* unused);
         var span = new Span<byte>(buffer, PreambleCapacity);
         int written = slot.Kind == StreamKind.Bidirectional
             ? WebTransportFraming.WriteBidirectionalPreamble(span, _sessionId)
@@ -309,7 +375,7 @@ public sealed unsafe partial class WebTransportTransport
         if (!_sessionIdKnown) return TransportStatus.InvalidState;
         if (!WritePreamble(slot, id, out TransportSegment preamble)) return TransportStatus.Failed;
 
-        TransportSegment* segment = _preambleSegments.Pointer + id.Slot;
+        _ = PreambleStorage(id.Slot, out TransportSegment* segment);
         *segment = preamble;
 
         // The completion can arrive inline, so the slot says "swallow one" before the send is made.
@@ -386,12 +452,105 @@ public sealed unsafe partial class WebTransportTransport
     }
 
     /// <inheritdoc/>
-    /// <remarks>The carrier asks the inner transport for its own HTTP/3 streams on top of what Core wants.</remarks>
+    /// <remarks>
+    /// The carrier asks the inner transport for its own HTTP/3 streams on top of what Core wants. Core is shown no more
+    /// of the peer's unidirectional streams at once than it asked for (<see cref="TryCountPeerStream"/>), whatever the
+    /// peer does with the three that are HTTP/3's.
+    /// </remarks>
     public void UpdatePeerStreamLimits(ushort bidirectional, ushort unidirectional)
     {
         ITransport? inner = _inner;
+        bool waiting;
+        lock (_streamLock)
+        {
+            if (unidirectional > _sessionUniAllowed) _sessionUniAllowed = unidirectional;
+            waiting = _deferredStreams > 0;
+        }
+
         inner?.UpdatePeerStreamLimits(AddOverhead(bidirectional, _isClient ? 0 : 1), AddOverhead(unidirectional, Http3UniStreamCount));
+        if (waiting && inner is not null && IsSessionEstablished) ResumeDeferredStreams(inner);
     }
+
+    /// <summary>
+    /// Takes one of the session's peer unidirectional stream slots for a stream that is about to be shown to Core (under
+    /// <see cref="_streamLock"/>). A bidirectional stream needs none: the session's CONNECT stream is mandatory, so the
+    /// inner limit for those is exact.
+    /// </summary>
+    /// <remarks>
+    /// The inner connection grants three unidirectional streams more than the session has: HTTP/3's control stream and its
+    /// two QPACK streams. Only the control stream is mandatory (RFC 9114 §6.2.1; the QPACK streams may be left out by an
+    /// endpoint that never uses the dynamic table, RFC 9204 §4.2), so a peer that opens fewer can open that many more
+    /// session streams than Core was told — and Core sized its receive state for what it was told. The carrier therefore
+    /// counts the streams it shows Core and holds the rest back, unread on the inner transport, until one of them ends.
+    /// </remarks>
+    private bool TryCountPeerStream(StreamSlot slot)
+    {
+        if (slot.Kind != StreamKind.Unidirectional || slot.Counted) return true;
+        if (_peerUniExposed >= _sessionUniAllowed) return false;
+        _peerUniExposed++;
+        slot.Counted = true;
+        return true;
+    }
+
+    /// <summary>
+    /// Gives the session's free stream slots to the peer streams that wait for one and resumes their inner receive (any
+    /// thread). Each is shown to Core by the next event the inner transport reports for it, on its own thread:
+    /// <see cref="ExposeReserved"/>.
+    /// </summary>
+    private void ResumeDeferredStreams(ITransport inner)
+    {
+        while (true)
+        {
+            TransportStreamId id = default;
+            lock (_streamLock)
+            {
+                if (_deferredStreams == 0) return;
+                StreamSlot?[] slots = _streamSlots;
+                for (int i = 0; i < slots.Length; i++)
+                {
+                    StreamSlot? slot = slots[i];
+                    if (slot is null || !slot.Deferred || slot.ExposeReserved || slot.Role != StreamRole.Data) continue;
+                    if (!TryCountPeerStream(slot)) continue;
+                    slot.ExposeReserved = true;
+                    id = slot.Id;
+                    break;
+                }
+            }
+
+            if (!id.IsValid) return;
+            inner.ResumeStreamReceive(id, 0);
+        }
+    }
+
+    /// <summary>
+    /// Shows Core a stream that was held back and has its slot (inner transport's thread): the stream starts, and a FIN
+    /// its preamble indication carried is replayed when nothing will indicate it again.
+    /// </summary>
+    /// <returns>Whether the stream's FIN still has to be replayed by the caller.</returns>
+    private bool ExposeReserved(StreamSlot slot, TransportStreamId id, ITransportSink sink)
+    {
+        bool fin;
+        StreamKind kind;
+        lock (_streamLock)
+        {
+            slot.ExposeReserved = false;
+            slot.Deferred = false;
+            slot.Exposed = true;
+            _deferredStreams--;
+            fin = slot.DeferredFin;
+            slot.DeferredFin = false;
+            kind = slot.Kind;
+        }
+
+        sink.OnPeerStreamStarted(id, kind);
+        return fin;
+    }
+
+    /// <summary>
+    /// What the inner connection's initial unidirectional grant leaves for the session: three of those streams are HTTP/3's
+    /// own (control and the two QPACK streams) and never reach Core.
+    /// </summary>
+    private static int SessionPeerUnidiStreams(int inner) => Math.Max(0, inner - Http3UniStreamCount);
 
     private static ushort AddOverhead(ushort value, int overhead)
     {
@@ -450,9 +609,15 @@ public sealed unsafe partial class WebTransportTransport
         ITransportSink? sink = _sink;
         if (sink is null) return ReceiveResult.Consumed(TotalLength(segments));
 
-        // A stream held back until the session exists: leave its bytes where they are rather than showing Core a stream
-        // it has not been told about. AdoptRole already pended it; this only catches an indication already in flight.
-        if (!slot.Exposed) return ReceiveResult.PendingAfter(0);
+        // A stream held back until the session exists, or until the session has a stream slot for it: leave its bytes
+        // where they are rather than showing Core a stream it has not been told about. AdoptRole already pended it; this
+        // catches an indication already in flight — and the one that follows the resume of a stream that now has its slot,
+        // which is where Core is told about it.
+        if (!slot.Exposed)
+        {
+            if (!slot.ExposeReserved) return ReceiveResult.PendingAfter(0);
+            ExposeReserved(slot, id, sink);
+        }
 
         ReceiveResult result = sink.OnStreamReceived(id, segments, absoluteOffset - (ulong)slot.PreambleBytes, fin);
         return result;
@@ -572,7 +737,11 @@ public sealed unsafe partial class WebTransportTransport
                 slot, id, StreamRole.Data, signalLength + sessionLength, buffered, copied, fin, exposeAsData: false, defer: true);
         }
 
-        return AdoptRole(slot, id, StreamRole.Data, signalLength + sessionLength, buffered, copied, fin, exposeAsData: true);
+        // The session exists; it is shown the stream if it has a stream slot left for it, and the stream waits like an
+        // early one if it has not (TryCountPeerStream).
+        bool room;
+        lock (_streamLock) room = TryCountPeerStream(slot);
+        return AdoptRole(slot, id, StreamRole.Data, signalLength + sessionLength, buffered, copied, fin, exposeAsData: room, defer: !room);
     }
 
     /// <summary>
@@ -593,12 +762,14 @@ public sealed unsafe partial class WebTransportTransport
             slot.PreambleBytes = preambleLength;
             slot.Exposed = exposeAsData;
             slot.Deferred = defer;
+            if (defer) _deferredStreams++;
             slot.DeferredFin = defer && consumedHere == copied && fin;
             if (role is StreamRole.PeerControl or StreamRole.Connect) slot.Reader = new Http3FrameReader((ulong)MaxFrameLengthFor(role));
             if (role == StreamRole.Connect) slot.Capsules = new Http3FrameReader((ulong)_options.MaxCapsuleLength);
         }
 
-        // Stop the inner transport indicating this stream; ReleaseDeferredStreams resumes it once the session exists.
+        // Stop the inner transport indicating this stream; it is resumed once the session exists (ReleaseDeferredStreams)
+        // and has a stream slot for it (ResumeDeferredStreams).
         if (defer) return ReceiveResult.PendingAfter(consumedHere);
 
         if (exposeAsData)
@@ -618,46 +789,22 @@ public sealed unsafe partial class WebTransportTransport
     }
 
     /// <summary>
-    /// Hands over the peer data streams that arrived before the session existed, in the order they were adopted, and
-    /// lets the inner transport indicate their bytes again. Called once, straight after
-    /// <see cref="ITransportSink.OnConnected"/>, so Core learns of these streams after the connection and never before.
+    /// Hands over the peer data streams that arrived before the session existed — as many of the unidirectional ones as
+    /// the session has stream slots for — and lets the inner transport report them again. Called once, straight after
+    /// <see cref="ITransportSink.OnConnected"/>, on the inner transport's thread, so Core learns of these streams after the
+    /// connection and never before. Each stream is shown to Core by the next event the inner transport reports for it
+    /// (<see cref="ExposeReserved"/>); the ones that found no slot wait for a stream of the session to end.
     /// </summary>
-    private void ReleaseDeferredStreams()
+    /// <param name="sessionStreams">Peer unidirectional streams the session was told it may have open.</param>
+    private void ReleaseDeferredStreams(int sessionStreams)
     {
-        ITransportSink? sink = _sink;
         ITransport? inner = _inner;
-        if (sink is null || inner is null) return;
-
-        StreamSlot?[] slots = _streamSlots;
-        for (int i = 0; i < slots.Length; i++)
+        lock (_streamLock)
         {
-            StreamSlot? slot = Volatile.Read(ref slots[i]);
-            if (slot is null) continue;
-
-            TransportStreamId id;
-            StreamKind kind;
-            bool fin;
-            lock (_streamLock)
-            {
-                if (!slot.Deferred || slot.Role != StreamRole.Data) continue;
-                slot.Deferred = false;
-                slot.Exposed = true;
-                id = slot.Id;
-                kind = slot.Kind;
-                fin = slot.DeferredFin;
-                slot.DeferredFin = false;
-            }
-
-            sink.OnPeerStreamStarted(id, kind);
-            if (fin)
-            {
-                // The preamble indication carried the FIN, so there is nothing left to re-indicate.
-                sink.OnStreamReceived(id, default, 0, true);
-                continue;
-            }
-
-            inner.ResumeStreamReceive(id, 0);
+            if (sessionStreams > _sessionUniAllowed) _sessionUniAllowed = sessionStreams;
         }
+
+        if (inner is not null) ResumeDeferredStreams(inner);
     }
 
     /// <summary>Copies up to <paramref name="destination"/>.Length bytes from the front of the segment array.</summary>
@@ -738,8 +885,16 @@ public sealed unsafe partial class WebTransportTransport
             return;
         }
 
-        if (!slot.Exposed) return;
-        _sink?.OnStreamPeerSendShutdown(id);
+        ITransportSink? sink = _sink;
+        if (!slot.Exposed)
+        {
+            // A stream that was held back whole — its preamble indication carried the FIN — has its slot now and was
+            // resumed: the inner transport has nothing left to indicate, so this is the event that shows it to Core.
+            if (!slot.ExposeReserved || sink is null) return;
+            if (ExposeReserved(slot, id, sink)) sink.OnStreamReceived(id, default, 0, true);
+        }
+
+        sink?.OnStreamPeerSendShutdown(id);
     }
 
     /// <inheritdoc/>
@@ -748,16 +903,41 @@ public sealed unsafe partial class WebTransportTransport
         StreamSlot? slot = Lookup(id);
         if (slot is null) return;
 
+        ITransport? inner = _inner;
         bool exposed = slot.Exposed;
+        bool waiting;
         if (!exposed)
         {
-            // The carrier owns this stream: release it here, Core never hears of it.
-            lock (_streamLock) ResetSlot(slot);
-            _inner?.CloseStream(id);
+            // The carrier owns this stream: release it here, Core never hears of it. One that was waiting for the session
+            // (or for a stream slot of it) and ended first gives back what it held.
+            lock (_streamLock)
+            {
+                if (slot.Deferred) _deferredStreams--;
+                if (slot.Counted) _peerUniExposed--;
+                ResetSlot(slot);
+                waiting = _deferredStreams > 0;
+            }
+
+            inner?.CloseStream(id);
+            if (waiting && inner is not null && IsSessionEstablished) ResumeDeferredStreams(inner);
             return;
         }
 
         _sink?.OnStreamShutdownComplete(id);
+
+        // Core has released what it kept for the stream: its slot is free for a stream that waits for one.
+        lock (_streamLock)
+        {
+            if (slot.Counted && slot.Generation == id.Generation)
+            {
+                slot.Counted = false;
+                _peerUniExposed--;
+            }
+
+            waiting = _deferredStreams > 0;
+        }
+
+        if (waiting && inner is not null && IsSessionEstablished) ResumeDeferredStreams(inner);
     }
 
     /// <inheritdoc/>

@@ -233,6 +233,18 @@ internal abstract class ChannelEngine : IDisposable
     public abstract void OnStreamClosed(TransportStreamId id, bool aborted, ulong errorCode);
 
     /// <summary>
+    /// A peer stream this engine accepted ended (transport thread): the <see cref="OnStreamClosed"/> of a stream that has a
+    /// <c>StreamRecord</c>, with the value the engine gave it in <see cref="StreamAccept.Cookie"/>. An engine that keeps a
+    /// record per peer stream overrides this to release it by that value instead of searching for the id; the default is
+    /// <see cref="OnStreamClosed"/>. Exactly one of the two is called for a stream, once.
+    /// </summary>
+    /// <param name="id">The stream.</param>
+    /// <param name="cookie">The engine's per-stream value.</param>
+    /// <param name="aborted">True when the stream was reset or stopped rather than finished.</param>
+    /// <param name="errorCode">The reset code.</param>
+    public virtual void OnPeerStreamClosed(TransportStreamId id, long cookie, bool aborted, ulong errorCode) => OnStreamClosed(id, aborted, errorCode);
+
+    /// <summary>
     /// A stream this engine opened with a context from <see cref="PeerCore.MakeEngineStreamContext"/> finished starting
     /// (transport thread, routed by the context's mode). <paramref name="status"/> is <see cref="TransportStatus.Success"/>, or
     /// why the stream never started: with <see cref="TransportStatus.StreamLimitReached"/> the peer's stream limit refused it,
@@ -256,6 +268,19 @@ internal abstract class ChannelEngine : IDisposable
     /// <param name="id">The stream.</param>
     /// <param name="bytes">Bytes the transport would like kept outstanding.</param>
     public virtual void OnIdealSendBufferSize(TransportStreamId id, ulong bytes)
+    {
+    }
+
+    /// <summary>
+    /// The transport connected and reported how many unidirectional streams the peer can have open on this connection:
+    /// the larger of the session's own limit (<see cref="PeerCore.PeerUnidirectionalStreamLimit"/>) and what the transport
+    /// granted by itself (<see cref="TransportCapabilities.PeerUnidirectionalStreams"/>). An engine that keeps a record per
+    /// peer stream makes room for that many. Transport thread, from <see cref="ITransportSink.OnConnected"/>: before any
+    /// stream of the connection exists, and on the thread that owns the engine's receive state, so nothing can be using
+    /// what the engine replaces. Called again when a reconnect attaches a transport with a larger grant. Default: nothing.
+    /// </summary>
+    /// <param name="streams">Unidirectional streams the peer can have open at once.</param>
+    public virtual void OnPeerStreamCapacity(int streams)
     {
     }
 

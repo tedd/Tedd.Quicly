@@ -57,6 +57,9 @@ public sealed unsafe partial class MsQuicTransport
 
         /// <summary>START_COMPLETE was indicated (possibly inline, inside StreamStart).</summary>
         public volatile bool StartReported;
+
+        /// <summary>START_COMPLETE reported that the peer's stream limit refused the start (set with <see cref="StartReported"/>).</summary>
+        public volatile bool StartRefusedByLimit;
         public volatile bool SendClosed;
         public int CloseFlags;
         public int CloseQueued;
@@ -94,6 +97,12 @@ public sealed unsafe partial class MsQuicTransport
     private int _freeSlotCount;
     private int _slotHighWater;
     private int _maxStreams;
+
+    // Under _tableLock: the most streams the peer may have open in each direction (the largest grant made so far; QUIC
+    // never takes granted credit back), and the slots this end's own streams hold.
+    private int _grantedPeerUnidi;
+    private int _grantedPeerBidi;
+    private int _localSlots;
     private int _deferredHead = -1;
 
     /// <summary>
@@ -103,8 +112,49 @@ public sealed unsafe partial class MsQuicTransport
     /// </summary>
     private bool _tableClosed;
 
-    /// <summary>Capacity of the stream table (<see cref="MsQuicTransportOptions.MaxStreams"/>).</summary>
-    public int MaxStreams => _maxStreams;
+    /// <summary>
+    /// Capacity of the stream table: <see cref="MsQuicTransportOptions.MaxStreams"/>, or more when the streams the peer was
+    /// granted need it (<see cref="MakeRoomForPeerStreams"/>).
+    /// </summary>
+    public int MaxStreams
+    {
+        get
+        {
+            lock (_tableLock)
+                return _maxStreams;
+        }
+    }
+
+    /// <summary>
+    /// Sizes the stream table for what the peer may open: <paramref name="bidirectional"/> and
+    /// <paramref name="unidirectional"/> streams at once (the connection's settings at first, then every
+    /// <see cref="UpdatePeerStreamLimits"/>). MsQuic admits a stream the peer has credit for, and a stream that found no
+    /// slot could only be refused below the session, with whatever it carried lost — so the table always has room for the
+    /// grants, next to a quarter of it for this end's own streams (<see cref="MsQuicTransportOptions.StreamTableFor"/>).
+    /// <see cref="MsQuicTransportOptions.MaxStreams"/> is the size the table has when that is enough. Says so once,
+    /// through the diagnostic sink, when it is not.
+    /// </summary>
+    private void MakeRoomForPeerStreams(int bidirectional, int unidirectional)
+    {
+        int peer;
+        int before;
+        int after;
+        lock (_tableLock)
+        {
+            _grantedPeerBidi = Math.Max(_grantedPeerBidi, bidirectional);
+            _grantedPeerUnidi = Math.Max(_grantedPeerUnidi, unidirectional);
+            peer = _grantedPeerBidi + _grantedPeerUnidi;
+            before = _maxStreams;
+            after = Math.Max(before, MsQuicTransportOptions.StreamTableFor(peer));
+            _maxStreams = after;
+        }
+
+        if (after != before && Interlocked.Exchange(ref _streamTableRaised, 1) == 0)
+        {
+            Diagnose(TransportDiagnosticLevel.Information,
+                $"The peer may have {peer} streams open, more than a stream table of {before} slots (MsQuicTransportOptions.MaxStreams) has room for next to the local streams: the table was raised to {after} slots.", null);
+        }
+    }
 
     /// <summary>Stream slots in use: open streams plus released streams whose native close the cleanup work item has not run yet.</summary>
     public int OpenStreamCount
@@ -141,7 +191,7 @@ public sealed unsafe partial class MsQuicTransport
         int state = Volatile.Read(ref _state);
         if (state is not (StateConnecting or StateConnected) || _connection.IsClosed) return TransportStatus.InvalidState;
         if (kind is not (StreamKind.Unidirectional or StreamKind.Bidirectional)) return TransportStatus.NotSupported;
-        StreamSlot? slot = AllocateSlot(out TransportStatus refused);
+        StreamSlot? slot = AllocateSlot(local: true, out TransportStatus refused);
         if (slot is null) return refused;
         slot.Local = true;
         slot.Kind = kind;
@@ -219,6 +269,15 @@ public sealed unsafe partial class MsQuicTransport
     /// refuses completes canceled). <see cref="TransportStatus.InvalidState"/> unless connected, for a stream that cannot
     /// send (a peer unidirectional stream), after a <c>Fin</c> or an abort of the send direction, after a refused start, and
     /// for an unstarted stream without <c>Start</c>.
+    /// <para>
+    /// The start and the send are two MsQuic calls, and the worker can run the start between them. When the peer's stream
+    /// limit refuses it there (START_COMPLETE reports <c>STREAM_LIMIT_REACHED</c> and the stream shuts down), MsQuic rejects
+    /// the send with <c>INVALID_STATE</c>: the payload was never accepted, so no completion follows. The call then returns
+    /// <see cref="TransportStatus.StreamLimitReached"/> — a synchronous refusal — although
+    /// <see cref="ITransportSink.OnStreamStarted"/> and <see cref="ITransportSink.OnStreamShutdownComplete"/> may already
+    /// have been delivered for the stream (see <see cref="ITransport.SendStream"/>). Any other <c>INVALID_STATE</c> of the
+    /// send is <see cref="TransportStatus.InvalidState"/>.
+    /// </para>
     /// </remarks>
     public TransportStatus SendStream(TransportStreamId id, TransportSegment* segments, int count, ulong context, TransportSendFlags flags)
     {
@@ -230,17 +289,42 @@ public sealed unsafe partial class MsQuicTransport
         try
         {
             if (!slot.CanSend || slot.SendClosed) return TransportStatus.InvalidState;
+            bool startedHere = false;
             if (!slot.StartRequested)
             {
                 if (!slot.Local || (flags & TransportSendFlags.Start) == 0 || slot.StartRefused) return TransportStatus.InvalidState;
                 TransportStatus started = StartCore(slot);
                 if (started != TransportStatus.Success) return started;
+                startedHere = true;
+                Interlocked.Increment(ref _startsWithSend);
+                if (_delaySendUntilStartReported)
+                {
+                    WaitForStartReported(slot, 10_000);
+
+                    // MsQuic shuts a refused start down right after it indicates START_COMPLETE (SHUTDOWN_ON_FAIL); wait for that
+                    // too, so that the send always finds the stream shut down.
+                    if (slot.StartRefusedByLimit) WaitForNativeShutdown(slot, 10_000);
+                }
             }
             bool fin = (flags & TransportSendFlags.Fin) != 0;
             if (fin) slot.SendClosed = true;
             QUIC_SEND_FLAGS sendFlags = s_streamFlagMap[(int)flags & 63] & _supportedSendFlags;
             int status = slot.Stream!.Send((QUIC_BUFFER*)segments, (uint)count, sendFlags, (void*)context);
             if (MsQuicStatus.Succeeded(status)) return TransportStatus.Success;
+            if (startedHere && status == MsQuicStatus.QUIC_STATUS_INVALID_STATE && !slot.StartReported)
+            {
+                // A queued start always ends in START_COMPLETE, but the worker may shut the stream down a moment before it
+                // indicates it: wait (bounded) for the indication, which says whether the peer's stream limit refused it.
+                WaitForStartReported(slot, 1_000);
+            }
+            if (startedHere && status == MsQuicStatus.QUIC_STATUS_INVALID_STATE && slot.StartRefusedByLimit)
+            {
+                // The worker ran the start between StartCore and Send, the peer's stream limit refused it, and the stream
+                // shut down: the send was never accepted (no completion follows), and the stream is refused. The refusal
+                // callbacks may have been delivered already; SendClosed stays set, as the failed start left it.
+                Interlocked.Increment(ref _startRefusalRaces);
+                return TransportStatus.StreamLimitReached;
+            }
             if (fin) slot.SendClosed = false;
             return MapStatus(status, datagramSend: false);
         }
@@ -446,6 +530,46 @@ public sealed unsafe partial class MsQuicTransport
         if (close) EnqueueDeferredClose(slot, id.Generation);
     }
 
+    // Test seams (internal, for Tedd.Quicly.Transport.MsQuic.Tests): SendStream waits until START_COMPLETE was indicated
+    // before it queues the send, which makes the race that the remarks of SendStream describe deterministic; the counters
+    // say how many starts a SendStream made and how many of them lost the race.
+    private volatile bool _delaySendUntilStartReported;
+    private long _startsWithSend;
+    private long _startRefusalRaces;
+
+    /// <summary>Test seam: <see cref="SendStream"/> waits (at most 10 s each) for START_COMPLETE, and for the native shutdown of a stream whose start was refused, before it queues a send that started the stream.</summary>
+    internal bool DelaySendUntilStartReported
+    {
+        get => _delaySendUntilStartReported;
+        set => _delaySendUntilStartReported = value;
+    }
+
+    /// <summary>Test seam: starts made by <see cref="SendStream"/> (a send carrying <see cref="TransportSendFlags.Start"/> on an unstarted stream).</summary>
+    internal long StartsWithSend => Interlocked.Read(ref _startsWithSend);
+
+    /// <summary>Test seam: sends that returned <see cref="TransportStatus.StreamLimitReached"/> after the worker had already refused their start.</summary>
+    internal long StartRefusalRaces => Interlocked.Read(ref _startRefusalRaces);
+
+    /// <summary>
+    /// Waits (bounded) for START_COMPLETE of a start this thread queued: a busy wait that yields but never sleeps — a sleep is
+    /// a whole timer tick on Windows, and the worker answers in microseconds.
+    /// </summary>
+    private static void WaitForStartReported(StreamSlot slot, int milliseconds)
+    {
+        if (slot.StartReported) return;
+        long deadline = Environment.TickCount64 + milliseconds;
+        SpinWait spin = default;
+        while (!slot.StartReported && Environment.TickCount64 < deadline) spin.SpinOnce(sleep1Threshold: -1);
+    }
+
+    /// <summary>Waits (bounded, like <see cref="WaitForStartReported"/>) for the native SHUTDOWN_COMPLETE of the slot's stream.</summary>
+    private static void WaitForNativeShutdown(StreamSlot slot, int milliseconds)
+    {
+        long deadline = Environment.TickCount64 + milliseconds;
+        SpinWait spin = default;
+        while ((Volatile.Read(ref slot.CloseFlags) & NativeShutdownFlag) == 0 && Environment.TickCount64 < deadline) spin.SpinOnce(sleep1Threshold: -1);
+    }
+
     private TransportStatus StartCore(StreamSlot slot)
     {
         slot.StartRequested = true;
@@ -461,7 +585,13 @@ public sealed unsafe partial class MsQuicTransport
 
     // ------------------------------------------------------------------ slot table
 
-    private StreamSlot? AllocateSlot(out TransportStatus failure)
+    /// <summary>
+    /// Takes a slot for a stream. A local stream is refused (<see cref="TransportStatus.OutOfMemory"/>) once this end's
+    /// streams hold their whole share of the table — what the peer was granted is not theirs to take. A peer stream is
+    /// never refused for room: MsQuic admitted it, so it is within the grants the table was sized for; when its slot is
+    /// still held by streams whose native close has not run yet, the table grows.
+    /// </summary>
+    private StreamSlot? AllocateSlot(bool local, out TransportStatus failure)
     {
         lock (_tableLock)
         {
@@ -471,11 +601,21 @@ public sealed unsafe partial class MsQuicTransport
                 failure = TransportStatus.InvalidState;
                 return null;
             }
+            if (local)
+            {
+                if (_localSlots >= _maxStreams - (_grantedPeerBidi + _grantedPeerUnidi))
+                {
+                    failure = TransportStatus.OutOfMemory;
+                    return null;
+                }
+                _localSlots++;
+            }
             if (_freeSlotCount > 0) return _slots[_freeSlots[--_freeSlotCount]];
             if (_slotHighWater == _maxStreams)
             {
-                failure = TransportStatus.OutOfMemory;
-                return null;
+                // Every slot is in use although neither side is over what it may hold: slots of closed streams are given
+                // back by the cleanup work item, a moment after MsQuic returned their credit to the peer.
+                _maxStreams += Math.Max(16, _maxStreams / 8);
             }
             if (_slotHighWater == _slots.Length)
             {
@@ -493,6 +633,7 @@ public sealed unsafe partial class MsQuicTransport
     /// <summary>Resets a slot whose native stream is closed (or was never opened), bumps its generation and returns it to the free list.</summary>
     private void FreeSlot(StreamSlot slot)
     {
+        bool local = slot.Local;
         slot.Stream = null;
         slot.Local = false;
         slot.Kind = default;
@@ -504,6 +645,7 @@ public sealed unsafe partial class MsQuicTransport
         slot.StartRequested = false;
         slot.StartRefused = false;
         slot.StartReported = false;
+        slot.StartRefusedByLimit = false;
         slot.SendClosed = false;
         slot.PendingConsumed = 0;
         slot.PendingTotal = 0;
@@ -517,7 +659,10 @@ public sealed unsafe partial class MsQuicTransport
         slot.Generation = slot.Generation == uint.MaxValue ? 1 : slot.Generation + 1;
         Interlocked.And(ref slot.Guard, ~GuardClosing);
         lock (_tableLock)
+        {
+            if (local) _localSlots--;
             _freeSlots[_freeSlotCount++] = slot.Index;
+        }
     }
 
     /// <summary>Pins a live slot for an API call (see <see cref="StreamSlot.Guard"/>); null for unknown, stale, closed or closing ids.</summary>
@@ -684,9 +829,10 @@ public sealed unsafe partial class MsQuicTransport
     bool IMsQuicConnectionEvents.PeerStreamStarted(MsQuicConnection connection, MsQuicStream stream, QUIC_STREAM_OPEN_FLAGS flags)
     {
         if (Volatile.Read(ref _closedDelivered) != 0) return false;
-        StreamSlot? slot = AllocateSlot(out TransportStatus failure);
+        StreamSlot? slot = AllocateSlot(local: false, out TransportStatus failure);
         if (slot is null)
         {
+            // The table is closed (the connection is shutting down). Room is never the reason: see AllocateSlot.
             if (failure == TransportStatus.OutOfMemory)
             {
                 Interlocked.Increment(ref _refusedPeerStreams);
@@ -722,9 +868,11 @@ public sealed unsafe partial class MsQuicTransport
     void IMsQuicStreamEvents.StartComplete(MsQuicStream stream, int status, ulong id, bool peerAccepted)
     {
         var slot = (StreamSlot)stream.Tag!;
-        slot.StartReported = true;
         bool started = MsQuicStatus.Succeeded(status);
         if (!started) slot.SendClosed = true;
+        // Before StartReported: whoever sees the report sees why the start failed.
+        if (status == MsQuicStatus.QUIC_STATUS_STREAM_LIMIT_REACHED) slot.StartRefusedByLimit = true;
+        slot.StartReported = true;
         try
         {
             // The priority OpenStream or SetStreamPriority stored: set it here, on the worker, where the call runs inline.

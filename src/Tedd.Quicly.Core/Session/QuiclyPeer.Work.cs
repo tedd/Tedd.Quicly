@@ -59,11 +59,12 @@ public sealed unsafe partial class QuiclyPeer
     /// and evicts (see <see cref="Poll"/>). The one exception is short: when a burst fills the queue pool, the next
     /// message is held for the Drain that may follow in the same frame and the probe is set; a Poll that finds the
     /// channel undrained queues or drops it and clears the probe (the first Poll after the hold, or the second when the
-    /// channel had been drained just before). A
-    /// <em>reliable</em> channel without a handler that is not drained is different: once the queue pool is full its next
-    /// message is held and the ring behind it is not emptied, and the probe stays set for as long as that lasts, because
-    /// there is work that no <see cref="Poll"/> can consume. A host that polls while the probe is set then polls every
-    /// pass; the cure is to drain that channel or register a handler for it.
+    /// channel had been drained just before). A <em>reliable</em> channel without a handler that is not drained leaves
+    /// the probe clear as well: its streams are held back in the transport once its share is waiting (see
+    /// <see cref="Poll"/>), and a stream that merely waits for the application's Drain is not work. The probe is set
+    /// when such a stream is first held back, and when one that was held back ends, until the next Poll has looked at
+    /// them; that Poll clears it. Only a channel of a replaced engine (<see cref="PeerOptions.EngineFactory"/>), which
+    /// takes no receive credit, can still keep a message held and the probe set until it is drained.
     /// </para>
     /// </remarks>
     public bool HasPendingWork
@@ -143,6 +144,8 @@ public sealed unsafe partial class QuiclyPeer
             || core.LocalCompletionsQueued != 0
             || !core.ReceiveRing.IsEmpty
             || !core.PendedStreams.IsEmpty
+            || core.HasRetiredPendedStreams
+            || core.Credit.HasWork
             || !_pongs.IsEmpty
             || !_streamPings.IsEmpty
             || _transitionCount != 0

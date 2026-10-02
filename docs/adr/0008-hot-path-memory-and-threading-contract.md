@@ -25,6 +25,13 @@
    "the current callback"). `SendEntry.State` is the only dual-thread field and changes only by CAS:
    Free → Submitted → [Cancelling] → Completed → Free. The game thread reuses a slot only after observing the
    completion through the `CompletionRing`; it never polls `State`.
+   The per-channel receive credit (`ReceiveCredit`, 2026-09-30) keeps to the rule with three tables, each in whole
+   cache lines: what the transport thread took (its own line, with a private copy of what came back), what the
+   game thread gave back, and the limits (written by the game thread only when a channel's handler or drain state
+   changes, read-mostly). Neither thread writes the other's line, and each reads it only off the fast path: the
+   transport thread when its private copy says the channel is full, the game thread when it decides which held-back
+   streams to resume. Where one thread must not miss the other's change — a stream was held back while credit was
+   coming back — both store, fence (`Interlocked`) and then load, so at least one of them sees the other.
 5. **Rings are SPSC** per peer (`ReceiveRing`, `CompletionRing`, slab return ring): cached remote index,
    `Volatile.Read/Write` acquire/release, 128-byte padding between head, tail and entries, elements in a
    `NativeArray<T>` like every other hot struct array (invariant 12). One deliberate exception (2026-09-18): the

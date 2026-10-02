@@ -1,7 +1,8 @@
 #!/bin/bash
 # Paired in-process A/B over several launches (docs/adr/0007-measurement-method.md).
-# Usage: benchmarks/scripts/pair.sh <armA> <armB> <Class.Method | stages.<Packed|Keyed|Ordered64|Ordered4K|Loose>> \
+# Usage: benchmarks/scripts/pair.sh <armA> <armB> <Class.Method[:Prop=Value,...] | stages.<Packed|Keyed|Ordered64|Ordered4K|Loose>> \
 #          [launches=10] [pairs=12] [window=0.4] [tfm=net10.0]
+# Prop=Value sets a [Params] property of the benchmark class before its [GlobalSetup] (e.g. CompletionTableWaitBench.WaitWokenByOtherThread:DelayUs=10).
 # Each launch loads both arms (see build-arm.sh) into one pinned, high-priority PairHost process and alternates windows
 # A,B / B,A ...; launches alternate which arm is loaded first. Within one launch each arm carries a fixed offset of a few
 # percent (code and memory layout of that process), so the launch is the unit of evidence: COMBINED is the geometric

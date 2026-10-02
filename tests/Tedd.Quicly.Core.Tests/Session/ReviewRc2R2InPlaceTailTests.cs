@@ -3,10 +3,9 @@ using Tedd.Quicly.Core.Channels;
 using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Primitives;
 using Tedd.Quicly.Core.Session;
-using Tedd.Quicly.Core.Tests.Session;
 using Tedd.Quicly.Testing.Simulation;
 
-namespace Tedd.Quicly.Core.Tests.Review;
+namespace Tedd.Quicly.Core.Tests.Session;
 
 /// <summary>
 /// Adversarial review, RC2 round 2 of fix/stack-review (89efabc), lens: the stack tail of the in-place decode (8a7ca5d,
@@ -22,6 +21,13 @@ namespace Tedd.Quicly.Core.Tests.Review;
 /// <c>MaxStageLength</c> while the decoded size is not, <c>LimitedStagingLength</c> puts the message in the edge band: it is
 /// staged at its wire length, needs a second block of its decoded size, and is dropped and counted when none is free —
 /// after the sender was told Delivered. A test marked FINDING fails at 89efabc for the reason its comment gives.
+/// <para>
+/// Fixed since (RC2R2-1): <c>InPlaceTailCapacity</c> is the margin of a 1 MiB compressed block (4 128 bytes), which covers
+/// every compressed length a channel can carry (the wire length is below RawLength, at most 1 MiB), so
+/// <c>GetInPlaceLength</c> is the larger of the decoded and the wire length for all of them and such a message is staged
+/// in a block of its decoded size and decoded in place. The description above is what the tests found at 89efabc; the
+/// tests now pin the fix.
+/// </para>
 /// </remarks>
 public class ReviewRc2R2InPlaceTailTests
 {

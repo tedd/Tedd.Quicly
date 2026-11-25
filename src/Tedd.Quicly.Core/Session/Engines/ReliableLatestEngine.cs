@@ -387,7 +387,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
     /// <summary>
     /// Prepares the value's bytes in memory the value may be retransmitted from for up to 30 s: a copy (or its LZ4 block) in
-    /// a send lease, the caller's owned lease, or a reference-counted shared block. Pinned, borrowed and gathered payloads
+    /// a send lease, the caller's owned lease, or a reference-counted shared block. Pinned, borrowed and multi-page payloads
     /// are copied, because caller memory is only promised until the BufferReleased completion; a shared block needs no copy
     /// because the entry holds one reference on it until its payload is released
     /// (<see cref="EnginePayload.Commit"/> → <see cref="PeerCore.AttachShared"/>).
@@ -416,7 +416,7 @@ internal sealed unsafe partial class ReliableLatestEngine : ChannelEngine
 
         committed = copy.Kind;
         prepared = default;
-        return EnginePayload.TryPrepare(core, ref copy, channel, length, takeSinglePage: false, ref prepared);
+        return EnginePayload.TryPrepare(core, ref copy, channel, length, ref prepared);
     }
 
     /// <summary>Replaces the key's live value (PROTOCOL.md §4.3 <see cref="DeliveryStatus.Superseded"/>).</summary>

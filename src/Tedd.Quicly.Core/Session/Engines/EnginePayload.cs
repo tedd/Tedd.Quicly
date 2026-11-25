@@ -10,14 +10,11 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// <summary>The payload of an admission in progress: what the send entry takes when admission commits (game thread).</summary>
 internal unsafe struct PreparedPayload
 {
-    /// <summary>The lease the entry takes (rented here, or the caller's owned lease or single gathered page), or empty.</summary>
+    /// <summary>The lease the entry takes (rented here or owned by the caller), or empty.</summary>
     public BufferLease Lease;
 
     /// <summary><see cref="Lease"/> was rented here (give it back if admission fails).</summary>
     public bool Rented;
-
-    /// <summary>The caller's single gathered page is taken as it is (zero copy; see <see cref="EnginePayload.TryPrepare"/>).</summary>
-    public bool TookPage;
 
     /// <summary>First payload byte.</summary>
     public byte* Pointer;
@@ -41,8 +38,8 @@ internal unsafe struct PreparedPayload
 /// <summary>
 /// The send paths every engine shares (ARCHITECTURE.md §4.1; docs/design/session-layer.md §7.1): a copy into a send lease,
 /// the caller's owned lease (zero copy), pinned or native memory (zero copy), borrowed memory (an array is pinned with a
-/// <see cref="GCHandle"/>, other memory is copied), and gathered pages (copied into one lease, or, when the engine allows
-/// it, a single page taken as it is). LZ4 applies when the channel enables it, the payload is at least
+/// <see cref="GCHandle"/>, other memory is copied), and multi-page gathers (copied into one lease).
+/// LZ4 applies when the channel enables it, the payload is at least
 /// max(2, <see cref="ChannelDefinition.MinCompressSize"/>) bytes and the block is strictly shorter (PROTOCOL.md §2.1, §8);
 /// otherwise <see cref="PreparedPayload.RawLength"/> is 0. Game thread; allocation-free. Protocol: <see cref="TryPrepare"/>,
 /// then either <see cref="Commit"/> (the entry takes the payload) or <see cref="Release"/> (admission failed; the caller
@@ -76,7 +73,6 @@ internal static unsafe class EnginePayload
     /// <param name="request">The request.</param>
     /// <param name="channel">Its channel.</param>
     /// <param name="length">Raw payload bytes (for gathers: <see cref="GatherLength"/>).</param>
-    /// <param name="takeSinglePage">A gather of exactly one page that is not compressed is taken as it is (zero copy).</param>
     /// <param name="payload">Receives the prepared payload.</param>
     /// <returns><see langword="false"/> when no send lease was available (answer <see cref="SendStatus.OutOfBuffers"/>).</returns>
     /// <remarks>
@@ -85,19 +81,19 @@ internal static unsafe class EnginePayload
     /// compresses, goes through <see cref="TryPrepareGeneral"/>.
     /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static bool TryPrepare(PeerCore core, ref SendRequest request, ChannelDefinition channel, int length, bool takeSinglePage, ref PreparedPayload payload)
+    public static bool TryPrepare(PeerCore core, ref SendRequest request, ChannelDefinition channel, int length, ref PreparedPayload payload)
     {
         if (request.Kind == SendPayloadKind.Copy && channel.Compression == ChannelCompression.None)
         {
             return TryCopyInUncompressed(core, request.Source, ref payload);
         }
 
-        return TryPrepareGeneral(core, ref request, channel, length, takeSinglePage, ref payload);
+        return TryPrepareGeneral(core, ref request, channel, length, ref payload);
     }
 
     /// <summary>Every payload kind (see <see cref="TryPrepare"/>).</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static bool TryPrepareGeneral(PeerCore core, ref SendRequest request, ChannelDefinition channel, int length, bool takeSinglePage, ref PreparedPayload payload)
+    private static bool TryPrepareGeneral(PeerCore core, ref SendRequest request, ChannelDefinition channel, int length, ref PreparedPayload payload)
     {
         switch (request.Kind)
         {
@@ -161,19 +157,7 @@ internal static unsafe class EnginePayload
                 payload.Length = length;
                 return true;
             default:
-            {
-                ReadOnlySpan<BufferLease> pages = request.Gather;
-                if (takeSinglePage && pages.Length == 1 && !pages[0].IsEmpty && !ShouldCompress(channel, length))
-                {
-                    payload.Lease = pages[0];
-                    payload.TookPage = true;
-                    payload.Pointer = core.GetPointer(in pages[0]);
-                    payload.Length = length;
-                    return true;
-                }
-
-                return TryGatherIn(core, pages, length, channel, ref payload);
-            }
+                return TryGatherIn(core, request.Gather, length, channel, ref payload);
         }
     }
 
@@ -229,7 +213,7 @@ internal static unsafe class EnginePayload
         {
             core.ReturnSend(in request.Lease);
         }
-        else if (request.Kind == SendPayloadKind.Gather && !payload.TookPage)
+        else if (request.Kind == SendPayloadKind.Gather)
         {
             foreach (BufferLease page in request.Gather)
             {

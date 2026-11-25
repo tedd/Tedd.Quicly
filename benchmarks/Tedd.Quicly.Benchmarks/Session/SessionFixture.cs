@@ -47,7 +47,7 @@ internal sealed class SessionFixture : IDisposable
         return builder.Build();
     }
 
-    public SessionFixture(int pairs, bool compact = false, ChannelTable? table = null)
+    public SessionFixture(int pairs, bool compact = false, ChannelTable? table = null, SlabAllocatorOptions? clientAllocator = null)
     {
         ChannelTable channels = table ?? Table;
         Network = new SimulatedNetwork(Clock, 1);
@@ -56,6 +56,11 @@ internal sealed class SessionFixture : IDisposable
         Servers = new QuiclyPeer[pairs];
         PeerOptions serverOptions = Options(Clock, compact);
         PeerOptions clientOptions = Options(Clock, compact);
+        if (clientAllocator is not null)
+        {
+            clientOptions.AllocatorOptions = clientAllocator;
+        }
+
         QuiclyPeer? accepted = null;
         Listener.Start(static (in NewConnectionInfo _) => PreHandshakeDecision.Accept, (ITransport transport, in NewConnectionInfo info) =>
         {

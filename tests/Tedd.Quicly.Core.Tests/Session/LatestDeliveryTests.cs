@@ -57,20 +57,38 @@ public class LatestDeliveryTests
         Assert.Equal(PeerState.Connected, h.Client.State);
     }
 
-    [Fact]
-    public void A_Lost_Final_Update_Is_Eventually_Delivered()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_Lost_Final_Update_Is_Eventually_Delivered(bool singlePageGather)
     {
-        using SessionHarness h = Harness();
+        using SessionHarness h = Harness(client: o => o.SendBudgetBytes = 256);
         List<(ulong Key, uint Version, byte[] Payload, ReceiveFlags Flags)> received = [];
         h.Server!.RegisterHandler(2, LatestKit.Collect(received));
 
         // Three transmissions are lost: only the timer backstop can deliver the value (PROTOCOL.md §4.4).
         DatagramKit.TransportOf(h.Client).DropNextDatagrams(3);
-        SendResult result = h.Client.SendCopy(new SendHeader(2, 3), LatestKit.Payload(9, 100), SendOptions.Tracked);
+        byte[] expected = LatestKit.Payload(9, singlePageGather ? 256 : 100);
+        SendHeader header = new(2, 3);
+        SendResult result;
+        if (singlePageGather)
+        {
+            BufferLease page = h.Client.RentBuffer(expected.Length);
+            Assert.Equal(expected.Length, page.Length);
+            expected.CopyTo(h.Client.GetBufferSpan(in page));
+            result = h.Client.SendGather(header, [page], SendOptions.Tracked);
+        }
+        else
+        {
+            result = h.Client.SendCopy(header, expected, SendOptions.Tracked);
+        }
+
+        Assert.Equal(SendStatus.Admitted, result.Status);
         Assert.True(h.RunUntil(() => h.Client.GetDeliveryStatus(result.Token) == DeliveryStatus.Delivered, 2_000_000),
             $"status {h.Client.GetDeliveryStatus(result.Token)} after the retries");
         Assert.Single(received);
-        Assert.True(LatestKit.Matches(received[0].Payload, 9, 100));
+        Assert.Equal(expected, received[0].Payload);
+        Assert.True(h.RunUntil(() => DatagramKit.Statistics(h.Client).SendBytesOutstanding == 0));
         Assert.True(DatagramKit.ChannelStats(h.Client, 2).Retries >= 3, $"{DatagramKit.ChannelStats(h.Client, 2).Retries} retries");
     }
 

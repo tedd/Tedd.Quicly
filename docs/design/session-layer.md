@@ -205,8 +205,7 @@ which does one `SharedLeaseTable.Retain` and records the pair in a cold per-slot
 `Release`: at a datagram's `Sent` notice, when the packer has copied the message into a container, when an ordered channel's carrier
 is acknowledged, when the entry is discarded (expired, canceled, refused), when the session closes, and when the peer is disposed
 with the send in flight. A rejected admission never retained, so the caller keeps its own count; an empty payload takes no reference
-at all. From another thread (`ThreadSafeSend`) the bytes are copied at the call and no reference is taken, like every other
-foreign-thread path.
+at all. From another thread (`ThreadSafeSend`) the shared payload is copied at the call without taking a reference.
 
 ### 4.2 Flush (game thread)
 
@@ -1222,8 +1221,9 @@ registered in `ChannelEngines.Create`).
   (`QueueFull`); an entry (`QueueFull`); the payload (`OutOfBuffers`): Copy → one lease, compressed into it when that shrinks the
   payload; Owned → the caller's lease (zero copy) or a compressed lease (the caller's lease then returns to the pool at commit);
   Pinned → the pointer (zero copy) or compressed; Borrowed → an array pinned with a `GCHandle` (`SendEntryFlags.Pinned`, freed with
-  the payload) or compressed, while memory that is not an array is copied; Gather → the pages copied into one lease (compressed when
-  that shrinks it), the pages returned at commit. LZ4 applies when `Compression == Lz4`, the length is at least max(2,
+  the payload) or compressed, while memory that is not an array is copied. A single gather page follows the owned path.
+  Multiple gather pages are copied into one lease, compressed when that shrinks the payload, and returned at commit.
+  LZ4 applies when `Compression == Lz4`, the length is at least max(2,
   `MinCompressSize`) and the block is strictly shorter (the destination is one byte short), giving `RawLength = length`; otherwise
   `RawLength` is 0. Encoded size above the current `MaxDatagramPayload` ⇒ `TooLarge` (fragmenting channels: the `AdmitFragmented`
   hook, `NotSupported` until C2). Tracking (`QueueFull` when the completion table is full). Commit: the sequence from the channel
@@ -1540,8 +1540,9 @@ state of the peer's group streams. Every per-key array grows with the slots in u
   copy (ADR 0008 invariant 1). The value's `Aux1` packs its key slot, its outstanding transmissions, its flags
   (`Queued`, `Retrying`, `Superseded`, `Finish`, `Transmitted`) and, once known, the terminal status it still owes.
   Because caller memory is only promised until BufferReleased while a version may live for 30 s, `Admit` always takes the
-  bytes into memory the value may still be read from: a copy (or its LZ4 block) in a send lease, or the caller's owned lease;
-  pinned, borrowed and gathered payloads are copied. The hand-over itself goes through the shared
+  bytes into memory the value may still be read from. A single gather page supplies an owned lease.
+  Pinned, borrowed and multi-page gathered payloads are copied into a send lease, optionally compressed.
+  The hand-over itself goes through the shared
   `EnginePayload.TryPrepare` / `Commit` pair, so a `SendShared` block is **retained** rather than copied (one
   `SharedLeaseTable` reference, released exactly once in `ReleasePayload` when the value is acknowledged, superseded,
   canceled or fails — §4.1) and a payload kind added later cannot be dropped here silently. A refused admission gives back

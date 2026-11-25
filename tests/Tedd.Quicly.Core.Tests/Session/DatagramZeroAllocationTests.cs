@@ -1,4 +1,5 @@
 using Tedd.Quicly.Core.Channels;
+using Tedd.Quicly.Core.Memory;
 using Tedd.Quicly.Core.Session;
 using Tedd.Quicly.Testing.Simulation;
 
@@ -39,6 +40,13 @@ public class DatagramZeroAllocationTests
 
             client.SendCopy(new SendHeader(5), compressible);
             client.SendCopy(new SendHeader(2), payload, SendOptions.Tracked);
+            BufferLease page = client.RentBuffer(payload.Length);
+            payload.CopyTo(client.GetBufferSpan(in page));
+            if (!client.SendGather(new SendHeader(2), [page]).IsAdmitted)
+            {
+                throw new InvalidOperationException("The single-page gather was refused.");
+            }
+
             client.Flush(++tick);
             network.Advance(16_667);
             server.Poll();

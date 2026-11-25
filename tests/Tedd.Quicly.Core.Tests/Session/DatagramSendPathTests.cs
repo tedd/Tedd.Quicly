@@ -77,6 +77,9 @@ public class DatagramSendPathTests
         Assert.True(client.SendGather(new SendHeader(2), []).IsAdmitted);
         expected.Add([]);
         Flush();
+        Assert.True(client.SendGather(new SendHeader(2), [BufferLease.Empty]).IsAdmitted);
+        expected.Add([]);
+        Flush();
 
         client.Flush();
         Assert.True(h.RunUntil(() => got.Count == expected.Count));
@@ -90,6 +93,37 @@ public class DatagramSendPathTests
         Assert.True(h.RunUntil(() => DatagramKit.Statistics(client).SendEntriesInUse == 0));
         Assert.Equal(0, DatagramKit.Statistics(client).SendBytesOutstanding);
         NativeMemory.Free(native);
+    }
+
+    [Theory]
+    [InlineData(256, 0)]
+    [InlineData(512, 256)]
+    public void A_Single_Gather_Page_Can_Be_Retried_And_Compressed_Within_The_Send_Budget(int budget, int rawLength)
+    {
+        using SessionHarness h = new(table: Table, client: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.SendBudgetBytes = budget;
+        }, server: DatagramKit.Quiet);
+        QuiclyPeer client = h.Client;
+        Assert.True(h.RunUntil(() => DatagramKit.Statistics(client).SendEntriesInUse == 0));
+        List<(ReceiveHeader Header, byte[] Payload)> received = [];
+        h.Server!.RegisterHandler(5, Handlers.Collect(received));
+        BufferLease page = client.RentBuffer(256);
+        Assert.Equal(256, page.Length);
+
+        client.TransportSink.OnDatagramCapabilityChanged(true, 100);
+        Assert.Equal(SendStatus.TooLarge, client.SendGather(new SendHeader(2), [page]).Status);
+        Assert.Equal(page.Length, DatagramKit.Statistics(client).SendBytesOutstanding);
+
+        client.TransportSink.OnDatagramCapabilityChanged(true, 1200);
+        byte[] expected = new byte[page.Length];
+        expected.AsSpan().Fill(0x5a);
+        expected.CopyTo(client.GetBufferSpan(in page));
+        Assert.Equal(SendStatus.Admitted, client.SendGather(new SendHeader(5), [page]).Status);
+        Assert.True(h.RunUntil(() => received.Count == 1 && DatagramKit.Statistics(client).SendBytesOutstanding == 0));
+        Assert.Equal(expected, received[0].Payload);
+        Assert.Equal(rawLength, received[0].Header.RawLength);
     }
 
     [Fact]

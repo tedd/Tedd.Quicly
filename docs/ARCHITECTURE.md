@@ -196,7 +196,7 @@ target selection for datagrams completes inline.
 | `SendPinned(header, byte* ptr, int length)` / `SendPinned(header, PinnedMemory)` | none, no handle | `BufferReleased` completion | native memory or `GC.AllocateArray(pinned: true)` |
 | `SendBorrowed(header, ReadOnlyMemory<byte>)` | none, but pins (`MemoryHandle` stored as `nint` in a side table) | `BufferReleased` completion | convenience path for ordinary arrays |
 | `SendShared(header, table, sharedLease, length)` | none | this peer's reference is dropped when its own send completed (or was discarded); the block returns to the pool when the last peer released it | broadcast one serialisation to many peers — never compressed, so the caller compresses once instead of once per peer |
-| `SendGather(header, ReadOnlySpan<BufferLease>)` / `(header, TransportSegment*, count)` | none | `BufferReleased` | header + existing payload pages (≤ 8 segments) |
+| `SendGather(header, ReadOnlySpan<BufferLease>)` | one page uses the owned path, multiple pages are copied into one buffer | the peer takes ownership on admission | send the full contents of up to 8 pooled pages |
 
 The library never promises "no copy anywhere": it promises **at most one application-level copy**. MsQuic
 performs its own copy of send bytes into the packet buffer during encryption, and copies stream data from

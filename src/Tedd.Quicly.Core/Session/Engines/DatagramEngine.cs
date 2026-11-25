@@ -16,7 +16,7 @@ namespace Tedd.Quicly.Core.Session.Engines;
 /// <remarks>
 /// <para><b>Send (game thread).</b> <see cref="Admit"/> checks size, key and queue limit, then fills a send entry: the
 /// header in the slot's header block, the payload by every send path — a copy in a lease, an owned lease, pinned memory,
-/// pinned (array) or copied borrowed memory, gathered pages copied into one lease — LZ4-compressed when the channel asks
+/// pinned (array) or copied borrowed memory, multi-page gathers copied into one lease — LZ4-compressed when the channel asks
 /// for it and it shrinks the payload (PROTOCOL.md §2.1: RawLength 0 otherwise) — and appends the entry to the channel's
 /// FIFO (the entry's <c>Next</c> link). Nothing reaches the transport there: the scheduler's <see cref="FlushChannel"/>
 /// hands the queue to the packer in admission order and drops entries whose expiry has passed (counted
@@ -201,7 +201,7 @@ internal abstract unsafe partial class DatagramEngine : ChannelEngine
 
         NoteOrdinaryEntry(slot);
         PreparedPayload payload = default;
-        if (!EnginePayload.TryPrepare(_core, ref request, channel, length, takeSinglePage: false, ref payload))
+        if (!EnginePayload.TryPrepare(_core, ref request, channel, length, ref payload))
         {
             _core.DiscardEntry(slot);
             return SendStatus.OutOfBuffers;

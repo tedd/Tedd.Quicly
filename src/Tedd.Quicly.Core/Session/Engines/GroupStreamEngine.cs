@@ -292,7 +292,7 @@ internal sealed unsafe class GroupStreamEngine : ChannelEngine
         }
 
         PreparedPayload payload = default;
-        if (!EnginePayload.TryPrepare(_core, ref request, channel, length, takeSinglePage: true, ref payload))
+        if (!EnginePayload.TryPrepare(_core, ref request, channel, length, ref payload))
         {
             _core.DiscardEntry(slot);
             return SendStatus.OutOfBuffers;

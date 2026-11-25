@@ -147,9 +147,8 @@ public sealed unsafe partial class QuiclyPeer
 
     /// <summary>Sends existing payload pages as one message (at most <see cref="MaxGatherSegments"/>); ownership moves to the peer when admitted.</summary>
     /// <remarks>
-    /// Each page contributes its whole <see cref="BufferLease.Length"/>. On datagram channels the pages are copied into one
-    /// payload buffer at admission (a datagram message fits in one datagram) and given back to the pool. On ordered channels
-    /// a single page that is not compressed is sent as it is (zero copy); several pages are copied into one buffer.
+    /// Each page contributes its whole <see cref="BufferLease.Length"/>. A single page follows the <see cref="SendOwned"/>
+    /// path, including on a producer thread. Multiple pages are copied into one payload buffer at admission.
     /// </remarks>
     /// <param name="header">Channel and key.</param>
     /// <param name="segments">The pages, in order.</param>
@@ -159,6 +158,12 @@ public sealed unsafe partial class QuiclyPeer
     /// <exception cref="ArgumentOutOfRangeException">The channel is keyed and the key exceeds 2^62 − 1.</exception>
     public SendResult SendGather(in SendHeader header, ReadOnlySpan<BufferLease> segments, SendOptions options = default)
     {
+        if (segments.Length == 1)
+        {
+            BufferLease page = segments[0];
+            return SendOwned(in header, page, page.Length, options);
+        }
+
         if (segments.Length > MaxGatherSegments)
         {
             throw new ArgumentException($"A gather send has at most {MaxGatherSegments} segments.", nameof(segments));

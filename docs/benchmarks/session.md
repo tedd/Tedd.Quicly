@@ -744,3 +744,36 @@ is therefore about −2 % to +1 %, and a difference of 2 % or less is not eviden
   two B-inflated launches did not come back in 20 more launches of that series. They are in the pooled figures above. A run
   on a quiet machine would narrow the intervals; it would not move a 7 % cost on the Drain path, which every series of that
   kind showed.
+
+## Single-page gather sends (2026-11-25)
+
+`SendGather` can transfer a single rented page to the send queue through the owned-buffer path.
+This removes a second slab rental and a payload copy at datagram admission. On an uncompressed channel,
+a caller that already holds the entire send budget in one page can submit that page and recover its budget on completion.
+
+`SinglePageGatherBench.SendGather` sends 64 distinct 1 KiB pages per batch between two peers over a lossless simulated
+link on one thread. Each page fits one datagram. The timed work includes renting, filling, admission, flush, delivery,
+payload verification and completion. For reproduction, build the same benchmark and fixture against baseline
+`2c506b0` and the single-page change. Use PairHost with ten launches per runtime, alternating assembly load order,
+eight seconds of warmup and four pairs of 150 ms windows per launch. The host was a Ryzen 9 5950X, pinned to logical
+CPUs 4 and 6, with SDK 11.0.100.
+
+| Runtime | Baseline ns/message | Owned path ns/message | Paired time ratio (95% CI) |
+|---|---:|---:|---:|
+| .NET 10.0.15 | 1,090.55 | 977.70 | 0.960 (0.919–1.002) |
+| .NET 11.0.0 | 808.35 | 718.60 | 0.931 (0.907–0.954) |
+
+Absolute times are medians of launch medians. Ratios are geometric means of paired ratios, with a t interval across
+launches. The .NET 11 run took 6.95% less time per message. The .NET 10 interval includes parity.
+
+### Producer-thread admission
+
+A producer with `ThreadSafeSend` enabled can also hand its page to the game thread without copying it into a second
+lease. A separate .NET 10.0.15 experiment measured the time inside `SendGather` for 64 KiB reliable ordered sends.
+The producer rented and filled 32 pages before timing each batch. After admission, the game thread drained the queue,
+verified every byte in order and checked that the sender and receiver each reported zero outstanding payload bytes.
+
+Across ten independent pairs of process launches on the same host, alternating baseline and candidate order,
+the median admission cost was **1,565 ns before and 51 ns after**. The paired time ratio was **0.0317**
+(95% CI 0.0282–0.0357). Each process warmed up for at least two seconds and 64 batches, then measured 2,048 sends.
+Queue drain, transport and delivery were outside this timing window.

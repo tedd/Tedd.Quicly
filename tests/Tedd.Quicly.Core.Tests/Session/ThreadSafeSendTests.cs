@@ -167,6 +167,32 @@ public unsafe class ThreadSafeSendTests
     }
 
     [Fact]
+    public void A_Foreign_Gather_Transfers_One_Page_When_The_Send_Budget_Is_Full()
+    {
+        using SessionHarness h = new(table: Table, client: o =>
+        {
+            DatagramKit.Quiet(o);
+            o.ThreadSafeSend = true;
+            o.SendBudgetBytes = 256;
+        }, server: DatagramKit.Quiet);
+        Assert.True(h.RunUntil(() => DatagramKit.Statistics(h.Client).SendEntriesInUse == 0));
+        List<(ReceiveHeader Header, byte[] Payload)> received = [];
+        h.Server!.RegisterHandler(4, Handlers.Collect(received));
+        BufferLease page = h.Client.RentBuffer(256);
+        Assert.Equal(256, page.Length);
+        byte[] expected = DatagramKit.Payload(1, page.Length);
+        expected.CopyTo(h.Client.GetBufferSpan(in page));
+        SendResult result = default;
+        Thread producer = new(() => result = h.Client.SendGather(new SendHeader(4), [page]));
+        producer.Start();
+        Assert.True(producer.Join(TimeSpan.FromSeconds(10)));
+        Assert.Equal(SendStatus.Admitted, result.Status);
+        Assert.Equal(1, DatagramKit.Statistics(h.Client).ThreadSafeSends);
+        Assert.True(h.RunUntil(() => received.Count == 1 && DatagramKit.Statistics(h.Client).SendBytesOutstanding == 0));
+        Assert.Equal(expected, received[0].Payload);
+    }
+
+    [Fact]
     public void Sends_The_Game_Thread_Can_No_Longer_Admit_Are_Dropped_And_Counted()
     {
         using SessionHarness h = new(table: Table, client: o => o.ThreadSafeSend = true);
